@@ -60,7 +60,11 @@ def test_delegates_and_converts_float_scales_to_tensors():
         assert isinstance(attn.k_scale, torch.Tensor) and attn.k_scale.ndim == 0
         assert isinstance(attn.v_scale, torch.Tensor) and attn.v_scale.ndim == 0
         assert attn.k_scale.dtype == torch.float32
+        assert attn.v_scale.dtype == torch.float32
+        assert attn.k_scale.device.type == "cpu"
+        assert attn.v_scale.device.type == "cpu"
         assert torch.isclose(attn.k_scale, torch.tensor(expected))
+        assert torch.isclose(attn.v_scale, torch.tensor(expected))
         assert attn.k_scale_float == expected
         assert attn.v_scale_float == expected
 
@@ -68,11 +72,12 @@ def test_delegates_and_converts_float_scales_to_tensors():
 def test_tensor_scales_pass_through_unconverted():
     fake = _fake_language_model(1)
     attn = fake.lm.model.layers[0].self_attn.attn
+    assigned: dict[str, torch.Tensor] = {}
 
     def load_with_tensors(path: str) -> None:
         fake.calls.append(path)
-        attn.k_scale = torch.tensor(0.5)
-        attn.v_scale = torch.tensor(0.5)
+        assigned["k"] = attn.k_scale = torch.tensor(0.5)
+        assigned["v"] = attn.v_scale = torch.tensor(0.5)
 
     fake.lm.load_kv_cache_scales = load_with_tensors
     inst = MossTranscribeDiarizeForConditionalGeneration.__new__(
@@ -82,4 +87,5 @@ def test_tensor_scales_pass_through_unconverted():
 
     inst.load_kv_cache_scales("/tmp/kv_scales.json")
 
-    assert attn.k_scale.ndim == 0 and attn.v_scale.ndim == 0
+    assert attn.k_scale is assigned["k"] and attn.v_scale is assigned["v"]
+    assert torch.isclose(attn.k_scale, torch.tensor(0.5))
