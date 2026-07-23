@@ -6,6 +6,7 @@ visual embeddings for Qwen3-Omni's thinker stage.
 """
 from __future__ import annotations
 
+import bisect
 import contextlib
 import logging
 from collections.abc import Callable
@@ -109,8 +110,30 @@ class ThinkerModelRunner(ModelRunner):
         return CaptureHiddenMode.NULL
 
     # ------------------------------------------------------------------
-    # Multimodal embedding injection (~160 lines, from SGLangModelRunner)
+    # Multimodal embedding injection (batch-wide scatter, CPU-side placement)
     # ------------------------------------------------------------------
+
+    def _req_mm_token_positions(
+        self, req: Any, pad_values: dict
+    ) -> dict[str, list[int]]:
+        """Prompt-absolute placeholder positions per modality, from build-time
+        metadata when present, else scanned once from the CPU-side prompt ids —
+        so the merge never derives placement from GPU masks."""
+        positions = getattr(req, "_omni_mm_positions", None)
+        if positions is not None:
+            return positions
+        match_to_modality = {
+            pad_values.get("image", self._image_token_id): "image",
+            pad_values.get("video", self._video_token_id): "video",
+            pad_values.get("audio", self._audio_token_id): "audio",
+        }
+        positions = {"image": [], "video": [], "audio": []}
+        for pos, token in enumerate(req.origin_input_ids):
+            modality = match_to_modality.get(token)
+            if modality is not None:
+                positions[modality].append(pos)
+        req._omni_mm_positions = positions
+        return positions
 
     def _inject_multimodal_embeds(
         self, forward_batch: Any, schedule_batch: Any
@@ -119,9 +142,6 @@ class ThinkerModelRunner(ModelRunner):
             return None
 
         device = forward_batch.input_ids.device
-        image_token_id = self._image_token_id
-        video_token_id = self._video_token_id
-        audio_token_id = self._audio_token_id
 
         embed_input_ids = forward_batch.input_ids.clamp(
             0, self._embed_tokens.num_embeddings - 1
@@ -129,15 +149,19 @@ class ThinkerModelRunner(ModelRunner):
         input_embeds = self._embed_tokens(embed_input_ids)
 
         extend_lens = forward_batch.extend_seq_lens_cpu
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
         offsets = []
         pos = 0
         for length in extend_lens:
             offsets.append(pos)
             pos += length
 
+        # Accumulated across requests so the merge is one scatter per batch
+        # instead of per-request writes with device->host syncs.
+        scatter_rows: list[int] = []
+        scatter_srcs: list[torch.Tensor] = []
         deepstack_visual_embeds_list = []
-        visual_pos_masks_list = []
-        has_deepstack = False
+        visual_rows: list[int] = []
 
         for i, req in enumerate(schedule_batch.reqs):
             omni_inputs = req.omni_model_inputs
@@ -145,63 +169,66 @@ class ThinkerModelRunner(ModelRunner):
                 continue
 
             start = offsets[i]
-            end = start + extend_lens[i]
-            req_input_ids = forward_batch.input_ids[start:end]
+            length = extend_lens[i]
+            prefix = 0 if prefix_lens is None else int(prefix_lens[i])
             consumed = req._omni_consumed or {}
+            req._omni_consumed = consumed
             chunk_offsets: dict[str, tuple[int, int]] = {}
             pad_values = omni_inputs.get("pad_values", {})
 
-            for modality, token_id in [
-                ("image", image_token_id),
-                ("video", video_token_id),
-                ("audio", audio_token_id),
-            ]:
+            positions = self._req_mm_token_positions(req, pad_values)
+            chunk_positions: dict[str, list[int]] = {}
+            for modality in ("image", "video", "audio"):
+                mod_positions = positions[modality]
+                lo = bisect.bisect_left(mod_positions, prefix)
+                hi = bisect.bisect_left(mod_positions, prefix + length)
+                rel = [p - prefix for p in mod_positions[lo:hi]]
+                chunk_positions[modality] = rel
                 embeds = omni_inputs.get(f"{modality}_embeds")
-                if embeds is None:
+                if embeds is None or not rel:
                     continue
-                match_id = pad_values.get(modality, token_id)
-                mask = req_input_ids == match_id
-                if not mask.any():
-                    continue
-                n_tokens = int(mask.sum().item())
                 offset = consumed.get(modality, 0)
-                chunk_offsets[modality] = (offset, n_tokens)
-                chunk_embeds = embeds[offset : offset + n_tokens].to(
-                    device=device, dtype=input_embeds.dtype
-                )
-                input_embeds[torch.where(mask)[0] + start] = chunk_embeds
-                consumed[modality] = offset + n_tokens
-
-            req._omni_consumed = consumed
+                chunk_offsets[modality] = (offset, len(rel))
+                scatter_rows.extend(start + p for p in rel)
+                scatter_srcs.append(embeds[offset : offset + len(rel)])
+                consumed[modality] = offset + len(rel)
 
             ds_embeds = omni_inputs.get("deepstack_visual_embeds")
             image_ds = omni_inputs.get("image_deepstack_visual_embeds")
             video_ds = omni_inputs.get("video_deepstack_visual_embeds")
 
             if ds_embeds is not None or image_ds is not None or video_ds is not None:
-                has_deepstack = True
-                img_match_id = pad_values.get("image", image_token_id)
-                vid_match_id = pad_values.get("video", video_token_id)
-                img_mask = req_input_ids == img_match_id
-                vid_mask = req_input_ids == vid_match_id
-                visual_mask = img_mask | vid_mask
+                img_pos = chunk_positions["image"]
+                vid_pos = chunk_positions["video"]
+                visual_pos = sorted(img_pos + vid_pos)
+                visual_count = len(visual_pos)
 
                 if ds_embeds is None:
                     if image_ds and video_ds:
                         image_offset, image_count = chunk_offsets.get("image", (0, 0))
                         video_offset, video_count = chunk_offsets.get("video", (0, 0))
+                        img_set = set(img_pos)
+                        img_slots = [
+                            s for s, p in enumerate(visual_pos) if p in img_set
+                        ]
+                        vid_slots = [
+                            s for s, p in enumerate(visual_pos) if p not in img_set
+                        ]
+                        img_idx = torch.tensor(img_slots, dtype=torch.long)
+                        vid_idx = torch.tensor(vid_slots, dtype=torch.long)
                         merged = []
                         for img_e, vid_e in zip(image_ds, video_ds):
                             img_e = img_e[image_offset : image_offset + image_count]
                             vid_e = vid_e[video_offset : video_offset + video_count]
-                            num_visual = int(visual_mask.sum().item())
-                            joint = img_e.new_zeros(num_visual, img_e.shape[-1])
-                            img_in_visual = img_mask[visual_mask]
-                            vid_in_visual = vid_mask[visual_mask]
-                            if img_in_visual.any():
-                                joint[img_in_visual] = img_e.to(device=device)
-                            if vid_in_visual.any():
-                                joint[vid_in_visual] = vid_e.to(device=device)
+                            joint = img_e.new_zeros(visual_count, img_e.shape[-1])
+                            if img_slots:
+                                joint[img_idx.to(joint.device)] = img_e.to(
+                                    device=device
+                                )
+                            if vid_slots:
+                                joint[vid_idx.to(joint.device)] = vid_e.to(
+                                    device=device
+                                )
                             merged.append(joint)
                         ds_embeds = merged
                     elif image_ds:
@@ -216,11 +243,10 @@ class ThinkerModelRunner(ModelRunner):
                             layer[video_offset : video_offset + video_count]
                             for layer in video_ds
                         ]
-                elif visual_mask.any():
-                    visual_count = int(visual_mask.sum().item())
-                    if vid_mask.any() and not img_mask.any():
+                elif visual_count > 0:
+                    if vid_pos and not img_pos:
                         visual_offset = chunk_offsets.get("video", (0, 0))[0]
-                    elif img_mask.any() and not vid_mask.any():
+                    elif img_pos and not vid_pos:
                         visual_offset = chunk_offsets.get("image", (0, 0))[0]
                     else:
                         visual_offset = consumed.get("_visual", 0)
@@ -233,31 +259,42 @@ class ThinkerModelRunner(ModelRunner):
                     ds_embeds = None
 
                 if ds_embeds is not None:
-                    global_mask = torch.zeros(
-                        len(forward_batch.input_ids),
-                        dtype=torch.bool,
-                        device=device,
-                    )
-                    global_mask[start:end] = visual_mask
                     deepstack_visual_embeds_list.append(ds_embeds)
-                    visual_pos_masks_list.append(global_mask)
+                    visual_rows.extend(start + p for p in visual_pos)
 
             if req.is_chunked == 0:
                 req.omni_model_inputs = None
                 req._omni_consumed = None
+                req._omni_mm_positions = None
+
+        if scatter_rows:
+            row_idx = torch.tensor(scatter_rows, dtype=torch.long).to(
+                device=device, non_blocking=True
+            )
+            src = torch.cat(
+                [
+                    s.to(device=device, dtype=input_embeds.dtype, non_blocking=True)
+                    for s in scatter_srcs
+                ],
+                dim=0,
+            )
+            input_embeds.index_copy_(0, row_idx, src)
 
         ds_embeds_out = None
         visual_masks_out = None
-        if has_deepstack and deepstack_visual_embeds_list:
+        if deepstack_visual_embeds_list:
+            combined_mask = torch.zeros(
+                len(forward_batch.input_ids), dtype=torch.bool, device=device
+            )
+            combined_mask[
+                torch.tensor(visual_rows, dtype=torch.long).to(
+                    device=device, non_blocking=True
+                )
+            ] = True
+            visual_masks_out = combined_mask
             if len(deepstack_visual_embeds_list) == 1:
                 ds_embeds_out = deepstack_visual_embeds_list[0]
-                visual_masks_out = visual_pos_masks_list[0]
             else:
-                combined_mask = torch.zeros(
-                    len(forward_batch.input_ids), dtype=torch.bool, device=device
-                )
-                for m in visual_pos_masks_list:
-                    combined_mask |= m
                 num_layers = len(deepstack_visual_embeds_list[0])
                 merged_ds = []
                 for layer_idx in range(num_layers):
@@ -267,7 +304,6 @@ class ThinkerModelRunner(ModelRunner):
                     ]
                     merged_ds.append(torch.cat(parts, dim=0))
                 ds_embeds_out = merged_ds
-                visual_masks_out = combined_mask
 
         return input_embeds, ds_embeds_out, visual_masks_out
 
