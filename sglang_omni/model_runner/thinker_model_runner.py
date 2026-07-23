@@ -214,21 +214,25 @@ class ThinkerModelRunner(ModelRunner):
                         vid_slots = [
                             s for s, p in enumerate(visual_pos) if p not in img_set
                         ]
-                        img_idx = torch.tensor(img_slots, dtype=torch.long)
-                        vid_idx = torch.tensor(vid_slots, dtype=torch.long)
+                        img_idx = (
+                            torch.tensor(img_slots, dtype=torch.long, device=device)
+                            if img_slots
+                            else None
+                        )
+                        vid_idx = (
+                            torch.tensor(vid_slots, dtype=torch.long, device=device)
+                            if vid_slots
+                            else None
+                        )
                         merged = []
                         for img_e, vid_e in zip(image_ds, video_ds):
                             img_e = img_e[image_offset : image_offset + image_count]
                             vid_e = vid_e[video_offset : video_offset + video_count]
                             joint = img_e.new_zeros(visual_count, img_e.shape[-1])
-                            if img_slots:
-                                joint[img_idx.to(joint.device)] = img_e.to(
-                                    device=device
-                                )
-                            if vid_slots:
-                                joint[vid_idx.to(joint.device)] = vid_e.to(
-                                    device=device
-                                )
+                            if img_idx is not None:
+                                joint[img_idx] = img_e.to(device=device)
+                            if vid_idx is not None:
+                                joint[vid_idx] = vid_e.to(device=device)
                             merged.append(joint)
                         ds_embeds = merged
                     elif image_ds:
