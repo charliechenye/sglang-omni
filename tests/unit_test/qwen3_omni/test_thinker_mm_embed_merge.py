@@ -354,23 +354,9 @@ def test_prefix_lens_as_cpu_tensor():
 # ---------------------------------------------------------------------------
 
 
-def test_no_host_syncs_on_hot_path(monkeypatch):
-    # the rewrite's contract: placement comes from CPU-side metadata, so the
-    # merge never calls Tensor.item / Tensor.any / torch.where — the ops that
-    # force a device->host sync per request on the current implementation.
-    runner = _runner()
-    reqs = []
-    for _ in range(4):
-        ids = [TEXT, IMAGE_ID, IMAGE_ID, AUDIO_ID, TEXT]
-        reqs.append(_req(ids, {"image_embeds": _rand(2), "audio_embeds": _rand(1)}))
-    fb, sb = _batches(reqs)
-
+def _count_sync_ops(monkeypatch, runner, fb, sb):
     calls = {"item": 0, "any": 0, "where": 0}
-    orig_item, orig_any, orig_where = (
-        torch.Tensor.item,
-        torch.Tensor.any,
-        torch.where,
-    )
+    orig_item, orig_any, orig_where = torch.Tensor.item, torch.Tensor.any, torch.where
 
     def counting_item(self, *a, **k):
         calls["item"] += 1
@@ -387,7 +373,47 @@ def test_no_host_syncs_on_hot_path(monkeypatch):
     monkeypatch.setattr(torch.Tensor, "item", counting_item)
     monkeypatch.setattr(torch.Tensor, "any", counting_any)
     monkeypatch.setattr(torch, "where", counting_where)
-
     runner._inject_multimodal_embeds(fb, sb)
+    return calls
 
-    assert calls == {"item": 0, "any": 0, "where": 0}, calls
+
+def _mixed_mm_batch():
+    reqs = [
+        _req(
+            [TEXT, IMAGE_ID, IMAGE_ID, AUDIO_ID, TEXT],
+            {"image_embeds": _rand(2), "audio_embeds": _rand(1)},
+        )
+        for _ in range(4)
+    ]
+    return _batches(reqs)
+
+
+def test_no_host_syncs_on_hot_path(monkeypatch):
+    # the rewrite's contract: placement comes from CPU-side metadata, so the
+    # merge never calls Tensor.item / Tensor.any / torch.where — the ops that
+    # force a device->host sync per request on the current implementation.
+    runner = _runner()
+    fb, sb = _mixed_mm_batch()
+    assert _count_sync_ops(monkeypatch, runner, fb, sb) == {
+        "item": 0,
+        "any": 0,
+        "where": 0,
+    }
+
+
+def test_no_host_syncs_with_cpu_tensor_extend_lens(monkeypatch):
+    # ForwardBatch.extend_seq_lens_cpu / extend_prefix_lens_cpu can be CPU
+    # tensors (not lists) on some sglang paths; int(tensor[i]) would call
+    # Tensor.item() per request. The merge must normalize them up front so the
+    # no-sync contract holds for the production input type too.
+    runner = _runner()
+    fb, sb = _mixed_mm_batch()
+    fb.extend_seq_lens_cpu = torch.tensor(fb.extend_seq_lens_cpu, dtype=torch.int64)
+    fb.extend_prefix_lens_cpu = torch.tensor(
+        fb.extend_prefix_lens_cpu, dtype=torch.int64
+    )
+    assert _count_sync_ops(monkeypatch, runner, fb, sb) == {
+        "item": 0,
+        "any": 0,
+        "where": 0,
+    }

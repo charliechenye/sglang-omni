@@ -148,8 +148,14 @@ class ThinkerModelRunner(ModelRunner):
         )
         input_embeds = self._embed_tokens(embed_input_ids)
 
+        # Normalize once: these can arrive as CPU tensors on some sglang paths,
+        # and per-request int(tensor[i]) would reintroduce a Tensor.item() call.
         extend_lens = forward_batch.extend_seq_lens_cpu
         prefix_lens = forward_batch.extend_prefix_lens_cpu
+        if isinstance(extend_lens, torch.Tensor):
+            extend_lens = extend_lens.tolist()
+        if isinstance(prefix_lens, torch.Tensor):
+            prefix_lens = prefix_lens.tolist()
         offsets = []
         pos = 0
         for length in extend_lens:
@@ -228,7 +234,9 @@ class ThinkerModelRunner(ModelRunner):
                         for img_e, vid_e in zip(image_ds, video_ds):
                             img_e = img_e[image_offset : image_offset + image_count]
                             vid_e = vid_e[video_offset : video_offset + video_count]
-                            joint = img_e.new_zeros(visual_count, img_e.shape[-1])
+                            joint = img_e.new_zeros(
+                                visual_count, img_e.shape[-1], device=device
+                            )
                             if img_idx is not None:
                                 joint[img_idx] = img_e.to(device=device)
                             if vid_idx is not None:
@@ -272,9 +280,10 @@ class ThinkerModelRunner(ModelRunner):
                 req._omni_mm_positions = None
 
         if scatter_rows:
-            row_idx = torch.tensor(scatter_rows, dtype=torch.long).to(
-                device=device, non_blocking=True
-            )
+            # The index is built from a Python list (pageable memory), so
+            # non_blocking would be a no-op here; only the embed sources, which
+            # may be pinned, use it.
+            row_idx = torch.tensor(scatter_rows, dtype=torch.long, device=device)
             src = torch.cat(
                 [
                     s.to(device=device, dtype=input_embeds.dtype, non_blocking=True)
@@ -291,9 +300,7 @@ class ThinkerModelRunner(ModelRunner):
                 len(forward_batch.input_ids), dtype=torch.bool, device=device
             )
             combined_mask[
-                torch.tensor(visual_rows, dtype=torch.long).to(
-                    device=device, non_blocking=True
-                )
+                torch.tensor(visual_rows, dtype=torch.long, device=device)
             ] = True
             visual_masks_out = combined_mask
             if len(deepstack_visual_embeds_list) == 1:
