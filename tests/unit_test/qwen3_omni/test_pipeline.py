@@ -1429,8 +1429,14 @@ def test_qwen_sglang_request_records_mm_token_positions(
 
     positions = req_data.req._omni_mm_positions
     # image kept its raw token id; audio was rewritten to its hashed pad value,
-    # but positions must reflect the final (padded) prompt either way.
-    assert positions == {"image": [1, 2], "video": [], "audio": [4]}
+    # but positions must reflect the final (padded) prompt either way. Recorded
+    # as CPU int64 tensors so the merge can slice them without a Python pass.
+    assert {k: v.tolist() for k, v in positions.items()} == {
+        "image": [1, 2],
+        "video": [],
+        "audio": [4],
+    }
+    assert all(v.dtype == torch.int64 and not v.is_cuda for v in positions.values())
 
 
 def _encode_processed_tensor(tensor: torch.Tensor) -> dict[str, object]:

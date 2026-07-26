@@ -319,7 +319,11 @@ def test_build_time_positions_take_precedence_over_prompt_scan():
     ids = [TEXT, IMAGE_ID, IMAGE_ID, TEXT]
     image_embeds = _rand(2)
     req = _req(ids, {"image_embeds": image_embeds})
-    req._omni_mm_positions = {"image": [1, 2], "video": [], "audio": []}
+    req._omni_mm_positions = {
+        "image": torch.tensor([1, 2]),
+        "video": torch.empty(0, dtype=torch.long),
+        "audio": torch.empty(0, dtype=torch.long),
+    }
     req.origin_input_ids = None  # would crash the fallback scan
     fb, sb = _batches([req], chunk_ids=[ids])
 

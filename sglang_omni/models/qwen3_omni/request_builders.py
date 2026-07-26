@@ -628,19 +628,19 @@ def build_sglang_thinker_request(
     req._codec_suppress_tokens = None
 
     # From the final (pad-substituted) prompt, so the thinker prefill merge
-    # never has to sync on GPU masks to locate placeholders.
+    # never has to sync on GPU masks to locate placeholders. Kept as CPU int64
+    # tensors: the merge slices and shifts them with vectorized ops, so neither
+    # side ever walks the placeholder positions in Python.
     req._omni_mm_positions = None
     if model_inputs and thinker_config is not None:
-        mm_positions: dict[str, list[int]] = {}
+        mm_positions: dict[str, torch.Tensor] = {}
         for modality, orig_token_id in [
             ("image", thinker_config.image_token_id),
             ("video", thinker_config.video_token_id),
             ("audio", thinker_config.audio_token_id),
         ]:
             match_id = pad_values.get(modality, orig_token_id)
-            mm_positions[modality] = (
-                (input_ids == match_id).nonzero(as_tuple=True)[0].tolist()
-            )
+            mm_positions[modality] = (input_ids == match_id).nonzero(as_tuple=True)[0]
         req._omni_mm_positions = mm_positions
 
     # Build SGLangARRequestData — output_ids points to req.output_ids
