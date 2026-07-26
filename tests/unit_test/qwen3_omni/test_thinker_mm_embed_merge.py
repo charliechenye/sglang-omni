@@ -4,11 +4,11 @@
 The merge is exercised on a bare instance (``object.__new__``, same pattern as
 test_thinker_lookahead_eligible) with stand-in forward/schedule batches. Every
 test builds its expected embeddings directly from the constructed inputs — an
-oracle independent of the implementation — so these tests pin the current
-behavior and must stay green across the batch-scatter rewrite.
+oracle independent of the implementation — so they pin the merge's behavior
+regardless of how the scatter is built.
 
-test_no_host_syncs_on_hot_path additionally asserts the rewrite's contract:
-no ``Tensor.item`` / ``Tensor.any`` / ``torch.where`` on the merge hot path.
+test_no_host_syncs_on_hot_path additionally asserts the merge's contract:
+no ``Tensor.item`` / ``Tensor.any`` / ``torch.where`` on the hot path.
 """
 from __future__ import annotations
 
@@ -354,7 +354,7 @@ def test_prefix_lens_as_cpu_tensor():
 
 
 # ---------------------------------------------------------------------------
-# Host-sync contract (RED until the batch-scatter rewrite lands)
+# Host-sync contract: the merge must never read from device back to host
 # ---------------------------------------------------------------------------
 
 
