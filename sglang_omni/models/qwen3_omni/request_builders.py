@@ -627,10 +627,8 @@ def build_sglang_thinker_request(
     req._omni_consumed = None
     req._codec_suppress_tokens = None
 
-    # From the final (pad-substituted) prompt, so the thinker prefill merge
-    # never has to sync on GPU masks to locate placeholders. Kept as CPU int64
-    # tensors: the merge slices and shifts them with vectorized ops, so neither
-    # side ever walks the placeholder positions in Python.
+    # From the final (pad-substituted) prompt, so the thinker merge never syncs
+    # on a GPU mask to find placeholders; tensors so it never walks them either.
     req._omni_mm_positions = None
     if model_inputs and thinker_config is not None:
         mm_positions: dict[str, torch.Tensor] = {}

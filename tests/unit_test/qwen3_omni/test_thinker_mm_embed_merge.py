@@ -393,9 +393,8 @@ def _mixed_mm_batch():
 
 
 def test_no_host_syncs_on_hot_path(monkeypatch):
-    # the rewrite's contract: placement comes from CPU-side metadata, so the
-    # merge never calls Tensor.item / Tensor.any / torch.where — the ops that
-    # force a device->host sync per request on the current implementation.
+    # Placement comes from CPU-side metadata, so none of the ops that force a
+    # device->host sync should appear.
     runner = _runner()
     fb, sb = _mixed_mm_batch()
     assert _count_sync_ops(monkeypatch, runner, fb, sb) == {
@@ -406,10 +405,8 @@ def test_no_host_syncs_on_hot_path(monkeypatch):
 
 
 def test_no_host_syncs_with_cpu_tensor_extend_lens(monkeypatch):
-    # ForwardBatch.extend_seq_lens_cpu / extend_prefix_lens_cpu can be CPU
-    # tensors (not lists) on some sglang paths; int(tensor[i]) would call
-    # Tensor.item() per request. The merge must normalize them up front so the
-    # no-sync contract holds for the production input type too.
+    # These arrive as CPU tensors on some sglang paths, where int(tensor[i])
+    # would put a .item() back per request.
     runner = _runner()
     fb, sb = _mixed_mm_batch()
     fb.extend_seq_lens_cpu = torch.tensor(fb.extend_seq_lens_cpu, dtype=torch.int64)

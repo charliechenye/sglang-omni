@@ -115,10 +115,8 @@ class ThinkerModelRunner(ModelRunner):
     def _req_mm_token_positions(
         self, req: Any, pad_values: dict
     ) -> dict[str, torch.Tensor]:
-        """Prompt-absolute placeholder positions per modality as CPU int64
-        tensors, from build-time metadata when present, else derived once from
-        the CPU-side prompt ids — so the merge never derives placement from GPU
-        masks, and never walks the positions in Python."""
+        """Prompt-absolute placeholder positions per modality, as CPU int64
+        tensors so the merge never reads placement off a GPU mask."""
         positions = getattr(req, "_omni_mm_positions", None)
         if positions is not None:
             return positions
@@ -149,8 +147,8 @@ class ThinkerModelRunner(ModelRunner):
         )
         input_embeds = self._embed_tokens(embed_input_ids)
 
-        # Normalize once: these can arrive as CPU tensors on some sglang paths,
-        # and per-request int(tensor[i]) would reintroduce a Tensor.item() call.
+        # CPU tensors on some sglang paths; int(tensor[i]) per request would
+        # put a .item() back on the hot path.
         extend_lens = forward_batch.extend_seq_lens_cpu
         prefix_lens = forward_batch.extend_prefix_lens_cpu
         if isinstance(extend_lens, torch.Tensor):
@@ -163,8 +161,7 @@ class ThinkerModelRunner(ModelRunner):
             offsets.append(pos)
             pos += length
 
-        # Accumulated across requests so the merge is one scatter per batch
-        # instead of per-request writes with device->host syncs.
+        # One scatter per batch instead of per-request writes that force syncs.
         scatter_rows: list[torch.Tensor] = []
         scatter_srcs: list[torch.Tensor] = []
         deepstack_visual_embeds_list = []
@@ -187,9 +184,8 @@ class ThinkerModelRunner(ModelRunner):
             chunk_positions: dict[str, torch.Tensor] = {}
             for modality in ("image", "video", "audio"):
                 mod_positions = positions[modality]
-                # Absent modalities are the common case; skipping them keeps
-                # small batches off the tensor-op path, which has a higher
-                # fixed cost per call than the work it replaces.
+                # Skip absent modalities: torch dispatch costs more than the
+                # empty slice it would replace.
                 if mod_positions.numel() == 0:
                     chunk_positions[modality] = mod_positions
                     continue
@@ -213,9 +209,8 @@ class ThinkerModelRunner(ModelRunner):
             if ds_embeds is not None or image_ds is not None or video_ds is not None:
                 img_pos = chunk_positions["image"]
                 vid_pos = chunk_positions["video"]
-                # Deepstack rows follow prompt order across both visual
-                # modalities; positions are unique, so the sort has no ties and
-                # its permutation tells us which slot came from which modality.
+                # Positions are unique across modalities, so the sort has no
+                # ties and its permutation says which slot came from which.
                 visual_pos, visual_order = torch.sort(torch.cat([img_pos, vid_pos]))
                 visual_count = visual_pos.numel()
 
@@ -274,11 +269,8 @@ class ThinkerModelRunner(ModelRunner):
                 req._omni_mm_positions = None
 
         if scatter_rows:
-            # One index_copy_ for the whole batch: the kernel sequence is then
-            # independent of how many requests and modalities the batch happens
-            # to carry, which per-segment writes would not be. The price is one
-            # full-width temporary for the concatenated sources, so skip it when
-            # a single segment already is the whole scatter.
+            # One index_copy_ keeps the kernel count independent of batch
+            # composition; the cat temporary it costs is pointless for one src.
             row_idx = torch.cat(scatter_rows).to(device=device)
             srcs = [
                 s.to(device=device, dtype=input_embeds.dtype, non_blocking=True)
