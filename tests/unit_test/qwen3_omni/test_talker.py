@@ -1599,8 +1599,6 @@ def test_qwen_model_runner_and_code_predictor_tensor_contracts() -> None:
     runner._image_token_id = 5
     runner._video_token_id = 6
     runner._audio_token_id = 7
-    # note (chenrui): the merge resolves placeholders from prefix lens and the
-    # positions recorded at request build, so both belong in the stand-in.
     req = SimpleNamespace(
         omni_model_inputs={
             "audio_embeds": torch.tensor([[1.0, 2.0, 3.0, 4.0]]),

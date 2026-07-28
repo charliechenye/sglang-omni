@@ -109,7 +109,7 @@ class ThinkerModelRunner(ModelRunner):
         return CaptureHiddenMode.NULL
 
     # ------------------------------------------------------------------
-    # Multimodal embedding injection (batch-wide scatter, CPU-side placement)
+    # Multimodal embedding injection
     # ------------------------------------------------------------------
 
     def _req_mm_token_positions(
@@ -161,8 +161,6 @@ class ThinkerModelRunner(ModelRunner):
             offsets.append(pos)
             pos += length
 
-        # note (chenrui): placing a write per request needs a device-side mask to
-        # say where it lands, so the whole batch is scattered at once instead.
         scatter_rows: list[torch.Tensor] = []
         scatter_srcs: list[torch.Tensor] = []
         deepstack_visual_embeds_list = []
@@ -185,8 +183,8 @@ class ThinkerModelRunner(ModelRunner):
             chunk_positions: dict[str, torch.Tensor] = {}
             for modality in ("image", "video", "audio"):
                 mod_positions = positions[modality]
-                # note (chenrui): torch dispatch on an absent modality costs more
-                # than the empty slice it would produce.
+                # note (chenrui): dispatching the mask ops for an absent modality
+                # costs more than this shortcut saves.
                 if mod_positions.numel() == 0:
                     chunk_positions[modality] = mod_positions
                     continue
@@ -219,9 +217,8 @@ class ThinkerModelRunner(ModelRunner):
                     if image_ds and video_ds:
                         image_offset, image_count = chunk_offsets.get("image", (0, 0))
                         video_offset, video_count = chunk_offsets.get("video", (0, 0))
-                        # note (chenrui): inverting the sort permutation gives the
-                        # same slots as a mask plus nonzero, without an op that
-                        # syncs the moment its input lands on device.
+                        # note (chenrui): the equivalent mask plus nonzero would
+                        # sync the moment its input is device-resident.
                         slots = torch.empty_like(visual_order)
                         slots[visual_order] = torch.arange(
                             visual_count, device=slots.device
