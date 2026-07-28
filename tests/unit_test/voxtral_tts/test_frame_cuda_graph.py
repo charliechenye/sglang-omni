@@ -473,6 +473,7 @@ def test_frame_chain_has_no_boolean_mask_assignment():
     ), "boolean-mask assignment is not capturable; use torch.where"
 
 
+@pytest.mark.skipif(not _HAS_CUDA, reason="frame graph requires CUDA")
 def test_frame_noise_is_pinned_to_the_cpu_generator(monkeypatch: pytest.MonkeyPatch):
     """The draw must stay on the host RNG even under a default-device switch.
 

@@ -25,6 +25,11 @@ DIM = 16
 WINDOW = 50
 
 
+_HAS_CUDA = torch.cuda.is_available()
+
+pytestmark = pytest.mark.skipif(not _HAS_CUDA, reason="tail graph replay requires CUDA")
+
+
 def _params(**overrides) -> SimpleNamespace:
     base = dict(
         temperature=1.15,
