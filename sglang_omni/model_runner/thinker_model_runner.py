@@ -147,8 +147,8 @@ class ThinkerModelRunner(ModelRunner):
         )
         input_embeds = self._embed_tokens(embed_input_ids)
 
-        # CPU tensors on some sglang paths; int(tensor[i]) per request would
-        # put a .item() back on the hot path.
+        # note (chenrui): these arrive as CPU tensors on some sglang paths, where
+        # int(tensor[i]) per request would put a .item() on the hot path.
         extend_lens = forward_batch.extend_seq_lens_cpu
         prefix_lens = forward_batch.extend_prefix_lens_cpu
         if isinstance(extend_lens, torch.Tensor):
@@ -161,7 +161,8 @@ class ThinkerModelRunner(ModelRunner):
             offsets.append(pos)
             pos += length
 
-        # One scatter per batch instead of per-request writes that force syncs.
+        # note (chenrui): placing a write per request needs a device-side mask to
+        # say where it lands, so the whole batch is scattered at once instead.
         scatter_rows: list[torch.Tensor] = []
         scatter_srcs: list[torch.Tensor] = []
         deepstack_visual_embeds_list = []
@@ -184,8 +185,8 @@ class ThinkerModelRunner(ModelRunner):
             chunk_positions: dict[str, torch.Tensor] = {}
             for modality in ("image", "video", "audio"):
                 mod_positions = positions[modality]
-                # Skip absent modalities: torch dispatch costs more than the
-                # empty slice it would replace.
+                # note (chenrui): torch dispatch on an absent modality costs more
+                # than the empty slice it would produce.
                 if mod_positions.numel() == 0:
                     chunk_positions[modality] = mod_positions
                     continue
@@ -209,8 +210,8 @@ class ThinkerModelRunner(ModelRunner):
             if ds_embeds is not None or image_ds is not None or video_ds is not None:
                 img_pos = chunk_positions["image"]
                 vid_pos = chunk_positions["video"]
-                # Positions are unique across modalities, so the sort has no
-                # ties and its permutation says which slot came from which.
+                # note (chenrui): positions are unique across modalities, so the
+                # sort is tie-free and its permutation identifies each slot.
                 visual_pos, visual_order = torch.sort(torch.cat([img_pos, vid_pos]))
                 visual_count = visual_pos.numel()
 
@@ -218,9 +219,16 @@ class ThinkerModelRunner(ModelRunner):
                     if image_ds and video_ds:
                         image_offset, image_count = chunk_offsets.get("image", (0, 0))
                         video_offset, video_count = chunk_offsets.get("video", (0, 0))
-                        is_image = visual_order < img_pos.numel()
-                        img_idx = is_image.nonzero(as_tuple=True)[0].to(device)
-                        vid_idx = (~is_image).nonzero(as_tuple=True)[0].to(device)
+                        # note (chenrui): inverting the sort permutation gives the
+                        # same slots as a mask plus nonzero, without an op that
+                        # syncs the moment its input lands on device.
+                        slots = torch.empty_like(visual_order)
+                        slots[visual_order] = torch.arange(
+                            visual_count, device=slots.device
+                        )
+                        n_image = img_pos.numel()
+                        img_idx = slots[:n_image].to(device)
+                        vid_idx = slots[n_image:].to(device)
                         merged = []
                         for img_e, vid_e in zip(image_ds, video_ds):
                             img_e = img_e[image_offset : image_offset + image_count]
@@ -269,8 +277,8 @@ class ThinkerModelRunner(ModelRunner):
                 req._omni_mm_positions = None
 
         if scatter_rows:
-            # One index_copy_ keeps the kernel count independent of batch
-            # composition; the cat temporary it costs is pointless for one src.
+            # note (chenrui): one index_copy_ keeps the kernel count independent
+            # of batch composition; the cat it costs is pointless for one source.
             row_idx = torch.cat(scatter_rows).to(device=device)
             srcs = [
                 s.to(device=device, dtype=input_embeds.dtype, non_blocking=True)
