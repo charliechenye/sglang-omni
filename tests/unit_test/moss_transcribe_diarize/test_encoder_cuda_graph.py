@@ -111,9 +111,8 @@ def _pos() -> torch.Tensor:
 
 def test_some_graphs_captured(encoder_bundle):
     _, _, runner = encoder_bundle
-    captured = runner.captured_buckets()
-    assert captured, "no encoder CUDA graphs captured (all fell back to eager)"
-    assert captured == sorted(_CHUNK_BUCKETS)
+    assert runner._graphs, "no encoder CUDA graphs captured (all fell back to eager)"
+    assert set(runner._graphs) == set(_CHUNK_BUCKETS)
 
 
 @pytest.mark.parametrize("n", _TEST_CHUNKS)
@@ -166,7 +165,7 @@ def test_vram_guard_skips_capture(encoder_bundle):
         encoder, num_mel_bins, _INPUT_FEATURE_LEN, min_free_gb=100000.0
     )
     runner.capture(_CHUNK_BUCKETS)
-    assert runner.captured_buckets() == [], "VRAM guard must skip all captures"
+    assert runner._graphs == {}, "VRAM guard must skip all captures"
 
 
 def test_capture_failure_falls_back_to_eager(encoder_bundle):
@@ -180,9 +179,7 @@ def test_capture_failure_falls_back_to_eager(encoder_bundle):
 
     runner._capture_bucket = boom
     runner.capture(_CHUNK_BUCKETS)
-    assert (
-        runner.captured_buckets() == []
-    ), "capture failures must be caught -> no graphs"
+    assert runner._graphs == {}, "capture failures must be caught -> no graphs"
 
     feat = _feat(num_mel_bins, 2)
     pos = _pos()
