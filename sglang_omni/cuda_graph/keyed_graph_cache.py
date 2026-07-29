@@ -71,6 +71,7 @@ class KeyedGraphCache:
         env_var: str | None = None,
         max_keys: int = DEFAULT_MAX_KEYS,
         max_failures: int = DEFAULT_MAX_FAILURES,
+        pool_factory: Callable[[], Any] | None = None,
     ) -> None:
         self.name = name
         self.batch_sizes = tuple(sorted({int(b) for b in batch_sizes if int(b) >= 1}))
@@ -78,9 +79,12 @@ class KeyedGraphCache:
         self.max_keys = int(max_keys)
         self.max_failures = int(max_failures)
         self._graphs: dict[tuple, Any] = {}
+        self._graphs_view = MappingProxyType(self._graphs)
         self._disabled_keys: set[tuple] = set()
         self._failure_count = 0
         self._enabled: bool | None = None
+        self._pool: Any | None = None
+        self._pool_factory = pool_factory
 
     @property
     def enabled(self) -> bool:
@@ -90,8 +94,12 @@ class KeyedGraphCache:
 
     @property
     def graphs(self) -> Mapping[tuple, Any]:
-        """Captured graphs by key, read-only."""
-        return MappingProxyType(self._graphs)
+        """Captured graphs by key, read-only.
+
+        The proxy is built once: adopters read this on the replay path, and a
+        fresh proxy per access shows up there (measured ~100 ns).
+        """
+        return self._graphs_view
 
     @property
     def disabled_keys(self) -> frozenset:
@@ -112,11 +120,24 @@ class KeyedGraphCache:
         return None
 
     def memory_pool(self):
-        """Shared graph pool so per-key captures do not each reserve one."""
-        pool = getattr(self, "_pool", None)
-        if pool is None:
-            pool = self._pool = torch.cuda.graph_pool_handle()
-        return pool
+        """Shared graph pool so per-key captures do not each reserve one.
+
+        Note: (Jiaxin Deng) ``pool_factory`` exists for a caller that routes
+        every CUDA call through an injectable seam; the pool must not bypass it.
+        """
+        if self._pool is None:
+            factory = self._pool_factory or torch.cuda.graph_pool_handle
+            self._pool = factory()
+        return self._pool
+
+    def clear(self) -> None:
+        """Drop every captured graph and release the shared pool.
+
+        For a caller that tears its graphs down on failure. Disabled keys and
+        the failure count survive, so clearing never revives a failed key.
+        """
+        self._graphs.clear()
+        self._pool = None
 
     def warmup(
         self,

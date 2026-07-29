@@ -192,6 +192,34 @@ def test_warmup_tolerates_a_failed_key_and_keeps_going():
     assert cache.disabled_keys == frozenset({4})
 
 
+def test_pool_factory_lets_a_caller_keep_its_own_cuda_seam():
+    """Code2Wav routes every CUDA call through an injectable API for testing;
+    the shared pool must go through that seam too."""
+    handles = []
+    cache = _cache(pool_factory=lambda: handles.append(object()) or handles[-1])
+    assert cache.memory_pool() is cache.memory_pool()
+    assert len(handles) == 1
+
+
+def test_clear_drops_graphs_and_pool_but_still_refuses_failed_keys():
+    cache = _cache(pool_factory=object)
+    cache.get_or_capture(("a",), object)
+
+    def boom():
+        raise RuntimeError("capture failed")
+
+    assert cache.get_or_capture(("bad",), boom) is None
+    pool = cache.memory_pool()
+
+    cache.clear()
+
+    assert dict(cache.graphs) == {}
+    assert cache.memory_pool() is not pool
+    retried = []
+    assert cache.get_or_capture(("bad",), lambda: retried.append(1)) is None
+    assert retried == []
+
+
 def test_warmup_stops_when_a_precheck_declines():
     """A VRAM headroom check must be able to stop before capture, not after."""
     cache = _cache()
@@ -203,3 +231,15 @@ def test_warmup_stops_when_a_precheck_declines():
     )
     assert captured == [4, 2]
     assert warmed == 2
+
+
+def test_graphs_view_is_stable_and_tracks_clear():
+    """Adopters read `graphs` on the replay path, so the proxy is built once;
+    it must still reflect a later clear()."""
+    cache = _cache()
+    first_view = cache.graphs
+    graph = cache.get_or_capture((4,), object)
+    assert cache.graphs is first_view, "the view must not be rebuilt per access"
+    assert dict(first_view) == {(4,): graph}
+    cache.clear()
+    assert dict(cache.graphs) == {}, "the held view must track a clear()"
