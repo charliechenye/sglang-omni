@@ -213,6 +213,8 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         ):
             raise RuntimeError("Qwen3-Omni audio item metadata changed during forward")
 
+        source_parts: list[torch.Tensor] = []
+        destination_parts: list[torch.Tensor] = []
         flat_start = 0
         for request_index, mm_input in enumerate(mm_inputs):
             extend_len = extend_lens[request_index]
@@ -253,18 +255,49 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                         "Qwen3-Omni audio placement exceeds the forward buffer"
                     )
 
-                source_rows = source[source_start:source_end]
-                if source_rows.device != target.device or source_rows.dtype != target.dtype:
-                    source_rows = source_rows.to(
-                        device=target.device,
-                        dtype=target.dtype,
-                        non_blocking=True,
-                    )
-                destination = destination_cpu.to(
-                    device=target.device, non_blocking=True
-                )
-                target.index_copy_(0, destination, source_rows)
+                source_parts.append(source[source_start:source_end])
+                destination_parts.append(destination_cpu)
             flat_start += extend_len
+
+        if destination_parts:
+            destination_cpu = (
+                destination_parts[0]
+                if len(destination_parts) == 1
+                else torch.cat(destination_parts, dim=0)
+            )
+            destination = destination_cpu.to(device=target.device, non_blocking=True)
+
+            first_source = source_parts[0]
+            same_source_layout = all(
+                source_part.device == first_source.device
+                and source_part.dtype == first_source.dtype
+                for source_part in source_parts[1:]
+            )
+            if same_source_layout:
+                source_rows = (
+                    first_source
+                    if len(source_parts) == 1
+                    else torch.cat(source_parts, dim=0)
+                )
+            else:
+                source_rows = torch.cat(
+                    [
+                        source_part.to(
+                            device=target.device,
+                            dtype=target.dtype,
+                            non_blocking=True,
+                        )
+                        for source_part in source_parts
+                    ],
+                    dim=0,
+                )
+            if source_rows.device != target.device or source_rows.dtype != target.dtype:
+                source_rows = source_rows.to(
+                    device=target.device,
+                    dtype=target.dtype,
+                    non_blocking=True,
+                )
+            target.index_copy_(0, destination, source_rows)
 
         return target
 

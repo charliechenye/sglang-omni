@@ -202,6 +202,45 @@ def test_audio_placement_preserves_flat_batch_offsets() -> None:
     assert torch.equal(inner.calls[-1]["input_embeds"], expected)
 
 
+def test_audio_placement_coalesces_multiple_items_into_one_index_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    outer, inner = _outer()
+    input_ids = torch.tensor([3, 99, 5, 98, 7], dtype=torch.long)
+    first = _AudioItem([1], torch.tensor([[100.0] * 4]))
+    second = _AudioItem([3], torch.tensor([[200.0] * 4]))
+    batch = _forward_batch(
+        input_ids,
+        mm_inputs=[SimpleNamespace(mm_items=[first, second])],
+    )
+
+    cat_calls: list[int] = []
+    index_copy_calls: list[int] = []
+    original_cat = torch.cat
+    original_index_copy = torch.Tensor.index_copy_
+
+    def counted_cat(tensors, *args, **kwargs):
+        cat_calls.append(len(tensors))
+        return original_cat(tensors, *args, **kwargs)
+
+    def counted_index_copy(self, *args, **kwargs):
+        index_copy_calls.append(1)
+        return original_index_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "cat", counted_cat)
+    monkeypatch.setattr(torch.Tensor, "index_copy_", counted_index_copy)
+
+    outer(input_ids, torch.arange(5), batch)
+
+    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+    expected[1] = first.precomputed_embeddings[0]
+    expected[3] = second.precomputed_embeddings[0]
+    assert torch.equal(inner.calls[-1]["input_embeds"], expected)
+    assert len(index_copy_calls) == 1
+    # One source cat and one destination cat; no per-item placement calls.
+    assert len(cat_calls) == 2
+
+
 def test_legacy_multimodal_shell_preserves_external_embeddings() -> None:
     outer, inner = _outer()
     input_ids = torch.tensor([3, 4], dtype=torch.long)
