@@ -515,6 +515,116 @@ def _compute_mrope_positions(
     return mrope_positions.squeeze(1), mrope_position_delta
 
 
+def _audio_placeholder_offsets(
+    positions_cpu: torch.Tensor,
+) -> list[tuple[int, int]]:
+    """Encode ordered CPU placeholder positions as inclusive offset spans."""
+    values = positions_cpu.tolist()
+    if not values:
+        return []
+
+    offsets: list[tuple[int, int]] = []
+    start = previous = int(values[0])
+    for value in values[1:]:
+        value = int(value)
+        if value != previous + 1:
+            offsets.append((start, previous))
+            start = value
+        previous = value
+    offsets.append((start, previous))
+    return offsets
+
+
+def _build_qwen_audio_forward_contract(
+    *,
+    input_ids: torch.Tensor,
+    model_inputs: dict[str, Any],
+    pad_values: dict[str, int],
+    media_cache_keys: dict[str, str],
+    thinker_config: Any,
+    capture_keys: Iterable[str],
+    generate_audio_output: bool,
+):
+    """Return the native Qwen audio contract when normal ``model.forward`` owns it.
+
+    This is a semantic representation check only. It does not inspect or
+    predict any upstream graph decision. Unsupported visual/deepstack payloads,
+    speech-output requests, and hidden-capture requests retain the existing
+    legacy Omni model-input contract.
+    """
+    if generate_audio_output or tuple(capture_keys or ()):
+        return None
+
+    audio_embeds = model_inputs.get("audio_embeds")
+    if not isinstance(audio_embeds, torch.Tensor) or audio_embeds.numel() == 0:
+        return None
+    if audio_embeds.ndim != 2:
+        raise ValueError(
+            "Qwen3-Omni precomputed audio embeddings must have shape [tokens, hidden]"
+        )
+
+    unsupported_keys = {
+        "image_embeds",
+        "video_embeds",
+        "image_deepstack_visual_embeds",
+        "video_deepstack_visual_embeds",
+        "deepstack_visual_embeds",
+        "image_grid_thw",
+        "video_grid_thw",
+        "video_second_per_grid",
+        "use_audio_in_video",
+    }
+    if any(model_inputs.get(key) is not None for key in unsupported_keys):
+        return None
+
+    audio_token_id = getattr(thinker_config, "audio_token_id", None)
+    if audio_token_id is None:
+        return None
+
+    pad_value = int(pad_values.get("audio", audio_token_id))
+    positions_cpu = (input_ids == pad_value).nonzero(as_tuple=True)[0]
+    if positions_cpu.numel() != int(audio_embeds.shape[0]):
+        raise ValueError(
+            "Qwen3-Omni audio embedding rows do not match prompt placeholders: "
+            f"embeddings={int(audio_embeds.shape[0])}, "
+            f"placeholders={positions_cpu.numel()}, pad_value={pad_value}"
+        )
+    if positions_cpu.device.type != "cpu":
+        raise RuntimeError(
+            "Qwen3-Omni audio placeholder positions must be materialized on CPU"
+        )
+
+    cache_key = media_cache_keys.get("audio")
+    audio_hash = (
+        xxhash.xxh3_64(cache_key.encode()).intdigest()
+        if cache_key is not None
+        else None
+    )
+
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputFormat,
+        MultimodalInputs,
+    )
+
+    audio_item = MultimodalDataItem(
+        modality=Modality.AUDIO,
+        hash=audio_hash,
+        pad_value=pad_value,
+        offsets=_audio_placeholder_offsets(positions_cpu),
+        format=MultimodalInputFormat.PRECOMPUTED_EMBEDDING,
+        # NOTE(qwen3-omni-pcg): Keep the encoder output and CPU positions by
+        # reference. Request construction does not clone, concatenate, hash,
+        # or move the large embedding tensor.
+        precomputed_embeddings=audio_embeds,
+        model_specific_data={"positions_cpu": positions_cpu},
+    )
+    mm_inputs = MultimodalInputs(mm_items=[audio_item])
+    mm_inputs.audio_token_id = int(audio_token_id)
+    return mm_inputs
+
+
 def build_sglang_thinker_request(
     state: Qwen3OmniPipelineState,
     *,
@@ -523,6 +633,7 @@ def build_sglang_thinker_request(
     vocab_size: int,
     request_id: str | None = None,
     thinker_config: Any = None,
+    stage_payload: StagePayload | None = None,
 ) -> "SGLangARRequestData":
     """Build SGLangARRequestData from pipeline state.
 
@@ -611,26 +722,53 @@ def build_sglang_thinker_request(
     )
     req.tokenizer = tokenizer
 
-    # Compute M-RoPE positions and attach multimodal_inputs to Req
+    # Build the standard contract only for requests that normal model.forward
+    # can represent. Direct unit callers without a StagePayload retain the
+    # legacy default; scheduler adapters pass the actual output modality.
+    standard_audio_inputs = None
+    if thinker_config is not None and model_inputs:
+        standard_audio_inputs = _build_qwen_audio_forward_contract(
+            input_ids=input_ids,
+            model_inputs=model_inputs,
+            pad_values=pad_values,
+            media_cache_keys=media_cache_keys,
+            thinker_config=thinker_config,
+            capture_keys=capture_keys,
+            generate_audio_output=(
+                should_generate_audio_output(stage_payload)
+                if stage_payload is not None
+                else True
+            ),
+        )
+
+    if standard_audio_inputs is not None:
+        req.multimodal_inputs = standard_audio_inputs
+
+    # Compute M-RoPE positions without replacing the standard item shell.
     if thinker_config is not None and model_inputs:
         mrope_result = _compute_mrope_positions(
             original_input_ids.to(dtype=torch.long), model_inputs, thinker_config
         )
         if mrope_result is not None:
             mrope_positions, mrope_position_delta = mrope_result
-            mm_inputs = MultimodalInputs(mm_items=[])
+            mm_inputs = req.multimodal_inputs or MultimodalInputs(mm_items=[])
             mm_inputs.mrope_positions = mrope_positions
             mm_inputs.mrope_position_delta = mrope_position_delta
             req.multimodal_inputs = mm_inputs
 
-    req.omni_model_inputs = model_inputs if model_inputs else None
+    # A standard item is consumed by normal Qwen model.forward. Keeping the
+    # legacy payload attached would make ThinkerModelRunner intercept prefill
+    # before upstream SGLang sees the completed ForwardBatch.
+    req.omni_model_inputs = (
+        None if standard_audio_inputs is not None else (model_inputs or None)
+    )
     req._omni_consumed = None
     req._codec_suppress_tokens = None
 
     # note (chenrui): recording placement here spares the thinker merge a sync on
     # a GPU mask to find placeholders; tensors spare it walking them as well.
     req._omni_mm_positions = None
-    if model_inputs and thinker_config is not None:
+    if standard_audio_inputs is None and model_inputs and thinker_config is not None:
         mm_positions: dict[str, torch.Tensor] = {}
         for modality, orig_token_id in [
             ("image", thinker_config.image_token_id),
@@ -641,13 +779,22 @@ def build_sglang_thinker_request(
             mm_positions[modality] = (input_ids == match_id).nonzero(as_tuple=True)[0]
         req._omni_mm_positions = mm_positions
 
+    request_model_inputs = model_inputs
+    if standard_audio_inputs is not None:
+        # The MultimodalDataItem is the sole live owner of the large encoder
+        # tensor. Keep scalar/position metadata without retaining a duplicate
+        # tensor-bearing ``audio_embeds`` field in request data.
+        request_model_inputs = {
+            key: value for key, value in model_inputs.items() if key != "audio_embeds"
+        }
+
     # Build SGLangARRequestData — output_ids points to req.output_ids
     data = SGLangARRequestData(
         input_ids=input_ids.to(dtype=torch.long),
         attention_mask=(
             attention_mask if isinstance(attention_mask, torch.Tensor) else None
         ),
-        model_inputs=model_inputs,
+        model_inputs=request_model_inputs,
         capture_model_output_keys=tuple(capture_keys) if capture_keys else (),
         max_new_tokens=max_new_tokens,
         temperature=temperature,
@@ -953,6 +1100,24 @@ def make_thinker_scheduler_adapters(
 ):
     """Build model-specific StagePayload <-> scheduler adapters for thinker."""
 
+    def _release_standard_audio_payload_alias(payload: StagePayload) -> None:
+        """Drop the duplicate payload-side audio tensor after request build."""
+        state = Qwen3OmniPipelineState.from_dict(payload.data)
+        thinker_inputs = state.thinker_inputs
+        nested_inputs = thinker_inputs.get("model_inputs")
+        if isinstance(nested_inputs, dict) and "audio_embeds" in nested_inputs:
+            nested_inputs = dict(nested_inputs)
+            nested_inputs.pop("audio_embeds", None)
+            thinker_inputs = dict(thinker_inputs)
+            thinker_inputs["model_inputs"] = nested_inputs
+        elif "audio_embeds" in thinker_inputs:
+            thinker_inputs = dict(thinker_inputs)
+            thinker_inputs.pop("audio_embeds", None)
+        else:
+            return
+        state.thinker_inputs = thinker_inputs
+        payload.data = state.to_dict()
+
     def request_builder(payload: StagePayload) -> SGLangARRequestData:
         state = Qwen3OmniPipelineState.from_dict(payload.data)
         params = payload.request.params or {}
@@ -963,7 +1128,10 @@ def make_thinker_scheduler_adapters(
             vocab_size=vocab_size,
             request_id=payload.request_id,
             thinker_config=thinker_config,
+            stage_payload=payload,
         )
+        if req_data.req.omni_model_inputs is None:
+            _release_standard_audio_payload_alias(payload)
         req_data.stage_payload = payload
         return req_data
 
