@@ -20,7 +20,9 @@ def create_thinker_scheduler(
     """Create the Qwen thinker scheduler."""
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
-    from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+    from sglang_omni.models.qwen3_omni.thinker_model_runner import (
+        Qwen3OmniThinkerModelRunner,
+    )
     from sglang_omni.models.qwen3_omni.request_builders import (
         make_thinker_scheduler_adapters,
         make_thinker_stream_output_builder,
@@ -70,7 +72,7 @@ def create_thinker_scheduler(
         should_emit_hidden=_should_generate_qwen_audio_output,
     )
 
-    model_runner = ThinkerModelRunner(
+    model_runner = Qwen3OmniThinkerModelRunner(
         model_worker,
         output_proc,
         should_capture_hidden=_should_generate_qwen_audio_output,

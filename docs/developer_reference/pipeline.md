@@ -133,6 +133,11 @@ conversion into scheduler output.
 to prepare the forward batch by injecting multimodal embeddings such as image,
 video, audio, and deepstack inputs before the model forward.
 
+Qwen3-Omni wraps this runner with its model-owned
+`Qwen3OmniThinkerModelRunner` adapter for the semantic mixed native/legacy
+fallback contract. Native-only requests leave the hook returning `None`, so
+upstream SGLang still owns the normal forward and graph/eager dispatch.
+
 #### FeedbackARModelRunner
 
 The refactor design identifies a shared `FeedbackARModelRunner` role for AR

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Golden parity tests for ThinkerModelRunner._inject_multimodal_embeds.
+"""Golden parity tests for Qwen3OmniThinkerModelRunner._inject_multimodal_embeds.
 
 Every test builds its expected embeddings directly from the constructed inputs,
 so the oracle stays independent of how the scatter is implemented. The
@@ -12,7 +12,9 @@ import types
 
 import torch
 
-from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.models.qwen3_omni.thinker_model_runner import (
+    Qwen3OmniThinkerModelRunner,
+)
 
 VOCAB = 100
 HIDDEN = 8
@@ -22,9 +24,9 @@ AUDIO_ID = 93
 TEXT = 7
 
 
-def _runner() -> ThinkerModelRunner:
+def _runner() -> Qwen3OmniThinkerModelRunner:
     torch.manual_seed(0)
-    r = object.__new__(ThinkerModelRunner)
+    r = object.__new__(Qwen3OmniThinkerModelRunner)
     r._embed_tokens = torch.nn.Embedding(VOCAB, HIDDEN)
     r._image_token_id = IMAGE_ID
     r._video_token_id = VIDEO_ID

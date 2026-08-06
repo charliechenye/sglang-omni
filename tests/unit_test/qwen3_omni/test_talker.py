@@ -14,10 +14,12 @@ import torch
 from torch import nn
 
 import sglang_omni.models.qwen3_omni.components.talker as talker_module
-from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components.talker import (
     Qwen3OmniTalker,
     _bind_default_weight_loaders,
+)
+from sglang_omni.models.qwen3_omni.thinker_model_runner import (
+    Qwen3OmniThinkerModelRunner,
 )
 from sglang_omni.models.qwen3_omni.components.talker_input import build_assistant_part
 from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
@@ -1594,7 +1596,7 @@ def test_qwen_model_runner_and_code_predictor_tensor_contracts() -> None:
             self.seen = input_ids.clone()
             return torch.zeros((input_ids.shape[0], 4), dtype=torch.float32)
 
-    runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
+    runner = Qwen3OmniThinkerModelRunner.__new__(Qwen3OmniThinkerModelRunner)
     runner._embed_tokens = RecordingEmbed()
     runner._image_token_id = 5
     runner._video_token_id = 6

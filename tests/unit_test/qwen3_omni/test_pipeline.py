@@ -771,8 +771,11 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
-    from sglang_omni.model_runner import thinker_model_runner
-    from sglang_omni.models.qwen3_omni import bootstrap, request_builders
+    from sglang_omni.models.qwen3_omni import (
+        bootstrap,
+        request_builders,
+        thinker_model_runner,
+    )
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
     from sglang_omni.scheduling import omni_scheduler, sglang_backend
 
@@ -836,7 +839,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     )
     monkeypatch.setattr(
         thinker_model_runner,
-        "ThinkerModelRunner",
+        "Qwen3OmniThinkerModelRunner",
         lambda *args, **kwargs: object(),
     )
     monkeypatch.setattr(

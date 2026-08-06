@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Unit tests for ThinkerModelRunner.lookahead_eligible.
+"""Unit tests for Qwen3OmniThinkerModelRunner.lookahead_eligible.
 
 lookahead_eligible reads only per-request flags (never other instance state), so it
 is exercised on a bare instance built with ``object.__new__`` and stand-in requests.
@@ -12,7 +12,9 @@ import types
 
 import pytest
 
-from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.models.qwen3_omni.thinker_model_runner import (
+    Qwen3OmniThinkerModelRunner,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -23,8 +25,8 @@ def _stub_audio_output(monkeypatch):
     )
 
 
-def _runner() -> ThinkerModelRunner:
-    return object.__new__(ThinkerModelRunner)
+def _runner() -> Qwen3OmniThinkerModelRunner:
+    return object.__new__(Qwen3OmniThinkerModelRunner)
 
 
 def _sp(**kw):
