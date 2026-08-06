@@ -172,7 +172,7 @@ def test_mixed_native_audio_and_legacy_visual_deepstack_merge():
     expected[3] = native_audio[1]
     expected[5:7] = image_audio
     torch.testing.assert_close(out, expected)
-    assert masks.tolist() == [False, True, False, True, False, True, True, False]
+    assert masks.tolist() == [False, False, False, False, False, True, True, False]
     for actual, expected_layer in zip(ds, deepstack):
         torch.testing.assert_close(actual, expected_layer)
 

@@ -134,6 +134,101 @@ class ThinkerModelRunner(ModelRunner):
         req._omni_mm_positions = positions
         return positions
 
+    def _append_native_audio_scatter_parts(
+        self,
+        *,
+        req: Any,
+        request_start: int,
+        prefix_len: int,
+        extend_len: int,
+        target_hidden_size: int,
+        scatter_rows: list[torch.Tensor],
+        scatter_srcs: list[torch.Tensor],
+    ) -> None:
+        """Append native audio views to the legacy batch-wide scatter."""
+        mm_inputs = getattr(req, "multimodal_inputs", None)
+        if mm_inputs is None:
+            return
+        mm_items = getattr(mm_inputs, "mm_items", None) or ()
+        for item in mm_items:
+            modality = getattr(item, "modality", None)
+            modality_name = getattr(modality, "name", modality)
+            item_format = getattr(item, "format", None)
+            format_name = getattr(item_format, "name", item_format)
+            if (
+                modality_name not in ("AUDIO", "audio")
+                or format_name != "PRECOMPUTED_EMBEDDING"
+            ):
+                raise RuntimeError(
+                    "Qwen3-Omni mixed eager batches only support native "
+                    "PRECOMPUTED_EMBEDDING audio items"
+                )
+
+            source = getattr(item, "precomputed_embeddings", None)
+            if not isinstance(source, torch.Tensor) or source.ndim != 2:
+                raise RuntimeError(
+                    "Qwen3-Omni native audio items must carry a 2-D "
+                    "precomputed_embeddings tensor"
+                )
+            if source.shape[1] != target_hidden_size:
+                raise ValueError(
+                    "Qwen3-Omni native audio embedding width does not match "
+                    "the thinker hidden size"
+                )
+
+            model_specific_data = getattr(item, "model_specific_data", None) or {}
+            positions_cpu = model_specific_data.get("positions_cpu")
+            if (
+                not isinstance(positions_cpu, torch.Tensor)
+                or positions_cpu.device.type != "cpu"
+                or positions_cpu.ndim != 1
+                or positions_cpu.dtype != torch.long
+            ):
+                raise RuntimeError(
+                    "Qwen3-Omni native audio items must carry 1-D CPU int64 "
+                    "positions_cpu metadata"
+                )
+            if positions_cpu.numel() != source.shape[0]:
+                raise ValueError(
+                    "Qwen3-Omni native audio rows do not match positions_cpu"
+                )
+            if positions_cpu.numel() > 1 and not torch.equal(
+                positions_cpu, positions_cpu.sort().values
+            ):
+                raise RuntimeError(
+                    "Qwen3-Omni native audio positions_cpu must be sorted"
+                )
+
+            in_chunk = (positions_cpu >= prefix_len) & (
+                positions_cpu < prefix_len + extend_len
+            )
+            source_indices = in_chunk.nonzero(as_tuple=True)[0]
+            if source_indices.numel() == 0:
+                continue
+
+            # positions_cpu is sorted, so a chunk is one contiguous source view;
+            # all scalar metadata below stays on CPU and never synchronizes a GPU.
+            source_start = int(source_indices[0])
+            source_count = source_indices.numel()
+            source_last = int(source_indices[-1])
+            source_end = source_start + source_count
+            if source_last + 1 != source_end:
+                raise RuntimeError(
+                    "Qwen3-Omni native audio positions are not one-to-one"
+                )
+            selected_positions = positions_cpu[source_start:source_end]
+            destination_cpu = selected_positions - prefix_len + request_start
+            if (
+                int(destination_cpu[0]) < request_start
+                or int(destination_cpu[-1]) >= request_start + extend_len
+            ):
+                raise RuntimeError(
+                    "Qwen3-Omni native audio placement exceeds the request chunk"
+                )
+
+            scatter_rows.append(destination_cpu)
+            scatter_srcs.append(source[source_start:source_end])
+
     def _inject_multimodal_embeds(
         self, forward_batch: Any, schedule_batch: Any
     ) -> tuple[torch.Tensor | None, list | None, torch.Tensor | None] | None:
@@ -168,12 +263,24 @@ class ThinkerModelRunner(ModelRunner):
 
         for i, req in enumerate(schedule_batch.reqs):
             omni_inputs = req.omni_model_inputs
-            if omni_inputs is None:
-                continue
-
             start = offsets[i]
             length = extend_lens[i]
             prefix = 0 if prefix_lens is None else int(prefix_lens[i])
+            if omni_inputs is None:
+                # NOTE(qwen3-omni-pcg): One legacy request moves the whole batch onto the
+                # Qwen eager path. Native audio items from other requests must therefore be
+                # included in the same batch-wide scatter rather than left for model.forward.
+                self._append_native_audio_scatter_parts(
+                    req=req,
+                    request_start=start,
+                    prefix_len=prefix,
+                    extend_len=length,
+                    target_hidden_size=input_embeds.shape[1],
+                    scatter_rows=scatter_rows,
+                    scatter_srcs=scatter_srcs,
+                )
+                continue
+
             consumed = req._omni_consumed or {}
             req._omni_consumed = consumed
             chunk_offsets: dict[str, tuple[int, int]] = {}
