@@ -164,11 +164,11 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
     ) -> torch.Tensor:
         """Compose text and native audio rows into the supplied model buffer.
 
-        ``input_embeds`` is the model argument supplied by the upstream runner.
-        It is intentionally distinct from ``forward_batch.input_embeds``: the
-        latter is an upstream graph-eligibility input and remains empty for a
-        graph-compatible request. With a supplied buffer, text is copied into
-        that stable storage first and audio rows are then replaced in place.
+        ``input_embeds`` is the stable model buffer selected by the outer
+        forward from the upstream model argument or replay ForwardBatch. The
+        live serving ForwardBatch keeps its eligibility input empty. With a
+        supplied buffer, text is copied into that stable storage first and
+        audio rows are then replaced in place.
 
         Pros: the encoder output remains owned by the multimodal item, text is
         embedded exactly once, and eager and graph paths share the same model
@@ -328,7 +328,13 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
 
         audio_items, has_mm_shell = _standard_qwen_audio_items(forward_batch)
         model_input_ids = input_ids
-        model_input_embeds = input_embeds
+        # The serving batch keeps this field empty so upstream owns graph
+        # eligibility. During graph replay, upstream replaces it with the
+        # graph-owned stable buffer on its static ForwardBatch.
+        stable_input_embeds = input_embeds
+        if stable_input_embeds is None:
+            stable_input_embeds = getattr(forward_batch, "input_embeds", None)
+        model_input_embeds = stable_input_embeds
         phase = getattr(forward_batch, "forward_mode", None)
         is_decode = _forward_mode_flag(phase, "is_decode")
         is_target_verify = _forward_mode_flag(phase, "is_target_verify")
@@ -346,22 +352,27 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
                 model_input_embeds = self._compose_standard_audio_embeddings(
                     effective_input_ids,
                     forward_batch,
-                    input_embeds,
+                    stable_input_embeds,
                     audio_items,
                 )
                 model_input_ids = None
-            elif not has_mm_shell and input_embeds is not None:
+            elif (
+                stable_input_embeds is not None
+                and (input_embeds is None or not has_mm_shell)
+            ):
                 # Upstream graph replay supplies the graph-owned stable buffer as
-                # this model argument. Text-only eager must keep input_ids so the
-                # inner model performs its ordinary embedding path.
+                # this ForwardBatch field (or model argument). Text-only eager
+                # must keep input_ids so the inner model performs its ordinary
+                # embedding path. An empty M-RoPE shell is still standard; an
+                # explicit embedding argument on a legacy shell is preserved.
                 embed_tokens = self.model.get_input_embeddings()
                 text_embeds = embed_tokens(
                     effective_input_ids.clamp(
                         min=0, max=embed_tokens.num_embeddings - 1
                     )
                 )
-                input_embeds.copy_(text_embeds)
-                model_input_embeds = input_embeds
+                stable_input_embeds.copy_(text_embeds)
+                model_input_embeds = stable_input_embeds
                 model_input_ids = None
 
         hidden_states = self.model(

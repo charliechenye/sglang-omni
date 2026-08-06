@@ -121,13 +121,54 @@ def test_text_only_graph_populates_the_model_argument_buffer() -> None:
     stable = torch.full((3, 4), -12345.0)
     batch = _forward_batch(input_ids, input_embeds=stable)
 
-    outer(input_ids, torch.arange(3), batch, input_embeds=stable)
+    # Upstream's body-capture replay supplies the stable buffer through the
+    # static ForwardBatch rather than necessarily as an outer kwarg.
+    outer(input_ids, torch.arange(3), batch)
 
     expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
     assert torch.equal(stable, expected)
     call = inner.calls[-1]
     assert call["input_ids"] is None
     assert call["input_embeds"] is stable
+
+
+def test_audio_graph_uses_the_static_forward_batch_embedding_buffer() -> None:
+    outer, inner = _outer()
+    input_ids = torch.tensor([3, 99, 5, 99, 7], dtype=torch.long)
+    audio = torch.tensor([[100.0] * 4, [200.0] * 4])
+    item = _AudioItem([1, 3], audio)
+    stable = torch.full((5, 4), -12345.0)
+    batch = _forward_batch(
+        input_ids,
+        mm_inputs=[SimpleNamespace(mm_items=[item])],
+        input_embeds=stable,
+    )
+
+    outer(input_ids, torch.arange(5), batch)
+
+    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
+    expected[[1, 3]] = audio
+    assert torch.equal(stable, expected)
+    assert inner.calls[-1]["input_embeds"] is stable
+    assert inner.calls[-1]["input_ids"] is None
+
+
+def test_text_graph_populates_buffer_with_empty_mrope_shell() -> None:
+    outer, inner = _outer()
+    input_ids = torch.tensor([3, 4, 5], dtype=torch.long)
+    stable = torch.full((3, 4), -12345.0)
+    batch = _forward_batch(
+        input_ids,
+        mm_inputs=[SimpleNamespace(mm_items=[])],
+        input_embeds=stable,
+    )
+
+    outer(input_ids, torch.arange(3), batch)
+
+    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
+    assert torch.equal(stable, expected)
+    assert inner.calls[-1]["input_embeds"] is stable
+    assert inner.calls[-1]["input_ids"] is None
 
 
 def test_audio_eager_composes_text_and_precomputed_rows() -> None:
