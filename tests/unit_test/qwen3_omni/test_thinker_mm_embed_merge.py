@@ -86,11 +86,198 @@ def _rand(n):
     return torch.randn(n, HIDDEN)
 
 
+class _NativeAudioItem:
+    modality = types.SimpleNamespace(name="AUDIO")
+    format = types.SimpleNamespace(name="PRECOMPUTED_EMBEDDING")
+
+    def __init__(self, positions, embeds):
+        self.precomputed_embeddings = embeds
+        self.model_specific_data = {
+            "positions_cpu": torch.tensor(positions, dtype=torch.long)
+        }
+
+    def is_precomputed_embedding(self):
+        return True
+
+
+def _native_audio_req(input_ids, positions, embeds, *, is_chunked=0):
+    req = _req(input_ids, None, is_chunked=is_chunked)
+    req.multimodal_inputs = types.SimpleNamespace(
+        mm_items=[_NativeAudioItem(positions, embeds)]
+    )
+    return req
+
+
+class _ExtendMode:
+    def is_extend(self):
+        return True
+
+
+def _custom_forward_batch(fb):
+    fb.forward_mode = _ExtendMode()
+    fb.positions = torch.arange(fb.input_ids.numel(), dtype=torch.long)
+    fb.mrope_positions = None
+    return fb
+
+
 def test_text_only_batch_returns_none():
     runner = _runner()
     req = _req([TEXT, TEXT, TEXT], None)
     fb, sb = _batches([req])
     assert runner._inject_multimodal_embeds(fb, sb) is None
+
+
+def test_mixed_native_audio_and_legacy_audio_merge():
+    runner = _runner()
+    native_ids = [TEXT, AUDIO_ID, AUDIO_ID, TEXT]
+    legacy_ids = [TEXT, AUDIO_ID, TEXT]
+    native_audio = _rand(2)
+    legacy_audio = _rand(1)
+    reqs = [
+        _native_audio_req(native_ids, [1, 2], native_audio),
+        _req(legacy_ids, {"audio_embeds": legacy_audio}),
+    ]
+    fb, sb = _batches(reqs)
+
+    out, ds, masks = runner._inject_multimodal_embeds(fb, sb)
+
+    expected = _base_embeds(runner, fb)
+    expected[1:3] = native_audio
+    expected[5:6] = legacy_audio
+    torch.testing.assert_close(out, expected)
+    assert ds is None and masks is None
+
+
+def test_mixed_native_audio_and_legacy_visual_deepstack_merge():
+    runner = _runner()
+    native_audio = _rand(2)
+    image_audio = _rand(2)
+    deepstack = [_rand(2), _rand(2)]
+    reqs = [
+        _native_audio_req([TEXT, AUDIO_ID, TEXT, AUDIO_ID], [1, 3], native_audio),
+        _req(
+            [TEXT, IMAGE_ID, IMAGE_ID, TEXT],
+            {
+                "image_embeds": image_audio,
+                "image_deepstack_visual_embeds": deepstack,
+            },
+        ),
+    ]
+    fb, sb = _batches(reqs)
+
+    out, ds, masks = runner._inject_multimodal_embeds(fb, sb)
+
+    expected = _base_embeds(runner, fb)
+    expected[1] = native_audio[0]
+    expected[3] = native_audio[1]
+    expected[5:7] = image_audio
+    torch.testing.assert_close(out, expected)
+    assert masks.tolist() == [False, True, False, True, False, True, True, False]
+    for actual, expected_layer in zip(ds, deepstack):
+        torch.testing.assert_close(actual, expected_layer)
+
+
+def test_native_audio_and_text_only_requests_stay_on_standard_forward():
+    runner = _runner()
+    reqs = [
+        _native_audio_req([TEXT, AUDIO_ID, TEXT], [1], _rand(1)),
+        _req([TEXT, TEXT], None),
+    ]
+    fb, sb = _batches(reqs)
+    fb = _custom_forward_batch(fb)
+    sb.forward_mode = _ExtendMode()
+
+    assert runner.custom_prefill_forward(fb, sb, reqs) is None
+
+
+def test_two_native_audio_requests_and_one_legacy_visual_merge():
+    runner = _runner()
+    native0 = _rand(1)
+    native1 = _rand(2)
+    image = _rand(1)
+    reqs = [
+        _native_audio_req([AUDIO_ID, TEXT], [0], native0),
+        _native_audio_req([TEXT, AUDIO_ID, TEXT, AUDIO_ID], [1, 3], native1),
+        _req([TEXT, IMAGE_ID], {"image_embeds": image}),
+    ]
+    fb, sb = _batches(reqs)
+
+    out, ds, masks = runner._inject_multimodal_embeds(fb, sb)
+
+    expected = _base_embeds(runner, fb)
+    expected[0] = native0[0]
+    expected[3] = native1[0]
+    expected[5] = native1[1]
+    expected[7] = image[0]
+    torch.testing.assert_close(out, expected)
+    assert ds is None and masks is None
+
+
+def test_chunked_native_audio_and_legacy_request_merge_current_chunk():
+    runner = _runner()
+    native_prompt = [TEXT, AUDIO_ID, AUDIO_ID, TEXT, AUDIO_ID, TEXT]
+    native_audio = _rand(3)
+    native = _native_audio_req(
+        native_prompt, [1, 2, 4], native_audio, is_chunked=1
+    )
+    legacy = _req(
+        [TEXT, IMAGE_ID, TEXT, IMAGE_ID],
+        {"image_embeds": _rand(2)},
+        is_chunked=1,
+    )
+    fb, sb = _batches(
+        [native, legacy],
+        chunk_ids=[native_prompt[:4], legacy.origin_input_ids[:3]],
+        prefix_lens=[0, 0],
+    )
+
+    out, ds, masks = runner._inject_multimodal_embeds(fb, sb)
+
+    expected = _base_embeds(runner, fb)
+    expected[1:3] = native_audio[:2]
+    expected[5] = legacy.omni_model_inputs["image_embeds"][0]
+    torch.testing.assert_close(out, expected)
+    assert ds is None and masks is None
+
+
+def test_mixed_custom_prefill_is_eager_and_uses_one_scatter(monkeypatch):
+    runner = _runner()
+    native_audio = _rand(2)
+    legacy_audio = _rand(1)
+    reqs = [
+        _native_audio_req([TEXT, AUDIO_ID, AUDIO_ID], [1, 2], native_audio),
+        _req([TEXT, AUDIO_ID], {"audio_embeds": legacy_audio}),
+    ]
+    fb, sb = _batches(reqs)
+    fb = _custom_forward_batch(fb)
+    sb.forward_mode = _ExtendMode()
+
+    clone_calls = 0
+    index_copy_calls = 0
+    original_clone = torch.Tensor.clone
+    original_index_copy = torch.Tensor.index_copy_
+
+    def counted_clone(self, *args, **kwargs):
+        nonlocal clone_calls
+        clone_calls += 1
+        return original_clone(self, *args, **kwargs)
+
+    def counted_index_copy(self, *args, **kwargs):
+        nonlocal index_copy_calls
+        index_copy_calls += 1
+        return original_index_copy(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "clone", counted_clone)
+    monkeypatch.setattr(torch.Tensor, "index_copy_", counted_index_copy)
+    runner._forward_with_omni_embeds = lambda *args: types.SimpleNamespace(
+        can_run_cuda_graph=False
+    )
+
+    result = runner.custom_prefill_forward(fb, sb, reqs)
+
+    assert result.can_run_cuda_graph is False
+    assert index_copy_calls == 1
+    assert clone_calls == 0
 
 
 def test_single_request_image_merge():
