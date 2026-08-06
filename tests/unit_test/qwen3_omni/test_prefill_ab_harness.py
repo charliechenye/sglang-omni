@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import torch
 
+from benchmarks.eval.benchmark_qwen3_omni_prefill_ab import _arm_config
+
 
 def _oracle_text_audio_embeddings(
     input_ids: torch.Tensor,
@@ -53,3 +55,10 @@ def test_prefill_oracle_handles_current_chunk_positions() -> None:
 
     assert torch.equal(expected[0], audio[1])
     assert torch.equal(expected[2], audio[2])
+
+
+def test_benchmark_arms_keep_graph_configuration_external() -> None:
+    assert _arm_config("A", None).prefill_backend == "disabled"
+    assert _arm_config("B", None).prefill_backend == "disabled"
+    assert _arm_config("C", None).prefill_backend == "breakable"
+    assert _arm_config("C", "disabled").prefill_backend == "disabled"

@@ -100,6 +100,7 @@ def test_audio_to_text_uses_native_precomputed_item_without_alias(
     assert req.omni_model_inputs is None
     assert item.format is MultimodalInputFormat.PRECOMPUTED_EMBEDDING
     assert item.precomputed_embeddings is audio
+    assert item.offsets == [(1, 1), (3, 3)]
     assert item.model_specific_data["positions_cpu"].tolist() == [1, 3]
     assert request_data.model_inputs.get("audio_embeds") is None
     assert "audio_embeds" not in payload.data["thinker_inputs"]["model_inputs"]

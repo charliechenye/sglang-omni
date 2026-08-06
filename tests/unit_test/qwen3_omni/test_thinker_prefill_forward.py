@@ -31,7 +31,7 @@ class _EmbedTokens(nn.Module):
     num_embeddings = 128
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return input_ids.to(dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+        return input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
 
 
 class _InnerModel(nn.Module):
@@ -90,10 +90,12 @@ def _forward_batch(
     extend_lens: list[int] | None = None,
     prefix_lens: list[int] | None = None,
     mode: _Mode | None = None,
+    input_embeds: torch.Tensor | None = None,
 ):
     return SimpleNamespace(
         input_ids=input_ids,
         mm_inputs=mm_inputs,
+        input_embeds=input_embeds,
         extend_seq_lens_cpu=extend_lens or [int(input_ids.numel())],
         extend_prefix_lens_cpu=prefix_lens or [0],
         forward_mode=mode or _Mode(),
@@ -117,11 +119,11 @@ def test_text_only_graph_populates_the_model_argument_buffer() -> None:
     outer, inner = _outer()
     input_ids = torch.tensor([3, 4, 5], dtype=torch.long)
     stable = torch.full((3, 4), -12345.0)
-    batch = _forward_batch(input_ids)
+    batch = _forward_batch(input_ids, input_embeds=stable)
 
     outer(input_ids, torch.arange(3), batch, input_embeds=stable)
 
-    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
     assert torch.equal(stable, expected)
     call = inner.calls[-1]
     assert call["input_ids"] is None
@@ -140,7 +142,7 @@ def test_audio_eager_composes_text_and_precomputed_rows() -> None:
 
     outer(input_ids, torch.arange(5), batch)
 
-    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
     expected[[1, 3]] = audio
     assert torch.equal(inner.calls[-1]["input_embeds"], expected)
     assert inner.calls[-1]["input_ids"] is None
@@ -155,11 +157,12 @@ def test_audio_graph_overwrites_sentinel_in_stable_buffer() -> None:
     batch = _forward_batch(
         input_ids,
         mm_inputs=[SimpleNamespace(mm_items=[item])],
+        input_embeds=stable,
     )
 
     outer(input_ids, torch.arange(5), batch, input_embeds=stable)
 
-    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
     expected[[1, 3]] = audio
     assert torch.equal(stable, expected)
     assert inner.calls[-1]["input_embeds"] is stable
@@ -180,7 +183,7 @@ def test_audio_placement_uses_absolute_positions_for_chunked_prefill() -> None:
 
     outer(input_ids, torch.arange(3), batch)
 
-    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
     expected[2] = torch.tensor([200.0] * 4)
     assert torch.equal(inner.calls[-1]["input_embeds"], expected)
 
@@ -198,7 +201,7 @@ def test_audio_placement_preserves_flat_batch_offsets() -> None:
 
     outer(input_ids, torch.arange(5), batch)
 
-    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
     expected[3] = torch.tensor([200.0] * 4)
     assert torch.equal(inner.calls[-1]["input_embeds"], expected)
 
@@ -233,13 +236,57 @@ def test_audio_placement_coalesces_multiple_items_into_one_index_copy(
 
     outer(input_ids, torch.arange(5), batch)
 
-    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).expand(-1, 4)
+    expected = input_ids.to(dtype=torch.float32).unsqueeze(-1).repeat(1, 4)
     expected[1] = first.precomputed_embeddings[0]
     expected[3] = second.precomputed_embeddings[0]
     assert torch.equal(inner.calls[-1]["input_embeds"], expected)
     assert len(index_copy_calls) == 1
     # One source cat and one destination cat; no per-item placement calls.
     assert len(cat_calls) == 2
+
+
+@pytest.mark.parametrize("audio_tokens", [256, 2912, 8192])
+def test_audio_placement_scaling_checkpoints(audio_tokens: int) -> None:
+    outer, inner = _outer()
+    input_ids = torch.full((audio_tokens,), 99, dtype=torch.long)
+    audio = torch.arange(audio_tokens * 4, dtype=torch.float32).reshape(
+        audio_tokens, 4
+    )
+    item = _AudioItem(list(range(audio_tokens)), audio)
+    batch = _forward_batch(
+        input_ids,
+        mm_inputs=[SimpleNamespace(mm_items=[item])],
+    )
+
+    outer(input_ids, torch.arange(audio_tokens), batch)
+
+    assert torch.equal(inner.calls[-1]["input_embeds"], audio)
+
+
+def test_audio_width_mismatch_is_a_semantic_contract_error() -> None:
+    outer, _ = _outer()
+    input_ids = torch.tensor([3, 99], dtype=torch.long)
+    item = _AudioItem([1], torch.ones((1, 3)))
+    batch = _forward_batch(
+        input_ids,
+        mm_inputs=[SimpleNamespace(mm_items=[item])],
+    )
+
+    with pytest.raises(ValueError, match="width"):
+        outer(input_ids, torch.arange(2), batch)
+
+
+def test_audio_positions_must_be_ordered_source_metadata() -> None:
+    outer, _ = _outer()
+    input_ids = torch.tensor([3, 99, 98], dtype=torch.long)
+    item = _AudioItem([2, 1], torch.ones((2, 4)))
+    batch = _forward_batch(
+        input_ids,
+        mm_inputs=[SimpleNamespace(mm_items=[item])],
+    )
+
+    with pytest.raises(RuntimeError, match="sorted"):
+        outer(input_ids, torch.arange(3), batch)
 
 
 def test_legacy_multimodal_shell_preserves_external_embeddings() -> None:
@@ -274,6 +321,18 @@ def test_outer_mrope_contract_checks_root_and_text_configs() -> None:
     text = SimpleNamespace(rope_scaling=None)
 
     assert _qwen_mrope_enabled(root, text)
+
+
+def test_outer_forward_uses_mrope_positions_for_the_inner_model() -> None:
+    outer, inner = _outer()
+    input_ids = torch.tensor([3, 4], dtype=torch.long)
+    mrope_positions = torch.arange(6, dtype=torch.long).reshape(3, 2)
+    batch = _forward_batch(input_ids)
+    batch.mrope_positions = mrope_positions
+
+    outer(input_ids, torch.arange(2), batch)
+
+    assert inner.calls[-1]["positions"] is mrope_positions
 
 
 def test_upstream_prefill_runner_uses_outer_mrope_contract() -> None:
