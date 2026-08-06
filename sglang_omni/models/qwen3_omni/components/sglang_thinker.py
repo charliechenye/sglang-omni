@@ -36,6 +36,11 @@ def _config_has_mrope(config: Any) -> bool:
     return False
 
 
+def _qwen_mrope_enabled(*configs: Any) -> bool:
+    """Expose the outer model's M-RoPE contract to upstream graph capture."""
+    return any(_config_has_mrope(config) for config in configs)
+
+
 def _cpu_int_list(values: Any, *, name: str) -> list[int]:
     """Convert scheduler-owned host metadata without a device synchronization."""
     if values is None:
@@ -128,9 +133,10 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         self.root_config = config
         self.thinker_config = getattr(config, "thinker_config", config)
         self.config = getattr(self.thinker_config, "text_config", self.thinker_config)
-        self.is_mrope_enabled = any(
-            _config_has_mrope(candidate)
-            for candidate in (self.root_config, self.thinker_config, self.config)
+        self.is_mrope_enabled = _qwen_mrope_enabled(
+            self.root_config,
+            self.thinker_config,
+            self.config,
         )
 
         self.model = Qwen3MoeLLMModel(

@@ -11,6 +11,7 @@ from torch import nn
 from sglang_omni.models.qwen3_omni.components.sglang_thinker import (
     Qwen3OmniThinkerForCausalLM,
     _config_has_mrope,
+    _qwen_mrope_enabled,
 )
 
 
@@ -266,6 +267,13 @@ def test_mrope_declaration_accepts_both_upstream_config_shapes() -> None:
         SimpleNamespace(rope_scaling={"mrope_section": [16, 24, 24]})
     )
     assert not _config_has_mrope(SimpleNamespace(rope_scaling={"factor": 2.0}))
+
+
+def test_outer_mrope_contract_checks_root_and_text_configs() -> None:
+    root = SimpleNamespace(rope_parameters={"mrope_section": [16, 24, 24]})
+    text = SimpleNamespace(rope_scaling=None)
+
+    assert _qwen_mrope_enabled(root, text)
 
 
 def test_upstream_prefill_runner_uses_outer_mrope_contract() -> None:
