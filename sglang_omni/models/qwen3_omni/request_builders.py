@@ -595,11 +595,12 @@ def _build_qwen_audio_forward_contract(
         )
 
     cache_key = media_cache_keys.get("audio")
-    audio_hash = (
-        xxhash.xxh3_64(cache_key.encode()).intdigest()
-        if cache_key is not None
-        else None
-    )
+    if cache_key is None:
+        # NOTE(qwen3-omni-pcg): A native precomputed item requires media-derived
+        # cache identity. Without it, identical token placeholders could map to
+        # different audio embeddings under prefix caching.
+        return None
+    audio_hash = xxhash.xxh3_64(cache_key.encode()).intdigest()
 
     from sglang.srt.managers.schedule_batch import (
         Modality,

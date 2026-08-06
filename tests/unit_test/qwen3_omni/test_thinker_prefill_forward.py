@@ -377,18 +377,15 @@ def test_outer_forward_uses_mrope_positions_for_the_inner_model() -> None:
 
 
 def test_upstream_prefill_runner_uses_outer_mrope_contract() -> None:
-    runner_module = pytest.importorskip(
-        "sglang.srt.model_executor.cuda_graph_runner"
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        PrefillCudaGraphRunner,
     )
-    runner_type = getattr(runner_module, "PrefillCudaGraphRunner", None)
-    if runner_type is None:
-        pytest.skip("pinned SGLang does not expose PrefillCudaGraphRunner here")
 
     outer, _ = _outer()
     mrope = torch.arange(12, dtype=torch.long).reshape(3, 4)
     positions = torch.arange(4, dtype=torch.long)
     forward_batch = SimpleNamespace(mrope_positions=mrope, positions=positions)
-    runner = runner_type.__new__(runner_type)
+    runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
     runner.model_runner = SimpleNamespace(model=outer)
 
     selected = runner._get_layer_model_positions(forward_batch)

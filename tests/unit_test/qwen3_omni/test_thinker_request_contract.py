@@ -106,7 +106,7 @@ def test_audio_to_text_uses_native_precomputed_item_without_alias(
     assert "audio_embeds" not in payload.data["thinker_inputs"]["model_inputs"]
 
 
-def test_audio_to_text_without_cache_key_keeps_audio_token_positions(
+def test_audio_to_text_without_cache_key_keeps_legacy_contract(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_builder(monkeypatch)
@@ -120,10 +120,10 @@ def test_audio_to_text_without_cache_key_keeps_audio_token_positions(
         thinker_config=_thinker_config(),
     )
     request_data = request_builder(payload)
-    item = request_data.req.multimodal_inputs.mm_items[0]
 
-    assert item.pad_value == 77
-    assert item.model_specific_data["positions_cpu"].tolist() == [1, 3]
+    assert request_data.req.omni_model_inputs is not None
+    assert request_data.req.multimodal_inputs.mm_items == []
+    assert "audio_embeds" in payload.data["thinker_inputs"]["model_inputs"]
 
 
 def test_speech_output_remains_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
