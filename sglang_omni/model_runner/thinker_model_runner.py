@@ -196,12 +196,17 @@ class ThinkerModelRunner(ModelRunner):
             mm_items = getattr(item, "mm_items", None)
             if mm_items is None or len(mm_items) != 0:
                 return False
-            for field in ("mrope_positions", "mrope_position_delta"):
-                if (
-                    getattr(item, field, None) is not None
-                    and getattr(forward_batch, field, None) is None
-                ):
-                    return False
+            shell_has_mrope = (
+                getattr(item, "mrope_positions", None) is not None
+                or getattr(item, "mrope_position_delta", None) is not None
+            )
+            if shell_has_mrope and getattr(
+                forward_batch, "mrope_positions", None
+            ) is None:
+                # note (chenrui): SGLang materializes only current-prefill
+                # M-RoPE positions on ForwardBatch; the delta stays on the
+                # request-side MultimodalInputs for future decode positions.
+                return False
 
         return True
 
@@ -212,10 +217,8 @@ class ThinkerModelRunner(ModelRunner):
         if mm_inputs is None:
             return
 
-        # NOTE(qwen3-omni-pcg): Qwen uses an empty MultimodalInputs shell to
-        # move M-RoPE metadata onto ForwardBatch. At this point that metadata
-        # has already been materialized; only an item-free shell may be replaced
-        # with None entries before the official platform payload is attached.
+        # note (chenrui): Replace only the ForwardBatch-local shell. The
+        # request's MultimodalInputs retains mrope_position_delta for decode.
         forward_batch.mm_inputs = [None] * forward_batch.batch_size
 
     def _build_prefill_input_embeds(
@@ -245,7 +248,7 @@ class ThinkerModelRunner(ModelRunner):
             return
         self._clear_qwen_prefill_mm_shell(forward_batch)
 
-        # NOTE(qwen3-omni-pcg): Compose the normal eager prefill embeddings
+        # note (chenrui): Compose the normal eager prefill embeddings
         # first, then carry them through the platform OmniPrefillInputs channel.
         # The live ForwardBatch.input_embeds remains None so upstream SGLang owns
         # graph eligibility and graph-static storage.
