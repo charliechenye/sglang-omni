@@ -663,26 +663,21 @@ def test_qwen_builder_forwards_explicit_mem_fraction_static() -> None:
 def test_qwen_breakable_lifecycle_uses_real_server_args_and_model_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """Keep the graph claim coupled to pinned SGLang config resolution."""
-    qwen_config_module = pytest.importorskip(
-        "transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe"
-    )
-    qwen_config_class = getattr(qwen_config_module, "Qwen3OmniMoeConfig", None)
-    if qwen_config_class is None:
-        pytest.skip("pinned Transformers does not expose Qwen3OmniMoeConfig")
-
     from transformers import GenerationConfig
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+        Qwen3OmniMoeConfig,
+    )
 
     from sglang.srt.configs import model_config as model_config_module
-    from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.server_args import Phase, ServerArgs
 
     from sglang_omni.models.qwen3_omni.components import sglang_thinker
     from sglang_omni.scheduling.generation_batch_policy import (
         build_generation_batch_overrides,
+        get_prefill_cuda_graph_backend,
     )
 
-    hf_config = qwen_config_class()
+    hf_config = Qwen3OmniMoeConfig()
     hf_config.architectures = ["Qwen3OmniMoeForConditionalGeneration"]
     hf_config.thinker_config.text_config.rope_parameters = {
         "mrope_section": [16, 24, 24]
@@ -706,37 +701,39 @@ def test_qwen_breakable_lifecycle_uses_real_server_args_and_model_config(
         lambda config: config.thinker_config.text_config,
     )
 
-    real_model_config = ModelConfig(
-        model_path=str(tmp_path),
-        trust_remote_code=True,
-        context_length=1024,
-        enable_multimodal=True,
-    )
-    assert real_model_config.is_multimodal is True
-    assert real_model_config.is_multimodal_breakable_cuda_graph_supported is False
-
     overrides = build_generation_batch_overrides(
         max_running_requests=2,
         server_args_overrides={
             "cuda_graph_backend_prefill": "breakable",
-            "cuda_graph_bs_prefill": [1, 2],
-            "cuda_graph_max_bs_prefill": 2,
+            "cuda_graph_bs_prefill": [4, 8, 16, 32],
+            "cuda_graph_max_bs_prefill": 32,
         },
     )
+    # Use a real model path so ServerArgs runs its one-shot model/config and
+    # CUDA-graph resolution lifecycle. Only the external HF loading boundary
+    # above is replaced with the in-memory pinned Qwen config.
     server_args = build_sglang_server_args(
-        "dummy",
+        str(tmp_path),
         context_length=1024,
+        enable_multimodal=True,
+        attention_backend="triton",
         **overrides,
     )
     assert isinstance(server_args, ServerArgs)
-    object.__setattr__(server_args, "model_config", real_model_config)
-    server_args._handle_cuda_graph_config()
-    resolved_backend = server_args.cuda_graph_config.prefill.backend
+    model_config = server_args.get_model_config()
+    resolved_backend = get_prefill_cuda_graph_backend(server_args)
     resolved_backend_name = getattr(resolved_backend, "value", resolved_backend)
+
+    assert model_config.is_multimodal is True
+    assert model_config.is_multimodal_breakable_cuda_graph_supported is False
     assert resolved_backend_name == "breakable", (
         "requested breakable must remain breakable through the real pinned "
         f"ServerArgs resolution; got {resolved_backend!r}"
     )
+    # The root checkpoint is multimodal and not in SGLang's validated BCG
+    # allowlist, but an explicit prefill backend is locked by SGLang 0.5.16.
+    # The Omni safety rail therefore owns the model-level qualification.
+    assert (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
 
     class FakeTextModel(torch.nn.Module):
         def __init__(self, *args, **kwargs):
@@ -756,7 +753,7 @@ def test_qwen_breakable_lifecycle_uses_real_server_args_and_model_config(
         "LogitsProcessor",
         lambda config: SimpleNamespace(config=config),
     )
-    thinker = sglang_thinker.Qwen3OmniThinkerForCausalLM(real_model_config.hf_config)
+    thinker = sglang_thinker.Qwen3OmniThinkerForCausalLM(model_config.hf_config)
     assert thinker.is_mrope_enabled is True
 
 
