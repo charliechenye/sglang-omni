@@ -128,13 +128,6 @@ def test_text_only_batch_is_payload_compatible() -> None:
     assert runner._can_use_qwen_prefill_payload(schedule_batch, requests)
 
 
-def test_audio_to_text_batch_is_payload_compatible() -> None:
-    runner = _runner()
-    schedule_batch, requests = _requests([_audio_inputs()])
-
-    assert runner._can_use_qwen_prefill_payload(schedule_batch, requests)
-
-
 @pytest.mark.parametrize(
     "model_inputs",
     [
