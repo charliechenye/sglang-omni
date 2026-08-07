@@ -204,7 +204,7 @@ class ThinkerModelRunner(ModelRunner):
                 shell_has_mrope
                 and getattr(forward_batch, "mrope_positions", None) is None
             ):
-                # note (chenrui): SGLang materializes only current-prefill
+                # note (chenye): SGLang materializes only current-prefill
                 # M-RoPE positions on ForwardBatch; the delta stays on the
                 # request-side MultimodalInputs for future decode positions.
                 return False
@@ -218,7 +218,7 @@ class ThinkerModelRunner(ModelRunner):
         if mm_inputs is None:
             return
 
-        # note (chenrui): Replace only the ForwardBatch-local shell. The
+        # note (chenye): Replace only the ForwardBatch-local shell. The
         # request's MultimodalInputs retains mrope_position_delta for decode.
         forward_batch.mm_inputs = [None] * forward_batch.batch_size
 
@@ -249,7 +249,7 @@ class ThinkerModelRunner(ModelRunner):
             return
         self._clear_qwen_prefill_mm_shell(forward_batch)
 
-        # note (chenrui): Compose the normal eager prefill embeddings
+        # note (chenye): Compose the normal eager prefill embeddings
         # first, then carry them through the platform OmniPrefillInputs channel.
         # The live ForwardBatch.input_embeds remains None so upstream SGLang owns
         # graph eligibility and graph-static storage.
