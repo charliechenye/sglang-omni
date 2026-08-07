@@ -507,13 +507,18 @@ def test_ordinary_multimodal_prefill_delegates_with_input_embeds(
 def test_qwen_runner_falls_back_to_shared_legacy_prefill() -> None:
     runner = _runner()
     forward_batch, schedule_batch, requests, schedule_req = _legacy_request_pair(
-        {"audio_embeds": torch.randn(1, 4)}, [7, 93, 7]
+        {"image_embeds": torch.randn(1, 4)}, [7, 91, 7]
     )
+    image_embed = schedule_req.omni_model_inputs["image_embeds"][0]
+
+    runner.before_prefill(forward_batch, schedule_batch, requests)
+    assert forward_batch.mm_inputs is None
 
     result = runner.custom_prefill_forward(forward_batch, schedule_batch, requests)
 
     assert result is None
     assert forward_batch.input_embeds is not None
+    assert torch.allclose(forward_batch.input_embeds[1], image_embed)
     assert schedule_req.omni_model_inputs is None
 
 
