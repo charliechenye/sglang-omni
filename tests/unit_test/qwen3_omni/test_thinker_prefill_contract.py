@@ -6,9 +6,11 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import torch
+import torch.nn as nn
 
 from sglang_omni.model_runner.prefill_inputs import OmniPrefillInputs
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+from sglang_omni.models.qwen3_omni.components import sglang_thinker
 
 
 def _runner(*, capture_hidden: bool = False) -> ThinkerModelRunner:
@@ -182,3 +184,77 @@ def test_payload_batch_custom_forward_delegates_to_normal_worker() -> None:
     schedule_batch.forward_mode = SimpleNamespace(is_extend=lambda: True)
 
     assert runner.custom_prefill_forward(forward_batch, schedule_batch, requests) is None
+
+
+def test_qwen_outer_model_consumes_payload_as_single_prefill_embedding_source() -> None:
+    class FakeTextModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.seen: dict[str, object] = {}
+
+        def forward(self, **kwargs):
+            self.seen = kwargs
+            return torch.zeros(3, 4)
+
+    model = object.__new__(sglang_thinker.Qwen3OmniThinkerForCausalLM)
+    nn.Module.__init__(model)
+    text_model = FakeTextModel()
+    model.model = text_model
+    model.lm_head = object()
+    logits_calls: list[tuple[object, ...]] = []
+
+    def fake_logits_processor(*args):
+        logits_calls.append(args)
+        return "logits"
+
+    model.logits_processor = fake_logits_processor
+    input_ids = torch.tensor([11, 12, 13])
+    payload_embeds = torch.randn(3, 4)
+    forward_batch = SimpleNamespace(
+        mrope_positions=None,
+        forward_mode=SimpleNamespace(is_extend=lambda: True),
+        mm_inputs=OmniPrefillInputs(
+            input_embeds=payload_embeds,
+            rids=("req-0",),
+        ),
+    )
+
+    result = model(
+        input_ids=input_ids,
+        positions=torch.arange(3),
+        forward_batch=forward_batch,
+    )
+
+    assert result == "logits"
+    assert text_model.seen["input_ids"] is None
+    assert text_model.seen["input_embeds"] is payload_embeds
+    assert logits_calls[0][0] is input_ids
+
+
+def test_qwen_mrope_config_detection_is_semantic() -> None:
+    assert sglang_thinker._config_uses_mrope(
+        SimpleNamespace(rope_parameters={"mrope_section": [16, 24, 24]})
+    )
+    assert not sglang_thinker._config_uses_mrope(
+        SimpleNamespace(rope_parameters={"rope_type": "default"})
+    )
+
+
+def test_pinned_sglang_prefill_runner_uses_qwen_mrope_positions() -> None:
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        PrefillCudaGraphRunner,
+    )
+
+    runner = object.__new__(PrefillCudaGraphRunner)
+    runner.model_runner = SimpleNamespace(
+        model=SimpleNamespace(is_mrope_enabled=True)
+    )
+    forward_batch = SimpleNamespace(
+        positions=torch.arange(3),
+        mrope_positions=torch.arange(9).reshape(3, 3),
+    )
+
+    assert (
+        runner._get_layer_model_positions(forward_batch)
+        is forward_batch.mrope_positions
+    )
