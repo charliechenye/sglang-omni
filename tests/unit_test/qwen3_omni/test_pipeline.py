@@ -881,11 +881,13 @@ def test_qwen_cli_mem_fraction_static_survives_runtime_overrides_overlay() -> No
         "prefill_backend",
         "expected_enable_prefill_input_embeds",
         "expected_attestation_calls",
+        "expected_error",
     ),
     [
-        (False, False, None, 0, "disabled", False, 0),
-        (True, True, [0, 24], 1, "disabled", False, 0),
-        (False, False, None, 0, "breakable", True, 1),
+        (False, False, None, 0, "disabled", False, 0, False),
+        (True, True, [0, 24], 1, "disabled", False, 0, False),
+        (False, False, None, 0, "breakable", True, 1, False),
+        (True, False, None, 0, "breakable", False, 0, True),
     ],
 )
 def test_qwen_thinker_cuda_graph_capture_lifecycle(
@@ -897,6 +899,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     prefill_backend: str,
     expected_enable_prefill_input_embeds: bool,
     expected_attestation_calls: int,
+    expected_error: bool,
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
@@ -994,6 +997,19 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
         fake_attest_prefill_cuda_graphs,
     )
 
+    if expected_error:
+        with pytest.raises(
+            RuntimeError,
+            match="speech-enabled thinker cannot use the breakable",
+        ):
+            bootstrap.create_thinker_scheduler(server_args, speech_enabled=True)
+        assert infrastructure_saw_graph_disabled == []
+        assert capture_hidden_layers_seen == []
+        assert enable_prefill_input_embeds_seen == []
+        assert init_graph_calls == 0
+        assert attestation_calls == 0
+        return
+
     scheduler = bootstrap.create_thinker_scheduler(
         server_args, speech_enabled=speech_enabled
     )
@@ -1006,48 +1022,6 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert server_args.enable_return_hidden_states is speech_enabled
     assert server_args.disable_cuda_graph is False
     assert scheduler.server_args is server_args
-
-
-def test_qwen_thinker_rejects_speech_breakable_before_infrastructure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Speech hidden-state capture must never silently enter the BCG path."""
-    from sglang_omni.models.qwen3_omni import bootstrap
-    from sglang_omni.scheduling import generation_batch_policy
-    from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
-
-    server_args = FakeServerArgs(
-        disable_cuda_graph=False,
-        enable_return_hidden_states=False,
-        cuda_graph_backend_prefill="breakable",
-        cuda_graph_config=SimpleNamespace(
-            # Exercise the no-silent-downgrade case: an explicit request may
-            # have been normalized to disabled before the thinker bootstrap.
-            prefill=SimpleNamespace(backend="disabled")
-        ),
-    )
-
-    monkeypatch.setattr(
-        generation_batch_policy,
-        "get_prefill_cuda_graph_backend",
-        lambda args: args.cuda_graph_config.prefill.backend,
-    )
-
-    def infrastructure_must_not_run(*args, **kwargs):
-        del args, kwargs
-        raise AssertionError("speech-enabled breakable must fail before infrastructure")
-
-    monkeypatch.setattr(
-        scheduling_bootstrap,
-        "create_sglang_infrastructure",
-        infrastructure_must_not_run,
-    )
-
-    with pytest.raises(
-        RuntimeError,
-        match="speech-enabled thinker cannot use the breakable",
-    ):
-        bootstrap.create_thinker_scheduler(server_args, speech_enabled=True)
 
 
 def test_qwen_cli_mem_fraction_static_rejects_runtime_override_duplicate() -> None:

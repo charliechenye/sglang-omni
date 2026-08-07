@@ -42,22 +42,12 @@ def create_thinker_scheduler(
     prefill_graph_backend_name = getattr(
         prefill_graph_backend, "value", prefill_graph_backend
     )
-    requested_prefill_graph_backend = getattr(
-        server_args, "cuda_graph_backend_prefill", None
-    )
-    requested_prefill_graph_backend_name = getattr(
-        requested_prefill_graph_backend,
-        "value",
-        requested_prefill_graph_backend,
-    )
-    if speech_enabled and (
-        prefill_graph_backend_name == "breakable"
-        or requested_prefill_graph_backend_name == "breakable"
-    ):
+    if speech_enabled and prefill_graph_backend_name != "disabled":
         raise RuntimeError(
-            "Qwen3-Omni speech-enabled thinker cannot use the breakable "
-            "prefill CUDA-graph backend: hidden-state capture and audio "
-            "generation are not qualified on that path. Set "
+            "Qwen3-Omni speech-enabled thinker cannot use the "
+            f"{prefill_graph_backend_name} prefill CUDA-graph backend: "
+            "hidden-state capture and audio generation are not qualified "
+            "on that path. Set "
             "cuda_graph_backend_prefill=disabled."
         )
     enable_prefill_input_embeds = prefill_graph_backend_name == "breakable"
