@@ -14,7 +14,7 @@ def test_audio_prefill_publishes_embeds_to_sglang_runner() -> None:
     runner = ThinkerModelRunner.__new__(ThinkerModelRunner)
     input_embeds = torch.ones(3, 4)
     runner._inject_multimodal_embeds = lambda *_args: (input_embeds, None, None)
-    forward_batch = SimpleNamespace(input_embeds=None)
+    forward_batch = SimpleNamespace(input_embeds=None, mm_inputs=None)
 
     result = runner.custom_prefill_forward(
         forward_batch,
@@ -38,7 +38,7 @@ def test_visual_deepstack_prefill_keeps_model_specific_forward() -> None:
     )
     seen = []
     runner._forward_with_omni_embeds = lambda *args: seen.append(args) or "result"
-    forward_batch = SimpleNamespace(input_embeds=None)
+    forward_batch = SimpleNamespace(input_embeds=None, mm_inputs=None)
 
     result = runner.custom_prefill_forward(
         forward_batch,

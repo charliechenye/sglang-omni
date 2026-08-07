@@ -1539,6 +1539,7 @@ def test_qwen_model_runner_and_code_predictor_tensor_contracts() -> None:
     runner._video_token_id = 6
     runner._audio_token_id = 7
     req = SimpleNamespace(
+        origin_input_ids=[1, 999, 2],
         omni_model_inputs={
             "audio_embeds": torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
             "pad_values": {"audio": 999},
@@ -1547,7 +1548,11 @@ def test_qwen_model_runner_and_code_predictor_tensor_contracts() -> None:
         inflight_middle_chunks=0,
     )
     input_embeds, _, _ = runner._inject_multimodal_embeds(
-        SimpleNamespace(input_ids=torch.tensor([1, 999, 2]), extend_seq_lens_cpu=[3]),
+        SimpleNamespace(
+            input_ids=torch.tensor([1, 999, 2]),
+            extend_seq_lens_cpu=[3],
+            extend_prefix_lens_cpu=[0],
+        ),
         SimpleNamespace(reqs=[req]),
     )
 

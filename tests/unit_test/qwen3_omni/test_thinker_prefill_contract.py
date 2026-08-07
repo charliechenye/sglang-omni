@@ -14,6 +14,7 @@ from sglang_omni.model_runner.prefill_inputs import OmniPrefillInputs
 from sglang_omni.model_runner import thinker_model_runner as thinker_runner_module
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components import sglang_thinker
+from sglang_omni.proto import OmniRequest, StagePayload
 
 
 def _runner(*, capture_hidden: bool = False) -> ThinkerModelRunner:
@@ -277,8 +278,13 @@ def test_classifier_matches_actual_qwen_request_builder_outputs(
         request_id="req-builder",
         thinker_config=None,
     )
-    req_data.stage_payload = SimpleNamespace(
-        metadata={"output_modalities": list(output_modalities)}
+    req_data.stage_payload = StagePayload(
+        request_id="req-builder",
+        request=OmniRequest(
+            inputs=None,
+            metadata={"output_modalities": list(output_modalities)},
+        ),
+        data=None,
     )
     schedule_batch = SimpleNamespace(reqs=[req_data.req])
     requests = [SimpleNamespace(request_id="req-builder", data=req_data)]
