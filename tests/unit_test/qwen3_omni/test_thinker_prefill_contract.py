@@ -14,10 +14,23 @@ from sglang_omni.model_runner import thinker_model_runner as thinker_runner_modu
 from sglang_omni.model_runner.prefill_inputs import OmniPrefillInputs
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components import sglang_thinker
+from sglang_omni.models.qwen3_omni.thinker_model_runner import (
+    Qwen3OmniThinkerModelRunner,
+)
 from sglang_omni.proto import OmniRequest, StagePayload
 
 
-def _runner(*, capture_hidden: bool = False) -> ThinkerModelRunner:
+def _runner(*, capture_hidden: bool = False) -> Qwen3OmniThinkerModelRunner:
+    runner = object.__new__(Qwen3OmniThinkerModelRunner)
+    runner._should_capture_hidden = lambda request: capture_hidden
+    runner._embed_tokens = nn.Embedding(128, 4)
+    runner._image_token_id = 91
+    runner._video_token_id = 92
+    runner._audio_token_id = 93
+    return runner
+
+
+def _base_runner(*, capture_hidden: bool = False) -> ThinkerModelRunner:
     runner = object.__new__(ThinkerModelRunner)
     runner._should_capture_hidden = lambda request: capture_hidden
     runner._embed_tokens = nn.Embedding(128, 4)
@@ -161,7 +174,7 @@ def test_text_only_batch_is_payload_compatible() -> None:
     runner = _runner()
     schedule_batch, requests = _requests([None])
 
-    assert runner._can_use_qwen_prefill_payload(schedule_batch, requests)
+    assert runner._can_use_prefill_payload(schedule_batch, requests)
 
 
 @pytest.mark.parametrize(
@@ -177,14 +190,14 @@ def test_incomplete_audio_payload_is_not_graph_compatible(model_inputs) -> None:
     runner = _runner()
     schedule_batch, requests = _requests([model_inputs])
 
-    assert not runner._can_use_qwen_prefill_payload(schedule_batch, requests)
+    assert not runner._can_use_prefill_payload(schedule_batch, requests)
 
 
 def test_multiple_audio_requests_and_text_audio_mix_are_compatible() -> None:
     runner = _runner()
     schedule_batch, requests = _requests([_audio_inputs(), _audio_inputs(), None])
 
-    assert runner._can_use_qwen_prefill_payload(schedule_batch, requests)
+    assert runner._can_use_prefill_payload(schedule_batch, requests)
 
 
 def test_speech_output_is_rejected_from_payload_path() -> None:
@@ -193,14 +206,14 @@ def test_speech_output_is_rejected_from_payload_path() -> None:
         [_audio_inputs()], output_modalities=("audio",)
     )
 
-    assert not runner._can_use_qwen_prefill_payload(schedule_batch, requests)
+    assert not runner._can_use_prefill_payload(schedule_batch, requests)
 
 
 def test_hidden_capture_is_rejected_from_payload_path() -> None:
     runner = _runner(capture_hidden=True)
     schedule_batch, requests = _requests([_audio_inputs()])
 
-    assert not runner._can_use_qwen_prefill_payload(schedule_batch, requests)
+    assert not runner._can_use_prefill_payload(schedule_batch, requests)
 
 
 def test_visual_and_deepstack_inputs_are_rejected() -> None:
@@ -214,7 +227,7 @@ def test_visual_and_deepstack_inputs_are_rejected() -> None:
         {"use_audio_in_video": True},
     ):
         schedule_batch, requests = _requests([inputs])
-        assert not runner._can_use_qwen_prefill_payload(schedule_batch, requests)
+        assert not runner._can_use_prefill_payload(schedule_batch, requests)
 
 
 def test_unknown_auxiliary_input_is_rejected() -> None:
@@ -223,14 +236,14 @@ def test_unknown_auxiliary_input_is_rejected() -> None:
         [{**_audio_inputs(), "unqualified_aux": torch.zeros(1)}]
     )
 
-    assert not runner._can_use_qwen_prefill_payload(schedule_batch, requests)
+    assert not runner._can_use_prefill_payload(schedule_batch, requests)
 
 
 def test_incompatible_request_rejects_the_entire_batch() -> None:
     runner = _runner()
     schedule_batch, requests = _requests([None, {"image_embeds": torch.zeros(1, 4)}])
 
-    assert not runner._can_use_qwen_prefill_payload(schedule_batch, requests)
+    assert not runner._can_use_prefill_payload(schedule_batch, requests)
 
 
 @pytest.mark.parametrize(
@@ -334,7 +347,7 @@ def test_classifier_matches_actual_qwen_request_builder_outputs(
     schedule_batch = SimpleNamespace(reqs=[req_data.req])
     requests = [SimpleNamespace(request_id="req-builder", data=req_data)]
 
-    assert _runner()._can_use_qwen_prefill_payload(schedule_batch, requests) is expected
+    assert _runner()._can_use_prefill_payload(schedule_batch, requests) is expected
 
 
 def test_before_prefill_attaches_audio_payload_and_preserves_request_mrope_delta() -> (
@@ -492,7 +505,7 @@ def test_payload_batch_custom_forward_delegates_to_normal_worker() -> None:
 def test_ordinary_multimodal_prefill_delegates_with_input_embeds(
     token_id: int, embed_key: str
 ) -> None:
-    runner = _runner()
+    runner = _base_runner()
     input_ids = [7, token_id, 7]
     model_inputs = {embed_key: torch.randn(1, 4)}
     forward_batch, schedule_batch, requests, schedule_req = _legacy_request_pair(
@@ -507,10 +520,23 @@ def test_ordinary_multimodal_prefill_delegates_with_input_embeds(
     assert schedule_req.omni_model_inputs is None
 
 
+def test_qwen_runner_falls_back_to_shared_legacy_prefill() -> None:
+    runner = _runner()
+    forward_batch, schedule_batch, requests, schedule_req = _legacy_request_pair(
+        {"audio_embeds": torch.randn(1, 4)}, [7, 93, 7]
+    )
+
+    result = runner.custom_prefill_forward(forward_batch, schedule_batch, requests)
+
+    assert result is None
+    assert forward_batch.input_embeds is not None
+    assert schedule_req.omni_model_inputs is None
+
+
 def test_deepstack_prefill_uses_direct_forward_and_attention_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runner = _runner()
+    runner = _base_runner()
     input_ids = [7, 91, 7]
     model_inputs = {
         "image_embeds": torch.randn(1, 4),
@@ -576,7 +602,8 @@ def test_deepstack_prefill_uses_direct_forward_and_attention_context(
 def test_payload_and_ordinary_delegation_do_not_enter_manual_attention_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runner = _runner()
+    payload_runner = _runner()
+    ordinary_runner = _base_runner()
     context_enters = 0
 
     @contextlib.contextmanager
@@ -597,7 +624,9 @@ def test_payload_and_ordinary_delegation_do_not_enter_manual_attention_context(
     )
     payload_schedule.forward_mode = SimpleNamespace(is_extend=lambda: True)
     assert (
-        runner.custom_prefill_forward(payload_batch, payload_schedule, payload_requests)
+        payload_runner.custom_prefill_forward(
+            payload_batch, payload_schedule, payload_requests
+        )
         is None
     )
 
@@ -606,7 +635,7 @@ def test_payload_and_ordinary_delegation_do_not_enter_manual_attention_context(
         {"audio_embeds": torch.randn(1, 4)}, input_ids
     )
     assert (
-        runner.custom_prefill_forward(
+        ordinary_runner.custom_prefill_forward(
             ordinary_batch, ordinary_schedule, ordinary_requests
         )
         is None

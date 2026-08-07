@@ -881,8 +881,11 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
-    from sglang_omni.model_runner import thinker_model_runner
-    from sglang_omni.models.qwen3_omni import bootstrap, request_builders
+    from sglang_omni.models.qwen3_omni import (
+        bootstrap,
+        request_builders,
+        thinker_model_runner as qwen_thinker_model_runner,
+    )
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
     from sglang_omni.scheduling import omni_scheduler, sglang_backend
     from sglang_omni.utils import cuda_graph_batch_validator
@@ -899,6 +902,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     enable_prefill_input_embeds_seen: list[bool] = []
     attestation_calls = 0
     init_graph_calls = 0
+    constructed_runners: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     class FakeModelRunner:
         model = object()
@@ -959,10 +963,14 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     monkeypatch.setattr(
         sglang_backend, "SGLangOutputProcessor", lambda **kwargs: object()
     )
+    def fake_qwen_thinker_model_runner(*args, **kwargs):
+        constructed_runners.append((args, kwargs))
+        return object()
+
     monkeypatch.setattr(
-        thinker_model_runner,
-        "ThinkerModelRunner",
-        lambda *args, **kwargs: object(),
+        qwen_thinker_model_runner,
+        "Qwen3OmniThinkerModelRunner",
+        fake_qwen_thinker_model_runner,
     )
     monkeypatch.setattr(
         omni_scheduler,
@@ -986,6 +994,7 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
         assert enable_prefill_input_embeds_seen == []
         assert init_graph_calls == 0
         assert attestation_calls == 0
+        assert constructed_runners == []
         return
 
     scheduler = bootstrap.create_thinker_scheduler(
@@ -1000,6 +1009,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert server_args.enable_return_hidden_states is speech_enabled
     assert server_args.disable_cuda_graph is False
     assert scheduler.server_args is server_args
+    assert len(constructed_runners) == 1
+    assert constructed_runners[0][0][0] is model_worker
+    assert callable(constructed_runners[0][1]["should_capture_hidden"])
 
 
 def test_qwen_cli_mem_fraction_static_rejects_runtime_override_duplicate() -> None:
