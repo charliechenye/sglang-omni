@@ -660,6 +660,106 @@ def test_qwen_builder_forwards_explicit_mem_fraction_static() -> None:
     assert server_args.dtype == "bfloat16"
 
 
+def test_qwen_breakable_lifecycle_uses_real_server_args_and_model_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """Keep the graph claim coupled to pinned SGLang config resolution."""
+    qwen_config_module = pytest.importorskip(
+        "transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe"
+    )
+    qwen_config_class = getattr(qwen_config_module, "Qwen3OmniMoeConfig", None)
+    if qwen_config_class is None:
+        pytest.skip("pinned Transformers does not expose Qwen3OmniMoeConfig")
+
+    from transformers import GenerationConfig
+
+    from sglang.srt.configs import model_config as model_config_module
+    from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.server_args import ServerArgs
+
+    from sglang_omni.models.qwen3_omni.components import sglang_thinker
+    from sglang_omni.scheduling.generation_batch_policy import (
+        build_generation_batch_overrides,
+    )
+
+    hf_config = qwen_config_class()
+    hf_config.architectures = ["Qwen3OmniMoeForConditionalGeneration"]
+    hf_config.thinker_config.text_config.rope_parameters = {
+        "mrope_section": [16, 24, 24]
+    }
+
+    # ModelConfig remains real; only the filesystem/HF fetch boundary is pinned
+    # to the in-memory Qwen config so this test never downloads a checkpoint.
+    monkeypatch.setattr(
+        model_config_module,
+        "get_config",
+        lambda *args, **kwargs: hf_config,
+    )
+    monkeypatch.setattr(
+        model_config_module,
+        "get_generation_config",
+        lambda *args, **kwargs: GenerationConfig(),
+    )
+    monkeypatch.setattr(
+        model_config_module,
+        "get_hf_text_config",
+        lambda config: config.thinker_config.text_config,
+    )
+
+    real_model_config = ModelConfig(
+        model_path=str(tmp_path),
+        trust_remote_code=True,
+        context_length=1024,
+        enable_multimodal=True,
+    )
+    assert real_model_config.is_multimodal is True
+    assert real_model_config.is_multimodal_breakable_cuda_graph_supported is False
+
+    overrides = build_generation_batch_overrides(
+        max_running_requests=2,
+        server_args_overrides={
+            "cuda_graph_backend_prefill": "breakable",
+            "cuda_graph_bs_prefill": [1, 2],
+            "cuda_graph_max_bs_prefill": 2,
+        },
+    )
+    server_args = build_sglang_server_args(
+        "dummy",
+        context_length=1024,
+        **overrides,
+    )
+    assert isinstance(server_args, ServerArgs)
+    object.__setattr__(server_args, "model_config", real_model_config)
+    server_args._handle_cuda_graph_config()
+    resolved_backend = server_args.cuda_graph_config.prefill.backend
+    resolved_backend_name = getattr(resolved_backend, "value", resolved_backend)
+    assert resolved_backend_name == "breakable", (
+        "requested breakable must remain breakable through the real pinned "
+        f"ServerArgs resolution; got {resolved_backend!r}"
+    )
+
+    class FakeTextModel(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(128, 4)
+
+    class FakeLMHead(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            del args, kwargs
+            super().__init__()
+
+    monkeypatch.setattr(sglang_thinker, "Qwen3MoeLLMModel", FakeTextModel)
+    monkeypatch.setattr(sglang_thinker, "ParallelLMHead", FakeLMHead)
+    monkeypatch.setattr(
+        sglang_thinker,
+        "LogitsProcessor",
+        lambda config: SimpleNamespace(config=config),
+    )
+    thinker = sglang_thinker.Qwen3OmniThinkerForCausalLM(real_model_config.hf_config)
+    assert thinker.is_mrope_enabled is True
+
+
 def test_qwen_encoder_mem_reserve_applies_only_to_valid_auto_values() -> None:
     server_args = FakeServerArgs(mem_fraction_static=0.929)
 
@@ -909,6 +1009,45 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     assert server_args.enable_return_hidden_states is speech_enabled
     assert server_args.disable_cuda_graph is False
     assert scheduler.server_args is server_args
+
+
+def test_qwen_thinker_rejects_speech_breakable_before_infrastructure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Speech hidden-state capture must never silently enter the BCG path."""
+    from sglang_omni.models.qwen3_omni import bootstrap
+    from sglang_omni.scheduling import generation_batch_policy
+    from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
+
+    server_args = FakeServerArgs(
+        disable_cuda_graph=False,
+        enable_return_hidden_states=False,
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(backend="breakable")
+        ),
+    )
+
+    monkeypatch.setattr(
+        generation_batch_policy,
+        "get_prefill_cuda_graph_backend",
+        lambda args: args.cuda_graph_config.prefill.backend,
+    )
+
+    def infrastructure_must_not_run(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("speech-enabled breakable must fail before infrastructure")
+
+    monkeypatch.setattr(
+        scheduling_bootstrap,
+        "create_sglang_infrastructure",
+        infrastructure_must_not_run,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="speech-enabled thinker cannot use the breakable",
+    ):
+        bootstrap.create_thinker_scheduler(server_args, speech_enabled=True)
 
 
 def test_qwen_cli_mem_fraction_static_rejects_runtime_override_duplicate() -> None:

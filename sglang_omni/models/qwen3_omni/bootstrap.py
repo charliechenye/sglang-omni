@@ -39,7 +39,17 @@ def create_thinker_scheduler(
     from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
 
     prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
-    enable_prefill_input_embeds = prefill_graph_backend == "breakable"
+    prefill_graph_backend_name = getattr(
+        prefill_graph_backend, "value", prefill_graph_backend
+    )
+    if speech_enabled and prefill_graph_backend_name == "breakable":
+        raise RuntimeError(
+            "Qwen3-Omni speech-enabled thinker cannot use the breakable "
+            "prefill CUDA-graph backend: hidden-state capture and audio "
+            "generation are not qualified on that path. Set "
+            "cuda_graph_backend_prefill=disabled."
+        )
+    enable_prefill_input_embeds = prefill_graph_backend_name == "breakable"
     capture_hidden_layers = [0, 24] if speech_enabled else None
     capture_hidden = speech_enabled
     want_cuda_graph = not bool(server_args.disable_cuda_graph)
@@ -80,7 +90,7 @@ def create_thinker_scheduler(
         )
         model_worker.model_runner.init_cuda_graphs()
 
-    if prefill_graph_backend != "disabled":
+    if prefill_graph_backend_name != "disabled":
         # Reuse the #1364 startup safety rail after Qwen's custom bootstrap has
         # completed capture. This validates the platform runner and declared
         # buckets; batch-level graph eligibility remains upstream SGLang's job.
