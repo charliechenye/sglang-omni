@@ -32,7 +32,8 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Generic, Mapping, TypeVar
+from collections.abc import Callable, Mapping
+from typing import Any, Generic, TypeVar
 
 import torch
 
@@ -57,18 +58,16 @@ def resolve_initial_codec_chunk_frames(
     params: Mapping[str, Any] | None,
     *,
     steady_chunk_frames: int,
+    default_frames: int = 0,
 ) -> int:
-    """Return the request-level first codec chunk size, clamped to steady size."""
+    """Resolve the model default or request override, clamped to steady size."""
     if steady_chunk_frames <= 0:
         raise ValueError(
             f"steady_chunk_frames must be positive, got {steady_chunk_frames}"
         )
-    if params is None:
-        return 0
-
-    value = params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM)
+    value = params.get(INITIAL_CODEC_CHUNK_FRAMES_PARAM) if params is not None else None
     if value is None:
-        return 0
+        value = default_frames
 
     try:
         frames = int(value)
@@ -96,6 +95,8 @@ class StreamingVocoderBase(
 
     ``stream_source_hint`` names the model in client-visible payloads and in
     the base-owned scaffold error/log text; it defaults to the subclass name.
+    ``stream_input_modality`` defaults to discrete ``audio_codes`` and can be
+    set to ``audio_latents`` by continuous-latent vocoders.
     """
 
     def __init__(
@@ -104,6 +105,7 @@ class StreamingVocoderBase(
         *,
         sample_rate: int,
         stream_source_hint: str | None = None,
+        stream_input_modality: str = "audio_codes",
         batch_compute_fn: Callable[[list[Any]], list[Any]] | None = None,
         max_batch_size: int = 1,
         max_batch_wait_ms: int = 0,
@@ -116,6 +118,7 @@ class StreamingVocoderBase(
         self._completed_stream_request_ids: dict[str, None] = {}
         self._sample_rate = int(sample_rate)
         self._stream_source_hint = stream_source_hint or type(self).__name__
+        self._stream_input_modality = str(stream_input_modality)
         super().__init__(
             compute_fn,
             batch_compute_fn=batch_compute_fn,
@@ -307,10 +310,10 @@ class StreamingVocoderBase(
                 f"{self._stream_source_hint} stream chunk for {request_id!r} is "
                 "missing metadata"
             )
-        if metadata.get("modality") not in (None, "audio_codes"):
+        if metadata.get("modality") not in (None, self._stream_input_modality):
             raise ValueError(
                 f"{self._stream_source_hint} stream chunk modality must be "
-                f"audio_codes, got {metadata.get('modality')!r}"
+                f"{self._stream_input_modality}, got {metadata.get('modality')!r}"
             )
         if not isinstance(metadata.get("stream"), bool):
             raise RuntimeError(

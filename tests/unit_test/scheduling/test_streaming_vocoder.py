@@ -216,6 +216,24 @@ def test_resolve_initial_codec_chunk_frames() -> None:
     assert resolve_initial_codec_chunk_frames(None, steady_chunk_frames=10) == 0
     assert resolve_initial_codec_chunk_frames({}, steady_chunk_frames=10) == 0
     assert (
+        resolve_initial_codec_chunk_frames({}, steady_chunk_frames=10, default_frames=4)
+        == 4
+    )
+    assert (
+        resolve_initial_codec_chunk_frames(
+            {INITIAL_CODEC_CHUNK_FRAMES_PARAM: 0},
+            steady_chunk_frames=10,
+            default_frames=4,
+        )
+        == 0
+    )
+    assert (
+        resolve_initial_codec_chunk_frames(
+            {}, steady_chunk_frames=10, default_frames=99
+        )
+        == 10
+    )
+    assert (
         resolve_initial_codec_chunk_frames(
             {INITIAL_CODEC_CHUNK_FRAMES_PARAM: 3}, steady_chunk_frames=10
         )
@@ -442,6 +460,19 @@ def test_chunk_scaffold_errors_name_subclass() -> None:
                 from_stage="tts_engine",
                 metadata={"stream": True},
             ),
+        )
+
+
+def test_chunk_scaffold_accepts_configured_input_modality() -> None:
+    scheduler = _FakeStreamingVocoder(stream_input_modality="audio_latents")
+    scheduler.on_stream_chunk(
+        "r",
+        _item([1], {"stream": True, "modality": "audio_latents"}),
+    )
+    with pytest.raises(ValueError, match="modality must be audio_latents"):
+        scheduler.on_stream_chunk(
+            "r",
+            _item([2], {"stream": True, "modality": "audio_codes"}),
         )
 
 
