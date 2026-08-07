@@ -135,6 +135,22 @@ def test_audio_to_text_batch_is_payload_compatible() -> None:
     assert runner._can_use_qwen_prefill_payload(schedule_batch, requests)
 
 
+@pytest.mark.parametrize(
+    "model_inputs",
+    [
+        {"audio_feature_lengths": torch.tensor([8])},
+        {"audio_embeds": None},
+        {"audio_embeds": [[0.0, 1.0]]},
+    ],
+    ids=["missing-audio-embeds", "none-audio-embeds", "non-tensor-audio-embeds"],
+)
+def test_incomplete_audio_payload_is_not_graph_compatible(model_inputs) -> None:
+    runner = _runner()
+    schedule_batch, requests = _requests([model_inputs])
+
+    assert not runner._can_use_qwen_prefill_payload(schedule_batch, requests)
+
+
 def test_multiple_audio_requests_and_text_audio_mix_are_compatible() -> None:
     runner = _runner()
     schedule_batch, requests = _requests([_audio_inputs(), _audio_inputs(), None])
@@ -309,6 +325,31 @@ def test_before_prefill_replaces_only_metadata_shell_and_attaches_payload(
     assert isinstance(forward_batch.mm_inputs, OmniPrefillInputs)
     assert forward_batch.mm_inputs.rids == ("req-0",)
     assert forward_batch.mm_inputs.input_embeds.shape == (3, 4)
+
+
+def test_before_prefill_does_not_consume_state_when_input_embeds_is_set() -> None:
+    runner = _runner()
+    input_ids = [7, 93, 7]
+    model_inputs = _audio_inputs()
+    forward_batch, schedule_batch, requests, schedule_req = _legacy_request_pair(
+        model_inputs, input_ids
+    )
+    existing_input_embeds = torch.randn(3, 4)
+    forward_batch.input_embeds = existing_input_embeds
+    shell = SimpleNamespace(mm_items=[])
+    forward_batch.mm_inputs = [shell]
+    consumed = {"audio": 1}
+    schedule_req._omni_consumed = consumed
+    model_inputs_before = schedule_req.omni_model_inputs
+    positions_before = schedule_req._omni_mm_positions
+
+    runner.before_prefill(forward_batch, schedule_batch, requests)
+
+    assert forward_batch.input_embeds is existing_input_embeds
+    assert forward_batch.mm_inputs == [shell]
+    assert schedule_req.omni_model_inputs is model_inputs_before
+    assert schedule_req._omni_consumed is consumed
+    assert schedule_req._omni_mm_positions is positions_before
 
 
 def test_before_prefill_fails_closed_on_genuine_multimodal_items() -> None:
@@ -613,26 +654,6 @@ def test_qwen_outer_model_and_pinned_runner_share_mrope_contract(
     )
 
     assert outer.is_mrope_enabled is True
-    assert (
-        runner._get_layer_model_positions(forward_batch)
-        is forward_batch.mrope_positions
-    )
-
-
-def test_pinned_sglang_prefill_runner_uses_qwen_mrope_positions() -> None:
-    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-        PrefillCudaGraphRunner,
-    )
-
-    runner = object.__new__(PrefillCudaGraphRunner)
-    runner.model_runner = SimpleNamespace(
-        model=SimpleNamespace(is_mrope_enabled=True)
-    )
-    forward_batch = SimpleNamespace(
-        positions=torch.arange(3),
-        mrope_positions=torch.arange(9).reshape(3, 3),
-    )
-
     assert (
         runner._get_layer_model_positions(forward_batch)
         is forward_batch.mrope_positions

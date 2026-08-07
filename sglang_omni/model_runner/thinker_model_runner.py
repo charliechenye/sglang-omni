@@ -140,6 +140,15 @@ class ThinkerModelRunner(ModelRunner):
             if any(key not in _QWEN_PREFILL_AUDIO_INPUT_KEYS for key in model_inputs):
                 return False
 
+            audio_keys = _QWEN_PREFILL_AUDIO_INPUT_KEYS.intersection(model_inputs)
+            if audio_keys:
+                audio_embeds = model_inputs.get("audio_embeds")
+                if (
+                    not isinstance(audio_embeds, torch.Tensor)
+                    or audio_embeds.ndim != 2
+                ):
+                    return False
+
             pad_values = model_inputs.get("pad_values")
             if pad_values is not None and (
                 not isinstance(pad_values, dict)
@@ -148,6 +157,23 @@ class ThinkerModelRunner(ModelRunner):
                 return False
 
         return True
+
+    def _qwen_prefill_payload_preflight(
+        self, forward_batch: Any, schedule_batch: Any, requests: list[Any]
+    ) -> bool:
+        """Check attachment invariants before composing request embeddings."""
+        if not self._can_use_qwen_prefill_payload(schedule_batch, requests):
+            return False
+
+        # The semantic classifier already establishes schedule/request
+        # alignment; this check ties that batch to the live ForwardBatch.
+        if len(requests) != forward_batch.batch_size:
+            return False
+        if getattr(forward_batch, "input_embeds", None) is not None:
+            return False
+        if get_omni_prefill_inputs(forward_batch) is not None:
+            return False
+        return self._qwen_prefill_payload_mm_shell_is_replaceable(forward_batch)
 
     @staticmethod
     def _qwen_prefill_payload_mm_shell_is_replaceable(forward_batch: Any) -> bool:
@@ -209,9 +235,9 @@ class ThinkerModelRunner(ModelRunner):
         return input_embeds
 
     def before_prefill(self, forward_batch, schedule_batch, requests):
-        if not self._can_use_qwen_prefill_payload(schedule_batch, requests):
-            return
-        if not self._qwen_prefill_payload_mm_shell_is_replaceable(forward_batch):
+        if not self._qwen_prefill_payload_preflight(
+            forward_batch, schedule_batch, requests
+        ):
             return
         composed_input_embeds = self._build_prefill_input_embeds(
             forward_batch, schedule_batch
