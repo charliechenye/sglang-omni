@@ -21,7 +21,19 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3_vl_moe import Qwen3MoeLLMModel, load_fused_expert_weights
 from sglang.srt.utils import add_prefix, logger
 
+from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.quantization import get_weight_preprocessor
+
+
+def _config_uses_mrope(*configs: Any) -> bool:
+    for config in configs:
+        if config is None:
+            continue
+        for field in ("rope_parameters", "rope_scaling"):
+            rope_config = getattr(config, field, None)
+            if isinstance(rope_config, dict) and "mrope_section" in rope_config:
+                return True
+    return False
 
 
 class Qwen3OmniThinkerForCausalLM(nn.Module):
@@ -37,6 +49,9 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         self.root_config = config
         self.thinker_config = getattr(config, "thinker_config", config)
         self.config = getattr(self.thinker_config, "text_config", self.thinker_config)
+        self.is_mrope_enabled = _config_uses_mrope(
+            self.root_config, self.thinker_config, self.config
+        )
 
         self.model = Qwen3MoeLLMModel(
             config=self.config,
@@ -73,11 +88,26 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         if forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
 
+        model_input_ids = input_ids
+        model_input_embeds = input_embeds
+        forward_mode = getattr(forward_batch, "forward_mode", None)
+        is_prefill = forward_mode is not None and forward_mode.is_extend()
+        prefill_inputs = (
+            get_omni_prefill_inputs(forward_batch) if is_prefill else None
+        )
+        if prefill_inputs is not None:
+            if input_embeds is not None:
+                raise RuntimeError(
+                    "Qwen payload prefill received a second embedding source"
+                )
+            model_input_ids = None
+            model_input_embeds = prefill_inputs.input_embeds
+
         hidden_states = self.model(
-            input_ids=input_ids,
+            input_ids=model_input_ids,
             positions=positions,
             forward_batch=forward_batch,
-            input_embeds=input_embeds,
+            input_embeds=model_input_embeds,
             pp_proxy_tensors=pp_proxy_tensors,
             input_deepstack_embeds=input_deepstack_embeds,
         )
