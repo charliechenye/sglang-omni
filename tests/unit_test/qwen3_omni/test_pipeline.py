@@ -660,6 +660,75 @@ def test_qwen_builder_forwards_explicit_mem_fraction_static() -> None:
     assert server_args.dtype == "bfloat16"
 
 
+def test_qwen_breakable_lifecycle_uses_real_server_args_and_model_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from sglang.srt.configs import model_config as model_config_module
+    from sglang.srt.server_args import Phase, ServerArgs
+    from transformers import GenerationConfig
+    from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+        Qwen3OmniMoeConfig,
+    )
+
+    from sglang_omni.scheduling.generation_batch_policy import (
+        build_generation_batch_overrides,
+        get_prefill_cuda_graph_backend,
+    )
+
+    hf_config = Qwen3OmniMoeConfig()
+    hf_config.architectures = ["Qwen3OmniMoeForConditionalGeneration"]
+    hf_config.thinker_config.text_config.rope_parameters = {
+        "mrope_section": [16, 24, 24]
+    }
+
+    # Keep ModelConfig real; only the external HF loading boundary is replaced
+    # with an in-memory Qwen config so this test never downloads a checkpoint.
+    monkeypatch.setattr(
+        model_config_module,
+        "get_config",
+        lambda *args, **kwargs: hf_config,
+    )
+    monkeypatch.setattr(
+        model_config_module,
+        "get_generation_config",
+        lambda *args, **kwargs: GenerationConfig(),
+    )
+    monkeypatch.setattr(
+        model_config_module,
+        "get_hf_text_config",
+        lambda config: config.thinker_config.text_config,
+    )
+
+    overrides = build_generation_batch_overrides(
+        max_running_requests=2,
+        server_args_overrides={
+            "cuda_graph_backend_prefill": "breakable",
+            "cuda_graph_bs_prefill": [4, 8, 16, 32],
+            "cuda_graph_max_bs_prefill": 32,
+        },
+    )
+    server_args = build_sglang_server_args(
+        str(tmp_path),
+        context_length=1024,
+        enable_multimodal=True,
+        attention_backend="triton",
+        **overrides,
+    )
+    assert isinstance(server_args, ServerArgs)
+    model_config = server_args.get_model_config()
+    resolved_backend = get_prefill_cuda_graph_backend(server_args)
+    resolved_backend_name = getattr(resolved_backend, "value", resolved_backend)
+
+    assert model_config.model_is_mrope is True
+    assert model_config.is_multimodal is True
+    assert model_config.is_multimodal_breakable_cuda_graph_supported is False
+    assert resolved_backend_name == "breakable", (
+        "requested breakable must remain breakable through the real pinned "
+        f"ServerArgs resolution; got {resolved_backend!r}"
+    )
+    assert (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
+
+
 def test_qwen_encoder_mem_reserve_applies_only_to_valid_auto_values() -> None:
     server_args = FakeServerArgs(mem_fraction_static=0.929)
 
@@ -781,10 +850,16 @@ def test_qwen_cli_mem_fraction_static_survives_runtime_overrides_overlay() -> No
         "expected_infrastructure_graph_disabled",
         "expected_capture_hidden_layers",
         "expected_init_graph_calls",
+        "prefill_backend",
+        "expected_enable_prefill_input_embeds",
+        "expected_attestation_calls",
+        "expected_error",
     ),
     [
-        (False, False, None, 0),
-        (True, True, [0, 24], 1),
+        (False, False, None, 0, "disabled", False, 0, False),
+        (True, True, [0, 24], 1, "disabled", False, 0, False),
+        (False, False, None, 0, "breakable", True, 1, False),
+        (True, False, None, 0, "breakable", False, 0, True),
     ],
 )
 def test_qwen_thinker_cuda_graph_capture_lifecycle(
@@ -793,20 +868,35 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     expected_infrastructure_graph_disabled: bool,
     expected_capture_hidden_layers: list[int] | None,
     expected_init_graph_calls: int,
+    prefill_backend: str,
+    expected_enable_prefill_input_embeds: bool,
+    expected_attestation_calls: int,
+    expected_error: bool,
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
-    from sglang_omni.model_runner import thinker_model_runner
-    from sglang_omni.models.qwen3_omni import bootstrap, request_builders
+    from sglang_omni.models.qwen3_omni import (
+        bootstrap,
+        request_builders,
+        thinker_model_runner as qwen_thinker_model_runner,
+    )
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
     from sglang_omni.scheduling import omni_scheduler, sglang_backend
+    from sglang_omni.utils import cuda_graph_batch_validator
 
     server_args = FakeServerArgs(
-        disable_cuda_graph=False, enable_return_hidden_states=False
+        disable_cuda_graph=False,
+        enable_return_hidden_states=False,
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(backend=prefill_backend)
+        ),
     )
     infrastructure_saw_graph_disabled: list[bool] = []
     capture_hidden_layers_seen: list[list[int] | None] = []
+    enable_prefill_input_embeds_seen: list[bool] = []
+    attestation_calls = 0
     init_graph_calls = 0
+    constructed_runners: list[tuple[tuple[object, ...], dict[str, object]]] = []
 
     class FakeModelRunner:
         model = object()
@@ -829,6 +919,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     def fake_create_infrastructure(*args, **kwargs):
         infrastructure_saw_graph_disabled.append(bool(args[0].disable_cuda_graph))
         capture_hidden_layers_seen.append(kwargs.get("capture_hidden_layers"))
+        enable_prefill_input_embeds_seen.append(
+            bool(kwargs.get("enable_prefill_input_embeds"))
+        )
         return (
             model_worker,
             object(),
@@ -838,6 +931,11 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
             object(),
             model_config,
         )
+
+    def fake_attest_prefill_cuda_graphs(*args, **kwargs):
+        nonlocal attestation_calls
+        del args, kwargs
+        attestation_calls += 1
 
     monkeypatch.setattr(
         scheduling_bootstrap,
@@ -859,10 +957,15 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     monkeypatch.setattr(
         sglang_backend, "SGLangOutputProcessor", lambda **kwargs: object()
     )
+
+    def fake_qwen_thinker_model_runner(*args, **kwargs):
+        constructed_runners.append((args, kwargs))
+        return object()
+
     monkeypatch.setattr(
-        thinker_model_runner,
-        "ThinkerModelRunner",
-        lambda *args, **kwargs: object(),
+        qwen_thinker_model_runner,
+        "Qwen3OmniThinkerModelRunner",
+        fake_qwen_thinker_model_runner,
     )
     monkeypatch.setattr(
         omni_scheduler,
@@ -870,16 +973,41 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
         SimpleNamespace,
     )
 
+    monkeypatch.setattr(
+        cuda_graph_batch_validator,
+        "attest_prefill_cuda_graphs",
+        fake_attest_prefill_cuda_graphs,
+    )
+
+    if expected_error:
+        with pytest.raises(
+            RuntimeError,
+            match="speech-enabled thinker cannot use the breakable",
+        ):
+            bootstrap.create_thinker_scheduler(server_args, speech_enabled=True)
+        assert infrastructure_saw_graph_disabled == []
+        assert capture_hidden_layers_seen == []
+        assert enable_prefill_input_embeds_seen == []
+        assert init_graph_calls == 0
+        assert attestation_calls == 0
+        assert constructed_runners == []
+        return
+
     scheduler = bootstrap.create_thinker_scheduler(
         server_args, speech_enabled=speech_enabled
     )
 
     assert infrastructure_saw_graph_disabled == [expected_infrastructure_graph_disabled]
     assert capture_hidden_layers_seen == [expected_capture_hidden_layers]
+    assert enable_prefill_input_embeds_seen == [expected_enable_prefill_input_embeds]
     assert init_graph_calls == expected_init_graph_calls
+    assert attestation_calls == expected_attestation_calls
     assert server_args.enable_return_hidden_states is speech_enabled
     assert server_args.disable_cuda_graph is False
     assert scheduler.server_args is server_args
+    assert len(constructed_runners) == 1
+    assert constructed_runners[0][0][0] is model_worker
+    assert callable(constructed_runners[0][1]["should_capture_hidden"])
 
 
 def test_qwen_cli_mem_fraction_static_rejects_runtime_override_duplicate() -> None:
