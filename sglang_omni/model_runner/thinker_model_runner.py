@@ -22,8 +22,6 @@ logger = logging.getLogger(__name__)
 
 
 class ThinkerModelRunner(ModelRunner):
-    """Thinker: injects multimodal embeddings in the prefill phase."""
-
     def __init__(
         self,
         tp_worker: Any,
@@ -78,18 +76,15 @@ class ThinkerModelRunner(ModelRunner):
         return False
 
     def custom_prefill_forward(self, forward_batch, schedule_batch, requests):
-        """Run custom prefill when multimodal embeddings must be injected."""
         if not schedule_batch.forward_mode.is_extend():
             return None
 
         omni_result = self._inject_multimodal_embeds(forward_batch, schedule_batch)
         if omni_result is not None and omni_result[0] is not None:
             input_embeds, ds_embeds, vis_masks = omni_result
-            # Publish ordinary multimodal embeddings through SGLang's
-            # ForwardBatch contract so its runner remains the sole owner of
-            # attention metadata and eager/CUDA-graph dispatch. Visual
-            # deepstack still needs the model-specific forward below because
-            # ForwardBatch has no field for those residual embeddings.
+            # note (jun): SGLang owns ordinary input embeds and attention
+            # dispatch; deepstack uses the custom forward because ForwardBatch
+            # cannot carry its residual embeddings.
             if ds_embeds is None:
                 forward_batch.input_embeds = input_embeds
                 return None
@@ -98,24 +93,21 @@ class ThinkerModelRunner(ModelRunner):
             )
         return None
 
+    # note (jingwen): thinker streaming captures hidden states through local
+    # forward hooks; both SGLang hooks must return NULL because LAST can disable
+    # CUDA-graph replay.
     def requested_capture_hidden_mode_prefill(
         self, schedule_batch: Any, requests: list
     ):
         del schedule_batch, requests
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-        # Hidden capture for thinker streaming comes from our local forward hooks,
-        # not from SGLang's logits-output hidden-state path. Requesting LAST here
-        # causes CUDA-graph mode mismatches and can silently disable replay.
         return CaptureHiddenMode.NULL
 
     def requested_capture_hidden_mode_decode(self, schedule_batch: Any, requests: list):
         del schedule_batch, requests
         from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
 
-        # Hidden capture for thinker streaming comes from our local forward hooks,
-        # not from SGLang's logits-output hidden-state path. Requesting LAST here
-        # causes CUDA-graph mode mismatches and can silently disable replay.
         return CaptureHiddenMode.NULL
 
     # ------------------------------------------------------------------
@@ -193,8 +185,6 @@ class ThinkerModelRunner(ModelRunner):
             chunk_positions: dict[str, torch.Tensor] = {}
             for modality in ("image", "video", "audio"):
                 mod_positions = positions[modality]
-                # note (chenrui): dispatching the mask ops for an absent modality
-                # costs more than this shortcut saves.
                 if mod_positions.numel() == 0:
                     chunk_positions[modality] = mod_positions
                     continue
@@ -218,8 +208,9 @@ class ThinkerModelRunner(ModelRunner):
             if ds_embeds is not None or image_ds is not None or video_ds is not None:
                 img_pos = chunk_positions["image"]
                 vid_pos = chunk_positions["video"]
-                # note (chenrui): positions are unique across modalities, so the
-                # sort is tie-free and its permutation identifies each slot.
+                # note (chenrui): unique modality positions make this sort
+                # tie-free; its inverse below preserves prompt order without
+                # device-mask synchronization.
                 visual_pos, visual_order = torch.sort(torch.cat([img_pos, vid_pos]))
                 visual_count = visual_pos.numel()
 
@@ -227,8 +218,6 @@ class ThinkerModelRunner(ModelRunner):
                     if image_ds and video_ds:
                         image_offset, image_count = chunk_offsets.get("image", (0, 0))
                         video_offset, video_count = chunk_offsets.get("video", (0, 0))
-                        # note (chenrui): the equivalent mask plus nonzero would
-                        # sync the moment its input is device-resident.
                         slots = torch.empty_like(visual_order)
                         slots[visual_order] = torch.arange(
                             visual_count, device=slots.device
@@ -285,7 +274,7 @@ class ThinkerModelRunner(ModelRunner):
 
         if scatter_rows:
             # note (chenrui): one index_copy_ keeps the kernel count independent
-            # of batch composition; the cat it costs is pointless for one source.
+            # of batch mix; avoid concatenating the common single-source case.
             row_idx = torch.cat(scatter_rows).to(device=device)
             srcs = [
                 s.to(device=device, dtype=input_embeds.dtype, non_blocking=True)
@@ -372,14 +361,10 @@ class ThinkerModelRunner(ModelRunner):
         )
 
     def lookahead_eligible(self, batch: Any) -> bool:
-        """Route to sync where the one-step lag would diverge from sync. A request
-        that emits audio captures hidden states for the talker; the per-forward
-        _captured_aux_hidden_states side channel would be overwritten by a lookahead
-        launch(N) before resolve(N-1) collects it, so those requests route to sync
-        per batch. Sampling that reads the lagged output history (repetition /
-        presence / frequency penalty, min_new_tokens), a fixed seed, or
-        return_logprob (the lookahead sampler skips the base logprob path) also
-        diverges; logit_bias / custom_params are routed conservatively.
+        """Reject batches whose state would diverge under one-step lookahead.
+
+        Audio can overwrite hidden-state capture before resolve; stateful or
+        unsupported sampling options use the synchronous path for parity.
         """
         from sglang_omni.models.qwen3_omni.request_builders import (
             should_generate_audio_output,
