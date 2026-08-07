@@ -436,9 +436,7 @@ def build_thinker_request(
     model_inputs = dict(thinker_inputs.get("model_inputs", {}))
     if not model_inputs:
         model_inputs = {
-            k: v
-            for k, v in thinker_inputs.items()
-            if k not in {"capture_model_output_keys", "model_inputs"}
+            k: v for k, v in thinker_inputs.items() if k != "capture_model_output_keys"
         }
 
     capture_keys = thinker_inputs.get("capture_model_output_keys", ())

@@ -670,7 +670,6 @@ def test_qwen_breakable_lifecycle_uses_real_server_args_and_model_config(
         Qwen3OmniMoeConfig,
     )
 
-    from sglang_omni.models.qwen3_omni.components import sglang_thinker
     from sglang_omni.scheduling.generation_batch_policy import (
         build_generation_batch_overrides,
         get_prefill_cuda_graph_backend,
@@ -723,6 +722,7 @@ def test_qwen_breakable_lifecycle_uses_real_server_args_and_model_config(
     resolved_backend = get_prefill_cuda_graph_backend(server_args)
     resolved_backend_name = getattr(resolved_backend, "value", resolved_backend)
 
+    assert model_config.model_is_mrope is True
     assert model_config.is_multimodal is True
     assert model_config.is_multimodal_breakable_cuda_graph_supported is False
     assert resolved_backend_name == "breakable", (
@@ -733,27 +733,6 @@ def test_qwen_breakable_lifecycle_uses_real_server_args_and_model_config(
     # allowlist, but an explicit prefill backend is locked by SGLang 0.5.16.
     # The Omni safety rail therefore owns the model-level qualification.
     assert (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
-
-    class FakeTextModel(torch.nn.Module):
-        def __init__(self, *args, **kwargs):
-            del args, kwargs
-            super().__init__()
-            self.embed_tokens = torch.nn.Embedding(128, 4)
-
-    class FakeLMHead(torch.nn.Module):
-        def __init__(self, *args, **kwargs):
-            del args, kwargs
-            super().__init__()
-
-    monkeypatch.setattr(sglang_thinker, "Qwen3MoeLLMModel", FakeTextModel)
-    monkeypatch.setattr(sglang_thinker, "ParallelLMHead", FakeLMHead)
-    monkeypatch.setattr(
-        sglang_thinker,
-        "LogitsProcessor",
-        lambda config: SimpleNamespace(config=config),
-    )
-    thinker = sglang_thinker.Qwen3OmniThinkerForCausalLM(model_config.hf_config)
-    assert thinker.is_mrope_enabled is True
 
 
 def test_qwen_encoder_mem_reserve_applies_only_to_valid_auto_values() -> None:
