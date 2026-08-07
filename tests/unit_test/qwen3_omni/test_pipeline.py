@@ -1022,8 +1022,11 @@ def test_qwen_thinker_rejects_speech_breakable_before_infrastructure(
     server_args = FakeServerArgs(
         disable_cuda_graph=False,
         enable_return_hidden_states=False,
+        cuda_graph_backend_prefill="breakable",
         cuda_graph_config=SimpleNamespace(
-            prefill=SimpleNamespace(backend="breakable")
+            # Exercise the no-silent-downgrade case: an explicit request may
+            # have been normalized to disabled before the thinker bootstrap.
+            prefill=SimpleNamespace(backend="disabled")
         ),
     )
 
