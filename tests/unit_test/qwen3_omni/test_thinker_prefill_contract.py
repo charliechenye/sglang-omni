@@ -10,8 +10,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from sglang_omni.model_runner.prefill_inputs import OmniPrefillInputs
 from sglang_omni.model_runner import thinker_model_runner as thinker_runner_module
+from sglang_omni.model_runner.prefill_inputs import OmniPrefillInputs
 from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
 from sglang_omni.models.qwen3_omni.components import sglang_thinker
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -104,9 +104,7 @@ def _legacy_request_pair(model_inputs: dict, input_ids: list[int]):
     request = SimpleNamespace(
         request_id="req-0",
         data=SimpleNamespace(
-            stage_payload=SimpleNamespace(
-                metadata={"output_modalities": ["text"]}
-            )
+            stage_payload=SimpleNamespace(metadata={"output_modalities": ["text"]})
         ),
     )
     schedule_batch = SimpleNamespace(
@@ -630,9 +628,7 @@ def test_qwen_outer_model_and_pinned_runner_share_mrope_contract(
         hidden_size=4,
         rope_parameters={"mrope_section": [16, 24, 24]},
     )
-    config = SimpleNamespace(
-        thinker_config=SimpleNamespace(text_config=text_config)
-    )
+    config = SimpleNamespace(thinker_config=SimpleNamespace(text_config=text_config))
     outer = sglang_thinker.Qwen3OmniThinkerForCausalLM(config)
 
     from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (

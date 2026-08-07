@@ -663,13 +663,12 @@ def test_qwen_builder_forwards_explicit_mem_fraction_static() -> None:
 def test_qwen_breakable_lifecycle_uses_real_server_args_and_model_config(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
+    from sglang.srt.configs import model_config as model_config_module
+    from sglang.srt.server_args import Phase, ServerArgs
     from transformers import GenerationConfig
     from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
         Qwen3OmniMoeConfig,
     )
-
-    from sglang.srt.configs import model_config as model_config_module
-    from sglang.srt.server_args import Phase, ServerArgs
 
     from sglang_omni.models.qwen3_omni.components import sglang_thinker
     from sglang_omni.scheduling.generation_batch_policy import (

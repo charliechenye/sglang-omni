@@ -128,7 +128,8 @@ class ThinkerModelRunner(ModelRunner):
             # contract. This is a Qwen capability decision, not graph routing.
             if any(
                 key.startswith(("image_", "video_"))
-                or key in {
+                or key
+                in {
                     "image_embeds",
                     "video_embeds",
                     "deepstack_visual_embeds",
@@ -143,10 +144,7 @@ class ThinkerModelRunner(ModelRunner):
             audio_keys = _QWEN_PREFILL_AUDIO_INPUT_KEYS.intersection(model_inputs)
             if audio_keys:
                 audio_embeds = model_inputs.get("audio_embeds")
-                if (
-                    not isinstance(audio_embeds, torch.Tensor)
-                    or audio_embeds.ndim != 2
-                ):
+                if not isinstance(audio_embeds, torch.Tensor) or audio_embeds.ndim != 2:
                     return False
 
             pad_values = model_inputs.get("pad_values")
@@ -199,9 +197,10 @@ class ThinkerModelRunner(ModelRunner):
             if mm_items is None or len(mm_items) != 0:
                 return False
             for field in ("mrope_positions", "mrope_position_delta"):
-                if getattr(item, field, None) is not None and getattr(
-                    forward_batch, field, None
-                ) is None:
+                if (
+                    getattr(item, field, None) is not None
+                    and getattr(forward_batch, field, None) is None
+                ):
                     return False
 
         return True
