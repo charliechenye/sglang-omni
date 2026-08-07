@@ -781,10 +781,14 @@ def test_qwen_cli_mem_fraction_static_survives_runtime_overrides_overlay() -> No
         "expected_infrastructure_graph_disabled",
         "expected_capture_hidden_layers",
         "expected_init_graph_calls",
+        "prefill_backend",
+        "expected_enable_prefill_input_embeds",
+        "expected_attestation_calls",
     ),
     [
-        (False, False, None, 0),
-        (True, True, [0, 24], 1),
+        (False, False, None, 0, "disabled", False, 0),
+        (True, True, [0, 24], 1, "disabled", False, 0),
+        (False, False, None, 0, "breakable", True, 1),
     ],
 )
 def test_qwen_thinker_cuda_graph_capture_lifecycle(
@@ -793,6 +797,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     expected_infrastructure_graph_disabled: bool,
     expected_capture_hidden_layers: list[int] | None,
     expected_init_graph_calls: int,
+    prefill_backend: str,
+    expected_enable_prefill_input_embeds: bool,
+    expected_attestation_calls: int,
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
@@ -800,12 +807,19 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     from sglang_omni.models.qwen3_omni import bootstrap, request_builders
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
     from sglang_omni.scheduling import omni_scheduler, sglang_backend
+    from sglang_omni.utils import cuda_graph_batch_validator
 
     server_args = FakeServerArgs(
-        disable_cuda_graph=False, enable_return_hidden_states=False
+        disable_cuda_graph=False,
+        enable_return_hidden_states=False,
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(backend=prefill_backend)
+        ),
     )
     infrastructure_saw_graph_disabled: list[bool] = []
     capture_hidden_layers_seen: list[list[int] | None] = []
+    enable_prefill_input_embeds_seen: list[bool] = []
+    attestation_calls = 0
     init_graph_calls = 0
 
     class FakeModelRunner:
@@ -829,6 +843,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     def fake_create_infrastructure(*args, **kwargs):
         infrastructure_saw_graph_disabled.append(bool(args[0].disable_cuda_graph))
         capture_hidden_layers_seen.append(kwargs.get("capture_hidden_layers"))
+        enable_prefill_input_embeds_seen.append(
+            bool(kwargs.get("enable_prefill_input_embeds"))
+        )
         return (
             model_worker,
             object(),
@@ -838,6 +855,11 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
             object(),
             model_config,
         )
+
+    def fake_attest_prefill_cuda_graphs(*args, **kwargs):
+        nonlocal attestation_calls
+        del args, kwargs
+        attestation_calls += 1
 
     monkeypatch.setattr(
         scheduling_bootstrap,
@@ -869,6 +891,11 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
         "OmniScheduler",
         SimpleNamespace,
     )
+    monkeypatch.setattr(
+        cuda_graph_batch_validator,
+        "attest_prefill_cuda_graphs",
+        fake_attest_prefill_cuda_graphs,
+    )
 
     scheduler = bootstrap.create_thinker_scheduler(
         server_args, speech_enabled=speech_enabled
@@ -876,7 +903,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
 
     assert infrastructure_saw_graph_disabled == [expected_infrastructure_graph_disabled]
     assert capture_hidden_layers_seen == [expected_capture_hidden_layers]
+    assert enable_prefill_input_embeds_seen == [expected_enable_prefill_input_embeds]
     assert init_graph_calls == expected_init_graph_calls
+    assert attestation_calls == expected_attestation_calls
     assert server_args.enable_return_hidden_states is speech_enabled
     assert server_args.disable_cuda_graph is False
     assert scheduler.server_args is server_args
