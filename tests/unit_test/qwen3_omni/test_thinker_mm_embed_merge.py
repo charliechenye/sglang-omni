@@ -32,12 +32,19 @@ def _runner() -> ThinkerModelRunner:
     return r
 
 
-def _req(input_ids, omni_model_inputs, *, is_chunked=0, consumed=None, positions=True):
+def _req(
+    input_ids,
+    omni_model_inputs,
+    *,
+    inflight_middle_chunks=0,
+    consumed=None,
+    positions=True,
+):
     req = types.SimpleNamespace(
         origin_input_ids=list(input_ids),
         omni_model_inputs=omni_model_inputs,
         _omni_consumed=consumed,
-        is_chunked=is_chunked,
+        inflight_middle_chunks=inflight_middle_chunks,
     )
     if positions:
         # note (chenrui): build_sglang_thinker_request records these for every
@@ -169,7 +176,7 @@ def test_chunked_prefill_advances_consumed_offsets():
     image_embeds = _rand(4)
     inputs = {"image_embeds": image_embeds}
 
-    req = _req(prompt, inputs, is_chunked=1)
+    req = _req(prompt, inputs, inflight_middle_chunks=1)
     fb1, sb1 = _batches([req], chunk_ids=[prompt[:4]], prefix_lens=[0])
     out1, _, _ = runner._inject_multimodal_embeds(fb1, sb1)
 
@@ -179,7 +186,7 @@ def test_chunked_prefill_advances_consumed_offsets():
     assert req._omni_consumed == {"image": 3}
     assert req.omni_model_inputs is inputs
 
-    req.is_chunked = 0
+    req.inflight_middle_chunks = 0
     fb2, sb2 = _batches([req], chunk_ids=[prompt[4:]], prefix_lens=[4])
     out2, _, _ = runner._inject_multimodal_embeds(fb2, sb2)
 
@@ -347,7 +354,10 @@ def test_prefix_lens_as_cpu_tensor():
     prompt = [TEXT, IMAGE_ID, IMAGE_ID, TEXT]
     image_embeds = _rand(2)
     req = _req(
-        prompt, {"image_embeds": image_embeds}, is_chunked=0, consumed={"image": 1}
+        prompt,
+        {"image_embeds": image_embeds},
+        inflight_middle_chunks=0,
+        consumed={"image": 1},
     )
     fb, sb = _batches([req], chunk_ids=[prompt[2:]], prefix_lens=[2])
     fb.extend_prefix_lens_cpu = torch.tensor([2], dtype=torch.int64)

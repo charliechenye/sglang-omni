@@ -20,6 +20,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     attach_omni_prefill_inputs,
     get_omni_prefill_inputs,
 )
+from sglang_omni.model_runner.sglang_execution import attn_forward_context
 
 logger = logging.getLogger(__name__)
 
@@ -149,12 +150,20 @@ class ThinkerModelRunner(ModelRunner):
         return True
 
     @staticmethod
-    def _replace_consumed_mrope_shell(forward_batch: Any) -> bool:
-        """Clear only item-free Qwen ``MultimodalInputs`` shells."""
+    def _qwen_prefill_payload_mm_shell_is_replaceable(forward_batch: Any) -> bool:
+        """Check whether SGLang's MM shell can be replaced by our payload.
+
+        This check must remain pure.  ``_inject_multimodal_embeds`` consumes
+        request-side multimodal state at the end of a prefill chunk, so doing
+        composition before this check would make a genuine SGLang multimodal
+        batch impossible to recover from after failing closed.
+        """
         mm_inputs = getattr(forward_batch, "mm_inputs", None)
         if mm_inputs is None:
             return True
         if not isinstance(mm_inputs, (list, tuple)):
+            return False
+        if len(mm_inputs) != forward_batch.batch_size:
             return False
 
         for item in mm_inputs:
@@ -169,12 +178,20 @@ class ThinkerModelRunner(ModelRunner):
                 ) is None:
                     return False
 
+        return True
+
+    @staticmethod
+    def _clear_qwen_prefill_mm_shell(forward_batch: Any) -> None:
+        """Clear an already-validated, item-free SGLang MM shell."""
+        mm_inputs = getattr(forward_batch, "mm_inputs", None)
+        if mm_inputs is None:
+            return
+
         # NOTE(qwen3-omni-pcg): Qwen uses an empty MultimodalInputs shell to
         # move M-RoPE metadata onto ForwardBatch. At this point that metadata
         # has already been materialized; only an item-free shell may be replaced
         # with None entries before the official platform payload is attached.
         forward_batch.mm_inputs = [None] * forward_batch.batch_size
-        return True
 
     def _build_prefill_input_embeds(
         self, forward_batch: Any, schedule_batch: Any
@@ -194,13 +211,14 @@ class ThinkerModelRunner(ModelRunner):
     def before_prefill(self, forward_batch, schedule_batch, requests):
         if not self._can_use_qwen_prefill_payload(schedule_batch, requests):
             return
+        if not self._qwen_prefill_payload_mm_shell_is_replaceable(forward_batch):
+            return
         composed_input_embeds = self._build_prefill_input_embeds(
             forward_batch, schedule_batch
         )
         if composed_input_embeds is None:
             return
-        if not self._replace_consumed_mrope_shell(forward_batch):
-            return
+        self._clear_qwen_prefill_mm_shell(forward_batch)
 
         # NOTE(qwen3-omni-pcg): Compose the normal eager prefill embeddings
         # first, then carry them through the platform OmniPrefillInputs channel.
@@ -226,6 +244,12 @@ class ThinkerModelRunner(ModelRunner):
         omni_result = self._inject_multimodal_embeds(forward_batch, schedule_batch)
         if omni_result is not None and omni_result[0] is not None:
             input_embeds, ds_embeds, vis_masks = omni_result
+            if ds_embeds is None:
+                # Preserve current-main legacy semantics: ordinary multimodal
+                # prefill hands the composed embeddings to SGLang's normal
+                # eager path, while deepstack remains on this direct path.
+                forward_batch.input_embeds = input_embeds
+                return None
             return self._forward_with_omni_embeds(
                 forward_batch, input_embeds, ds_embeds, vis_masks
             )
@@ -250,14 +274,6 @@ class ThinkerModelRunner(ModelRunner):
         # not from SGLang's logits-output hidden-state path. Requesting LAST here
         # causes CUDA-graph mode mismatches and can silently disable replay.
         return CaptureHiddenMode.NULL
-
-    @staticmethod
-    def _is_final_prefill_chunk(req: Any) -> bool:
-        """Support the current Req chunk marker and older SGLang snapshots."""
-        is_chunked = getattr(req, "is_chunked", None)
-        if is_chunked is not None:
-            return not bool(is_chunked)
-        return int(getattr(req, "inflight_middle_chunks", 0) or 0) == 0
 
     # ------------------------------------------------------------------
     # Multimodal embedding injection
@@ -419,7 +435,7 @@ class ThinkerModelRunner(ModelRunner):
                     deepstack_visual_embeds_list.append(ds_embeds)
                     visual_rows.append(visual_pos + start)
 
-            if self._is_final_prefill_chunk(req):
+            if req.inflight_middle_chunks == 0:
                 req.omni_model_inputs = None
                 req._omni_consumed = None
                 req._omni_mm_positions = None
@@ -492,20 +508,21 @@ class ThinkerModelRunner(ModelRunner):
             full_ds[visual_pos_masks] = ds_input
             ds_input = full_ds
 
-        hidden_states = outer.model(
-            input_ids=None,
-            positions=positions,
-            forward_batch=forward_batch,
-            input_embeds=input_embeds,
-            input_deepstack_embeds=ds_input,
-        )
+        with attn_forward_context(model_runner.attn_backend):
+            hidden_states = outer.model(
+                input_ids=None,
+                positions=positions,
+                forward_batch=forward_batch,
+                input_embeds=input_embeds,
+                input_deepstack_embeds=ds_input,
+            )
 
-        logits_output = outer.logits_processor(
-            forward_batch.input_ids,
-            hidden_states,
-            outer.lm_head,
-            forward_batch,
-        )
+            logits_output = outer.logits_processor(
+                forward_batch.input_ids,
+                hidden_states,
+                outer.lm_head,
+                forward_batch,
+            )
 
         return GenerationBatchResult(
             logits_output=logits_output, can_run_cuda_graph=False
