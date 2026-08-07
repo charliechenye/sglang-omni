@@ -337,7 +337,9 @@ def test_classifier_matches_actual_qwen_request_builder_outputs(
     assert _runner()._can_use_qwen_prefill_payload(schedule_batch, requests) is expected
 
 
-def test_before_prefill_attaches_audio_payload_and_preserves_request_mrope_delta() -> None:
+def test_before_prefill_attaches_audio_payload_and_preserves_request_mrope_delta() -> (
+    None
+):
     runner = _runner()
     (
         forward_batch,

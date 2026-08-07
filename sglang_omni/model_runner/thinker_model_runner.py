@@ -200,9 +200,10 @@ class ThinkerModelRunner(ModelRunner):
                 getattr(item, "mrope_positions", None) is not None
                 or getattr(item, "mrope_position_delta", None) is not None
             )
-            if shell_has_mrope and getattr(
-                forward_batch, "mrope_positions", None
-            ) is None:
+            if (
+                shell_has_mrope
+                and getattr(forward_batch, "mrope_positions", None) is None
+            ):
                 # note (chenrui): SGLang materializes only current-prefill
                 # M-RoPE positions on ForwardBatch; the delta stays on the
                 # request-side MultimodalInputs for future decode positions.
