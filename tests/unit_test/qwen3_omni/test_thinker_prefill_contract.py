@@ -174,6 +174,25 @@ def test_before_prefill_accepts_no_mm_input_placeholder() -> None:
     assert forward_batch.input_embeds is None
 
 
+def test_before_prefill_requires_mrope_shell_metadata_to_be_transferred() -> None:
+    runner = _runner()
+    schedule_batch, requests = _requests([_audio_inputs()])
+    runner._build_prefill_input_embeds = lambda forward_batch, batch: torch.zeros(
+        len(forward_batch.input_ids), 4
+    )
+    mrope_positions = torch.arange(9).reshape(3, 3)
+    shell = SimpleNamespace(mm_items=[], mrope_positions=mrope_positions)
+
+    missing = _forward_batch(mm_inputs=[shell])
+    runner.before_prefill(missing, schedule_batch, requests)
+    assert missing.mm_inputs == [shell]
+
+    transferred = _forward_batch(mm_inputs=[shell])
+    transferred.mrope_positions = mrope_positions
+    runner.before_prefill(transferred, schedule_batch, requests)
+    assert isinstance(transferred.mm_inputs, OmniPrefillInputs)
+
+
 def test_payload_batch_custom_forward_delegates_to_normal_worker() -> None:
     runner = _runner()
     schedule_batch, requests = _requests([None])
