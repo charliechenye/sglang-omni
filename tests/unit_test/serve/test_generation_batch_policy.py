@@ -30,7 +30,8 @@ def _server_args(**overrides: object) -> SimpleNamespace:
         decode=SimpleNamespace(
             max_bs=values.pop("cuda_graph_max_bs"),
             bs=values.pop("cuda_graph_bs"),
-        )
+        ),
+        prefill=SimpleNamespace(backend="disabled", bs=None, max_bs=None),
     )
     return SimpleNamespace(**values)
 
