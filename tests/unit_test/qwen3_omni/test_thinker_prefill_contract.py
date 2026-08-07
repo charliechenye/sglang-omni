@@ -119,6 +119,44 @@ def _legacy_request_pair(model_inputs: dict, input_ids: list[int]):
     return forward_batch, schedule_batch, [request], schedule_req
 
 
+def _real_mrope_audio_prefill_state():
+    from sglang.srt.managers.schedule_batch import MultimodalInputs
+
+    audio_rows = torch.tensor([[10.0, 11.0, 12.0, 13.0]])
+    model_inputs = {
+        **_audio_inputs(),
+        "audio_embeds": audio_rows,
+    }
+    forward_batch, schedule_batch, requests, schedule_req = _legacy_request_pair(
+        model_inputs, [7, 93, 7]
+    )
+
+    shell = MultimodalInputs(mm_items=[])
+    shell.mrope_positions = torch.tensor(
+        [[100, 101, 102], [200, 201, 202], [300, 301, 302]],
+        dtype=torch.long,
+    )
+    delta = torch.tensor([17], dtype=torch.long)
+    shell.mrope_position_delta = delta
+    schedule_req.multimodal_inputs = shell
+    forward_batch.mm_inputs = [shell]
+    current_prefill_positions = torch.tensor(
+        [[400, 401, 402], [500, 501, 502], [600, 601, 602]],
+        dtype=torch.long,
+    )
+    forward_batch.mrope_positions = current_prefill_positions
+    return (
+        forward_batch,
+        schedule_batch,
+        requests,
+        schedule_req,
+        shell,
+        delta,
+        audio_rows,
+        current_prefill_positions,
+    )
+
+
 def test_text_only_batch_is_payload_compatible() -> None:
     runner = _runner()
     schedule_batch, requests = _requests([None])
@@ -299,23 +337,63 @@ def test_classifier_matches_actual_qwen_request_builder_outputs(
     assert _runner()._can_use_qwen_prefill_payload(schedule_batch, requests) is expected
 
 
-def test_before_prefill_replaces_only_metadata_shell_and_attaches_payload(
-    monkeypatch,
-) -> None:
+def test_before_prefill_attaches_audio_payload_and_preserves_request_mrope_delta() -> None:
     runner = _runner()
-    schedule_batch, requests = _requests([_audio_inputs()])
-    runner._build_prefill_input_embeds = lambda forward_batch, batch: torch.zeros(
-        len(forward_batch.input_ids), 4
-    )
-    shell = SimpleNamespace(mm_items=[])
-    forward_batch = _forward_batch(mm_inputs=[shell])
+    (
+        forward_batch,
+        schedule_batch,
+        requests,
+        schedule_req,
+        shell,
+        delta,
+        audio_rows,
+        current_prefill_positions,
+    ) = _real_mrope_audio_prefill_state()
+
+    assert shell.mrope_positions is not None
+    assert shell.mrope_position_delta is delta
+    assert "mrope_position_delta" not in vars(forward_batch)
 
     runner.before_prefill(forward_batch, schedule_batch, requests)
 
+    payload = forward_batch.mm_inputs
+    assert isinstance(payload, OmniPrefillInputs)
+    assert payload.rids == ("req-0",)
+    assert torch.equal(payload.input_embeds[1:2], audio_rows)
     assert forward_batch.input_embeds is None
-    assert isinstance(forward_batch.mm_inputs, OmniPrefillInputs)
-    assert forward_batch.mm_inputs.rids == ("req-0",)
-    assert forward_batch.mm_inputs.input_embeds.shape == (3, 4)
+    assert forward_batch.mrope_positions is current_prefill_positions
+    assert schedule_req.multimodal_inputs is shell
+    assert schedule_req.multimodal_inputs.mrope_position_delta is delta
+
+
+def test_before_prefill_fails_closed_without_materialized_mrope_positions() -> None:
+    runner = _runner()
+    (
+        forward_batch,
+        schedule_batch,
+        requests,
+        schedule_req,
+        shell,
+        delta,
+        _,
+        _,
+    ) = _real_mrope_audio_prefill_state()
+    forward_batch.mrope_positions = None
+    original_mm_inputs = forward_batch.mm_inputs
+    original_model_inputs = schedule_req.omni_model_inputs
+    original_consumed = schedule_req._omni_consumed
+    original_positions = schedule_req._omni_mm_positions
+
+    runner.before_prefill(forward_batch, schedule_batch, requests)
+
+    assert forward_batch.mm_inputs is original_mm_inputs
+    assert forward_batch.mm_inputs[0] is shell
+    assert forward_batch.input_embeds is None
+    assert schedule_req.omni_model_inputs is original_model_inputs
+    assert schedule_req._omni_consumed is original_consumed
+    assert schedule_req._omni_mm_positions is original_positions
+    assert schedule_req.multimodal_inputs is shell
+    assert schedule_req.multimodal_inputs.mrope_position_delta is delta
 
 
 def test_before_prefill_does_not_consume_state_when_input_embeds_is_set() -> None:
@@ -389,25 +467,6 @@ def test_before_prefill_accepts_no_mm_input_placeholder() -> None:
 
     assert isinstance(forward_batch.mm_inputs, OmniPrefillInputs)
     assert forward_batch.input_embeds is None
-
-
-def test_before_prefill_requires_mrope_shell_metadata_to_be_transferred() -> None:
-    runner = _runner()
-    schedule_batch, requests = _requests([_audio_inputs()])
-    runner._build_prefill_input_embeds = lambda forward_batch, batch: torch.zeros(
-        len(forward_batch.input_ids), 4
-    )
-    mrope_positions = torch.arange(9).reshape(3, 3)
-    shell = SimpleNamespace(mm_items=[], mrope_positions=mrope_positions)
-
-    missing = _forward_batch(mm_inputs=[shell])
-    runner.before_prefill(missing, schedule_batch, requests)
-    assert missing.mm_inputs == [shell]
-
-    transferred = _forward_batch(mm_inputs=[shell])
-    transferred.mrope_positions = mrope_positions
-    runner.before_prefill(transferred, schedule_batch, requests)
-    assert isinstance(transferred.mm_inputs, OmniPrefillInputs)
 
 
 def test_payload_batch_custom_forward_delegates_to_normal_worker() -> None:
@@ -577,8 +636,9 @@ def test_qwen_outer_model_consumes_payload_as_single_prefill_embedding_source() 
     model.logits_processor = fake_logits_processor
     input_ids = torch.tensor([11, 12, 13])
     payload_embeds = torch.randn(3, 4)
+    current_prefill_positions = torch.arange(9).reshape(3, 3)
     forward_batch = SimpleNamespace(
-        mrope_positions=None,
+        mrope_positions=current_prefill_positions,
         forward_mode=SimpleNamespace(is_extend=lambda: True),
         mm_inputs=OmniPrefillInputs(
             input_embeds=payload_embeds,
@@ -594,6 +654,7 @@ def test_qwen_outer_model_consumes_payload_as_single_prefill_embedding_source() 
 
     assert result == "logits"
     assert text_model.seen["input_ids"] is None
+    assert text_model.seen["positions"] is current_prefill_positions
     assert text_model.seen["input_embeds"] is payload_embeds
     assert logits_calls[0][0] is input_ids
 
