@@ -176,7 +176,7 @@ def test_text_only_batch_is_payload_compatible() -> None:
     ],
     ids=["missing-audio-embeds", "none-audio-embeds", "non-tensor-audio-embeds"],
 )
-def test_incomplete_audio_payload_is_not_graph_compatible(model_inputs) -> None:
+def test_incomplete_audio_payload_is_not_payload_compatible(model_inputs) -> None:
     runner = _runner()
     schedule_batch, requests = _requests([model_inputs])
 
