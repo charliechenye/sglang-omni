@@ -24,15 +24,6 @@ _PREFILL_AUDIO_INPUT_KEYS = frozenset(
 )
 
 
-def _request_generates_speech(request: Any) -> bool:
-    from sglang_omni.models.qwen3_omni.request_builders import (
-        should_generate_audio_output,
-    )
-
-    data = getattr(request, "data", None)
-    return should_generate_audio_output(getattr(data, "stage_payload", None))
-
-
 class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
     """Thinker runner with Qwen3-Omni's qualified prefill payload path."""
 
@@ -50,10 +41,7 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         if self._batch_should_capture_hidden(requests):
             return False
 
-        for req, request in zip(schedule_reqs, requests):
-            if _request_generates_speech(request):
-                return False
-
+        for req in schedule_reqs:
             model_inputs = getattr(req, "omni_model_inputs", None)
             if model_inputs is None:
                 continue

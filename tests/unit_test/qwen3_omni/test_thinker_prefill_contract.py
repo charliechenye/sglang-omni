@@ -200,15 +200,6 @@ def test_multiple_audio_requests_and_text_audio_mix_are_compatible() -> None:
     assert runner._can_use_prefill_payload(schedule_batch, requests)
 
 
-def test_speech_output_is_rejected_from_payload_path() -> None:
-    runner = _runner()
-    schedule_batch, requests = _requests(
-        [_audio_inputs()], output_modalities=("audio",)
-    )
-
-    assert not runner._can_use_prefill_payload(schedule_batch, requests)
-
-
 def test_hidden_capture_is_rejected_from_payload_path() -> None:
     runner = _runner(capture_hidden=True)
     schedule_batch, requests = _requests([_audio_inputs()])
@@ -283,13 +274,6 @@ def test_incompatible_request_rejects_the_entire_batch() -> None:
             [7, 91, 93, 7],
             {**_audio_inputs(), "image_embeds": torch.zeros(1, 4)},
             ("text",),
-            False,
-        ),
-        (
-            "speech",
-            [7, 93, 7],
-            _audio_inputs(),
-            ("audio",),
             False,
         ),
     ],
