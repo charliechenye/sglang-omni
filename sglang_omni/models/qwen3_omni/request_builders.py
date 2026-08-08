@@ -433,8 +433,14 @@ def build_thinker_request(
     attention_mask = prompt.get("attention_mask")
     thinker_inputs = state.thinker_inputs or {}
 
-    model_inputs = dict(thinker_inputs.get("model_inputs", {}))
-    if not model_inputs:
+    if "model_inputs" in thinker_inputs:
+        raw_model_inputs = thinker_inputs["model_inputs"]
+        if not isinstance(raw_model_inputs, dict):
+            raise TypeError(
+                "Qwen3-Omni thinker model_inputs must be a dict when provided"
+            )
+        model_inputs = dict(raw_model_inputs)
+    else:
         model_inputs = {
             k: v for k, v in thinker_inputs.items() if k != "capture_model_output_keys"
         }
@@ -541,8 +547,14 @@ def build_sglang_thinker_request(
     attention_mask = prompt.get("attention_mask")
     thinker_inputs = state.thinker_inputs or {}
 
-    model_inputs = dict(thinker_inputs.get("model_inputs", {}))
-    if not model_inputs:
+    if "model_inputs" in thinker_inputs:
+        raw_model_inputs = thinker_inputs["model_inputs"]
+        if not isinstance(raw_model_inputs, dict):
+            raise TypeError(
+                "Qwen3-Omni thinker model_inputs must be a dict when provided"
+            )
+        model_inputs = dict(raw_model_inputs)
+    else:
         model_inputs = {
             k: v
             for k, v in thinker_inputs.items()
@@ -551,7 +563,7 @@ def build_sglang_thinker_request(
     capture_keys = thinker_inputs.get("capture_model_output_keys", ())
     media_cache_keys = thinker_inputs.get("media_cache_keys", {})
     pad_values: dict[str, int] = {}
-    if media_cache_keys and thinker_config is not None:
+    if model_inputs and media_cache_keys and thinker_config is not None:
         token_id_map: dict[int, int] = {}
         for modality, orig_token_id in [
             ("image", thinker_config.image_token_id),
