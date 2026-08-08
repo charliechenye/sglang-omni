@@ -26,14 +26,41 @@ def create_thinker_scheduler(
     from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
     from sglang_omni.model_runner.thinker_model_runner import ThinkerModelRunner
+    from sglang_omni.models.qwen3_omni.thinker_model_runner import (
+        Qwen3OmniThinkerModelRunner,
+    )
     from sglang_omni.models.qwen3_omni.request_builders import (
         make_thinker_scheduler_adapters,
         make_thinker_stream_output_builder,
         should_generate_audio_output,
     )
     from sglang_omni.scheduling.bootstrap import create_sglang_infrastructure
+    from sglang_omni.scheduling.generation_batch_policy import (
+        CudaGraphBackend,
+        get_prefill_cuda_graph_backend,
+    )
     from sglang_omni.scheduling.omni_scheduler import OmniScheduler
     from sglang_omni.scheduling.sglang_backend import SGLangOutputProcessor
+
+    prefill_graph_backend = get_prefill_cuda_graph_backend(server_args)
+    if prefill_graph_backend not in (
+        CudaGraphBackend.DISABLED,
+        CudaGraphBackend.BREAKABLE,
+    ):
+        raise RuntimeError(
+            "Qwen3-Omni thinker supports only disabled or breakable prefill "
+            f"CUDA graphs, got {prefill_graph_backend!r}"
+        )
+    if speech_enabled and prefill_graph_backend != CudaGraphBackend.DISABLED:
+        raise RuntimeError(
+            "Qwen3-Omni speech-enabled thinker cannot use a non-disabled "
+            f"prefill CUDA-graph backend ({prefill_graph_backend!r}): "
+            "hidden-state capture and audio generation are not qualified on "
+            "that path. Set cuda_graph_backend_prefill=disabled."
+        )
+    enable_prefill_input_embeds = (
+        prefill_graph_backend == CudaGraphBackend.BREAKABLE
+    )
 
     capture_hidden_layers = [0, 24] if speech_enabled else None
     capture_hidden = speech_enabled
@@ -64,6 +91,7 @@ def create_thinker_scheduler(
         capture_hidden_layers=capture_hidden_layers,
         total_gpu_memory_fraction=total_gpu_memory_fraction,
         defer_cuda_graph_capture=defer_cuda_graph_capture,
+        enable_prefill_input_embeds=enable_prefill_input_embeds,
     )
 
     if defer_cuda_graph_capture:
@@ -73,6 +101,13 @@ def create_thinker_scheduler(
             disable_cuda_graph=False,
         )
         model_worker.model_runner.init_cuda_graphs()
+
+    if prefill_graph_backend == CudaGraphBackend.BREAKABLE:
+        from sglang_omni.utils import cuda_graph_batch_validator
+
+        cuda_graph_batch_validator.attest_prefill_cuda_graphs(
+            model_worker.model_runner, server_args
+        )
 
     def _should_generate_qwen_audio_output(request: Any) -> bool:
         return should_generate_audio_output(request.data.stage_payload)
@@ -84,7 +119,12 @@ def create_thinker_scheduler(
         should_emit_hidden=_should_generate_qwen_audio_output,
     )
 
-    model_runner = ThinkerModelRunner(
+    runner_cls = (
+        Qwen3OmniThinkerModelRunner
+        if prefill_graph_backend == CudaGraphBackend.BREAKABLE
+        else ThinkerModelRunner
+    )
+    model_runner = runner_cls(
         model_worker,
         output_proc,
         should_capture_hidden=_should_generate_qwen_audio_output,

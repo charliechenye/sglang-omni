@@ -9,6 +9,7 @@ prefill, so this wrapper keeps only the text model and LM head.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, Iterable, Optional, Tuple
 
 import torch
@@ -24,6 +25,32 @@ from sglang.srt.utils import add_prefix, logger
 from sglang_omni.quantization import get_weight_preprocessor
 
 
+def _config_uses_mrope(*configs: Any) -> bool:
+    """Return whether one of the relevant Qwen text configs declares M-RoPE."""
+
+    def contains_mrope_section(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return (
+                value.get("mrope_section") is not None
+                or any(contains_mrope_section(child) for child in value.values())
+            )
+        to_dict = getattr(value, "to_dict", None)
+        if callable(to_dict):
+            try:
+                return contains_mrope_section(to_dict())
+            except (TypeError, ValueError):
+                return False
+        return False
+
+    for config in configs:
+        if config is None:
+            continue
+        for field in ("rope_parameters", "rope_scaling"):
+            if contains_mrope_section(getattr(config, field, None)):
+                return True
+    return False
+
+
 class Qwen3OmniThinkerForCausalLM(nn.Module):
     """Qwen3-Omni thinker text model without duplicated audio/vision towers."""
 
@@ -37,6 +64,11 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         self.root_config = config
         self.thinker_config = getattr(config, "thinker_config", config)
         self.config = getattr(self.thinker_config, "text_config", self.thinker_config)
+        # ``self.config`` is the exact text configuration passed to the inner
+        # transformer. Do not infer this from the enclosing Omni config: the
+        # talker may have different rotary semantics, while the pinned
+        # PrefillCudaGraphRunner is inspecting this outer text model.
+        self.is_mrope_enabled = _config_uses_mrope(self.config)
 
         self.model = Qwen3MoeLLMModel(
             config=self.config,
@@ -68,8 +100,9 @@ class Qwen3OmniThinkerForCausalLM(nn.Module):
         pp_proxy_tensors: Any | None = None,
         input_embeds: torch.Tensor | None = None,
         input_deepstack_embeds: torch.Tensor | None = None,
+        omni_prefill_rids: list[str] | tuple[str, ...] | None = None,
     ):
-        del get_embedding
+        del get_embedding, omni_prefill_rids
         if forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions
 

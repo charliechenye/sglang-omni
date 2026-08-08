@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import typer
+from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 
 import sglang_omni.models.qwen3_omni.stages as qwen_stages
 from sglang_omni.cli.serve import (
@@ -778,34 +779,51 @@ def test_qwen_cli_mem_fraction_static_survives_runtime_overrides_overlay() -> No
 @pytest.mark.parametrize(
     (
         "speech_enabled",
+        "prefill_backend",
         "expected_infrastructure_graph_disabled",
         "expected_capture_hidden_layers",
         "expected_init_graph_calls",
+        "expected_prefill_input_embeds",
+        "expected_runner_kind",
     ),
     [
-        (False, False, None, 0),
-        (True, True, [0, 24], 1),
+        (False, CudaGraphBackend.DISABLED, False, None, 0, False, "base"),
+        (True, CudaGraphBackend.DISABLED, True, [0, 24], 1, False, "base"),
+        (False, CudaGraphBackend.BREAKABLE, False, None, 0, True, "qwen"),
     ],
 )
 def test_qwen_thinker_cuda_graph_capture_lifecycle(
     monkeypatch: pytest.MonkeyPatch,
     speech_enabled: bool,
+    prefill_backend: CudaGraphBackend,
     expected_infrastructure_graph_disabled: bool,
     expected_capture_hidden_layers: list[int] | None,
     expected_init_graph_calls: int,
+    expected_prefill_input_embeds: bool,
+    expected_runner_kind: str,
 ) -> None:
     from sglang.srt.utils import hf_transformers_utils
 
     from sglang_omni.model_runner import thinker_model_runner
     from sglang_omni.models.qwen3_omni import bootstrap, request_builders
+    from sglang_omni.models.qwen3_omni import thinker_model_runner as qwen_runner
     from sglang_omni.scheduling import bootstrap as scheduling_bootstrap
     from sglang_omni.scheduling import omni_scheduler, sglang_backend
+    from sglang_omni.utils import cuda_graph_batch_validator
 
     server_args = FakeServerArgs(
-        disable_cuda_graph=False, enable_return_hidden_states=False
+        disable_cuda_graph=False,
+        enable_return_hidden_states=False,
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(backend=prefill_backend)
+        ),
     )
+
     infrastructure_saw_graph_disabled: list[bool] = []
     capture_hidden_layers_seen: list[list[int] | None] = []
+    prefill_input_embeds_seen: list[bool] = []
+    runner_kinds: list[str] = []
+    attest_calls: list[tuple[object, object]] = []
     init_graph_calls = 0
 
     class FakeModelRunner:
@@ -829,6 +847,9 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     def fake_create_infrastructure(*args, **kwargs):
         infrastructure_saw_graph_disabled.append(bool(args[0].disable_cuda_graph))
         capture_hidden_layers_seen.append(kwargs.get("capture_hidden_layers"))
+        prefill_input_embeds_seen.append(
+            bool(kwargs.get("enable_prefill_input_embeds"))
+        )
         return (
             model_worker,
             object(),
@@ -862,7 +883,17 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
     monkeypatch.setattr(
         thinker_model_runner,
         "ThinkerModelRunner",
-        lambda *args, **kwargs: object(),
+        lambda *args, **kwargs: runner_kinds.append("base") or object(),
+    )
+    monkeypatch.setattr(
+        qwen_runner,
+        "Qwen3OmniThinkerModelRunner",
+        lambda *args, **kwargs: runner_kinds.append("qwen") or object(),
+    )
+    monkeypatch.setattr(
+        cuda_graph_batch_validator,
+        "attest_prefill_cuda_graphs",
+        lambda model_runner, args: attest_calls.append((model_runner, args)),
     )
     monkeypatch.setattr(
         omni_scheduler,
@@ -876,10 +907,30 @@ def test_qwen_thinker_cuda_graph_capture_lifecycle(
 
     assert infrastructure_saw_graph_disabled == [expected_infrastructure_graph_disabled]
     assert capture_hidden_layers_seen == [expected_capture_hidden_layers]
+    assert prefill_input_embeds_seen == [expected_prefill_input_embeds]
+    assert runner_kinds == [expected_runner_kind]
+    assert len(attest_calls) == (
+        1 if prefill_backend == CudaGraphBackend.BREAKABLE else 0
+    )
     assert init_graph_calls == expected_init_graph_calls
     assert server_args.enable_return_hidden_states is speech_enabled
     assert server_args.disable_cuda_graph is False
     assert scheduler.server_args is server_args
+
+
+def test_qwen_speech_thinker_rejects_breakable_prefill(monkeypatch) -> None:
+    from sglang_omni.models.qwen3_omni import bootstrap
+
+    server_args = FakeServerArgs(
+        disable_cuda_graph=False,
+        enable_return_hidden_states=False,
+        cuda_graph_config=SimpleNamespace(
+            prefill=SimpleNamespace(backend=CudaGraphBackend.BREAKABLE)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="speech-enabled thinker"):
+        bootstrap.create_thinker_scheduler(server_args, speech_enabled=True)
 
 
 def test_qwen_cli_mem_fraction_static_rejects_runtime_override_duplicate() -> None:
