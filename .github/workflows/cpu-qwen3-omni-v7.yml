@@ -1,0 +1,382 @@
+name: Qwen3-Omni v7 CPU validation
+
+on:
+  push:
+    branches:
+      - cpu-validation/qwen3-omni-pcg-v7
+
+  # This becomes manually usable if/when the workflow also exists
+  # on the repository default branch. The push trigger above is
+  # the primary trigger for this temporary validation branch.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Frozen B/C production code under validation.
+  FROZEN_B_SHA: b39388dbc6fba44b8a6a5079357880b55b65f6d2
+
+  # Keep test tooling isolated from the container's system Python,
+  # while inheriting its preinstalled SGLang/PyTorch runtime packages.
+  TEST_VENV: /tmp/sglang-omni-cpu-venv
+
+jobs:
+  qwen3-omni-cpu:
+    name: Qwen3-Omni CPU tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    # Match the environment family used by upstream SGLang-Omni CI.
+    container:
+      image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout the exact frozen B SHA.
+      #
+      # The workflow itself lives on the temporary validation branch, but
+      # the source tree tested below is exactly FROZEN_B_SHA.
+      # -----------------------------------------------------------------------
+
+      - name: Checkout frozen B
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.FROZEN_B_SHA }}
+          fetch-depth: 0
+
+      # actions/checkout configures safe.directory using a temporary HOME.
+      # Commands below execute inside the job container with HOME=/github/home,
+      # so explicitly trust only this workspace.
+      - name: Configure Git safe directory
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify frozen revision
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          ACTUAL="$(git rev-parse HEAD)"
+
+          echo "Expected B SHA: ${FROZEN_B_SHA}"
+          echo "Actual SHA:     ${ACTUAL}"
+
+          test "${ACTUAL}" = "${FROZEN_B_SHA}"
+
+          echo
+          echo "=== Git status ==="
+          git status --short
+
+          echo
+          echo "=== Host/container information ==="
+          uname -a
+          uname -m
+          python --version
+
+          echo
+          echo "=== Filesystem ==="
+          df -h
+
+      # -----------------------------------------------------------------------
+      # 2. Confirm the pinned container already provides the heavyweight
+      #    runtime dependencies. We do NOT reinstall torch/sglang/transformers.
+      # -----------------------------------------------------------------------
+
+      - name: Inspect preinstalled runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          python - <<'PY'
+          import sys
+
+          import numpy
+          import pydantic
+          import sglang
+          import torch
+          import transformers
+          import typer
+
+          print("python:", sys.version)
+          print("torch:", torch.__version__)
+          print("transformers:", transformers.__version__)
+          print("sglang:", getattr(sglang, "__version__", "unknown"))
+          print("numpy:", numpy.__version__)
+          print("pydantic:", pydantic.__version__)
+          print("typer:", typer.__version__)
+          print("torch.cuda.is_available:", torch.cuda.is_available())
+          print("preinstalled runtime: OK")
+          PY
+
+      # -----------------------------------------------------------------------
+      # 3. Create a small test-tools venv.
+      #
+      # --system-site-packages lets the venv reuse the container's already
+      # installed torch/sglang/transformers stack without modifying the
+      # externally-managed Debian system Python.
+      #
+      # If ensurepip/venv is unexpectedly absent, install only python3.12-venv
+      # and retry.
+      # -----------------------------------------------------------------------
+
+      - name: Create CPU test virtualenv
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          if ! python -m venv --system-site-packages "${TEST_VENV}"; then
+            echo "python venv support missing; installing python3.12-venv"
+            apt-get update
+            apt-get install -y --no-install-recommends python3.12-venv
+            rm -rf "${TEST_VENV}"
+            python -m venv --system-site-packages "${TEST_VENV}"
+          fi
+
+          "${TEST_VENV}/bin/python" - <<'PY'
+          import numpy
+          import pydantic
+          import pytest
+          import pre_commit
+          import sglang
+          import torch
+          import transformers
+          import typer
+
+          print("torch:", torch.__version__)
+          print("transformers:", transformers.__version__)
+          print("sglang:", getattr(sglang, "__version__", "unknown"))
+          print("numpy:", numpy.__version__)
+          print("pydantic:", pydantic.__version__)
+          print("typer:", typer.__version__)
+          print("pytest:", pytest.__version__)
+          print("pre_commit:", pre_commit.__file__)
+          print("test virtualenv: OK")
+          PY
+
+          "${TEST_VENV}/bin/python" -m pre_commit --version
+
+      # -----------------------------------------------------------------------
+      # 4. Load-bearing tests.
+      #
+      # Individual failures are recorded but do NOT prevent later suites from
+      # running. The final validation gate fails the job if anything failed.
+      # -----------------------------------------------------------------------
+
+      - name: Focused request-builder tests
+        id: request_builder
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/qwen3_omni/test_request_builder_text_only.py
+
+      - name: Focused M-RoPE tests
+        id: mrope
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/qwen3_omni/test_sglang_thinker.py
+
+      - name: Focused prefill-contract tests
+        id: prefill_contract
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py
+
+      - name: Pipeline and bootstrap tests
+        id: pipeline
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/qwen3_omni/test_pipeline.py
+
+      - name: Preserve merged #1161 behavior
+        id: mm_embed_merge
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py
+
+      # -----------------------------------------------------------------------
+      # 5. Broader regression suites.
+      # CPU suite exclusions:
+      # - test_talker.py
+      # - test_talker_attention.py
+
+      # Reason:
+      # collection requires CUDA-loaded sgl_kernel operators on a GPU host.
+      # These files are unchanged by this contribution and remain covered by GPU/model CI.
+      # -----------------------------------------------------------------------
+
+      - name: CPU-compatible Qwen3-Omni unit suite
+        id: qwen_cpu
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/qwen3_omni \
+            --ignore=tests/unit_test/qwen3_omni/test_talker.py \
+            --ignore=tests/unit_test/qwen3_omni/test_talker_attention.py
+
+      - name: Model-runner unit suite
+        id: model_runner
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/model_runner
+
+      - name: Prefill graph policy tests
+        id: prefill_policy
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/scheduling/test_prefill_graph_policy.py
+
+      - name: Generation batch policy tests
+        id: generation_policy
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/serve/test_generation_batch_policy.py
+
+      # -----------------------------------------------------------------------
+      # 6. Source hygiene.
+      # -----------------------------------------------------------------------
+
+      - name: Diff sanity
+        id: diff_sanity
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          git diff --check
+
+          echo
+          echo "=== Git status ==="
+          git status --short
+
+          test -z "$(git status --porcelain)"
+
+      - name: Pre-commit
+        id: precommit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pre_commit \
+            run \
+            --all-files \
+            --show-diff-on-failure
+
+      # -----------------------------------------------------------------------
+      # 7. Always print every result.
+      # -----------------------------------------------------------------------
+
+      - name: CPU validation summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## Qwen3-Omni v7 CPU validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Outcome |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Request builder | ${{ steps.request_builder.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| M-RoPE | ${{ steps.mrope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Prefill contract | ${{ steps.prefill_contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline/bootstrap | ${{ steps.pipeline.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| #1161 embed merge | ${{ steps.mm_embed_merge.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| CPU-compatible Qwen3-Omni | ${{ steps.qwen_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Model runner | ${{ steps.model_runner.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Prefill policy | ${{ steps.prefill_policy.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Generation policy | ${{ steps.generation_policy.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Diff sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pre-commit | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      # -----------------------------------------------------------------------
+      # 8. Fail exactly once, after all checks have run.
+      # -----------------------------------------------------------------------
+
+      - name: Final CPU validation gate
+        if: always()
+        shell: bash
+        env:
+          REQUEST_BUILDER: ${{ steps.request_builder.outcome }}
+          MROPE: ${{ steps.mrope.outcome }}
+          PREFILL_CONTRACT: ${{ steps.prefill_contract.outcome }}
+          PIPELINE: ${{ steps.pipeline.outcome }}
+          MM_EMBED_MERGE: ${{ steps.mm_embed_merge.outcome }}
+          QWEN_CPU: ${{ steps.qwen_cpu.outcome }}
+          MODEL_RUNNER: ${{ steps.model_runner.outcome }}
+          PREFILL_POLICY: ${{ steps.prefill_policy.outcome }}
+          GENERATION_POLICY: ${{ steps.generation_policy.outcome }}
+          DIFF_SANITY: ${{ steps.diff_sanity.outcome }}
+          PRECOMMIT: ${{ steps.precommit.outcome }}
+        run: |
+          set -euxo pipefail
+
+          failed=0
+
+          check() {
+            local name="$1"
+            local outcome="$2"
+
+            if [[ "${outcome}" != "success" ]]; then
+              echo "::error::${name} outcome=${outcome}"
+              failed=1
+            else
+              echo "${name}: success"
+            fi
+          }
+
+          check "request-builder" "${REQUEST_BUILDER}"
+          check "mrope" "${MROPE}"
+          check "prefill-contract" "${PREFILL_CONTRACT}"
+          check "pipeline" "${PIPELINE}"
+          check "mm-embed-merge" "${MM_EMBED_MERGE}"
+          check "qwen-cpu" "${QWEN_CPU}"
+          check "model-runner" "${MODEL_RUNNER}"
+          check "prefill-policy" "${PREFILL_POLICY}"
+          check "generation-policy" "${GENERATION_POLICY}"
+          check "diff-sanity" "${DIFF_SANITY}"
+          check "pre-commit" "${PRECOMMIT}"
+
+          if [[ "${failed}" -ne 0 ]]; then
+            echo
+            echo "One or more CPU validation checks failed."
+            echo "Review all failed steps above before modifying frozen B."
+            exit 1
+          fi
+
+          echo
+          echo "All CPU validation checks passed."
