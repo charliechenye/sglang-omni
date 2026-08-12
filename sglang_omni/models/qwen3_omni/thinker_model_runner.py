@@ -229,6 +229,13 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         model_inputs: Any,
         chunk_span: tuple[int, int],
     ) -> None:
+        """Repair a missing cursor for cached-audio eager fallback only.
+
+        This deliberately handles only otherwise sidecar-shaped text/audio
+        payloads that are forced onto the inherited eager path by a fresh
+        cached audio prefix. Visual, deepstack, and auxiliary payloads remain
+        owned by their existing eager fallback behavior.
+        """
         if (
             getattr(req, "_omni_consumed", None) is not None
             or not isinstance(model_inputs, dict)
@@ -275,17 +282,12 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             or prefix + length > origin_num_tokens
         ):
             return
-        cached_audio_count = (audio_positions < prefix).sum().item()
-        live_audio_count = (
-            ((audio_positions >= prefix) & (audio_positions < prefix + length))
-            .sum()
-            .item()
-        )
+        cached_audio_count = audio_positions[audio_positions < prefix].numel()
+        remaining_audio_count = audio_positions[audio_positions >= prefix].numel()
         if (
             not cached_audio_count
-            or not live_audio_count
+            or not remaining_audio_count
             or cached_audio_count > audio_embeds.shape[0]
-            or cached_audio_count + live_audio_count > audio_embeds.shape[0]
         ):
             return
 
