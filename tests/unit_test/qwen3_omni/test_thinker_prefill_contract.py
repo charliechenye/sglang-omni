@@ -386,53 +386,213 @@ def test_fresh_cached_prefix_with_only_live_audio_is_sidecar_eligible():
     torch.testing.assert_close(sidecar.input_embeds, expected)
 
 
-def test_fresh_cached_audio_prefix_is_not_sidecar_eligible_without_shared_cursor(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("input_ids", "audio_positions", "prefix", "live_chunk", "expected_audio_row"),
+    [
+        ([AUDIO_ID, 7, AUDIO_ID, 8], (0, 2), 2, [AUDIO_ID, 8], 1),
+        (
+            [AUDIO_ID, 7, AUDIO_ID, 8, AUDIO_ID, 9],
+            (0, 2, 4),
+            4,
+            [AUDIO_ID, 9],
+            2,
+        ),
+    ],
+)
+def test_fresh_cached_audio_prefix_uses_correct_inherited_eager_embedding(
+    input_ids: list[int],
+    audio_positions: tuple[int, ...],
+    prefix: int,
+    live_chunk: list[int],
+    expected_audio_row: int,
 ):
+    """Cached audio rows must seed the real inherited eager merge at the correct offset."""
     runner = _runner()
     audio_inputs = {
         "audio_embeds": torch.tensor(
-            [[1.0] * HIDDEN, [2.0] * HIDDEN], dtype=torch.float32
+            [[float(row + 1)] * HIDDEN for row in range(len(audio_positions))],
+            dtype=torch.float32,
         )
     }
     request = _request(
-        [AUDIO_ID, 7, AUDIO_ID, 8],
+        input_ids,
         audio_inputs,
-        positions=_positions(audio=(0, 2)),
+        positions=_positions(audio=audio_positions),
     )
     forward_batch, schedule_batch = _batch(
-        [request], chunks=[[AUDIO_ID, 8]], prefix_lens=[2]
+        [request], chunks=[live_chunk], prefix_lens=[prefix]
     )
-    original_positions = request._omni_mm_positions
-    original_audio_inputs = request.omni_model_inputs
     official_mm_inputs = forward_batch.mm_inputs
     official_request_mm_inputs = request.multimodal_inputs
     official_mrope_delta = official_request_mm_inputs.mrope_position_delta
     requests = [request]
-    seen = []
-
-    def inherited_eager(self, forward_batch, schedule_batch, requests):
-        seen.append((forward_batch, schedule_batch, requests))
-        return "eager"
-
-    monkeypatch.setattr(ThinkerModelRunner, "custom_prefill_forward", inherited_eager)
 
     runner.before_prefill(forward_batch, schedule_batch, requests)
 
     assert get_omni_prefill_inputs(forward_batch) is None
     result = runner.custom_prefill_forward(forward_batch, schedule_batch, requests)
 
-    assert result == "eager"
-    assert len(seen) == 1
-    assert seen[0][0] is forward_batch
-    assert seen[0][1] is schedule_batch
-    assert seen[0][2] is requests
+    assert result is None
+    expected = runner._embed_tokens(forward_batch.input_ids).detach().clone()
+    expected[0] = audio_inputs["audio_embeds"][expected_audio_row]
+    torch.testing.assert_close(
+        forward_batch.input_embeds[0],
+        audio_inputs["audio_embeds"][expected_audio_row],
+    )
+    torch.testing.assert_close(
+        forward_batch.input_embeds[1],
+        runner._embed_tokens(torch.tensor([live_chunk[1]], dtype=torch.long))[0],
+    )
+    torch.testing.assert_close(forward_batch.input_embeds, expected)
     assert forward_batch.mm_inputs is official_mm_inputs
-    assert request.omni_model_inputs is original_audio_inputs
+    assert request.omni_model_inputs is None
     assert request._omni_consumed is None
-    assert request._omni_mm_positions is original_positions
+    assert request._omni_mm_positions is None
     assert request.multimodal_inputs is official_request_mm_inputs
     assert request.multimodal_inputs.mrope_position_delta is official_mrope_delta
+
+
+def test_cached_audio_eager_cursor_survives_text_only_middle_chunk():
+    """The cached audio cursor must survive an intermediate eager chunk with no live audio."""
+    runner = _runner()
+    audio_embeds = torch.tensor([[1.0] * HIDDEN, [2.0] * HIDDEN], dtype=torch.float32)
+    audio_inputs = {"audio_embeds": audio_embeds}
+    request = _request(
+        [AUDIO_ID, 7, 8, AUDIO_ID, 9],
+        audio_inputs,
+        positions=_positions(audio=(0, 3)),
+        inflight_middle_chunks=1,
+    )
+
+    first_batch, first_schedule = _batch([request], chunks=[[7, 8]], prefix_lens=[1])
+    runner.before_prefill(first_batch, first_schedule, [request])
+
+    assert get_omni_prefill_inputs(first_batch) is None
+    assert runner.custom_prefill_forward(first_batch, first_schedule, [request]) is None
+    first_expected = runner._embed_tokens(first_batch.input_ids).detach().clone()
+    torch.testing.assert_close(first_batch.input_embeds, first_expected)
+    assert request._omni_consumed == {"audio": 1}
+    assert request.omni_model_inputs is audio_inputs
+
+    request.inflight_middle_chunks = 0
+    second_batch, second_schedule = _batch(
+        [request], chunks=[[AUDIO_ID, 9]], prefix_lens=[3]
+    )
+    runner.before_prefill(second_batch, second_schedule, [request])
+
+    second_sidecar = get_omni_prefill_inputs(second_batch)
+    assert second_sidecar is not None
+    assert (
+        runner.custom_prefill_forward(second_batch, second_schedule, [request]) is None
+    )
+    second_expected = runner._embed_tokens(second_batch.input_ids).detach().clone()
+    second_expected[0] = audio_embeds[1]
+    torch.testing.assert_close(second_sidecar.input_embeds, second_expected)
+    assert request.omni_model_inputs is None
+    assert request._omni_consumed is None
+    assert request._omni_mm_positions is None
+
+
+def test_cached_audio_eager_cursor_survives_unsupported_image_sibling():
+    """An unsupported sibling must not prevent per-request cached-audio cursor repair."""
+    runner = _runner()
+    audio_embeds = torch.tensor([[1.0] * HIDDEN, [2.0] * HIDDEN], dtype=torch.float32)
+    image_embeds = torch.full((1, HIDDEN), 3.0)
+    audio_request = _request(
+        [AUDIO_ID, 7, AUDIO_ID, 8],
+        {"audio_embeds": audio_embeds},
+        positions=_positions(audio=(0, 2)),
+    )
+    image_request = _request(
+        [IMAGE_ID],
+        {"image_embeds": image_embeds},
+        positions=_positions(image=(0,)),
+    )
+    forward_batch, schedule_batch = _batch(
+        [audio_request, image_request],
+        chunks=[[AUDIO_ID, 8], [IMAGE_ID]],
+        prefix_lens=[2, 0],
+    )
+
+    runner.before_prefill(
+        forward_batch,
+        schedule_batch,
+        [audio_request, image_request],
+    )
+
+    assert get_omni_prefill_inputs(forward_batch) is None
+    assert (
+        runner.custom_prefill_forward(
+            forward_batch,
+            schedule_batch,
+            [audio_request, image_request],
+        )
+        is None
+    )
+    torch.testing.assert_close(forward_batch.input_embeds[0], audio_embeds[1])
+    torch.testing.assert_close(
+        forward_batch.input_embeds[1],
+        runner._embed_tokens(torch.tensor([8], dtype=torch.long))[0],
+    )
+    torch.testing.assert_close(forward_batch.input_embeds[2], image_embeds[0])
+    assert audio_request.omni_model_inputs is None
+    assert audio_request._omni_consumed is None
+    assert audio_request._omni_mm_positions is None
+    assert image_request.omni_model_inputs is None
+    assert image_request._omni_consumed is None
+    assert image_request._omni_mm_positions is None
+
+
+def test_cached_audio_eager_cursor_preserves_existing_cursor():
+    """A valid existing audio cursor remains authoritative during eager fallback."""
+    runner = _runner()
+    audio_embeds = torch.tensor([[1.0] * HIDDEN, [2.0] * HIDDEN], dtype=torch.float32)
+    audio_request = _request(
+        [AUDIO_ID, 7, AUDIO_ID, 8],
+        {"audio_embeds": audio_embeds},
+        positions=_positions(audio=(0, 2)),
+        inflight_middle_chunks=1,
+    )
+    image_embeds = torch.full((1, HIDDEN), 3.0)
+    image_request = _request(
+        [IMAGE_ID],
+        {"image_embeds": image_embeds},
+        positions=_positions(image=(0,)),
+    )
+    existing_cursor = {"audio": 1}
+    audio_request._omni_consumed = existing_cursor
+    forward_batch, schedule_batch = _batch(
+        [audio_request, image_request],
+        chunks=[[AUDIO_ID, 8], [IMAGE_ID]],
+        prefix_lens=[2, 0],
+    )
+
+    runner.before_prefill(
+        forward_batch,
+        schedule_batch,
+        [audio_request, image_request],
+    )
+
+    assert get_omni_prefill_inputs(forward_batch) is None
+    assert (
+        runner.custom_prefill_forward(
+            forward_batch,
+            schedule_batch,
+            [audio_request, image_request],
+        )
+        is None
+    )
+    torch.testing.assert_close(forward_batch.input_embeds[0], audio_embeds[1])
+    torch.testing.assert_close(
+        forward_batch.input_embeds[1],
+        runner._embed_tokens(torch.tensor([8], dtype=torch.long))[0],
+    )
+    torch.testing.assert_close(forward_batch.input_embeds[2], image_embeds[0])
+    # Qwen repair must not replace shared cursor ownership.
+    assert audio_request._omni_consumed is existing_cursor
+    assert audio_request._omni_consumed == {"audio": 2}
+    assert audio_request.omni_model_inputs is not None
+    assert image_request.omni_model_inputs is None
 
 
 @pytest.mark.parametrize(
