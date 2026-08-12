@@ -386,51 +386,67 @@ def test_fresh_cached_prefix_with_only_live_audio_is_sidecar_eligible():
     torch.testing.assert_close(sidecar.input_embeds, expected)
 
 
-def test_fresh_cached_audio_prefix_is_not_sidecar_eligible_without_shared_cursor(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    ("input_ids", "audio_positions", "prefix", "live_chunk", "expected_audio_row"),
+    [
+        ([AUDIO_ID, 7, AUDIO_ID, 8], (0, 2), 2, [AUDIO_ID, 8], 1),
+        (
+            [AUDIO_ID, 7, AUDIO_ID, 8, AUDIO_ID, 9],
+            (0, 2, 4),
+            4,
+            [AUDIO_ID, 9],
+            2,
+        ),
+    ],
+)
+def test_fresh_cached_audio_prefix_uses_correct_inherited_eager_embedding(
+    input_ids: list[int],
+    audio_positions: tuple[int, ...],
+    prefix: int,
+    live_chunk: list[int],
+    expected_audio_row: int,
 ):
     runner = _runner()
     audio_inputs = {
         "audio_embeds": torch.tensor(
-            [[1.0] * HIDDEN, [2.0] * HIDDEN], dtype=torch.float32
+            [[float(row + 1)] * HIDDEN for row in range(len(audio_positions))],
+            dtype=torch.float32,
         )
     }
     request = _request(
-        [AUDIO_ID, 7, AUDIO_ID, 8],
+        input_ids,
         audio_inputs,
-        positions=_positions(audio=(0, 2)),
+        positions=_positions(audio=audio_positions),
     )
     forward_batch, schedule_batch = _batch(
-        [request], chunks=[[AUDIO_ID, 8]], prefix_lens=[2]
+        [request], chunks=[live_chunk], prefix_lens=[prefix]
     )
-    original_positions = request._omni_mm_positions
-    original_audio_inputs = request.omni_model_inputs
     official_mm_inputs = forward_batch.mm_inputs
     official_request_mm_inputs = request.multimodal_inputs
     official_mrope_delta = official_request_mm_inputs.mrope_position_delta
     requests = [request]
-    seen = []
-
-    def inherited_eager(self, forward_batch, schedule_batch, requests):
-        seen.append((forward_batch, schedule_batch, requests))
-        return "eager"
-
-    monkeypatch.setattr(ThinkerModelRunner, "custom_prefill_forward", inherited_eager)
 
     runner.before_prefill(forward_batch, schedule_batch, requests)
 
     assert get_omni_prefill_inputs(forward_batch) is None
     result = runner.custom_prefill_forward(forward_batch, schedule_batch, requests)
 
-    assert result == "eager"
-    assert len(seen) == 1
-    assert seen[0][0] is forward_batch
-    assert seen[0][1] is schedule_batch
-    assert seen[0][2] is requests
+    assert result is None
+    expected = runner._embed_tokens(forward_batch.input_ids).detach().clone()
+    expected[0] = audio_inputs["audio_embeds"][expected_audio_row]
+    torch.testing.assert_close(
+        forward_batch.input_embeds[0],
+        audio_inputs["audio_embeds"][expected_audio_row],
+    )
+    torch.testing.assert_close(
+        forward_batch.input_embeds[1],
+        runner._embed_tokens(torch.tensor([live_chunk[1]], dtype=torch.long))[0],
+    )
+    torch.testing.assert_close(forward_batch.input_embeds, expected)
     assert forward_batch.mm_inputs is official_mm_inputs
-    assert request.omni_model_inputs is original_audio_inputs
+    assert request.omni_model_inputs is None
     assert request._omni_consumed is None
-    assert request._omni_mm_positions is original_positions
+    assert request._omni_mm_positions is None
     assert request.multimodal_inputs is official_request_mm_inputs
     assert request.multimodal_inputs.mrope_position_delta is official_mrope_delta
 
