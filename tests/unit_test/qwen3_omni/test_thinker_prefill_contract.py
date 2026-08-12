@@ -559,7 +559,8 @@ def test_cached_audio_eager_cursor_preserves_existing_cursor():
         {"image_embeds": image_embeds},
         positions=_positions(image=(0,)),
     )
-    audio_request._omni_consumed = {"audio": 1}
+    existing_cursor = {"audio": 1}
+    audio_request._omni_consumed = existing_cursor
     forward_batch, schedule_batch = _batch(
         [audio_request, image_request],
         chunks=[[AUDIO_ID, 8], [IMAGE_ID]],
@@ -587,6 +588,8 @@ def test_cached_audio_eager_cursor_preserves_existing_cursor():
         runner._embed_tokens(torch.tensor([8], dtype=torch.long))[0],
     )
     torch.testing.assert_close(forward_batch.input_embeds[2], image_embeds[0])
+    # Qwen repair must not replace shared cursor ownership.
+    assert audio_request._omni_consumed is existing_cursor
     assert audio_request._omni_consumed == {"audio": 2}
     assert audio_request.omni_model_inputs is not None
     assert image_request.omni_model_inputs is None
