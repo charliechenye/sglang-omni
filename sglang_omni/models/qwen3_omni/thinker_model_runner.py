@@ -198,8 +198,9 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         if consumed is None:
             cached_audio = positions["audio"][positions["audio"] < prefix]
             future_audio = positions["audio"][positions["audio"] >= prefix]
-            # A fresh radix prefix can hide prior audio rows without advancing the
-            # shared multimodal cursor; keep that state outside the Qwen sidecar.
+            # note(chenye): A fresh radix prefix can hide prior audio rows without
+            # advancing the shared multimodal cursor; keep that state outside the
+            # Qwen sidecar.
             if cached_audio.numel() and future_audio.numel():
                 return False
             audio_offset = 0

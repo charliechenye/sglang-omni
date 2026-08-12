@@ -424,10 +424,10 @@ def _single_encoder_stage_name(state: Qwen3OmniPipelineState) -> str:
 
 
 def _extract_thinker_model_inputs(thinker_inputs: dict[str, Any]) -> dict[str, Any]:
-    """Return the model-input payload without confusing an empty payload for absence.
+    """Return the model input payload without confusing an empty payload for absence.
 
     ``merge_for_thinker`` always emits ``model_inputs``.  In particular, a
-    genuine text-only request carries ``{"model_inputs": {}}``.  Only legacy
+    genuine text only request carries ``{"model_inputs": {}}``.  Only legacy
     payloads that omit that key should fall back to the historical flat shape.
     """
     if "model_inputs" in thinker_inputs:
