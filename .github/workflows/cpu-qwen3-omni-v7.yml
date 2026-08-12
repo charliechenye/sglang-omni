@@ -15,7 +15,7 @@ permissions:
 
 env:
   # Frozen B/C production code under validation.
-  FROZEN_B_SHA: b39388dbc6fba44b8a6a5079357880b55b65f6d2
+  FROZEN_B_SHA: 747035476375d68fecf4b7ededc0101f6fc14933
 
   # Keep test tooling isolated from the container's system Python,
   # while inheriting its preinstalled SGLang/PyTorch runtime packages.
