@@ -138,8 +138,6 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         req: Any,
         model_inputs: Any,
         chunk_span: tuple[int, int],
-        *,
-        allow_cached_audio_prefix: bool = False,
     ) -> bool:
         if not isinstance(model_inputs, dict) or not model_inputs:
             return False
@@ -203,13 +201,9 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             # note(chenye): A fresh radix prefix can hide prior audio rows without
             # advancing the shared multimodal cursor; keep that state outside the
             # Qwen sidecar.
-            if (
-                cached_audio.numel()
-                and future_audio.numel()
-                and not allow_cached_audio_prefix
-            ):
+            if cached_audio.numel() and future_audio.numel():
                 return False
-            audio_offset = cached_audio.numel() if allow_cached_audio_prefix else 0
+            audio_offset = 0
         elif isinstance(consumed, dict) and set(consumed) <= {"audio"}:
             audio_offset = consumed.get("audio", 0)
         else:
@@ -229,22 +223,46 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
             and middle_chunks >= 0
         )
 
-    def _fresh_cached_audio_fallback_offset(
+    def _seed_cached_audio_eager_cursor(
         self,
         req: Any,
         model_inputs: Any,
         chunk_span: tuple[int, int],
-    ) -> int | None:
-        if getattr(req, "_omni_consumed", None) is not None:
-            return None
-
-        if not self._audio_inputs_are_supported(
-            req,
-            model_inputs,
-            chunk_span,
-            allow_cached_audio_prefix=True,
+    ) -> None:
+        if (
+            getattr(req, "_omni_consumed", None) is not None
+            or not isinstance(model_inputs, dict)
+            or not model_inputs
+            or set(model_inputs) - _PREFILL_AUDIO_INPUT_KEYS
         ):
-            return None
+            return
+
+        audio_embeds = model_inputs.get("audio_embeds")
+        if (
+            not isinstance(audio_embeds, torch.Tensor)
+            or audio_embeds.ndim != 2
+            or audio_embeds.shape[0] <= 0
+            or audio_embeds.shape[1] <= 0
+        ):
+            return
+
+        pad_values = model_inputs.get("pad_values", {})
+        if not isinstance(pad_values, dict) or set(pad_values) - {"audio"}:
+            return
+        if "audio" in pad_values and (
+            not isinstance(pad_values["audio"], Integral)
+            or isinstance(pad_values["audio"], bool)
+        ):
+            return
+
+        positions = self._mm_positions(req, pad_values)
+        if positions is None:
+            return
+        if positions["image"].numel() or positions["video"].numel():
+            return
+        audio_positions = positions["audio"]
+        if audio_positions.numel() != audio_embeds.shape[0]:
+            return
 
         prefix, length = chunk_span
         origin_num_tokens = self._origin_num_tokens(
@@ -252,83 +270,26 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         )
         if (
             origin_num_tokens is None
-            or prefix > origin_num_tokens
+            or prefix < 0
+            or length <= 0
             or prefix + length > origin_num_tokens
         ):
-            return None
-        pad_values = model_inputs.get("pad_values", {})
-        positions = self._mm_positions(req, pad_values)
-        audio_embeds = model_inputs.get("audio_embeds")
-        if positions is None or not isinstance(audio_embeds, torch.Tensor):
-            return None
-        live_audio = positions["audio"][
-            (positions["audio"] >= prefix) & (positions["audio"] < prefix + length)
-        ]
-        cached_audio = positions["audio"][positions["audio"] < prefix]
-        future_audio = positions["audio"][positions["audio"] >= prefix]
-        if not cached_audio.numel() or not future_audio.numel():
-            return None
-
-        audio_offset = int(cached_audio.numel())
+            return
+        cached_audio_count = (audio_positions < prefix).sum().item()
+        live_audio_count = (
+            ((audio_positions >= prefix) & (audio_positions < prefix + length))
+            .sum()
+            .item()
+        )
         if (
-            audio_offset > audio_embeds.shape[0]
-            or audio_offset + live_audio.numel() > audio_embeds.shape[0]
-        ):
-            return None
-
-        middle_chunks = getattr(req, "inflight_middle_chunks", None)
-        if not (
-            isinstance(middle_chunks, Integral)
-            and not isinstance(middle_chunks, bool)
-            and middle_chunks >= 0
-        ):
-            return None
-        return audio_offset
-
-    def _seed_cached_audio_fallback_cursors(
-        self, forward_batch: Any, schedule_batch: Any
-    ) -> None:
-        forward_mode = getattr(schedule_batch, "forward_mode", None)
-        is_extend = getattr(forward_mode, "is_extend", None)
-        if not callable(is_extend) or not is_extend():
-            return
-        if (
-            getattr(forward_batch, "input_embeds", None) is not None
-            or getattr(forward_batch, "replace_embeds", None) is not None
-            or get_omni_prefill_inputs(forward_batch) is not None
+            not cached_audio_count
+            or not live_audio_count
+            or cached_audio_count > audio_embeds.shape[0]
+            or cached_audio_count + live_audio_count > audio_embeds.shape[0]
         ):
             return
 
-        schedule_reqs = getattr(schedule_batch, "reqs", None)
-        if schedule_reqs is None:
-            return
-        expected_batch_size = getattr(forward_batch, "batch_size", None)
-        if len(schedule_reqs) != expected_batch_size:
-            return
-        chunk_spans = self._batch_chunk_spans(forward_batch, len(schedule_reqs))
-        if chunk_spans is None:
-            return
-
-        pending: list[tuple[Any, int]] = []
-        for req, chunk_span in zip(schedule_reqs, chunk_spans):
-            model_inputs = getattr(req, "omni_model_inputs", None)
-            if model_inputs is None or (
-                isinstance(model_inputs, dict) and not model_inputs
-            ):
-                continue
-
-            audio_offset = self._fresh_cached_audio_fallback_offset(
-                req, model_inputs, chunk_span
-            )
-            if audio_offset is not None:
-                pending.append((req, audio_offset))
-                continue
-            if not self._audio_inputs_are_supported(req, model_inputs, chunk_span):
-                return
-
-        for req, audio_offset in pending:
-            if getattr(req, "_omni_consumed", None) is None:
-                req._omni_consumed = {"audio": audio_offset}
+        req._omni_consumed = {"audio": int(cached_audio_count)}
 
     def _classify_prefill(
         self, forward_batch: Any, schedule_batch: Any, requests: list[Any]
@@ -419,7 +380,26 @@ class Qwen3OmniThinkerModelRunner(ThinkerModelRunner):
         if disposition.kind == _SIDECAR:
             raise RuntimeError("Qwen prefill sidecar was not attached before forward")
 
-        self._seed_cached_audio_fallback_cursors(forward_batch, schedule_batch)
+        forward_mode = getattr(schedule_batch, "forward_mode", None)
+        is_extend = getattr(forward_mode, "is_extend", None)
+        if (
+            callable(is_extend)
+            and is_extend()
+            and getattr(forward_batch, "input_embeds", None) is None
+            and getattr(forward_batch, "replace_embeds", None) is None
+        ):
+            schedule_reqs = getattr(schedule_batch, "reqs", None)
+            if schedule_reqs is not None and getattr(
+                forward_batch, "batch_size", None
+            ) == len(schedule_reqs):
+                chunk_spans = self._batch_chunk_spans(forward_batch, len(schedule_reqs))
+                if chunk_spans is not None:
+                    for req, chunk_span in zip(schedule_reqs, chunk_spans):
+                        self._seed_cached_audio_eager_cursor(
+                            req,
+                            getattr(req, "omni_model_inputs", None),
+                            chunk_span,
+                        )
         return super().custom_prefill_forward(forward_batch, schedule_batch, requests)
 
 

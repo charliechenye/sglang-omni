@@ -451,6 +451,55 @@ def test_fresh_cached_audio_prefix_uses_correct_inherited_eager_embedding(
     assert request.multimodal_inputs.mrope_position_delta is official_mrope_delta
 
 
+def test_cached_audio_eager_cursor_survives_unsupported_image_sibling():
+    runner = _runner()
+    audio_embeds = torch.tensor([[1.0] * HIDDEN, [2.0] * HIDDEN], dtype=torch.float32)
+    image_embeds = torch.full((1, HIDDEN), 3.0)
+    audio_request = _request(
+        [AUDIO_ID, 7, AUDIO_ID, 8],
+        {"audio_embeds": audio_embeds},
+        positions=_positions(audio=(0, 2)),
+    )
+    image_request = _request(
+        [IMAGE_ID],
+        {"image_embeds": image_embeds},
+        positions=_positions(image=(0,)),
+    )
+    forward_batch, schedule_batch = _batch(
+        [audio_request, image_request],
+        chunks=[[AUDIO_ID, 8], [IMAGE_ID]],
+        prefix_lens=[2, 0],
+    )
+
+    runner.before_prefill(
+        forward_batch,
+        schedule_batch,
+        [audio_request, image_request],
+    )
+
+    assert get_omni_prefill_inputs(forward_batch) is None
+    assert (
+        runner.custom_prefill_forward(
+            forward_batch,
+            schedule_batch,
+            [audio_request, image_request],
+        )
+        is None
+    )
+    torch.testing.assert_close(forward_batch.input_embeds[0], audio_embeds[1])
+    torch.testing.assert_close(
+        forward_batch.input_embeds[1],
+        runner._embed_tokens(torch.tensor([8], dtype=torch.long))[0],
+    )
+    torch.testing.assert_close(forward_batch.input_embeds[2], image_embeds[0])
+    assert audio_request.omni_model_inputs is None
+    assert audio_request._omni_consumed is None
+    assert audio_request._omni_mm_positions is None
+    assert image_request.omni_model_inputs is None
+    assert image_request._omni_consumed is None
+    assert image_request._omni_mm_positions is None
+
+
 @pytest.mark.parametrize(
     "case",
     [
