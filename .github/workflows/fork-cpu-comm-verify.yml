@@ -24,6 +24,10 @@ jobs:
       - name: Check out branch
         uses: actions/checkout@v4
 
+      - name: Trust checked-out repository
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Verify checkout SHA
         shell: bash
         run: |
