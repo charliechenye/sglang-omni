@@ -1,4 +1,4 @@
-name: "Qwen3-Omni #1515 CPU validation"
+name: "Qwen3-Omni #1514 CPU validation"
 
 on:
   push:
@@ -14,13 +14,12 @@ permissions:
   contents: read
 
 env:
-  # Exact #1515 candidate under validation. Keep this pinned so the
+  # Exact #1514 candidate under validation. Keep this pinned so the
   # validation result is attributable to the exact tree intended for PR.
-  TARGET_SHA: b0678bcce546730d0dfaff0fdbb7bd3d289a7ea0
+  TARGET_SHA: b3b6ffa6c5011726eb70bc1bf02bc5950b85a985
 
-  # Exact parent/base of TARGET_SHA. Used only for candidate provenance,
-  # patch-scope validation, and committed-diff hygiene checks.
-  BASE_SHA: 86a7d48119551474add1cd371c619a70df0e6673
+  # Exact direct parent/base of TARGET_SHA.
+  BASE_SHA: e0c98529e5730f60e19251025877387b9476c8d4
 
   # Keep test tooling isolated from the container's system Python,
   # while inheriting its preinstalled SGLang/PyTorch runtime packages.
@@ -28,26 +27,25 @@ env:
 
 jobs:
   qwen3-omni-cpu:
-    name: "Qwen3-Omni #1515 CPU gate"
+    name: "Qwen3-Omni #1514 CPU gate"
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
-    # Match the environment family previously used successfully for
-    # Qwen3-Omni CPU qualification. The container already includes the
-    # heavyweight torch/sglang/transformers runtime, so this workflow does
-    # not reinstall those packages.
+    # Reuse the pinned environment previously used successfully for
+    # Qwen3-Omni CPU qualification. It already contains the heavyweight
+    # torch/sglang/transformers runtime.
     container:
       image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout the exact #1515 candidate.
+      # 1. Checkout the exact #1514 candidate.
       #
-      # The workflow itself lives on the temporary cpu-validation branch,
-      # while the source tree tested below is exactly TARGET_SHA.
+      # The workflow file itself lives on the temporary cpu-validation branch.
+      # The source tree tested below is exactly TARGET_SHA.
       # -----------------------------------------------------------------------
 
-      - name: "Checkout #1515 candidate"
+      - name: "Checkout #1514 candidate"
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_SHA }}
@@ -68,14 +66,17 @@ jobs:
           set -euxo pipefail
 
           ACTUAL="$(git rev-parse HEAD)"
+          ACTUAL_PARENT="$(git rev-parse "${TARGET_SHA}^")"
 
           echo "Expected candidate SHA: ${TARGET_SHA}"
           echo "Actual candidate SHA:   ${ACTUAL}"
-          echo "Candidate base SHA:     ${BASE_SHA}"
+          echo "Expected base SHA:      ${BASE_SHA}"
+          echo "Actual parent SHA:      ${ACTUAL_PARENT}"
 
           test "${ACTUAL}" = "${TARGET_SHA}"
           git cat-file -e "${BASE_SHA}^{commit}"
           git merge-base --is-ancestor "${BASE_SHA}" "${TARGET_SHA}"
+          test "${ACTUAL_PARENT}" = "${BASE_SHA}"
 
           echo
           echo "=== Candidate commits ==="
@@ -105,7 +106,7 @@ jobs:
 
       # -----------------------------------------------------------------------
       # 2. Confirm the pinned container still provides the heavyweight runtime.
-      #    We deliberately do NOT reinstall torch/sglang/transformers.
+      #    Do NOT reinstall torch/sglang/transformers.
       # -----------------------------------------------------------------------
 
       - name: Inspect preinstalled runtime
@@ -136,10 +137,6 @@ jobs:
 
       # -----------------------------------------------------------------------
       # 3. Create a small test-tools venv.
-      #
-      # --system-site-packages reuses the container's existing runtime without
-      # modifying the externally-managed system Python. If venv support is
-      # unexpectedly absent, install only python3.12-venv and retry.
       # -----------------------------------------------------------------------
 
       - name: Create CPU test virtualenv
@@ -179,24 +176,43 @@ jobs:
           "${TEST_VENV}/bin/python" -m pre_commit --version
 
       # -----------------------------------------------------------------------
-      # 4. #1515 load-bearing tests.
+      # 4. #1514 load-bearing focused tests.
       #
-      # Individual test steps use continue-on-error so later evidence still
-      # runs and the final gate reports every outcome together.
+      # Each test step uses continue-on-error so all evidence is collected.
+      # The final gate below fails once after every check has run.
       # -----------------------------------------------------------------------
 
-      - name: "Focused #1515 lifecycle regression"
-        id: lifecycle
+      - name: Shared Thinker multimodal merge contract
+        id: mm_merge
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
 
           "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/qwen3_omni/test_pipeline.py \
-            -k "qwen_thinker_cuda_graph_capture"
+            tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py
 
-      - name: Full Qwen3-Omni pipeline and bootstrap tests
+      - name: Qwen prefill and inherited eager fallback contract
+        id: prefill_contract
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py
+
+      - name: Direct ThinkerModelRunner contract
+        id: thinker_runner
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/qwen3_omni/test_thinker_model_runner.py
+
+      - name: Qwen3-Omni pipeline and bootstrap regression
         id: pipeline
         continue-on-error: true
         shell: bash
@@ -207,22 +223,19 @@ jobs:
             tests/unit_test/qwen3_omni/test_pipeline.py
 
       # -----------------------------------------------------------------------
-      # 5. Broader CPU regression coverage.
+      # 5. Broad CPU-compatible Qwen3-Omni regression coverage.
       #
-      # Preserve broad CPU-compatible Qwen3-Omni regression coverage.
-      #
-      # Exclusions:
+      # Known CPU exclusions:
       #
       # - test_talker.py / test_talker_attention.py:
       #   collection requires CUDA-loaded sgl_kernel operators.
       #
       # - Two Code2Wav CUDA-graph factory tests:
-      #   these explicitly exercise CUDA device normalization through
-      #   current_platform.get_device(...). On the GitHub CPU runner SGLang's
-      #   platform is device=unknown and get_device() is unsupported.
+      #   explicitly exercise CUDA device normalization through
+      #   current_platform.get_device(...). On this GitHub CPU runner SGLang
+      #   reports device=unknown and get_device() is unsupported.
       #
-      # These paths are unchanged by #1515. Keep every other Code2Wav test in
-      # the CPU sweep rather than ignoring test_code2wav.py wholesale.
+      # Keep every other Code2Wav test in the CPU sweep.
       # -----------------------------------------------------------------------
 
       - name: CPU-compatible Qwen3-Omni unit suite
@@ -242,11 +255,10 @@ jobs:
       # -----------------------------------------------------------------------
       # 6. Candidate scope and source hygiene.
       #
-      # #1515 is intentionally surgical. Fail the validation if the exact
-      # candidate grows beyond the two reviewed files.
+      # #1514 is intentionally limited to four reviewed files.
       # -----------------------------------------------------------------------
 
-      - name: "Verify #1515 patch scope"
+      - name: Verify #1514 patch scope
         id: scope
         continue-on-error: true
         shell: bash
@@ -255,8 +267,10 @@ jobs:
 
           actual="$(git diff --name-only "${BASE_SHA}...${TARGET_SHA}" | sort)"
           expected="$(printf '%s\n' \
-            'sglang_omni/models/qwen3_omni/bootstrap.py' \
-            'tests/unit_test/qwen3_omni/test_pipeline.py' \
+            'sglang_omni/model_runner/thinker_model_runner.py' \
+            'sglang_omni/models/qwen3_omni/thinker_model_runner.py' \
+            'tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py' \
+            'tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py' \
             | sort)"
 
           echo "=== Expected changed files ==="
@@ -279,8 +293,10 @@ jobs:
 
           "${TEST_VENV}/bin/python" -m pre_commit run \
             --files \
-            sglang_omni/models/qwen3_omni/bootstrap.py \
-            tests/unit_test/qwen3_omni/test_pipeline.py \
+            sglang_omni/model_runner/thinker_model_runner.py \
+            sglang_omni/models/qwen3_omni/thinker_model_runner.py \
+            tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py \
+            tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py \
             --show-diff-on-failure
 
       - name: Committed diff and working-tree sanity
@@ -290,16 +306,12 @@ jobs:
         run: |
           set -euxo pipefail
 
-          # Check the committed candidate diff, not only an empty working-tree
-          # diff after checkout.
           git diff --check "${BASE_SHA}...${TARGET_SHA}"
 
           echo
           echo "=== Git status after tests and pre-commit ==="
           git status --short
 
-          # pre-commit must not leave auto-fixes or other tracked/untracked
-          # changes behind in the exact candidate checkout.
           test -z "$(git status --porcelain)"
 
       # -----------------------------------------------------------------------
@@ -310,7 +322,7 @@ jobs:
         if: always()
         shell: bash
         run: |
-          echo "## Qwen3-Omni #1515 CPU validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Qwen3-Omni #1514 CPU validation" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Candidate: \`${TARGET_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -318,22 +330,26 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check | Outcome |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Focused #1515 lifecycle | ${{ steps.lifecycle.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pipeline/bootstrap file | ${{ steps.pipeline.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| CPU-compatible Qwen3-Omni | ${{ steps.qwen_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Exact two-file scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Shared Thinker multimodal merge | ${{ steps.mm_merge.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Qwen prefill / eager fallback contract | ${{ steps.prefill_contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Direct ThinkerModelRunner contract | ${{ steps.thinker_runner.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline / bootstrap regression | ${{ steps.pipeline.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| CPU-compatible Qwen3-Omni suite | ${{ steps.qwen_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Exact four-file scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Pre-commit changed files | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Diff / working-tree sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
 
       # -----------------------------------------------------------------------
-      # 8. Fail exactly once, after every check has had a chance to run.
+      # 8. Fail exactly once after every check has had a chance to run.
       # -----------------------------------------------------------------------
 
-      - name: "Final #1515 CPU validation gate"
+      - name: Final #1514 CPU validation gate
         if: always()
         shell: bash
         env:
-          LIFECYCLE: ${{ steps.lifecycle.outcome }}
+          MM_MERGE: ${{ steps.mm_merge.outcome }}
+          PREFILL_CONTRACT: ${{ steps.prefill_contract.outcome }}
+          THINKER_RUNNER: ${{ steps.thinker_runner.outcome }}
           PIPELINE: ${{ steps.pipeline.outcome }}
           QWEN_CPU: ${{ steps.qwen_cpu.outcome }}
           SCOPE: ${{ steps.scope.outcome }}
@@ -356,7 +372,9 @@ jobs:
             fi
           }
 
-          check "focused-lifecycle" "${LIFECYCLE}"
+          check "shared-mm-merge" "${MM_MERGE}"
+          check "prefill-contract" "${PREFILL_CONTRACT}"
+          check "direct-thinker-runner" "${THINKER_RUNNER}"
           check "pipeline-bootstrap" "${PIPELINE}"
           check "qwen-cpu" "${QWEN_CPU}"
           check "patch-scope" "${SCOPE}"
@@ -365,10 +383,10 @@ jobs:
 
           if [[ "${failed}" -ne 0 ]]; then
             echo
-            echo "One or more #1515 CPU validation checks failed."
+            echo "One or more #1514 CPU validation checks failed."
             echo "Review every failed step above before opening the upstream PR."
             exit 1
           fi
 
           echo
-          echo "All #1515 CPU validation checks passed."
+          echo "All #1514 CPU validation checks passed."
