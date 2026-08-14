@@ -37,6 +37,7 @@ jobs:
           test "${actual_sha}" = "${GITHUB_SHA}"
 
       - name: Prepare CI environment
+        id: prepare
         shell: bash
         run: |
           mkdir -p "${OMNI_CI_HOME}" "${UV_CACHE_DIR}"
@@ -52,6 +53,8 @@ jobs:
           python -c "import sglang_omni; import sglang_omni.comm.engine"
 
       - name: ACK lifecycle tests
+        id: ack
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
         shell: bash
         run: |
           source omni/bin/activate
@@ -59,15 +62,17 @@ jobs:
           python -m pytest -q tests/unit_test/pipeline/test_comm_engine_ack.py
 
       - name: Stage streaming tests
+        id: stage
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
         shell: bash
         run: |
           source omni/bin/activate
           export PYTHONPATH="$PWD"
-          # This case requires a GPU target and cannot run in the CPU container.
-          python -m pytest -q tests/unit_test/pipeline/test_stage_streaming.py \
-            -k "not test_explicit_scheduler_stream_target_keeps_stage_to_stage_routing"
+          python -m pytest -q tests/unit_test/pipeline/test_stage_streaming.py
 
       - name: Payload device restore tests
+        id: payload
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
         shell: bash
         run: |
           source omni/bin/activate
@@ -75,8 +80,20 @@ jobs:
           python -m pytest -q tests/unit_test/pipeline/test_payload_device_restore.py
 
       - name: SHM relay tests
+        id: shm
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
         shell: bash
         run: |
           source omni/bin/activate
           export PYTHONPATH="$PWD"
           python -m pytest -q tests/unit_test/relay/test_shm_relay.py
+
+      - name: Test matrix summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          echo "prepare=${{ steps.prepare.outcome }}"
+          echo "ack=${{ steps.ack.outcome }}"
+          echo "stage=${{ steps.stage.outcome }}"
+          echo "payload=${{ steps.payload.outcome }}"
+          echo "shm=${{ steps.shm.outcome }}"
