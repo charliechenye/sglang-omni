@@ -63,7 +63,9 @@ jobs:
         run: |
           source omni/bin/activate
           export PYTHONPATH="$PWD"
-          python -m pytest -q tests/unit_test/pipeline/test_stage_streaming.py
+          # This case requires a GPU target and cannot run in the CPU container.
+          python -m pytest -q tests/unit_test/pipeline/test_stage_streaming.py \
+            -k "not test_explicit_scheduler_stream_target_keeps_stage_to_stage_routing"
 
       - name: Payload device restore tests
         shell: bash
