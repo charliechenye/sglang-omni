@@ -1,0 +1,99 @@
+name: Fork CPU Comm Verify
+
+on:
+  push:
+    branches:
+      - "verify/**"
+
+permissions:
+  contents: read
+
+env:
+  OMNI_CI_HOME: /tmp/omni-ci
+  UV_CACHE_DIR: /tmp/uv-cache
+
+jobs:
+  cpu-comm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
+      options: --shm-size=1g
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+
+      - name: Trust checked-out repository
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify checkout SHA
+        shell: bash
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          echo "GITHUB_SHA=${GITHUB_SHA}"
+          echo "HEAD=${actual_sha}"
+          test "${actual_sha}" = "${GITHUB_SHA}"
+
+      - name: Prepare CI environment
+        id: prepare
+        shell: bash
+        run: |
+          mkdir -p "${OMNI_CI_HOME}" "${UV_CACHE_DIR}"
+          bash .github/scripts/prepare_omni_venv.sh omni
+
+      - name: Dependency and import smoke
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          python --version
+          python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+          python -c "import sglang_omni; import sglang_omni.comm.engine"
+
+      - name: ACK lifecycle tests
+        id: ack
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          python -m pytest -q tests/unit_test/pipeline/test_comm_engine_ack.py
+
+      - name: Stage streaming tests
+        id: stage
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          python -m pytest -q tests/unit_test/pipeline/test_stage_streaming.py
+
+      - name: Payload device restore tests
+        id: payload
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          python -m pytest -q tests/unit_test/pipeline/test_payload_device_restore.py
+
+      - name: SHM relay tests
+        id: shm
+        if: ${{ always() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          python -m pytest -q tests/unit_test/relay/test_shm_relay.py
+
+      - name: Test matrix summary
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          echo "prepare=${{ steps.prepare.outcome }}"
+          echo "ack=${{ steps.ack.outcome }}"
+          echo "stage=${{ steps.stage.outcome }}"
+          echo "payload=${{ steps.payload.outcome }}"
+          echo "shm=${{ steps.shm.outcome }}"
