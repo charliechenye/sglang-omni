@@ -209,10 +209,20 @@ jobs:
       # -----------------------------------------------------------------------
       # 5. Broader CPU regression coverage.
       #
-      # Preserve the proven CPU-compatible Qwen3-Omni suite. The two talker
-      # files are intentionally excluded because collection requires
-      # CUDA-loaded sgl_kernel operators on a GPU host. They are unchanged by
-      # #1515 and remain the responsibility of normal upstream GPU/model CI.
+      # Preserve broad CPU-compatible Qwen3-Omni regression coverage.
+      #
+      # Exclusions:
+      #
+      # - test_talker.py / test_talker_attention.py:
+      #   collection requires CUDA-loaded sgl_kernel operators.
+      #
+      # - Two Code2Wav CUDA-graph factory tests:
+      #   these explicitly exercise CUDA device normalization through
+      #   current_platform.get_device(...). On the GitHub CPU runner SGLang's
+      #   platform is device=unknown and get_device() is unsupported.
+      #
+      # These paths are unchanged by #1515. Keep every other Code2Wav test in
+      # the CPU sweep rather than ignoring test_code2wav.py wholesale.
       # -----------------------------------------------------------------------
 
       - name: CPU-compatible Qwen3-Omni unit suite
@@ -225,7 +235,9 @@ jobs:
           "${TEST_VENV}/bin/python" -m pytest -q \
             tests/unit_test/qwen3_omni \
             --ignore=tests/unit_test/qwen3_omni/test_talker.py \
-            --ignore=tests/unit_test/qwen3_omni/test_talker_attention.py
+            --ignore=tests/unit_test/qwen3_omni/test_talker_attention.py \
+            --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys \
+            --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_enabled_factory_logs_disabled_build_reason
 
       # -----------------------------------------------------------------------
       # 6. Candidate scope and source hygiene.
@@ -241,7 +253,7 @@ jobs:
         run: |
           set -euxo pipefail
 
-          actual="$({ git diff --name-only "${BASE_SHA}...${TARGET_SHA}" || true; } | sort)"
+          actual="$(git diff --name-only "${BASE_SHA}...${TARGET_SHA}" | sort)"
           expected="$(printf '%s\n' \
             'sglang_omni/models/qwen3_omni/bootstrap.py' \
             'tests/unit_test/qwen3_omni/test_pipeline.py' \
