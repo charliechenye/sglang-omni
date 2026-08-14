@@ -729,6 +729,7 @@ class CommEngine:
                 metadata=job.metadata,
                 transport=job.transport,
             )
+            object_id = data_ref.object_id
             write_ms = _comm_elapsed_ms(write_start)
             control_start = _comm_now_ns()
             await self._publish_data_ready(

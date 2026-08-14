@@ -134,6 +134,29 @@ async def _send_stream_for_ack_test(
     return DataRef.from_dict(control_plane.sent_to_stage[-1][2].data_ref)
 
 
+async def _send_payload_for_ack_test(
+    engine: CommEngine,
+    relay: _AckedRelay,
+    control_plane: RecordingStageControlPlane,
+    *,
+    request_id: str,
+    sequence: int,
+) -> DataRef:
+    return await engine.send_payload(
+        relay=relay,
+        control_plane=control_plane,
+        request_id=request_id,
+        payload=make_stage_payload(
+            request_id=request_id,
+            data={"sequence": sequence, "x": torch.ones(2)},
+        ),
+        transport=TransportKind.SHM,
+        from_stage="producer",
+        to_stage="consumer",
+        target_endpoint="inproc://consumer",
+    )
+
+
 def test_comm_engine_releases_sender_op_after_data_ack() -> None:
     async def _run() -> None:
         relay = _AckedRelay()
@@ -304,9 +327,7 @@ def test_comm_engine_stream_sends_with_reused_semantics_coexist() -> None:
     asyncio.run(_run())
 
 
-def test_comm_engine_stream_stale_ack_after_timeout_does_not_complete_reused_send() -> (
-    None
-):
+def test_stream_stale_ack_does_not_complete_reused_send() -> None:
     async def _run() -> None:
         relay = _AckedRelay()
         control_plane = RecordingStageControlPlane()
@@ -316,7 +337,7 @@ def test_comm_engine_stream_stale_ack_after_timeout_does_not_complete_reused_sen
                 gpu_id=None,
                 same_process_targets=set(),
                 gpu_stage_names=set(),
-                comm_config={"ack_timeout_s": 0.01},
+                comm_config={"ack_timeout_s": 0.05},
                 injected_relay=relay,
             ),
             task_done_callback=_consume_task_exception,
@@ -333,7 +354,8 @@ def test_comm_engine_stream_stale_ack_after_timeout_does_not_complete_reused_sen
 
         await _wait_until(
             lambda: data_ref_a.object_id not in engine._pending
-            and pending_a.task.done()
+            and pending_a.task.done(),
+            timeout=5.0,
         )
         with pytest.raises(asyncio.TimeoutError):
             await pending_a.task
@@ -348,13 +370,81 @@ def test_comm_engine_stream_stale_ack_after_timeout_does_not_complete_reused_sen
         )
         assert data_ref_a.object_id != data_ref_b.object_id
         assert data_ref_b.object_id in engine._pending
+        pending_b = engine._pending[data_ref_b.object_id]
         op_b = relay.ops[1]
 
         engine.ack_transfer(
             _stream_ack(request_id="req-reused", object_id=data_ref_a.object_id)
         )
         assert data_ref_b.object_id in engine._pending
-        assert not engine._pending[data_ref_b.object_id].ack.done()
+        assert not pending_b.ack.done()
+        assert not op_b.acked
+        assert not op_b.waited
+
+        engine.ack_transfer(
+            _stream_ack(request_id="req-reused", object_id=data_ref_b.object_id)
+        )
+        await _wait_until(
+            lambda: data_ref_b.object_id not in engine._pending and op_b.waited
+        )
+        assert op_b.acked
+
+    asyncio.run(_run())
+
+
+def test_payload_stale_ack_does_not_complete_reused_send() -> None:
+    async def _run() -> None:
+        relay = _AckedRelay()
+        control_plane = RecordingStageControlPlane()
+        engine = CommEngine(
+            CommRouter(
+                stage_name="producer",
+                gpu_id=None,
+                same_process_targets=set(),
+                gpu_stage_names=set(),
+                comm_config={"ack_timeout_s": 0.05},
+                injected_relay=relay,
+            ),
+            task_done_callback=_consume_task_exception,
+        )
+
+        data_ref_a = await _send_payload_for_ack_test(
+            engine,
+            relay,
+            control_plane,
+            request_id="req-reused",
+            sequence=1,
+        )
+        pending_a = engine._pending[data_ref_a.object_id]
+        assert pending_a.task is not None
+
+        await _wait_until(
+            lambda: data_ref_a.object_id not in engine._pending
+            and pending_a.task.done(),
+            timeout=5.0,
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await pending_a.task
+        assert relay.ops[0].failed is not None
+
+        engine._ack_timeout_s = 1.0
+        data_ref_b = await _send_payload_for_ack_test(
+            engine,
+            relay,
+            control_plane,
+            request_id="req-reused",
+            sequence=2,
+        )
+        assert data_ref_a.object_id != data_ref_b.object_id
+        assert data_ref_b.object_id in engine._pending
+        pending_b = engine._pending[data_ref_b.object_id]
+        op_b = relay.ops[1]
+
+        engine.ack_transfer(
+            _stream_ack(request_id="req-reused", object_id=data_ref_a.object_id)
+        )
+        assert data_ref_b.object_id in engine._pending
+        assert not pending_b.ack.done()
         assert not op_b.acked
         assert not op_b.waited
 

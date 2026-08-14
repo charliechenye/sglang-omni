@@ -1,0 +1,93 @@
+name: Fork CPU Comm Verify
+
+on:
+  push:
+    branches:
+      - "verify/**"
+
+permissions:
+  contents: read
+
+env:
+  OMNI_CI_HOME: /tmp/omni-ci
+  UV_CACHE_DIR: /tmp/uv-cache
+
+jobs:
+  cpu-comm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    container:
+      image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
+      options: --shm-size=1g
+
+    steps:
+      - name: Check out branch
+        uses: actions/checkout@v4
+
+      - name: Trust checked-out repository
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify checkout SHA
+        shell: bash
+        run: |
+          actual_sha="$(git rev-parse HEAD)"
+          echo "GITHUB_SHA=${GITHUB_SHA}"
+          echo "HEAD=${actual_sha}"
+          test "${actual_sha}" = "${GITHUB_SHA}"
+
+      - name: Prepare CI environment
+        shell: bash
+        run: |
+          mkdir -p "${OMNI_CI_HOME}" "${UV_CACHE_DIR}"
+          bash .github/scripts/prepare_omni_venv.sh omni
+
+      - name: Dependency and import smoke
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          python --version
+          python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+          python -c "import sglang_omni; import sglang_omni.comm.engine"
+
+      - name: ACK lifecycle tests
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          python -m pytest -q tests/unit_test/pipeline/test_comm_engine_ack.py
+
+      - name: "#1487 scheduler concurrency tests"
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          python -m pytest -q tests/unit_test/pipeline/test_simple_scheduler_concurrent.py
+
+      - name: Stage streaming tests
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          # This case requires a GPU target and cannot run in the CPU container.
+          python -m pytest -q tests/unit_test/pipeline/test_stage_streaming.py \
+            -k "not test_explicit_scheduler_stream_target_keeps_stage_to_stage_routing"
+
+      - name: Payload device restore tests
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          if [[ -f tests/unit_test/pipeline/test_payload_device_restore.py ]]; then
+            python -m pytest -q tests/unit_test/pipeline/test_payload_device_restore.py
+          else
+            echo "Payload device restore test is not present at the #1487 head; skipped."
+          fi
+
+      - name: SHM relay tests
+        shell: bash
+        run: |
+          source omni/bin/activate
+          export PYTHONPATH="$PWD"
+          python -m pytest -q tests/unit_test/relay/test_shm_relay.py
