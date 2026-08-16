@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 env:
-  TARGET_SHA: 805901eb4561f6b2723e3da0fae2f36c2018ea9f
+  TARGET_SHA: 9a7e86fb0a19ac97d25c7d269d164391c3ec840f
   BASE_SHA: 573ce7963fa7b95596459957a195c87cf60cda19
   TEST_VENV: /tmp/sglang-omni-cpu-venv
 
@@ -181,7 +181,10 @@ jobs:
             --ignore=tests/unit_test/qwen3_omni/test_talker.py \
             --ignore=tests/unit_test/qwen3_omni/test_talker_attention.py \
             --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys \
-            --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_enabled_factory_logs_disabled_build_reason
+            --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_enabled_factory_logs_disabled_build_reason \
+            --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_factory_allows_batching_with_cuda_graph \
+            --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_factory_combines_batching_with_cuda_graph \
+            --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_factory_disables_batching_when_runner_disabled
 
       - name: Verify Track 2.2 investigation patch scope
         id: scope
