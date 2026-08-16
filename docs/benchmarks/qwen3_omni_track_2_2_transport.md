@@ -34,7 +34,8 @@ The JSON reports these distinct timing domains:
 - `end_to_end_drain_chunks_per_sec`: measured chunks divided by measurement
   start through the final ACK/resource drain;
 - `final_ack_drain_ms`: final publication return through the final completion;
-- `maximum_outstanding_transfer_count`: peak published-but-not-retired objects.
+- `maximum_outstanding_transfer_count`: peak genuinely live published transfers
+  during measurement, after warmup has drained and the peak counter is reset.
 
 The sender keeps one persistent source tensor per arm for the whole process. In
 particular, C reuses one CUDA `uint8[1]` carrier for every chunk. Receiver
@@ -210,7 +211,9 @@ statistics. Arms are paired within identical `(direction, round, concurrency)`
 cells. Each paired metric reports median percentage delta, p25/p75, MAD,
 improvement count/total, improvement fraction, and stable-effect status.
 Latency deltas are positive when the candidate is faster; throughput deltas are
-positive when the candidate is faster.
+positive when the candidate is faster. Summary statistics use the conventional
+median, linearly interpolated p25/p75/p95 quantiles, and median absolute
+deviation.
 
 Incremental attribution remains:
 

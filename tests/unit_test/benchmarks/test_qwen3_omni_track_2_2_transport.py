@@ -187,6 +187,45 @@ class Track22TransportBenchmarkTest(unittest.TestCase):
         self.assertEqual(expected.values[-1], 2048.0)
         self.assertNotEqual(expected.values[-1], 2047.0)
 
+    def test_numeric_stats_use_conventional_quantiles_and_mad(self) -> None:
+        two_values = BENCHMARK._numeric_stats([0.2, 5.0])
+        assert two_values is not None
+        self.assertEqual(two_values["median"], 2.6)
+        self.assertEqual(two_values["mad"], 2.4)
+
+        one_value = BENCHMARK._numeric_stats([7.25])
+        assert one_value is not None
+        for field in ("median", "p25", "p75", "p95"):
+            self.assertEqual(one_value[field], 7.25)
+        self.assertEqual(one_value["mad"], 0.0)
+
+        even_values = BENCHMARK._numeric_stats([1.0, 2.0, 3.0, 4.0])
+        assert even_values is not None
+        self.assertEqual(even_values["median"], 2.5)
+        self.assertEqual(even_values["p25"], 1.75)
+        self.assertEqual(even_values["p75"], 3.25)
+
+        odd_values = BENCHMARK._numeric_stats([1.0, 2.0, 3.0, 4.0, 5.0])
+        assert odd_values is not None
+        self.assertEqual(odd_values["median"], 3.0)
+
+    def test_paired_effect_stats_interpolate_two_observations(self) -> None:
+        pairs = [
+            (
+                {"publish_latency_ms": _metric(100.0)},
+                {"publish_latency_ms": _metric(90.0)},
+            ),
+            (
+                {"publish_latency_ms": _metric(100.0)},
+                {"publish_latency_ms": _metric(80.0)},
+            ),
+        ]
+        stats = BENCHMARK._paired_metric_stats(pairs, "publish_latency_ms")
+        self.assertAlmostEqual(stats["median_paired_percentage_delta"], 15.0)
+        self.assertAlmostEqual(stats["mad_paired_percentage_delta"], 5.0)
+        self.assertAlmostEqual(stats["p25_paired_percentage_delta"], 12.5)
+        self.assertAlmostEqual(stats["p75_paired_percentage_delta"], 17.5)
+
 
 class Track22TransportAsyncTest(unittest.IsolatedAsyncioTestCase):
     async def _bare_control(self) -> tuple[object, asyncio.Future[int]]:
@@ -202,6 +241,53 @@ class Track22TransportAsyncTest(unittest.IsolatedAsyncioTestCase):
         control._max_outstanding = 0
         control._fatal = None
         return control, completion
+
+    async def test_max_outstanding_resets_at_measurement_boundary(self) -> None:
+        loop = asyncio.get_running_loop()
+        control = object.__new__(BENCHMARK._BenchmarkControlPlane)
+        control._object_ids = {}
+        control._object_keys = {}
+        control._ready = {}
+        control._complete = {}
+        control._outstanding = set()
+        control._max_outstanding = 0
+        control._fatal = None
+
+        def add_object(index: int) -> str:
+            object_id = f"object-{index}"
+            key = ("run:req0", index)
+            control._object_ids[key] = object_id
+            control._object_keys[object_id] = key
+            control._ready[object_id] = loop.create_future()
+            control._complete[object_id] = loop.create_future()
+            return object_id
+
+        def release_and_retire(object_id: str) -> None:
+            control._outstanding.remove(object_id)
+            control._complete[object_id].set_result(1)
+            control.retire(object_id)
+
+        warmup_objects = [add_object(index) for index in range(32)]
+        for object_id in warmup_objects:
+            control.mark_ready(object_id)
+        self.assertEqual(control.max_outstanding, 32)
+        with self.assertRaisesRegex(RuntimeError, "live objects"):
+            control.reset_max_outstanding()
+
+        for object_id in warmup_objects:
+            release_and_retire(object_id)
+        self.assertEqual(control._outstanding, set())
+
+        control.reset_max_outstanding()
+        self.assertEqual(control.max_outstanding, 0)
+        measured_objects = [add_object(index) for index in range(3)]
+        for object_id in measured_objects:
+            control.mark_ready(object_id)
+        reported_peak = control.max_outstanding
+        self.assertEqual(reported_peak, 3)
+
+        for object_id in measured_objects:
+            release_and_retire(object_id)
 
     async def test_ack_release_timestamp_and_retirement_are_distinct(self) -> None:
         control, completion = await self._bare_control()

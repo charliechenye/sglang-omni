@@ -760,6 +760,7 @@ async def _sender_process_async(
             warmup_counts, chunk_offsets=[0] * spec.concurrency, phase="warmup"
         )
         await asyncio.wait_for(drain(warmup_records), timeout=timeout_s)
+        control.reset_max_outstanding()
 
         measure_start_ns = time.perf_counter_ns()
         measure_records, _, measure_publish_end_ns = await produce_phase(
@@ -1141,7 +1142,15 @@ def _percentile(values: Iterable[float], fraction: float) -> float:
         return samples[0]
     if fraction >= 1.0:
         return samples[-1]
-    return samples[max(0, math.ceil(fraction * len(samples)) - 1)]
+    if len(samples) == 1:
+        return samples[0]
+    position = (len(samples) - 1) * fraction
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return samples[lower_index]
+    weight = position - lower_index
+    return samples[lower_index] * (1.0 - weight) + samples[upper_index] * weight
 
 
 def _trace_run_key(event: dict[str, Any]) -> str:
@@ -1156,16 +1165,17 @@ def _trace_run_key(event: dict[str, Any]) -> str:
 def _numeric_stats(values: list[float]) -> dict[str, Any] | None:
     if not values:
         return None
-    median = _percentile(values, 0.50)
-    deviations = [abs(float(value) - median) for value in values]
+    samples = [float(value) for value in values]
+    median = statistics.median(samples)
+    deviations = [abs(value - median) for value in samples]
     return {
-        "count": len(values),
+        "count": len(samples),
         "median": median,
-        "p25": _percentile(values, 0.25),
-        "p75": _percentile(values, 0.75),
-        "p95": _percentile(values, 0.95),
-        "mad": _percentile(deviations, 0.50),
-        "mean": statistics.fmean(values),
+        "p25": _percentile(samples, 0.25),
+        "p75": _percentile(samples, 0.75),
+        "p95": _percentile(samples, 0.95),
+        "mad": statistics.median(deviations),
+        "mean": statistics.fmean(samples),
     }
 
 
