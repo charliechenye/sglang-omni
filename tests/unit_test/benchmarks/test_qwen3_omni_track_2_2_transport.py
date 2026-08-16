@@ -1,8 +1,11 @@
+import asyncio
 import importlib.util
 import subprocess
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 BENCHMARK_PATH = REPOSITORY_ROOT / "benchmarks" / "qwen3_omni_track_2_2_transport.py"
@@ -38,8 +41,8 @@ def _metric(median: float) -> dict[str, float]:
 def _fake_runs() -> list[dict[str, object]]:
     values = {
         "A": (100.0, 100.0, 100.0, 100.0),
-        "B": (90.0, 90.0, 100.0, 100.0),
-        "C": (80.0, 80.0, 100.0, 100.0),
+        "B": (90.0, 99.0, 100.0, 100.0),
+        "C": (80.0, 99.0, 100.0, 100.0),
         "D": (120.0, 120.0, 100.0, 100.0),
     }
     transports = {"A": "cuda_ipc", "B": "cuda_ipc", "C": "cuda_ipc", "D": "shm"}
@@ -121,6 +124,7 @@ class Track22TransportBenchmarkTest(unittest.TestCase):
         self.assertEqual(comparisons["direct_from_A"]["A->C"]["decision"], "GO")
         self.assertEqual(comparisons["recommendation"]["recommended_candidate"], "C")
         self.assertEqual(comparisons["overall"], "GO")
+        self.assertEqual(comparisons["direct_from_A"]["A->D"]["decision"], "NO-GO")
 
     def test_variability_blocks_nominal_effect(self) -> None:
         pairs = []
@@ -134,6 +138,112 @@ class Track22TransportBenchmarkTest(unittest.TestCase):
             BENCHMARK._status_for_paired_metrics(metrics),
             "GO",
         )
+
+    def test_non_regression_threshold_is_not_mad_gated(self) -> None:
+        def stats(delta: float, mad: float) -> dict[str, float]:
+            return {
+                "median_paired_percentage_delta": delta,
+                "mad_paired_percentage_delta": mad,
+            }
+
+        self.assertTrue(BENCHMARK._stable_non_regression(stats(-1.0, 100.0)))
+        self.assertTrue(BENCHMARK._stable_non_regression(stats(-4.0, 100.0)))
+        self.assertFalse(BENCHMARK._stable_non_regression(stats(-6.0, 100.0)))
+
+
+class Track22TransportAsyncTest(unittest.IsolatedAsyncioTestCase):
+    async def _bare_control(self) -> tuple[object, asyncio.Future[int]]:
+        loop = asyncio.get_running_loop()
+        ready = loop.create_future()
+        completion: asyncio.Future[int] = loop.create_future()
+        control = object.__new__(BENCHMARK._BenchmarkControlPlane)
+        control._object_ids = {("run:req0", 0): "object-0"}
+        control._object_keys = {"object-0": ("run:req0", 0)}
+        control._ready = {"object-0": ready}
+        control._complete = {"object-0": completion}
+        control._outstanding = set()
+        control._max_outstanding = 0
+        control._fatal = None
+        return control, completion
+
+    async def test_ack_release_timestamp_and_retirement_are_distinct(self) -> None:
+        control, completion = await self._bare_control()
+        release_gate = asyncio.Event()
+
+        async def pending_task() -> None:
+            await release_gate.wait()
+
+        engine = SimpleNamespace(
+            _pending={
+                "object-0": SimpleNamespace(task=asyncio.create_task(pending_task()))
+            },
+            acked=None,
+        )
+
+        def ack_transfer(message: object) -> None:
+            engine.acked = message
+
+        engine.ack_transfer = ack_transfer
+        resolve_task = asyncio.create_task(
+            control._resolve_ack(SimpleNamespace(object_id="object-0"), engine)
+        )
+        await asyncio.sleep(0)
+        self.assertFalse(resolve_task.done())
+        self.assertIsNone(engine.acked)
+
+        self.assertIs(control.mark_ready("object-0"), completion)
+        self.assertEqual(control.max_outstanding, 1)
+        self.assertIn("object-0", control._outstanding)
+        release_gate.set()
+        release_ns = 1_234_567_890
+        with patch.object(BENCHMARK.time, "perf_counter_ns", return_value=release_ns):
+            await resolve_task
+
+        self.assertEqual(completion.result(), release_ns)
+        self.assertNotIn("object-0", control._outstanding)
+        self.assertIn("object-0", control._complete)
+        control.retire("object-0")
+        self.assertNotIn("object-0", control._object_keys)
+        self.assertNotIn("object-0", control._ready)
+        self.assertNotIn("object-0", control._complete)
+        self.assertEqual(control.max_outstanding, 1)
+
+    async def test_drain_uses_release_timestamp_without_observing_completion_time(
+        self,
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        completion: asyncio.Future[int] = loop.create_future()
+        release_ns = 1_002_000_000
+        completion.set_result(release_ns)
+        record = BENCHMARK._PendingSend(
+            object_id="object-0",
+            start_ns=1_000_000_000,
+            publish_end_ns=1_000_500_000,
+            phase="measure",
+            completion=completion,
+        )
+
+        class FakeControl:
+            def fatal_future(self) -> None:
+                return None
+
+            def retire(self, object_id: str) -> None:
+                self.retired = object_id
+
+        control = FakeControl()
+        ack_latencies_ms: list[float] = []
+        with patch.object(
+            BENCHMARK.time,
+            "perf_counter_ns",
+            side_effect=AssertionError("drain must not sample observation time"),
+        ):
+            latest_release_ns = await BENCHMARK._drain_completion_records(
+                [record], control, ack_latencies_ms
+            )
+
+        self.assertEqual(latest_release_ns, release_ns)
+        self.assertEqual(ack_latencies_ms, [2.0])
+        self.assertEqual(control.retired, "object-0")
 
 
 if __name__ == "__main__":

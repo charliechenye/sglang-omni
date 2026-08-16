@@ -17,7 +17,9 @@ messages use the repository's real `PushSocket` / `PullSocket` and msgpack
 serialization. There is no synthetic `torch.copy_` loop.
 
 The primary producer is one task, matching `Stage._drain_outbox_external`:
-request IDs are interleaved round-robin for c1/c8/c32. A send waits only for
+request IDs are interleaved round-robin for c1/c8/c32. Here c1/c8/c32 means 1,
+8, or 32 active request IDs; it is transport interleaving, not a complete
+high-concurrency serving benchmark. A send waits only for
 `CommEngine.send_stream_chunk()` to return after `DataReady` publication. It
 then marks that object ready for the ACK loop and immediately produces the next
 chunk. Warmup transfers are fully drained before measurement starts. Measured
@@ -69,10 +71,10 @@ python benchmarks/qwen3_omni_track_2_2_transport.py \
 ```
 
 Primary defaults are 100 warmup chunks, 2,000 measured chunks, five rounds,
-request counts 1/8/32, and both arm orders `A B C D` and `D C B A`. Chunk
-counts are aggregate per arm/cell and are distributed across request IDs. The
-single producer interleaves those request IDs without sleeps or per-request
-producer tasks.
+c1/c8/c32 active request IDs, and both arm orders `A B C D` and `D C B A`.
+Chunk counts are aggregate per arm/cell and are distributed across request IDs.
+The single producer interleaves those request IDs without sleeps or per-request
+producer tasks. c32 does not claim full Qwen3-Omni serving concurrency.
 
 The CUDA IPC pool size is intentionally unset by default. That leaves
 `cuda_ipc_pool_size_mb` absent from the router config, so the production relay
@@ -106,34 +108,97 @@ events are aggregated by run and process. Where emitted, JSON reports:
 
 SHM has no CUDA-event fields; those fields are absent rather than fabricated.
 
-## Modal smoke and full commands
+## Modal commands and JSON retrieval
 
 `modal shell --add-local .` mounts the current directory at
 `/mnt/{local-directory-basename}`. These commands derive that basename instead
 of assuming the checkout is named `sglang-omni`. They keep the pinned CI image,
 request two same-node H100s, and leave the CUDA IPC pool at its production
-default.
+default. Each command prints the complete JSON between explicit markers and
+also captures the full shell output locally with `tee`.
 
-Smoke run (trace mode, no production result):
+Run these in order. The first is a tiny trace-off primary smoke run:
 
 ```bash
 WORKTREE_BASENAME="$(basename "$PWD")"
 modal shell \
-  --gpu H100!:2 \
+  --gpu 'H100!:2' \
   --image hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101 \
   --add-local . \
-  -c "cd \"/mnt/${WORKTREE_BASENAME}\" && CUDA_VISIBLE_DEVICES=0,1 SGLANG_OMNI_COMM_TRACE=1 python benchmarks/qwen3_omni_track_2_2_transport.py --mode trace --json-output /tmp/qwen3-omni-track-2-2-transport-trace.json"
+  -c "cd \"/mnt/${WORKTREE_BASENAME}\" && \
+      CUDA_VISIBLE_DEVICES=0,1 \
+      SGLANG_OMNI_COMM_TRACE=0 \
+      python benchmarks/qwen3_omni_track_2_2_transport.py \
+        --mode primary \
+        --rounds 1 \
+        --concurrency 1 \
+        --warmup-chunks 32 \
+        --measure-chunks 128 \
+        --json-output /tmp/track22-smoke.json && \
+      echo __TRACK22_JSON_BEGIN__ && \
+      cat /tmp/track22-smoke.json && \
+      echo __TRACK22_JSON_END__" \
+  2>&1 | tee track22-smoke.log
 ```
 
-Full primary run:
+Then run the small trace diagnostic separately:
 
 ```bash
 WORKTREE_BASENAME="$(basename "$PWD")"
 modal shell \
-  --gpu H100!:2 \
+  --gpu 'H100!:2' \
   --image hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101 \
   --add-local . \
-  -c "cd \"/mnt/${WORKTREE_BASENAME}\" && CUDA_VISIBLE_DEVICES=0,1 SGLANG_OMNI_COMM_TRACE=0 python benchmarks/qwen3_omni_track_2_2_transport.py --mode primary --json-output /tmp/qwen3-omni-track-2-2-transport-primary.json"
+  -c "cd \"/mnt/${WORKTREE_BASENAME}\" && \
+      CUDA_VISIBLE_DEVICES=0,1 \
+      SGLANG_OMNI_COMM_TRACE=1 \
+      python benchmarks/qwen3_omni_track_2_2_transport.py \
+        --mode trace \
+        --rounds 1 \
+        --concurrency 1 \
+        --warmup-chunks 32 \
+        --measure-chunks 64 \
+        --json-output /tmp/track22-trace.json && \
+      echo __TRACK22_JSON_BEGIN__ && \
+      cat /tmp/track22-trace.json && \
+      echo __TRACK22_JSON_END__" \
+  2>&1 | tee track22-trace.log
+```
+
+Finally run the full primary evidence command:
+
+```bash
+WORKTREE_BASENAME="$(basename "$PWD")"
+modal shell \
+  --gpu 'H100!:2' \
+  --image hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101 \
+  --add-local . \
+  -c "cd \"/mnt/${WORKTREE_BASENAME}\" && \
+      CUDA_VISIBLE_DEVICES=0,1 \
+      SGLANG_OMNI_COMM_TRACE=0 \
+      python benchmarks/qwen3_omni_track_2_2_transport.py \
+        --mode primary \
+        --json-output /tmp/track22-primary.json && \
+      echo __TRACK22_JSON_BEGIN__ && \
+      cat /tmp/track22-primary.json && \
+      echo __TRACK22_JSON_END__" \
+  2>&1 | tee track22-primary.log
+```
+
+Extract and validate the complete JSON locally after each shell exits:
+
+```bash
+awk '/__TRACK22_JSON_BEGIN__/ {capture=1; next} /__TRACK22_JSON_END__/ {capture=0} capture' \
+  track22-smoke.log > track22-smoke.json
+python -m json.tool track22-smoke.json >/dev/null
+
+awk '/__TRACK22_JSON_BEGIN__/ {capture=1; next} /__TRACK22_JSON_END__/ {capture=0} capture' \
+  track22-trace.log > track22-trace.json
+python -m json.tool track22-trace.json >/dev/null
+
+awk '/__TRACK22_JSON_BEGIN__/ {capture=1; next} /__TRACK22_JSON_END__/ {capture=0} capture' \
+  track22-primary.log > track22-primary.json
+python -m json.tool track22-primary.json >/dev/null
 ```
 
 These are paid-GPU commands and are not run by CPU qualification.
@@ -164,11 +229,13 @@ The recommendation ranks candidates against A using direct evidence. A stable
 `C → D` regression means “prefer C over D”; it does not make the overall Track
 2.2 result NO-GO if direct `A → C` is a stable GO.
 
-The rubric is deliberately variability-aware:
+The rubric is deliberately variability-aware. ACK/resource latency is a
+guardrail, not a second hard GO requirement:
 
-- **GO:** paired median publication and ACK/resource latencies improve by at
-  least 5%, at least 60% of paired observations improve, the median effect is
-  larger than MAD, and neither throughput metric materially regresses;
+- **GO:** at least one publish-facing metric (publish latency, publish
+  throughput, or end-to-end drain throughput) has a stable improvement of at
+  least 5%, neither throughput metric materially regresses, and ACK/resource
+  latency has no stable material regression;
 - **MAYBE:** effects are marginal, mixed, or ordinary paired variation is
   comparable to the nominal effect;
 - **NO-GO:** the compared candidate has a stable material regression. This

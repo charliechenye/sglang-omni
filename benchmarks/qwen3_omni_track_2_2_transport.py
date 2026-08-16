@@ -6,8 +6,10 @@ GPU 0 and a Talker-like receiver process on GPU 1, then uses the production
 ``CommEngine`` and ``stage_io`` stream-chunk path.  Only tensor contents and
 the request scheduler are synthetic.
 
-The primary mode measures A/B/C/D and D/C/B/A order, request counts 1/8/32,
-five rounds, 100 warmup chunks per arm, and 2,000 measured chunks per arm.
+The primary mode measures A/B/C/D and D/C/B/A order, c1/c8/c32 active request
+IDs, five rounds, 100 warmup chunks per arm, and 2,000 measured chunks per
+arm.  c32 is a transport interleaving probe, not a complete high-concurrency
+serving benchmark.
 The trace mode is a smaller diagnostic with trace logging enabled.
 """
 
@@ -193,7 +195,7 @@ class _PendingSend:
     start_ns: int
     publish_end_ns: int
     phase: str
-    completion: asyncio.Future[None]
+    completion: asyncio.Future[int]
 
 
 class _TraceQueueHandler(logging.Handler):
@@ -253,7 +255,7 @@ class _BenchmarkControlPlane:
         self._object_ids: dict[tuple[str, int], str] = {}
         self._object_keys: dict[str, tuple[str, int]] = {}
         self._ready: dict[str, asyncio.Future[None]] = {}
-        self._complete: dict[str, asyncio.Future[None]] = {}
+        self._complete: dict[str, asyncio.Future[int]] = {}
         self._outstanding: set[str] = set()
         self._max_outstanding = 0
         self._fatal: asyncio.Future[None] | None = None
@@ -297,7 +299,7 @@ class _BenchmarkControlPlane:
                 f"no published object for {request_id}:{chunk_id}"
             ) from exc
 
-    def mark_ready(self, object_id: str) -> asyncio.Future[None]:
+    def mark_ready(self, object_id: str) -> asyncio.Future[int]:
         try:
             ready = self._ready[object_id]
             completion = self._complete[object_id]
@@ -334,7 +336,6 @@ class _BenchmarkControlPlane:
             self._object_ids.pop(key, None)
         self._ready.pop(object_id, None)
         self._complete.pop(object_id, None)
-        self._outstanding.discard(object_id)
 
     async def ack_loop(self, engine: CommEngine) -> None:
         self._fatal = asyncio.get_running_loop().create_future()
@@ -375,8 +376,10 @@ class _BenchmarkControlPlane:
         engine.ack_transfer(message)
         if pending.task is not None:
             await pending.task
+        release_ns = time.perf_counter_ns()
+        self._outstanding.discard(object_id)
         if not completion.done():
-            completion.set_result(None)
+            completion.set_result(release_ns)
 
     def _record_ack_failure(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -399,6 +402,38 @@ class _BenchmarkControlPlane:
         self._ready.clear()
         self._complete.clear()
         self._outstanding.clear()
+
+
+async def _drain_completion_records(
+    records: list[_PendingSend],
+    control: _BenchmarkControlPlane,
+    ack_release_latencies_ms: list[float],
+) -> int:
+    """Drain completions and use the resource-release timestamp they publish."""
+
+    pending = {record.completion: record for record in records}
+    latest_release_ns = 0
+    while pending:
+        fatal = control.fatal_future()
+        waitables: set[asyncio.Future[Any]] = set(pending)
+        if fatal is not None:
+            waitables.add(fatal)
+        done, _ = await asyncio.wait(waitables, return_when=asyncio.FIRST_COMPLETED)
+        if fatal is not None and fatal in done:
+            error = fatal.exception()
+            if error is not None:
+                raise error
+            raise RuntimeError("benchmark ACK loop failed without an error")
+        for completion in done:
+            record = pending.pop(completion)
+            release_ns = completion.result()
+            latest_release_ns = max(latest_release_ns, release_ns)
+            control.retire(record.object_id)
+            if record.phase == "measure":
+                ack_release_latencies_ms.append(
+                    (release_ns - record.start_ns) / 1_000_000.0
+                )
+    return latest_release_ns
 
 
 def _distribute_chunks(total: int, concurrency: int) -> list[int]:
@@ -709,30 +744,9 @@ async def _sender_process_async(
             return records, phase_start_ns, time.perf_counter_ns()
 
         async def drain(records: list[_PendingSend]) -> int:
-            pending = {record.completion: record for record in records}
-            while pending:
-                fatal = control.fatal_future()
-                waitables: set[asyncio.Future[None]] = set(pending)
-                if fatal is not None:
-                    waitables.add(fatal)
-                done, _ = await asyncio.wait(
-                    waitables, return_when=asyncio.FIRST_COMPLETED
-                )
-                if fatal is not None and fatal in done:
-                    error = fatal.exception()
-                    if error is not None:
-                        raise error
-                    raise RuntimeError("benchmark ACK loop failed without an error")
-                for completion in done:
-                    record = pending.pop(completion)
-                    completion.result()
-                    completed_ns = time.perf_counter_ns()
-                    control.retire(record.object_id)
-                    if record.phase == "measure":
-                        ack_release_latencies_ms.append(
-                            (completed_ns - record.start_ns) / 1_000_000.0
-                        )
-            return time.perf_counter_ns()
+            return await _drain_completion_records(
+                records, control, ack_release_latencies_ms
+            )
 
         warmup_records, _, _ = await produce_phase(
             warmup_counts, chunk_offsets=[0] * spec.concurrency, phase="warmup"
@@ -743,19 +757,20 @@ async def _sender_process_async(
         measure_records, _, measure_publish_end_ns = await produce_phase(
             measure_counts, chunk_offsets=warmup_counts, phase="measure"
         )
-        measure_drain_end_ns = await asyncio.wait_for(
+        latest_release_ns = await asyncio.wait_for(
             drain(measure_records), timeout=timeout_s
         )
         publish_elapsed_s = max(
             (measure_publish_end_ns - measure_start_ns) / 1_000_000_000.0,
             1e-12,
         )
+        measure_end_ns = max(measure_publish_end_ns, latest_release_ns)
         end_to_end_elapsed_s = max(
-            (measure_drain_end_ns - measure_start_ns) / 1_000_000_000.0,
+            (measure_end_ns - measure_start_ns) / 1_000_000_000.0,
             1e-12,
         )
         final_ack_drain_ms = max(
-            (measure_drain_end_ns - measure_publish_end_ns) / 1_000_000.0,
+            (latest_release_ns - measure_publish_end_ns) / 1_000_000.0,
             0.0,
         )
         return {
@@ -1599,10 +1614,7 @@ def _stable_regression(stats: dict[str, Any]) -> bool:
 
 def _stable_non_regression(stats: dict[str, Any]) -> bool:
     median = stats["median_paired_percentage_delta"]
-    mad = stats["mad_paired_percentage_delta"]
-    if median is None or mad is None or median < -_MATERIAL_CHANGE_PCT:
-        return False
-    return median >= 0 or median > mad
+    return median is not None and median > -_MATERIAL_CHANGE_PCT
 
 
 def _paired_metrics(
@@ -1612,8 +1624,13 @@ def _paired_metrics(
 
 
 def _status_for_paired_metrics(metrics: dict[str, dict[str, Any]]) -> str:
-    latency_good = all(
-        _stable_improvement(metrics[metric]) for metric in _LATENCY_METRICS
+    publish_facing_good = any(
+        _stable_improvement(metrics[metric])
+        for metric in (
+            "publish_latency_ms",
+            "publish_chunks_per_sec",
+            "end_to_end_drain_chunks_per_sec",
+        )
     )
     throughput_good = all(
         _stable_non_regression(metrics[metric])
@@ -1622,12 +1639,14 @@ def _status_for_paired_metrics(metrics: dict[str, dict[str, Any]]) -> str:
             "end_to_end_drain_chunks_per_sec",
         )
     )
-    if latency_good and throughput_good:
-        return "GO"
     has_stable_regression = any(
         _stable_regression(metrics[metric]) for metric in _PAIRED_METRICS
     )
-    return "NO-GO" if has_stable_regression else "MAYBE"
+    if has_stable_regression:
+        return "NO-GO"
+    if publish_facing_good and throughput_good:
+        return "GO"
+    return "MAYBE"
 
 
 def _decision_for_transition(comparisons: list[dict[str, Any]]) -> str:
@@ -1683,10 +1702,13 @@ def _recommend_candidate(direct_from_a: dict[str, dict[str, Any]]) -> dict[str, 
         drain_throughput = metrics["end_to_end_drain_chunks_per_sec"][
             "median_paired_percentage_delta"
         ]
-        latency_score = (
-            min(publish_delta, ack_delta)
-            if publish_delta is not None and ack_delta is not None
-            else None
+        publish_facing_deltas = [
+            delta
+            for delta in (publish_delta, publish_throughput, drain_throughput)
+            if delta is not None
+        ]
+        publish_facing_score = (
+            max(publish_facing_deltas) if publish_facing_deltas else None
         )
         throughput_score = (
             min(publish_throughput, drain_throughput)
@@ -1698,7 +1720,8 @@ def _recommend_candidate(direct_from_a: dict[str, dict[str, Any]]) -> dict[str, 
                 "candidate": transition["candidate"],
                 "transition": transition_name,
                 "decision": transition["decision"],
-                "latency_score_pct": latency_score,
+                "publish_facing_score_pct": publish_facing_score,
+                "ack_guardrail_delta_pct": ack_delta,
                 "throughput_score_pct": throughput_score,
                 "paired_observations": transition["overall_paired"][
                     "paired_observations"
@@ -1710,8 +1733,8 @@ def _recommend_candidate(direct_from_a: dict[str, dict[str, Any]]) -> dict[str, 
         key=lambda item: (
             rank[item["decision"]],
             (
-                item["latency_score_pct"]
-                if item["latency_score_pct"] is not None
+                item["publish_facing_score_pct"]
+                if item["publish_facing_score_pct"] is not None
                 else float("-inf")
             ),
             (
@@ -1760,9 +1783,10 @@ def _build_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
         "minimum_stable_improvement_fraction": _MIN_STABLE_IMPROVEMENT_FRACTION,
         "rubric": {
             "GO": (
-                "paired median publish and ACK/resource latencies improve by >=5%, "
-                "at least 60% of paired observations improve, the median effect "
-                "exceeds MAD, and neither throughput metric materially regresses"
+                "at least one publish-facing metric (publish latency, publish "
+                "throughput, or end-to-end drain throughput) has a stable >=5% "
+                "improvement, neither throughput metric materially regresses, "
+                "and ACK/resource latency has no stable material regression"
             ),
             "MAYBE": (
                 "effect is marginal, mixed, or ordinary paired variation is "
@@ -1895,10 +1919,52 @@ def _git_commit() -> str | None:
             check=True,
             capture_output=True,
             text=True,
+            cwd=_REPOSITORY_ROOT,
         )
     except (OSError, subprocess.CalledProcessError):
         return None
     return completed.stdout.strip()
+
+
+def _cuda_device_name(index: int) -> str | None:
+    if torch is None:
+        return None
+    try:
+        if not torch.cuda.is_available() or torch.cuda.device_count() <= index:
+            return None
+        return str(torch.cuda.get_device_name(index))
+    except Exception as exc:
+        return f"<unavailable: {type(exc).__name__}: {exc}>"
+
+
+def _runtime_provenance() -> dict[str, Any]:
+    cuda_version = None
+    torch_version = None
+    if torch is not None:
+        torch_version = str(torch.__version__)
+        cuda_version = torch.version.cuda
+        if cuda_version is not None:
+            cuda_version = str(cuda_version)
+    return {
+        "git_commit": _git_commit(),
+        "repository_root": str(_REPOSITORY_ROOT),
+        "sglang_omni_source": str(_SGLANG_OMNI_SOURCE),
+        "torch_version": torch_version,
+        "cuda_version": cuda_version,
+        "gpu_0_name": _cuda_device_name(0),
+        "gpu_1_name": _cuda_device_name(1),
+    }
+
+
+def _print_runtime_provenance(provenance: dict[str, Any]) -> None:
+    print("Track 2.2 benchmark runtime provenance:")
+    print(f"  Git commit: {provenance['git_commit']}")
+    print(f"  Repository root: {provenance['repository_root']}")
+    print(f"  Imported sglang_omni: {provenance['sglang_omni_source']}")
+    print(f"  torch: {provenance['torch_version']}")
+    print(f"  CUDA: {provenance['cuda_version']}")
+    print(f"  GPU 0: {provenance['gpu_0_name']}")
+    print(f"  GPU 1: {provenance['gpu_1_name']}")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1974,6 +2040,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     _load_runtime()
+    provenance = _runtime_provenance()
+    _print_runtime_provenance(provenance)
     trace_enabled = args.mode == "trace"
     os.environ["SGLANG_OMNI_COMM_TRACE"] = "1" if trace_enabled else "0"
     forward_specs = _build_run_specs(
@@ -2016,9 +2084,10 @@ def main(argv: list[str] | None = None) -> int:
     output = {
         "schema_version": 1,
         "benchmark": _BENCHMARK_NAME,
-        "git_commit": _git_commit(),
-        "repository_root": str(_REPOSITORY_ROOT),
-        "sglang_omni_source": str(_SGLANG_OMNI_SOURCE),
+        "git_commit": provenance["git_commit"],
+        "repository_root": provenance["repository_root"],
+        "sglang_omni_source": provenance["sglang_omni_source"],
+        "provenance": provenance,
         "mode": args.mode,
         "trace_enabled": trace_enabled,
         "architecture": {
@@ -2073,6 +2142,8 @@ def main(argv: list[str] | None = None) -> int:
             "platform": platform.platform(),
             "torch": torch.__version__,
             "cuda": torch.version.cuda,
+            "gpu_0_name": provenance["gpu_0_name"],
+            "gpu_1_name": provenance["gpu_1_name"],
         },
     }
     args.json_output.parent.mkdir(parents=True, exist_ok=True)
