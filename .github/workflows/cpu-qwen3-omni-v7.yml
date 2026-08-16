@@ -11,7 +11,7 @@ permissions:
 
 env:
   # Exact MOSS-TTS BCG candidate under validation.
-  TARGET_SHA: 4e75b74ad635e5abd88df1d4e93e9878b51fd9ac
+  TARGET_SHA: 40f2d8892000b639ab5524628e83e0d97801b34a
   # Exact base before the MOSS-TTS adopter commits.
   BASE_SHA: 9bc2cd7d91059c88565c163344d9a094d4cbd5d3
   TEST_VENV: /tmp/sglang-omni-cpu-venv
