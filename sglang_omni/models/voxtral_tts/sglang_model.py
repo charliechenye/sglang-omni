@@ -208,7 +208,11 @@ class VoxtralSGLangTTSModel(nn.Module):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor | None = None,
+        omni_prefill_rids: list[str] | tuple[str, ...] | None = None,
     ) -> LogitsProcessorOutput:
+        # note (chenye): Accepted as part of the shared Omni prefill sidecar contract.
+        # Voxtral's eager outer tail does not currently require request identity.
+        del omni_prefill_rids
         if input_embeds is None and forward_batch.forward_mode.is_decode():
             input_embeds = self._decode_input_embed_buffer[: input_ids.shape[0]]
         hidden_states = self.language_model(
