@@ -150,6 +150,43 @@ class Track22TransportBenchmarkTest(unittest.TestCase):
         self.assertTrue(BENCHMARK._stable_non_regression(stats(-4.0, 100.0)))
         self.assertFalse(BENCHMARK._stable_non_regression(stats(-6.0, 100.0)))
 
+    def test_bf16_expected_pattern_uses_bf16_construction(self) -> None:
+        class FakeTensor:
+            def __init__(self, values: list[float], dtype: object, device: str):
+                self.values = values
+                self.dtype = dtype
+                self.device = device
+
+        class FakeTorch:
+            bfloat16 = object()
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[int, object, str]] = []
+
+            def arange(self, length: int, *, dtype: object, device: str) -> FakeTensor:
+                self.calls.append((length, dtype, device))
+                values = [float(index) for index in range(length)]
+                values[-1] = 2048.0
+                return FakeTensor(values, dtype, device)
+
+        fake_torch = FakeTorch()
+        original_torch = BENCHMARK.torch
+        original_load_runtime = BENCHMARK._load_runtime
+        BENCHMARK.torch = fake_torch
+        BENCHMARK._load_runtime = lambda: None
+        try:
+            expected = BENCHMARK._expected_bf16_pattern(device="cpu")
+        finally:
+            BENCHMARK.torch = original_torch
+            BENCHMARK._load_runtime = original_load_runtime
+
+        self.assertEqual(
+            fake_torch.calls,
+            [(2048, fake_torch.bfloat16, "cpu")],
+        )
+        self.assertEqual(expected.values[-1], 2048.0)
+        self.assertNotEqual(expected.values[-1], 2047.0)
+
 
 class Track22TransportAsyncTest(unittest.IsolatedAsyncioTestCase):
     async def _bare_control(self) -> tuple[object, asyncio.Future[int]]:

@@ -557,6 +557,15 @@ def _run_key_and_request_index(request_id: str) -> tuple[str, int]:
     return run_key, int(raw_index)
 
 
+def _expected_bf16_pattern(*, device: Any) -> torch.Tensor:
+    _load_runtime()
+    return torch.arange(
+        2048,
+        dtype=_torch_dtype("torch.bfloat16"),
+        device=device,
+    )
+
+
 def _validate_received_payload(
     arm: ArmSpec,
     data: torch.Tensor,
@@ -606,14 +615,13 @@ def _validate_received_payload(
     if not check_contents:
         return
     if arm.name in {"A", "B"}:
-        if float(data[0].item()) != 0.0 or float(data[-1].item()) != 2047.0:
+        expected = _expected_bf16_pattern(device=data.device)
+        if not torch.equal(data, expected):
             raise AssertionError("BF16 primary content check failed")
         if arm.metadata_layer_hidden:
             assert isinstance(layer_hidden, torch.Tensor)
-            if (
-                float(layer_hidden[0].item()) != 0.0
-                or float(layer_hidden[-1].item()) != 2047.0
-            ):
+            expected_layer_hidden = _expected_bf16_pattern(device=layer_hidden.device)
+            if not torch.equal(layer_hidden, expected_layer_hidden):
                 raise AssertionError("BF16 layer_hidden content check failed")
     elif int(data[0].item()) != 17:
         raise AssertionError(f"carrier content check failed for arm {arm.name}")
