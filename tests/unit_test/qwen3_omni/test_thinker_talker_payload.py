@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from sglang_omni.models.qwen3_omni.components.talker_input import (
+    build_prefill_input,
     build_user_part,
 )
 from sglang_omni.models.qwen3_omni.components.talker_prefill import (
@@ -27,6 +28,8 @@ IM_START = 1
 USER = 2
 ASSISTANT = 3
 IM_END = 99
+AUDIO_TOKEN = 40
+IMAGE_TOKEN = 41
 
 
 def _fake_prefill_builder() -> TalkerPrefillBuilder:
@@ -122,6 +125,190 @@ def _assert_prefill_equal(left: dict, right: dict) -> None:
     assert len(left_rows) == len(right_rows)
     for left_row, right_row in zip(left_rows, right_rows):
         assert torch.equal(left_row, right_row)
+
+
+def _mixed_prompt_inputs() -> tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """Return one mixed user prompt followed by a multi-token assistant turn."""
+    thinker_input_ids = torch.tensor(
+        [
+            IM_START,
+            USER,
+            10,
+            AUDIO_TOKEN,
+            11,
+            IMAGE_TOKEN,
+            12,
+            IM_START,
+            ASSISTANT,
+            70,
+            71,
+            72,
+            73,
+            74,
+        ],
+        dtype=torch.long,
+    )
+    thinker_embed = (
+        thinker_input_ids.to(dtype=torch.float32)
+        .unsqueeze(1)
+        .expand(-1, HIDDEN)
+        .clone()
+    )
+    thinker_hidden = torch.arange(
+        thinker_input_ids.numel() * HIDDEN, dtype=torch.float32
+    ).reshape(-1, HIDDEN)
+    multimodal_mask = (thinker_input_ids == AUDIO_TOKEN) | (
+        thinker_input_ids == IMAGE_TOKEN
+    )
+    return thinker_embed, thinker_input_ids, thinker_hidden, multimodal_mask
+
+
+def _build_mixed_prefill(
+    builder: TalkerPrefillBuilder,
+    thinker_embed: torch.Tensor,
+    thinker_input_ids: torch.Tensor,
+    thinker_hidden: torch.Tensor,
+    multimodal_mask: torch.Tensor,
+) -> dict[str, torch.Tensor | None]:
+    tts_bos_embed, tts_eos_embed, tts_pad_embed = builder.get_tts_special_embeds()
+    return build_prefill_input(
+        thinker_embed=thinker_embed,
+        thinker_hidden=thinker_hidden,
+        thinker_input_ids=thinker_input_ids,
+        multimodal_mask=multimodal_mask,
+        text_projection=builder._model.text_projection,
+        hidden_projection=builder._model.hidden_projection,
+        codec_embed_fn=builder._model.get_input_embeddings,
+        tts_bos_embed=tts_bos_embed,
+        tts_eos_embed=tts_eos_embed,
+        tts_pad_embed=tts_pad_embed,
+        im_start_token_id=builder._im_start_token_id,
+        system_token_id=builder._system_token_id,
+        user_token_id=builder._user_token_id,
+        assistant_token_id=builder._assistant_token_id,
+        speaker_id=0,
+        codec_nothink_id=5,
+        codec_think_bos_id=6,
+        codec_think_eos_id=7,
+        codec_pad_id=8,
+        codec_bos_id=9,
+        tts_pad_token_id=10,
+        im_end_token_id=builder._im_end_token_id,
+    )
+
+
+def _assert_direct_prefill_equal(
+    left: dict[str, torch.Tensor | None], right: dict[str, torch.Tensor | None]
+) -> None:
+    for key in ("input_embeds", "input_ids", "future_text_rows"):
+        left_value = left[key]
+        right_value = right[key]
+        assert left_value is not None
+        assert right_value is not None
+        assert torch.equal(left_value, right_value), key
+
+
+def test_mixed_prompt_has_text_and_multiple_multimodal_positions() -> None:
+    _, thinker_input_ids, _, multimodal_mask = _mixed_prompt_inputs()
+
+    user_ids = thinker_input_ids[2:7]
+    user_mask = multimodal_mask[2:7]
+    assert user_ids[~user_mask].tolist() == [10, 11, 12]
+    assert user_ids[user_mask].tolist() == [AUDIO_TOKEN, IMAGE_TOKEN]
+
+
+def test_text_prompt_hidden_rows_do_not_affect_talker_prefill() -> None:
+    """Poisoning every non-multimodal hidden row leaves Talker input exact."""
+    builder = _fake_prefill_builder()
+    thinker_embed, thinker_input_ids, thinker_hidden, multimodal_mask = (
+        _mixed_prompt_inputs()
+    )
+    poisoned_hidden = thinker_hidden.clone()
+    poisoned_hidden[~multimodal_mask] = torch.full_like(
+        poisoned_hidden[~multimodal_mask], -1234.0
+    )
+    assert torch.equal(
+        poisoned_hidden[multimodal_mask], thinker_hidden[multimodal_mask]
+    )
+
+    normal = _build_mixed_prefill(
+        builder,
+        thinker_embed,
+        thinker_input_ids,
+        thinker_hidden,
+        multimodal_mask,
+    )
+    poisoned = _build_mixed_prefill(
+        builder,
+        thinker_embed,
+        thinker_input_ids,
+        poisoned_hidden,
+        multimodal_mask,
+    )
+
+    _assert_direct_prefill_equal(normal, poisoned)
+
+
+def test_multimodal_prompt_hidden_rows_change_corresponding_talker_rows() -> None:
+    """Changing multimodal prompt hidden rows changes only their projections."""
+    builder = _fake_prefill_builder()
+    thinker_embed, thinker_input_ids, thinker_hidden, multimodal_mask = (
+        _mixed_prompt_inputs()
+    )
+    changed_hidden = thinker_hidden.clone()
+    changed_hidden[multimodal_mask] += torch.tensor(
+        [[100.0] * HIDDEN, [200.0] * HIDDEN]
+    )
+
+    normal = _build_mixed_prefill(
+        builder,
+        thinker_embed,
+        thinker_input_ids,
+        thinker_hidden,
+        multimodal_mask,
+    )
+    changed = _build_mixed_prefill(
+        builder,
+        thinker_embed,
+        thinker_input_ids,
+        changed_hidden,
+        multimodal_mask,
+    )
+
+    assert torch.equal(normal["input_ids"], changed["input_ids"])
+    assert torch.equal(normal["future_text_rows"], changed["future_text_rows"])
+    changed_rows = (normal["input_embeds"] != changed["input_embeds"]).any(dim=1)
+    multimodal_rows = multimodal_mask.nonzero(as_tuple=True)[0].tolist()
+    assert changed_rows.nonzero(as_tuple=True)[0].tolist() == multimodal_rows
+
+
+def test_sparse_non_multimodal_hidden_is_equivalent_through_prefill() -> None:
+    """Keeping only multimodal prompt hidden rows preserves all Talker outputs."""
+    builder = _fake_prefill_builder()
+    thinker_embed, thinker_input_ids, thinker_hidden, multimodal_mask = (
+        _mixed_prompt_inputs()
+    )
+    sparse_hidden = torch.zeros_like(thinker_hidden)
+    sparse_hidden[multimodal_mask] = thinker_hidden[multimodal_mask]
+
+    normal = _build_mixed_prefill(
+        builder,
+        thinker_embed,
+        thinker_input_ids,
+        thinker_hidden,
+        multimodal_mask,
+    )
+    sparse = _build_mixed_prefill(
+        builder,
+        thinker_embed,
+        thinker_input_ids,
+        sparse_hidden,
+        multimodal_mask,
+    )
+
+    _assert_direct_prefill_equal(normal, sparse)
 
 
 @pytest.mark.parametrize("assistant_count", [3, 4, 5])
