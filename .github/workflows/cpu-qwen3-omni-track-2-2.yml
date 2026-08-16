@@ -1,4 +1,4 @@
-name: "Qwen3-Omni Track 2.2 CPU contracts"
+name: "Qwen3-Omni Track 2.2 CPU validation"
 
 on:
   push:
@@ -17,33 +17,20 @@ env:
 
 jobs:
   qwen3-omni-cpu:
-    name: "Qwen3-Omni #1514 CPU gate"
+    name: "Qwen3-Omni Track 2.2 CPU gate"
     runs-on: ubuntu-latest
     timeout-minutes: 90
 
-    # Reuse the pinned environment previously used successfully for
-    # Qwen3-Omni CPU qualification. It already contains the heavyweight
-    # torch/sglang/transformers runtime.
     container:
       image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
 
     steps:
-      # -----------------------------------------------------------------------
-      # 1. Checkout the exact #1514 candidate.
-      #
-      # The workflow file itself lives on the temporary cpu-validation branch.
-      # The source tree tested below is exactly TARGET_SHA.
-      # -----------------------------------------------------------------------
-
-      - name: "Checkout #1514 candidate"
+      - name: "Checkout Track 2.2 candidate"
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
 
-      # actions/checkout configures safe.directory using a temporary HOME.
-      # Commands below execute inside the job container with HOME=/github/home,
-      # so explicitly trust only this workspace.
       - name: Configure Git safe directory
         shell: bash
         run: |
@@ -91,11 +78,6 @@ jobs:
           echo "=== Filesystem ==="
           df -h
 
-      # -----------------------------------------------------------------------
-      # 2. Confirm the pinned container still provides the heavyweight runtime.
-      #    Do NOT reinstall torch/sglang/transformers.
-      # -----------------------------------------------------------------------
-
       - name: Inspect preinstalled runtime
         shell: bash
         run: |
@@ -103,7 +85,6 @@ jobs:
 
           python - <<'PY'
           import sys
-
           import numpy
           import pydantic
           import sglang
@@ -121,10 +102,6 @@ jobs:
           print("torch.cuda.is_available:", torch.cuda.is_available())
           print("preinstalled runtime: OK")
           PY
-
-      # -----------------------------------------------------------------------
-      # 3. Create a small test-tools venv.
-      # -----------------------------------------------------------------------
 
       - name: Create CPU test virtualenv
         shell: bash
@@ -162,44 +139,27 @@ jobs:
 
           "${TEST_VENV}/bin/python" -m pre_commit --version
 
-      # -----------------------------------------------------------------------
-      # 4. #1514 load-bearing focused tests.
-      #
-      # Each test step uses continue-on-error so all evidence is collected.
-      # The final gate below fails once after every check has run.
-      # -----------------------------------------------------------------------
-
-      - name: Shared Thinker multimodal merge contract
-        id: mm_merge
+      - name: Thinker to Talker payload contracts
+        id: payload_contract
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
 
           "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py
+            tests/unit_test/qwen3_omni/test_thinker_talker_payload.py
 
-      - name: Qwen prefill and inherited eager fallback contract
-        id: prefill_contract
+      - name: Qwen3-Omni streaming regression
+        id: streaming
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
 
           "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py
+            tests/unit_test/qwen3_omni/test_streaming.py
 
-      - name: Direct ThinkerModelRunner contract
-        id: thinker_runner
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/qwen3_omni/test_thinker_model_runner.py
-
-      - name: Qwen3-Omni pipeline and bootstrap regression
+      - name: Qwen3-Omni pipeline regression
         id: pipeline
         continue-on-error: true
         shell: bash
@@ -208,22 +168,6 @@ jobs:
 
           "${TEST_VENV}/bin/python" -m pytest -q \
             tests/unit_test/qwen3_omni/test_pipeline.py
-
-      # -----------------------------------------------------------------------
-      # 5. Broad CPU-compatible Qwen3-Omni regression coverage.
-      #
-      # Known CPU exclusions:
-      #
-      # - test_talker.py / test_talker_attention.py:
-      #   collection requires CUDA-loaded sgl_kernel operators.
-      #
-      # - Two Code2Wav CUDA-graph factory tests:
-      #   explicitly exercise CUDA device normalization through
-      #   current_platform.get_device(...). On this GitHub CPU runner SGLang
-      #   reports device=unknown and get_device() is unsupported.
-      #
-      # Keep every other Code2Wav test in the CPU sweep.
-      # -----------------------------------------------------------------------
 
       - name: CPU-compatible Qwen3-Omni unit suite
         id: qwen_cpu
@@ -239,13 +183,7 @@ jobs:
             --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys \
             --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_enabled_factory_logs_disabled_build_reason
 
-      # -----------------------------------------------------------------------
-      # 6. Candidate scope and source hygiene.
-      #
-      # #1514 is intentionally limited to four reviewed files.
-      # -----------------------------------------------------------------------
-
-      - name: Verify #1514 patch scope
+      - name: Verify Track 2.2 investigation patch scope
         id: scope
         continue-on-error: true
         shell: bash
@@ -253,12 +191,7 @@ jobs:
           set -euxo pipefail
 
           actual="$(git diff --name-only "${BASE_SHA}...${TARGET_SHA}" | sort)"
-          expected="$(printf '%s\n' \
-            'sglang_omni/model_runner/thinker_model_runner.py' \
-            'sglang_omni/models/qwen3_omni/thinker_model_runner.py' \
-            'tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py' \
-            'tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py' \
-            | sort)"
+          expected="tests/unit_test/qwen3_omni/test_thinker_talker_payload.py"
 
           echo "=== Expected changed files ==="
           printf '%s\n' "${expected}"
@@ -280,10 +213,7 @@ jobs:
 
           "${TEST_VENV}/bin/python" -m pre_commit run \
             --files \
-            sglang_omni/model_runner/thinker_model_runner.py \
-            sglang_omni/models/qwen3_omni/thinker_model_runner.py \
-            tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py \
-            tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py \
+            tests/unit_test/qwen3_omni/test_thinker_talker_payload.py \
             --show-diff-on-failure
 
       - name: Committed diff and working-tree sanity
@@ -301,15 +231,11 @@ jobs:
 
           test -z "$(git status --porcelain)"
 
-      # -----------------------------------------------------------------------
-      # 7. Always publish a concise evidence summary.
-      # -----------------------------------------------------------------------
-
       - name: CPU validation summary
         if: always()
         shell: bash
         run: |
-          echo "## Qwen3-Omni #1514 CPU validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Qwen3-Omni Track 2.2 CPU validation" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Candidate: \`${TARGET_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
@@ -317,26 +243,20 @@ jobs:
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check | Outcome |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Shared Thinker multimodal merge | ${{ steps.mm_merge.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Qwen prefill / eager fallback contract | ${{ steps.prefill_contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Direct ThinkerModelRunner contract | ${{ steps.thinker_runner.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pipeline / bootstrap regression | ${{ steps.pipeline.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Thinker to Talker payload contracts | ${{ steps.payload_contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Streaming regression | ${{ steps.streaming.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pipeline regression | ${{ steps.pipeline.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| CPU-compatible Qwen3-Omni suite | ${{ steps.qwen_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Exact four-file scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pre-commit changed files | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Exact investigation scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pre-commit changed file | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Diff / working-tree sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
 
-      # -----------------------------------------------------------------------
-      # 8. Fail exactly once after every check has had a chance to run.
-      # -----------------------------------------------------------------------
-
-      - name: Final #1514 CPU validation gate
+      - name: Final Track 2.2 CPU validation gate
         if: always()
         shell: bash
         env:
-          MM_MERGE: ${{ steps.mm_merge.outcome }}
-          PREFILL_CONTRACT: ${{ steps.prefill_contract.outcome }}
-          THINKER_RUNNER: ${{ steps.thinker_runner.outcome }}
+          PAYLOAD_CONTRACT: ${{ steps.payload_contract.outcome }}
+          STREAMING: ${{ steps.streaming.outcome }}
           PIPELINE: ${{ steps.pipeline.outcome }}
           QWEN_CPU: ${{ steps.qwen_cpu.outcome }}
           SCOPE: ${{ steps.scope.outcome }}
@@ -359,10 +279,9 @@ jobs:
             fi
           }
 
-          check "shared-mm-merge" "${MM_MERGE}"
-          check "prefill-contract" "${PREFILL_CONTRACT}"
-          check "direct-thinker-runner" "${THINKER_RUNNER}"
-          check "pipeline-bootstrap" "${PIPELINE}"
+          check "payload-contract" "${PAYLOAD_CONTRACT}"
+          check "streaming" "${STREAMING}"
+          check "pipeline" "${PIPELINE}"
           check "qwen-cpu" "${QWEN_CPU}"
           check "patch-scope" "${SCOPE}"
           check "precommit" "${PRECOMMIT}"
@@ -370,10 +289,10 @@ jobs:
 
           if [[ "${failed}" -ne 0 ]]; then
             echo
-            echo "One or more #1514 CPU validation checks failed."
-            echo "Review every failed step above before opening the upstream PR."
+            echo "One or more Track 2.2 CPU validation checks failed."
+            echo "Review every failed step above before proceeding to GPU measurement."
             exit 1
           fi
 
           echo
-          echo "All #1514 CPU validation checks passed."
+          echo "All Track 2.2 CPU validation checks passed."
