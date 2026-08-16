@@ -1,59 +1,36 @@
-name: "Qwen3-Omni #1514 CPU validation"
+name: "MOSS-TTS BCG CPU validation"
 
 on:
   push:
     branches:
       - cpu-validation/qwen3-omni-pcg-v7
-
-  # This becomes manually usable if/when the workflow also exists
-  # on the repository default branch. The push trigger above is
-  # the primary trigger for this temporary validation branch.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 env:
-  # Exact #1514 candidate under validation. Keep this pinned so the
-  # validation result is attributable to the exact tree intended for PR.
-  TARGET_SHA: b3b6ffa6c5011726eb70bc1bf02bc5950b85a985
-
-  # Exact direct parent/base of TARGET_SHA.
-  BASE_SHA: e0c98529e5730f60e19251025877387b9476c8d4
-
-  # Keep test tooling isolated from the container's system Python,
-  # while inheriting its preinstalled SGLang/PyTorch runtime packages.
+  # Exact MOSS-TTS BCG candidate under validation.
+  TARGET_SHA: 347ef512f969753d989e7a44615570186b9ad577
+  # Exact direct parent, which is current upstream main at candidate creation.
+  BASE_SHA: 9bc2cd7d91059c88565c163344d9a094d4cbd5d3
   TEST_VENV: /tmp/sglang-omni-cpu-venv
 
 jobs:
-  qwen3-omni-cpu:
-    name: "Qwen3-Omni #1514 CPU gate"
+  moss-tts-cpu:
+    name: "MOSS-TTS BCG CPU gate"
     runs-on: ubuntu-latest
     timeout-minutes: 90
-
-    # Reuse the pinned environment previously used successfully for
-    # Qwen3-Omni CPU qualification. It already contains the heavyweight
-    # torch/sglang/transformers runtime.
     container:
       image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
 
     steps:
-      # -----------------------------------------------------------------------
-      # 1. Checkout the exact #1514 candidate.
-      #
-      # The workflow file itself lives on the temporary cpu-validation branch.
-      # The source tree tested below is exactly TARGET_SHA.
-      # -----------------------------------------------------------------------
-
-      - name: "Checkout #1514 candidate"
+      - name: Checkout exact MOSS-TTS candidate
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
 
-      # actions/checkout configures safe.directory using a temporary HOME.
-      # Commands below execute inside the job container with HOME=/github/home,
-      # so explicitly trust only this workspace.
       - name: Configure Git safe directory
         shell: bash
         run: |
@@ -64,225 +41,146 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
           ACTUAL="$(git rev-parse HEAD)"
           ACTUAL_PARENT="$(git rev-parse "${TARGET_SHA}^")"
-
-          echo "Expected candidate SHA: ${TARGET_SHA}"
-          echo "Actual candidate SHA:   ${ACTUAL}"
-          echo "Expected base SHA:      ${BASE_SHA}"
-          echo "Actual parent SHA:      ${ACTUAL_PARENT}"
-
           test "${ACTUAL}" = "${TARGET_SHA}"
-          git cat-file -e "${BASE_SHA}^{commit}"
-          git merge-base --is-ancestor "${BASE_SHA}" "${TARGET_SHA}"
           test "${ACTUAL_PARENT}" = "${BASE_SHA}"
-
-          echo
+          git merge-base --is-ancestor "${BASE_SHA}" "${TARGET_SHA}"
           echo "=== Candidate commits ==="
           git log --oneline "${BASE_SHA}..${TARGET_SHA}"
-
-          echo
           echo "=== Candidate diff stat ==="
           git diff --stat "${BASE_SHA}...${TARGET_SHA}"
-
-          echo
           echo "=== Candidate changed files ==="
           git diff --name-only "${BASE_SHA}...${TARGET_SHA}"
-
-          echo
-          echo "=== Git status ==="
-          git status --short
-
-          echo
-          echo "=== Host/container information ==="
+          echo "=== Runtime ==="
           uname -a
-          uname -m
           python --version
-
-          echo
-          echo "=== Filesystem ==="
-          df -h
-
-      # -----------------------------------------------------------------------
-      # 2. Confirm the pinned container still provides the heavyweight runtime.
-      #    Do NOT reinstall torch/sglang/transformers.
-      # -----------------------------------------------------------------------
 
       - name: Inspect preinstalled runtime
         shell: bash
         run: |
           set -euxo pipefail
-
           python - <<'PY'
           import sys
-
           import numpy
           import pydantic
           import sglang
           import torch
           import transformers
-          import typer
-
           print("python:", sys.version)
           print("torch:", torch.__version__)
           print("transformers:", transformers.__version__)
           print("sglang:", getattr(sglang, "__version__", "unknown"))
           print("numpy:", numpy.__version__)
           print("pydantic:", pydantic.__version__)
-          print("typer:", typer.__version__)
           print("torch.cuda.is_available:", torch.cuda.is_available())
-          print("preinstalled runtime: OK")
           PY
-
-      # -----------------------------------------------------------------------
-      # 3. Create a small test-tools venv.
-      # -----------------------------------------------------------------------
 
       - name: Create CPU test virtualenv
         shell: bash
         run: |
           set -euxo pipefail
-
           if ! python -m venv --system-site-packages "${TEST_VENV}"; then
-            echo "python venv support missing; installing python3.12-venv"
             apt-get update
             apt-get install -y --no-install-recommends python3.12-venv
             rm -rf "${TEST_VENV}"
             python -m venv --system-site-packages "${TEST_VENV}"
           fi
-
           "${TEST_VENV}/bin/python" - <<'PY'
-          import numpy
-          import pydantic
-          import pre_commit
-          import pytest
-          import sglang
-          import torch
-          import transformers
-          import typer
-
-          print("torch:", torch.__version__)
-          print("transformers:", transformers.__version__)
-          print("sglang:", getattr(sglang, "__version__", "unknown"))
-          print("numpy:", numpy.__version__)
-          print("pydantic:", pydantic.__version__)
-          print("typer:", typer.__version__)
+          import pre_commit, pytest, sglang, torch, transformers
           print("pytest:", pytest.__version__)
           print("pre_commit:", pre_commit.__file__)
-          print("test virtualenv: OK")
+          print("sglang:", getattr(sglang, "__version__", "unknown"))
+          print("torch:", torch.__version__)
+          print("transformers:", transformers.__version__)
           PY
 
-          "${TEST_VENV}/bin/python" -m pre_commit --version
-
-      # -----------------------------------------------------------------------
-      # 4. #1514 load-bearing focused tests.
-      #
-      # Each test step uses continue-on-error so all evidence is collected.
-      # The final gate below fails once after every check has run.
-      # -----------------------------------------------------------------------
-
-      - name: Shared Thinker multimodal merge contract
-        id: mm_merge
+      # Candidate-specific contract checks. Continue so the run collects all evidence.
+      - name: MOSS prefill sidecar contract
+        id: sidecar
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
-
           "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py
+            tests/unit_test/moss_tts/test_pipeline.py::test_moss_prefill_forward_uses_prompt_row_embeds \
+            tests/unit_test/model_runner/test_prefill_inputs.py \
+            tests/unit_test/model_runner/test_prefill_forward_kwargs.py
 
-      - name: Qwen prefill and inherited eager fallback contract
-        id: prefill_contract
+      - name: MOSS BCG capability contract
+        id: capability
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
-
           "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py
+            tests/unit_test/moss_tts/test_sampling_cuda_graph.py::test_engine_builder_allows_breakable_prefill_as_an_opt_in \
+            tests/unit_test/models/test_model_capabilities.py
 
-      - name: Direct ThinkerModelRunner contract
-        id: thinker_runner
+      - name: Late-bound model forward compatibility
+        id: forward_contract
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
+          "${TEST_VENV}/bin/python" - <<'PY'
+          import inspect
 
-          "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/qwen3_omni/test_thinker_model_runner.py
+          from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
 
-      - name: Qwen3-Omni pipeline and bootstrap regression
-        id: pipeline
+          params = inspect.signature(MossTTSDelaySGLangModel.forward).parameters
+          accepts_kwargs = any(
+              p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
+          )
+          print("MossTTSDelaySGLangModel.forward parameters:", list(params))
+          for required in ("input_embeds", "omni_prefill_rids"):
+              if required not in params and not accepts_kwargs:
+                  raise AssertionError(
+                      f"late-bound Omni prefill kwarg {required!r} is not accepted "
+                      "by MossTTSDelaySGLangModel.forward"
+                  )
+          print("late-bound forward contract: OK")
+          PY
+
+      - name: CPU-compatible MOSS-TTS unit suite
+        id: moss_cpu
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pytest -q tests/unit_test/moss_tts
 
-          "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/qwen3_omni/test_pipeline.py
-
-      # -----------------------------------------------------------------------
-      # 5. Broad CPU-compatible Qwen3-Omni regression coverage.
-      #
-      # Known CPU exclusions:
-      #
-      # - test_talker.py / test_talker_attention.py:
-      #   collection requires CUDA-loaded sgl_kernel operators.
-      #
-      # - Two Code2Wav CUDA-graph factory tests:
-      #   explicitly exercise CUDA device normalization through
-      #   current_platform.get_device(...). On this GitHub CPU runner SGLang
-      #   reports device=unknown and get_device() is unsupported.
-      #
-      # Keep every other Code2Wav test in the CPU sweep.
-      # -----------------------------------------------------------------------
-
-      - name: CPU-compatible Qwen3-Omni unit suite
-        id: qwen_cpu
+      - name: Shared prefill infrastructure regression
+        id: shared_prefill
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
-
           "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/qwen3_omni \
-            --ignore=tests/unit_test/qwen3_omni/test_talker.py \
-            --ignore=tests/unit_test/qwen3_omni/test_talker_attention.py \
-            --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_enabled_factory_normalizes_device_and_derives_graph_keys \
-            --deselect=tests/unit_test/qwen3_omni/test_code2wav.py::test_qwen_code2wav_enabled_factory_logs_disabled_build_reason
+            tests/unit_test/model_runner/test_prefill_inputs.py \
+            tests/unit_test/model_runner/test_prefill_forward_kwargs.py \
+            tests/unit_test/model_runner/test_cuda_graph_batch_validator.py
 
-      # -----------------------------------------------------------------------
-      # 6. Candidate scope and source hygiene.
-      #
-      # #1514 is intentionally limited to four reviewed files.
-      # -----------------------------------------------------------------------
-
-      - name: Verify #1514 patch scope
+      - name: Verify MOSS-TTS candidate patch scope
         id: scope
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
-
           actual="$(git diff --name-only "${BASE_SHA}...${TARGET_SHA}" | sort)"
           expected="$(printf '%s\n' \
-            'sglang_omni/model_runner/thinker_model_runner.py' \
-            'sglang_omni/models/qwen3_omni/thinker_model_runner.py' \
-            'tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py' \
-            'tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py' \
+            'sglang_omni/models/moss_tts/__init__.py' \
+            'sglang_omni/models/moss_tts/engine_builder.py' \
+            'sglang_omni/models/moss_tts/model_runner.py' \
+            'tests/unit_test/models/test_model_capabilities.py' \
+            'tests/unit_test/moss_tts/test_pipeline.py' \
+            'tests/unit_test/moss_tts/test_sampling_cuda_graph.py' \
             | sort)"
-
-          echo "=== Expected changed files ==="
+          echo "=== Expected ==="
           printf '%s\n' "${expected}"
-
-          echo
-          echo "=== Actual changed files ==="
+          echo "=== Actual ==="
           printf '%s\n' "${actual}"
-
-          diff -u \
-            <(printf '%s\n' "${expected}") \
-            <(printf '%s\n' "${actual}")
+          diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}")
 
       - name: Pre-commit on changed files
         id: precommit
@@ -290,80 +188,63 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-
-          "${TEST_VENV}/bin/python" -m pre_commit run \
-            --files \
-            sglang_omni/model_runner/thinker_model_runner.py \
-            sglang_omni/models/qwen3_omni/thinker_model_runner.py \
-            tests/unit_test/qwen3_omni/test_thinker_mm_embed_merge.py \
-            tests/unit_test/qwen3_omni/test_thinker_prefill_contract.py \
+          "${TEST_VENV}/bin/python" -m pre_commit run --files \
+            sglang_omni/models/moss_tts/__init__.py \
+            sglang_omni/models/moss_tts/engine_builder.py \
+            sglang_omni/models/moss_tts/model_runner.py \
+            tests/unit_test/models/test_model_capabilities.py \
+            tests/unit_test/moss_tts/test_pipeline.py \
+            tests/unit_test/moss_tts/test_sampling_cuda_graph.py \
             --show-diff-on-failure
 
-      - name: Committed diff and working-tree sanity
+      - name: Diff and working-tree sanity
         id: diff_sanity
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
-
           git diff --check "${BASE_SHA}...${TARGET_SHA}"
-
-          echo
-          echo "=== Git status after tests and pre-commit ==="
           git status --short
-
           test -z "$(git status --porcelain)"
-
-      # -----------------------------------------------------------------------
-      # 7. Always publish a concise evidence summary.
-      # -----------------------------------------------------------------------
 
       - name: CPU validation summary
         if: always()
         shell: bash
         run: |
-          echo "## Qwen3-Omni #1514 CPU validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "## MOSS-TTS BCG CPU validation" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Candidate: \`${TARGET_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Base: \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check | Outcome |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Shared Thinker multimodal merge | ${{ steps.mm_merge.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Qwen prefill / eager fallback contract | ${{ steps.prefill_contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Direct ThinkerModelRunner contract | ${{ steps.thinker_runner.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pipeline / bootstrap regression | ${{ steps.pipeline.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| CPU-compatible Qwen3-Omni suite | ${{ steps.qwen_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Exact four-file scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Pre-commit changed files | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Diff / working-tree sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Prefill sidecar | ${{ steps.sidecar.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| BCG capability | ${{ steps.capability.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Late-bound model forward | ${{ steps.forward_contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| MOSS-TTS CPU suite | ${{ steps.moss_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Shared prefill infrastructure | ${{ steps.shared_prefill.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Exact candidate scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pre-commit | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Diff sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
 
-      # -----------------------------------------------------------------------
-      # 8. Fail exactly once after every check has had a chance to run.
-      # -----------------------------------------------------------------------
-
-      - name: Final #1514 CPU validation gate
+      - name: Final MOSS-TTS CPU validation gate
         if: always()
         shell: bash
         env:
-          MM_MERGE: ${{ steps.mm_merge.outcome }}
-          PREFILL_CONTRACT: ${{ steps.prefill_contract.outcome }}
-          THINKER_RUNNER: ${{ steps.thinker_runner.outcome }}
-          PIPELINE: ${{ steps.pipeline.outcome }}
-          QWEN_CPU: ${{ steps.qwen_cpu.outcome }}
+          SIDECAR: ${{ steps.sidecar.outcome }}
+          CAPABILITY: ${{ steps.capability.outcome }}
+          FORWARD_CONTRACT: ${{ steps.forward_contract.outcome }}
+          MOSS_CPU: ${{ steps.moss_cpu.outcome }}
+          SHARED_PREFILL: ${{ steps.shared_prefill.outcome }}
           SCOPE: ${{ steps.scope.outcome }}
           PRECOMMIT: ${{ steps.precommit.outcome }}
           DIFF_SANITY: ${{ steps.diff_sanity.outcome }}
         run: |
           set -euxo pipefail
-
           failed=0
-
           check() {
             local name="$1"
             local outcome="$2"
-
             if [[ "${outcome}" != "success" ]]; then
               echo "::error::${name} outcome=${outcome}"
               failed=1
@@ -371,22 +252,16 @@ jobs:
               echo "${name}: success"
             fi
           }
-
-          check "shared-mm-merge" "${MM_MERGE}"
-          check "prefill-contract" "${PREFILL_CONTRACT}"
-          check "direct-thinker-runner" "${THINKER_RUNNER}"
-          check "pipeline-bootstrap" "${PIPELINE}"
-          check "qwen-cpu" "${QWEN_CPU}"
+          check "prefill-sidecar" "${SIDECAR}"
+          check "bcg-capability" "${CAPABILITY}"
+          check "late-bound-forward" "${FORWARD_CONTRACT}"
+          check "moss-cpu-suite" "${MOSS_CPU}"
+          check "shared-prefill" "${SHARED_PREFILL}"
           check "patch-scope" "${SCOPE}"
           check "precommit" "${PRECOMMIT}"
           check "diff-sanity" "${DIFF_SANITY}"
-
           if [[ "${failed}" -ne 0 ]]; then
-            echo
-            echo "One or more #1514 CPU validation checks failed."
-            echo "Review every failed step above before opening the upstream PR."
+            echo "One or more MOSS-TTS CPU validation checks failed."
             exit 1
           fi
-
-          echo
-          echo "All #1514 CPU validation checks passed."
+          echo "All MOSS-TTS CPU validation checks passed."
