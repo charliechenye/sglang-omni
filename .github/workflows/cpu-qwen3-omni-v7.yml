@@ -11,8 +11,8 @@ permissions:
 
 env:
   # Exact MOSS-TTS BCG candidate under validation.
-  TARGET_SHA: 347ef512f969753d989e7a44615570186b9ad577
-  # Exact direct parent, which is current upstream main at candidate creation.
+  TARGET_SHA: 4e75b74ad635e5abd88df1d4e93e9878b51fd9ac
+  # Exact base before the MOSS-TTS adopter commits.
   BASE_SHA: 9bc2cd7d91059c88565c163344d9a094d4cbd5d3
   TEST_VENV: /tmp/sglang-omni-cpu-venv
 
@@ -42,9 +42,8 @@ jobs:
         run: |
           set -euxo pipefail
           ACTUAL="$(git rev-parse HEAD)"
-          ACTUAL_PARENT="$(git rev-parse "${TARGET_SHA}^")"
           test "${ACTUAL}" = "${TARGET_SHA}"
-          test "${ACTUAL_PARENT}" = "${BASE_SHA}"
+          git cat-file -e "${BASE_SHA}^{commit}"
           git merge-base --is-ancestor "${BASE_SHA}" "${TARGET_SHA}"
           echo "=== Candidate commits ==="
           git log --oneline "${BASE_SHA}..${TARGET_SHA}"
@@ -95,7 +94,6 @@ jobs:
           print("transformers:", transformers.__version__)
           PY
 
-      # Candidate-specific contract checks. Continue so the run collects all evidence.
       - name: MOSS prefill sidecar contract
         id: sidecar
         continue-on-error: true
@@ -104,6 +102,7 @@ jobs:
           set -euxo pipefail
           "${TEST_VENV}/bin/python" -m pytest -q \
             tests/unit_test/moss_tts/test_pipeline.py::test_moss_prefill_forward_uses_prompt_row_embeds \
+            tests/unit_test/moss_tts/test_pipeline.py::test_moss_prefill_sidecar_transport_reaches_model_forward \
             tests/unit_test/model_runner/test_prefill_inputs.py \
             tests/unit_test/model_runner/test_prefill_forward_kwargs.py
 
@@ -125,7 +124,6 @@ jobs:
           set -euxo pipefail
           "${TEST_VENV}/bin/python" - <<'PY'
           import inspect
-
           from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
 
           params = inspect.signature(MossTTSDelaySGLangModel.forward).parameters
@@ -172,6 +170,7 @@ jobs:
             'sglang_omni/models/moss_tts/__init__.py' \
             'sglang_omni/models/moss_tts/engine_builder.py' \
             'sglang_omni/models/moss_tts/model_runner.py' \
+            'sglang_omni/models/moss_tts/sglang_model.py' \
             'tests/unit_test/models/test_model_capabilities.py' \
             'tests/unit_test/moss_tts/test_pipeline.py' \
             'tests/unit_test/moss_tts/test_sampling_cuda_graph.py' \
@@ -192,6 +191,7 @@ jobs:
             sglang_omni/models/moss_tts/__init__.py \
             sglang_omni/models/moss_tts/engine_builder.py \
             sglang_omni/models/moss_tts/model_runner.py \
+            sglang_omni/models/moss_tts/sglang_model.py \
             tests/unit_test/models/test_model_capabilities.py \
             tests/unit_test/moss_tts/test_pipeline.py \
             tests/unit_test/moss_tts/test_sampling_cuda_graph.py \
