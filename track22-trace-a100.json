@@ -1,0 +1,2218 @@
+{
+  "aggregates": [
+    {
+      "ack_release_latency_ms": {
+        "median": 6.905011,
+        "p95": 7.640009125,
+        "run_median_mad": 0.4173235000000002
+      },
+      "all_transport_checks_passed": true,
+      "arm": "A",
+      "concurrency": 1,
+      "directions": [
+        "forward",
+        "reverse"
+      ],
+      "end_to_end_drain_chunks_per_sec": 360.64922825284265,
+      "final_ack_drain_ms": 3.070376,
+      "logical_tensor_bytes_per_chunk": 8192,
+      "maximum_outstanding_transfer_count": 3,
+      "producer_modes": [
+        "single_round_robin"
+      ],
+      "publish_chunks_per_sec": 367.0130470870422,
+      "publish_latency_ms": {
+        "median": 2.6971695,
+        "p95": 3.2258652000000003,
+        "run_median_mad": 0.18023900000000004
+      },
+      "runs": 2,
+      "tensor_transfers_per_chunk": 2,
+      "transport": "cuda_ipc"
+    },
+    {
+      "ack_release_latency_ms": {
+        "median": 4.85527625,
+        "p95": 5.284902949999999,
+        "run_median_mad": 0.16339024999999996
+      },
+      "all_transport_checks_passed": true,
+      "arm": "B",
+      "concurrency": 1,
+      "directions": [
+        "forward",
+        "reverse"
+      ],
+      "end_to_end_drain_chunks_per_sec": 575.5169603527811,
+      "final_ack_drain_ms": 1.5303845,
+      "logical_tensor_bytes_per_chunk": 4096,
+      "maximum_outstanding_transfer_count": 3,
+      "producer_modes": [
+        "single_round_robin"
+      ],
+      "publish_chunks_per_sec": 583.5003836505575,
+      "publish_latency_ms": {
+        "median": 1.7157550000000001,
+        "p95": 1.9454240499999997,
+        "run_median_mad": 0.12714150000000002
+      },
+      "runs": 2,
+      "tensor_transfers_per_chunk": 1,
+      "transport": "cuda_ipc"
+    },
+    {
+      "ack_release_latency_ms": {
+        "median": 4.87242225,
+        "p95": 5.980418224999998,
+        "run_median_mad": 0.19444874999999984
+      },
+      "all_transport_checks_passed": true,
+      "arm": "C",
+      "concurrency": 1,
+      "directions": [
+        "forward",
+        "reverse"
+      ],
+      "end_to_end_drain_chunks_per_sec": 590.291801409161,
+      "final_ack_drain_ms": 1.4692025,
+      "logical_tensor_bytes_per_chunk": 1,
+      "maximum_outstanding_transfer_count": 5,
+      "producer_modes": [
+        "single_round_robin"
+      ],
+      "publish_chunks_per_sec": 598.4357839550626,
+      "publish_latency_ms": {
+        "median": 1.662893,
+        "p95": 1.95850475,
+        "run_median_mad": 0.09271099999999999
+      },
+      "runs": 2,
+      "tensor_transfers_per_chunk": 1,
+      "transport": "cuda_ipc"
+    },
+    {
+      "ack_release_latency_ms": {
+        "median": 4.11945625,
+        "p95": 5.094928149999998,
+        "run_median_mad": 0.23481225000000006
+      },
+      "all_transport_checks_passed": true,
+      "arm": "D",
+      "concurrency": 1,
+      "directions": [
+        "forward",
+        "reverse"
+      ],
+      "end_to_end_drain_chunks_per_sec": 422.62153772574106,
+      "final_ack_drain_ms": 1.4940764999999998,
+      "logical_tensor_bytes_per_chunk": 8,
+      "maximum_outstanding_transfer_count": 2,
+      "producer_modes": [
+        "single_round_robin"
+      ],
+      "publish_chunks_per_sec": 427.9182946308541,
+      "publish_latency_ms": {
+        "median": 1.409785,
+        "p95": 1.8264154499999998,
+        "run_median_mad": 0.08525150000000004
+      },
+      "runs": 2,
+      "tensor_transfers_per_chunk": 1,
+      "transport": "shm"
+    }
+  ],
+  "architecture": {
+    "control_plane": "repository PushSocket/PullSocket with msgpack messages",
+    "cuda_ipc_pool_mb": null,
+    "cuda_ipc_pool_policy": "production relay default (1 GiB)",
+    "cuda_ipc_slot_kb": 64,
+    "data_path": "CommEngine.send_stream_chunk -> stage_io.write_stream_chunk/read_stream_chunk",
+    "model_weights_loaded": false,
+    "receiver": "Talker-like spawned process",
+    "receiver_gpu": 1,
+    "relay_credits": 2,
+    "sender": "Thinker-like spawned process",
+    "sender_gpu": 0
+  },
+  "arms": {
+    "A": {
+      "description": "BF16 primary [2048] plus BF16 layer_hidden [2048] metadata",
+      "expected_transport": "cuda_ipc",
+      "logical_bytes_per_chunk": 8192,
+      "metadata_layer_hidden": true,
+      "primary_dtype": "torch.bfloat16",
+      "primary_shape": [
+        2048
+      ],
+      "tensor_transfers_per_chunk": 2
+    },
+    "B": {
+      "description": "BF16 primary [2048] plus token_id metadata",
+      "expected_transport": "cuda_ipc",
+      "logical_bytes_per_chunk": 4096,
+      "metadata_layer_hidden": false,
+      "primary_dtype": "torch.bfloat16",
+      "primary_shape": [
+        2048
+      ],
+      "tensor_transfers_per_chunk": 1
+    },
+    "C": {
+      "description": "persistent CUDA uint8 carrier [1] plus token_id metadata",
+      "expected_transport": "cuda_ipc",
+      "logical_bytes_per_chunk": 1,
+      "metadata_layer_hidden": false,
+      "primary_dtype": "torch.uint8",
+      "primary_shape": [
+        1
+      ],
+      "tensor_transfers_per_chunk": 1
+    },
+    "D": {
+      "description": "CPU torch.long carrier [1] plus token_id metadata",
+      "expected_transport": "shm",
+      "logical_bytes_per_chunk": 8,
+      "metadata_layer_hidden": false,
+      "primary_dtype": "torch.int64",
+      "primary_shape": [
+        1
+      ],
+      "tensor_transfers_per_chunk": 1
+    }
+  },
+  "benchmark": "qwen3_omni_track_2_2_transport",
+  "comparisons": {
+    "direct_from_A": {
+      "A->B": {
+        "baseline": "A",
+        "candidate": "B",
+        "cells": [
+          {
+            "baseline": "A",
+            "candidate": "B",
+            "concurrency": 1,
+            "metrics": {
+              "ack_release_latency_ms": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 1.8903464144605628,
+                "median_paired_percentage_delta": 29.570494387062507,
+                "p25_paired_percentage_delta": 28.625321179832227,
+                "p75_paired_percentage_delta": 30.51566759429279,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "end_to_end_drain_chunks_per_sec": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 0.21518121471337892,
+                "median_paired_percentage_delta": 59.59310316107846,
+                "p25_paired_percentage_delta": 59.485512553721776,
+                "p75_paired_percentage_delta": 59.70069376843515,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "publish_chunks_per_sec": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 0.3725221294204175,
+                "median_paired_percentage_delta": 59.012687315690194,
+                "p25_paired_percentage_delta": 58.826426250979985,
+                "p75_paired_percentage_delta": 59.1989483804004,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "publish_latency_ms": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 0.46499734186167885,
+                "median_paired_percentage_delta": 36.41790427183008,
+                "p25_paired_percentage_delta": 36.18540560089924,
+                "p75_paired_percentage_delta": 36.65040294276092,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              }
+            },
+            "paired_observations": 2,
+            "status": "GO"
+          }
+        ],
+        "decision": "MAYBE",
+        "overall_paired": {
+          "metrics": {
+            "ack_release_latency_ms": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 1.8903464144605628,
+              "median_paired_percentage_delta": 29.570494387062507,
+              "p25_paired_percentage_delta": 28.625321179832227,
+              "p75_paired_percentage_delta": 30.51566759429279,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "end_to_end_drain_chunks_per_sec": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 0.21518121471337892,
+              "median_paired_percentage_delta": 59.59310316107846,
+              "p25_paired_percentage_delta": 59.485512553721776,
+              "p75_paired_percentage_delta": 59.70069376843515,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "publish_chunks_per_sec": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 0.3725221294204175,
+              "median_paired_percentage_delta": 59.012687315690194,
+              "p25_paired_percentage_delta": 58.826426250979985,
+              "p75_paired_percentage_delta": 59.1989483804004,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "publish_latency_ms": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 0.46499734186167885,
+              "median_paired_percentage_delta": 36.41790427183008,
+              "p25_paired_percentage_delta": 36.18540560089924,
+              "p75_paired_percentage_delta": 36.65040294276092,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            }
+          },
+          "paired_observations": 2
+        }
+      },
+      "A->C": {
+        "baseline": "A",
+        "candidate": "C",
+        "cells": [
+          {
+            "baseline": "A",
+            "candidate": "C",
+            "concurrency": 1,
+            "metrics": {
+              "ack_release_latency_ms": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 7.106716734797168,
+                "median_paired_percentage_delta": 29.006916150999018,
+                "p25_paired_percentage_delta": 25.453557783600438,
+                "p75_paired_percentage_delta": 32.5602745183976,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "end_to_end_drain_chunks_per_sec": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 21.157310023174233,
+                "median_paired_percentage_delta": 65.15608573165511,
+                "p25_paired_percentage_delta": 54.577430720067994,
+                "p75_paired_percentage_delta": 75.73474074324223,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "publish_chunks_per_sec": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 21.370285520520024,
+                "median_paired_percentage_delta": 64.57072953171962,
+                "p25_paired_percentage_delta": 53.885586771459614,
+                "p75_paired_percentage_delta": 75.25587229197963,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "publish_latency_ms": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 7.591237854408819,
+                "median_paired_percentage_delta": 37.83945090598097,
+                "p25_paired_percentage_delta": 34.04383197877655,
+                "p75_paired_percentage_delta": 41.635069833185376,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              }
+            },
+            "paired_observations": 2,
+            "status": "GO"
+          }
+        ],
+        "decision": "MAYBE",
+        "overall_paired": {
+          "metrics": {
+            "ack_release_latency_ms": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 7.106716734797168,
+              "median_paired_percentage_delta": 29.006916150999018,
+              "p25_paired_percentage_delta": 25.453557783600438,
+              "p75_paired_percentage_delta": 32.5602745183976,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "end_to_end_drain_chunks_per_sec": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 21.157310023174233,
+              "median_paired_percentage_delta": 65.15608573165511,
+              "p25_paired_percentage_delta": 54.577430720067994,
+              "p75_paired_percentage_delta": 75.73474074324223,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "publish_chunks_per_sec": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 21.370285520520024,
+              "median_paired_percentage_delta": 64.57072953171962,
+              "p25_paired_percentage_delta": 53.885586771459614,
+              "p75_paired_percentage_delta": 75.25587229197963,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "publish_latency_ms": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 7.591237854408819,
+              "median_paired_percentage_delta": 37.83945090598097,
+              "p25_paired_percentage_delta": 34.04383197877655,
+              "p75_paired_percentage_delta": 41.635069833185376,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            }
+          },
+          "paired_observations": 2
+        }
+      },
+      "A->D": {
+        "baseline": "A",
+        "candidate": "D",
+        "cells": [
+          {
+            "baseline": "A",
+            "candidate": "D",
+            "concurrency": 1,
+            "metrics": {
+              "ack_release_latency_ms": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 0.2057987456163346,
+                "median_paired_percentage_delta": 40.32862371213946,
+                "p25_paired_percentage_delta": 40.22572433933129,
+                "p75_paired_percentage_delta": 40.43152308494763,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "end_to_end_drain_chunks_per_sec": {
+                "improvement_count": 1,
+                "improvement_fraction": 0.5,
+                "mad_paired_percentage_delta": 74.76336472296934,
+                "median_paired_percentage_delta": 11.94903795634885,
+                "p25_paired_percentage_delta": -25.432644405135818,
+                "p75_paired_percentage_delta": 49.33072031783352,
+                "paired_observations": 2,
+                "regression_count": 1,
+                "stable_effect": false
+              },
+              "publish_chunks_per_sec": {
+                "improvement_count": 1,
+                "improvement_fraction": 0.5,
+                "mad_paired_percentage_delta": 74.60508167555977,
+                "median_paired_percentage_delta": 11.3058634346838,
+                "p25_paired_percentage_delta": -25.996677403096086,
+                "p75_paired_percentage_delta": 48.60840427246369,
+                "paired_observations": 2,
+                "regression_count": 1,
+                "stable_effect": false
+              },
+              "publish_latency_ms": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 0.3336053800752694,
+                "median_paired_percentage_delta": 47.70865208875475,
+                "p25_paired_percentage_delta": 47.54184939871712,
+                "p75_paired_percentage_delta": 47.875454778792374,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              }
+            },
+            "paired_observations": 2,
+            "status": "GO"
+          }
+        ],
+        "decision": "MAYBE",
+        "overall_paired": {
+          "metrics": {
+            "ack_release_latency_ms": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 0.2057987456163346,
+              "median_paired_percentage_delta": 40.32862371213946,
+              "p25_paired_percentage_delta": 40.22572433933129,
+              "p75_paired_percentage_delta": 40.43152308494763,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "end_to_end_drain_chunks_per_sec": {
+              "improvement_count": 1,
+              "improvement_fraction": 0.5,
+              "mad_paired_percentage_delta": 74.76336472296934,
+              "median_paired_percentage_delta": 11.94903795634885,
+              "p25_paired_percentage_delta": -25.432644405135818,
+              "p75_paired_percentage_delta": 49.33072031783352,
+              "paired_observations": 2,
+              "regression_count": 1,
+              "stable_effect": false
+            },
+            "publish_chunks_per_sec": {
+              "improvement_count": 1,
+              "improvement_fraction": 0.5,
+              "mad_paired_percentage_delta": 74.60508167555977,
+              "median_paired_percentage_delta": 11.3058634346838,
+              "p25_paired_percentage_delta": -25.996677403096086,
+              "p75_paired_percentage_delta": 48.60840427246369,
+              "paired_observations": 2,
+              "regression_count": 1,
+              "stable_effect": false
+            },
+            "publish_latency_ms": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 0.3336053800752694,
+              "median_paired_percentage_delta": 47.70865208875475,
+              "p25_paired_percentage_delta": 47.54184939871712,
+              "p75_paired_percentage_delta": 47.875454778792374,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            }
+          },
+          "paired_observations": 2
+        }
+      }
+    },
+    "incremental": {
+      "A->B": {
+        "baseline": "A",
+        "candidate": "B",
+        "cells": [
+          {
+            "baseline": "A",
+            "candidate": "B",
+            "concurrency": 1,
+            "metrics": {
+              "ack_release_latency_ms": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 1.8903464144605628,
+                "median_paired_percentage_delta": 29.570494387062507,
+                "p25_paired_percentage_delta": 28.625321179832227,
+                "p75_paired_percentage_delta": 30.51566759429279,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "end_to_end_drain_chunks_per_sec": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 0.21518121471337892,
+                "median_paired_percentage_delta": 59.59310316107846,
+                "p25_paired_percentage_delta": 59.485512553721776,
+                "p75_paired_percentage_delta": 59.70069376843515,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "publish_chunks_per_sec": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 0.3725221294204175,
+                "median_paired_percentage_delta": 59.012687315690194,
+                "p25_paired_percentage_delta": 58.826426250979985,
+                "p75_paired_percentage_delta": 59.1989483804004,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "publish_latency_ms": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 0.46499734186167885,
+                "median_paired_percentage_delta": 36.41790427183008,
+                "p25_paired_percentage_delta": 36.18540560089924,
+                "p75_paired_percentage_delta": 36.65040294276092,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              }
+            },
+            "paired_observations": 2,
+            "status": "GO"
+          }
+        ],
+        "decision": "MAYBE",
+        "overall_paired": {
+          "metrics": {
+            "ack_release_latency_ms": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 1.8903464144605628,
+              "median_paired_percentage_delta": 29.570494387062507,
+              "p25_paired_percentage_delta": 28.625321179832227,
+              "p75_paired_percentage_delta": 30.51566759429279,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "end_to_end_drain_chunks_per_sec": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 0.21518121471337892,
+              "median_paired_percentage_delta": 59.59310316107846,
+              "p25_paired_percentage_delta": 59.485512553721776,
+              "p75_paired_percentage_delta": 59.70069376843515,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "publish_chunks_per_sec": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 0.3725221294204175,
+              "median_paired_percentage_delta": 59.012687315690194,
+              "p25_paired_percentage_delta": 58.826426250979985,
+              "p75_paired_percentage_delta": 59.1989483804004,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "publish_latency_ms": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 0.46499734186167885,
+              "median_paired_percentage_delta": 36.41790427183008,
+              "p25_paired_percentage_delta": 36.18540560089924,
+              "p75_paired_percentage_delta": 36.65040294276092,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            }
+          },
+          "paired_observations": 2
+        }
+      },
+      "B->C": {
+        "baseline": "B",
+        "candidate": "C",
+        "cells": [
+          {
+            "baseline": "B",
+            "candidate": "C",
+            "concurrency": 1,
+            "metrics": {
+              "ack_release_latency_ms": {
+                "improvement_count": 1,
+                "improvement_fraction": 0.5,
+                "mad_paired_percentage_delta": 7.390359144086362,
+                "median_paired_percentage_delta": -0.6018427124804768,
+                "p25_paired_percentage_delta": -4.297022284523658,
+                "p75_paired_percentage_delta": 3.093336859562704,
+                "paired_observations": 2,
+                "regression_count": 1,
+                "stable_effect": false
+              },
+              "end_to_end_drain_chunks_per_sec": {
+                "improvement_count": 1,
+                "improvement_fraction": 0.5,
+                "mad_paired_percentage_delta": 13.117525643987975,
+                "median_paired_percentage_delta": 3.468042170951029,
+                "p25_paired_percentage_delta": -3.0907206510429592,
+                "p75_paired_percentage_delta": 10.026804992945017,
+                "paired_observations": 2,
+                "regression_count": 1,
+                "stable_effect": false
+              },
+              "publish_chunks_per_sec": {
+                "improvement_count": 1,
+                "improvement_fraction": 0.5,
+                "mad_paired_percentage_delta": 13.196970621135861,
+                "median_paired_percentage_delta": 3.464428325216417,
+                "p25_paired_percentage_delta": -3.1340569853515134,
+                "p75_paired_percentage_delta": 10.062913635784348,
+                "paired_observations": 2,
+                "regression_count": 1,
+                "stable_effect": false
+              },
+              "publish_latency_ms": {
+                "improvement_count": 1,
+                "improvement_fraction": 0.5,
+                "mad_paired_percentage_delta": 12.654929359311563,
+                "median_paired_percentage_delta": 2.143215843091295,
+                "p25_paired_percentage_delta": -4.184248836564485,
+                "p75_paired_percentage_delta": 8.470680522747076,
+                "paired_observations": 2,
+                "regression_count": 1,
+                "stable_effect": false
+              }
+            },
+            "paired_observations": 2,
+            "status": "MAYBE"
+          }
+        ],
+        "decision": "MAYBE",
+        "overall_paired": {
+          "metrics": {
+            "ack_release_latency_ms": {
+              "improvement_count": 1,
+              "improvement_fraction": 0.5,
+              "mad_paired_percentage_delta": 7.390359144086362,
+              "median_paired_percentage_delta": -0.6018427124804768,
+              "p25_paired_percentage_delta": -4.297022284523658,
+              "p75_paired_percentage_delta": 3.093336859562704,
+              "paired_observations": 2,
+              "regression_count": 1,
+              "stable_effect": false
+            },
+            "end_to_end_drain_chunks_per_sec": {
+              "improvement_count": 1,
+              "improvement_fraction": 0.5,
+              "mad_paired_percentage_delta": 13.117525643987975,
+              "median_paired_percentage_delta": 3.468042170951029,
+              "p25_paired_percentage_delta": -3.0907206510429592,
+              "p75_paired_percentage_delta": 10.026804992945017,
+              "paired_observations": 2,
+              "regression_count": 1,
+              "stable_effect": false
+            },
+            "publish_chunks_per_sec": {
+              "improvement_count": 1,
+              "improvement_fraction": 0.5,
+              "mad_paired_percentage_delta": 13.196970621135861,
+              "median_paired_percentage_delta": 3.464428325216417,
+              "p25_paired_percentage_delta": -3.1340569853515134,
+              "p75_paired_percentage_delta": 10.062913635784348,
+              "paired_observations": 2,
+              "regression_count": 1,
+              "stable_effect": false
+            },
+            "publish_latency_ms": {
+              "improvement_count": 1,
+              "improvement_fraction": 0.5,
+              "mad_paired_percentage_delta": 12.654929359311563,
+              "median_paired_percentage_delta": 2.143215843091295,
+              "p25_paired_percentage_delta": -4.184248836564485,
+              "p75_paired_percentage_delta": 8.470680522747076,
+              "paired_observations": 2,
+              "regression_count": 1,
+              "stable_effect": false
+            }
+          },
+          "paired_observations": 2
+        }
+      },
+      "C->D": {
+        "baseline": "C",
+        "candidate": "D",
+        "cells": [
+          {
+            "baseline": "C",
+            "candidate": "D",
+            "concurrency": 1,
+            "metrics": {
+              "ack_release_latency_ms": {
+                "improvement_count": 2,
+                "improvement_fraction": 1.0,
+                "mad_paired_percentage_delta": 8.206358401808796,
+                "median_paired_percentage_delta": 15.126128255143795,
+                "p25_paired_percentage_delta": 11.022949054239398,
+                "p75_paired_percentage_delta": 19.22930745604819,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              },
+              "end_to_end_drain_chunks_per_sec": {
+                "improvement_count": 1,
+                "improvement_fraction": 0.5,
+                "mad_paired_percentage_delta": 54.85191226697222,
+                "median_paired_percentage_delta": -25.189419123760253,
+                "p25_paired_percentage_delta": -52.615375257246356,
+                "p75_paired_percentage_delta": 2.2365370097258577,
+                "paired_observations": 2,
+                "regression_count": 1,
+                "stable_effect": false
+              },
+              "publish_chunks_per_sec": {
+                "improvement_count": 1,
+                "improvement_fraction": 0.5,
+                "mad_paired_percentage_delta": 55.04390700573336,
+                "median_paired_percentage_delta": -25.218230560411993,
+                "p25_paired_percentage_delta": -52.740184063278676,
+                "p75_paired_percentage_delta": 2.303722942454691,
+                "paired_observations": 2,
+                "regression_count": 1,
+                "stable_effect": false
+              },
+              "publish_latency_ms": {
+                "improvement_count": 1,
+                "improvement_fraction": 0.5,
+                "mad_paired_percentage_delta": 9.884094187145442,
+                "median_paired_percentage_delta": 14.669876981751406,
+                "p25_paired_percentage_delta": 9.727829888178686,
+                "p75_paired_percentage_delta": 19.611924075324126,
+                "paired_observations": 2,
+                "regression_count": 0,
+                "stable_effect": true
+              }
+            },
+            "paired_observations": 2,
+            "status": "MAYBE"
+          }
+        ],
+        "decision": "MAYBE",
+        "overall_paired": {
+          "metrics": {
+            "ack_release_latency_ms": {
+              "improvement_count": 2,
+              "improvement_fraction": 1.0,
+              "mad_paired_percentage_delta": 8.206358401808796,
+              "median_paired_percentage_delta": 15.126128255143795,
+              "p25_paired_percentage_delta": 11.022949054239398,
+              "p75_paired_percentage_delta": 19.22930745604819,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            },
+            "end_to_end_drain_chunks_per_sec": {
+              "improvement_count": 1,
+              "improvement_fraction": 0.5,
+              "mad_paired_percentage_delta": 54.85191226697222,
+              "median_paired_percentage_delta": -25.189419123760253,
+              "p25_paired_percentage_delta": -52.615375257246356,
+              "p75_paired_percentage_delta": 2.2365370097258577,
+              "paired_observations": 2,
+              "regression_count": 1,
+              "stable_effect": false
+            },
+            "publish_chunks_per_sec": {
+              "improvement_count": 1,
+              "improvement_fraction": 0.5,
+              "mad_paired_percentage_delta": 55.04390700573336,
+              "median_paired_percentage_delta": -25.218230560411993,
+              "p25_paired_percentage_delta": -52.740184063278676,
+              "p75_paired_percentage_delta": 2.303722942454691,
+              "paired_observations": 2,
+              "regression_count": 1,
+              "stable_effect": false
+            },
+            "publish_latency_ms": {
+              "improvement_count": 1,
+              "improvement_fraction": 0.5,
+              "mad_paired_percentage_delta": 9.884094187145442,
+              "median_paired_percentage_delta": 14.669876981751406,
+              "p25_paired_percentage_delta": 9.727829888178686,
+              "p75_paired_percentage_delta": 19.611924075324126,
+              "paired_observations": 2,
+              "regression_count": 0,
+              "stable_effect": true
+            }
+          },
+          "paired_observations": 2
+        }
+      }
+    },
+    "material_change_threshold_pct": 5.0,
+    "minimum_stable_improvement_fraction": 0.6,
+    "overall": "MAYBE",
+    "recommendation": {
+      "best_candidate_relative_to_A": "C",
+      "candidate_scores": [
+        {
+          "ack_guardrail_delta_pct": 29.006916150999018,
+          "candidate": "C",
+          "decision": "MAYBE",
+          "paired_observations": 2,
+          "publish_facing_score_pct": 65.15608573165511,
+          "throughput_score_pct": 64.57072953171962,
+          "transition": "A->C"
+        },
+        {
+          "ack_guardrail_delta_pct": 29.570494387062507,
+          "candidate": "B",
+          "decision": "MAYBE",
+          "paired_observations": 2,
+          "publish_facing_score_pct": 59.59310316107846,
+          "throughput_score_pct": 59.012687315690194,
+          "transition": "A->B"
+        },
+        {
+          "ack_guardrail_delta_pct": 40.32862371213946,
+          "candidate": "D",
+          "decision": "MAYBE",
+          "paired_observations": 2,
+          "publish_facing_score_pct": 47.70865208875475,
+          "throughput_score_pct": 11.3058634346838,
+          "transition": "A->D"
+        }
+      ],
+      "decision": "MAYBE",
+      "rationale": "Recommendation uses direct A-baseline evidence; incremental C->D regression does not override a stable A->C result.",
+      "recommended_candidate": "C"
+    },
+    "rubric": {
+      "GO": "at least one publish-facing metric (publish latency, publish throughput, or end-to-end drain throughput) has a stable >=5% improvement, neither throughput metric materially regresses, and ACK/resource latency has no stable material regression",
+      "MAYBE": "effect is marginal, mixed, or ordinary paired variation is comparable to the nominal effect",
+      "NO-GO": "the compared candidate has a stable material regression; this only rejects that candidate relative to its baseline"
+    }
+  },
+  "config": {
+    "concurrency": [
+      1
+    ],
+    "measure_chunks_per_arm": 64,
+    "orders": [
+      "A B C D",
+      "D C B A"
+    ],
+    "producer_mode": "single_round_robin",
+    "rounds": 1,
+    "timeout_s": 1800.0,
+    "warmup_chunks_per_arm": 32
+  },
+  "git_commit": "4b0e6b782b00bbdecc2e9e887c19813ae3e6e4eb",
+  "host": {
+    "cuda": "13.0",
+    "gpu_0_name": "NVIDIA A100-SXM4-40GB",
+    "gpu_1_name": "NVIDIA A100-SXM4-40GB",
+    "platform": "Linux-4.19.0-gvisor-x86_64-with-glibc2.39",
+    "python": "3.12.3 (main, Mar 23 2026, 19:04:32) [GCC 13.3.0]",
+    "torch": "2.11.0+cu130"
+  },
+  "mode": "trace",
+  "provenance": {
+    "cuda_version": "13.0",
+    "git_commit": "4b0e6b782b00bbdecc2e9e887c19813ae3e6e4eb",
+    "gpu_0_name": "NVIDIA A100-SXM4-40GB",
+    "gpu_1_name": "NVIDIA A100-SXM4-40GB",
+    "repository_root": "/mnt/sglang-omni",
+    "sglang_omni_source": "/mnt/sglang-omni/sglang_omni/__init__.py",
+    "torch_version": "2.11.0+cu130"
+  },
+  "repository_root": "/mnt/sglang-omni",
+  "runs": [
+    {
+      "ack_release_latency_ms": {
+        "count": 64,
+        "mad": 0.33100299999999994,
+        "mean": 7.394154859375,
+        "median": 7.3223345,
+        "p25": 7.09130875,
+        "p75": 7.724438,
+        "p95": 8.1818961
+      },
+      "arm": "A",
+      "concurrency": 1,
+      "direct_cuda_ipc_allowed": false,
+      "direction": "forward",
+      "end_to_end_drain_chunks_per_sec": 335.3986307581486,
+      "end_to_end_drain_wall_ms": 190.817714,
+      "final_ack_drain_ms": 3.131332,
+      "logical_tensor_bytes_per_chunk": 8192,
+      "maximum_outstanding_transfer_count": 2,
+      "measure_chunks": 64,
+      "order_position": 0,
+      "producer_mode": "single_round_robin",
+      "publish_chunks_per_sec": 340.994372196913,
+      "publish_latency_ms": {
+        "count": 64,
+        "mad": 0.18212249999999996,
+        "mean": 2.916997125,
+        "median": 2.8774085,
+        "p25": 2.7096857500000002,
+        "p75": 3.08605275,
+        "p95": 3.48105935
+      },
+      "publish_wall_ms": 187.686382,
+      "receiver": {
+        "arm": "A",
+        "backend_bytes": 786432,
+        "concurrency": 1,
+        "content_checks": 1,
+        "direction": "forward",
+        "logical_bytes": 786432,
+        "measured_backend_bytes": 524288,
+        "measured_logical_bytes": 524288,
+        "measured_message_count": 64,
+        "message_count": 96,
+        "relay_types": [
+          "CudaIpcRelay"
+        ],
+        "round": 0,
+        "run_key": "forward-round0-c1-A",
+        "tensor_transfer_counts": [
+          2
+        ],
+        "transports": [
+          "cuda_ipc"
+        ]
+      },
+      "relay_type": "CudaIpcRelay",
+      "round": 0,
+      "run_key": "forward-round0-c1-A",
+      "sender_gpu": 0,
+      "sender_router_selected_expected": true,
+      "tensor_transfers_per_chunk": 2,
+      "total_tensor_transfers": 128,
+      "total_transferred_logical_tensor_bytes": 524288,
+      "transport": "cuda_ipc",
+      "transport_check_passed": true,
+      "transport_checks": {
+        "pooled_cuda_ipc_not_direct": true,
+        "receiver_content_check_passed": true,
+        "receiver_data_refs_selected_expected": true,
+        "receiver_measured_message_count_expected": true,
+        "receiver_message_count_expected": true,
+        "receiver_relay_type_expected": true,
+        "receiver_tensor_transfer_count_expected": true,
+        "sender_router_selected_expected": true
+      },
+      "warmup_chunks": 32
+    },
+    {
+      "ack_release_latency_ms": {
+        "count": 64,
+        "mad": 0.26684649999999976,
+        "mean": 5.034439265625,
+        "median": 5.0186665,
+        "p25": 4.77275775,
+        "p75": 5.308795,
+        "p95": 5.6862284
+      },
+      "arm": "B",
+      "concurrency": 1,
+      "direct_cuda_ipc_allowed": false,
+      "direction": "forward",
+      "end_to_end_drain_chunks_per_sec": 535.9947976344941,
+      "end_to_end_drain_wall_ms": 119.404144,
+      "final_ack_drain_ms": 1.647683,
+      "logical_tensor_bytes_per_chunk": 4096,
+      "maximum_outstanding_transfer_count": 2,
+      "measure_chunks": 64,
+      "order_position": 1,
+      "producer_mode": "single_round_robin",
+      "publish_chunks_per_sec": 543.4945943220898,
+      "publish_latency_ms": {
+        "count": 64,
+        "mad": 0.1817310000000001,
+        "mean": 1.8256780625,
+        "median": 1.8428965000000002,
+        "p25": 1.6427334999999998,
+        "p75": 2.011902,
+        "p95": 2.1687152
+      },
+      "publish_wall_ms": 117.756461,
+      "receiver": {
+        "arm": "B",
+        "backend_bytes": 393216,
+        "concurrency": 1,
+        "content_checks": 1,
+        "direction": "forward",
+        "logical_bytes": 393216,
+        "measured_backend_bytes": 262144,
+        "measured_logical_bytes": 262144,
+        "measured_message_count": 64,
+        "message_count": 96,
+        "relay_types": [
+          "CudaIpcRelay"
+        ],
+        "round": 0,
+        "run_key": "forward-round0-c1-B",
+        "tensor_transfer_counts": [
+          1
+        ],
+        "transports": [
+          "cuda_ipc"
+        ]
+      },
+      "relay_type": "CudaIpcRelay",
+      "round": 0,
+      "run_key": "forward-round0-c1-B",
+      "sender_gpu": 0,
+      "sender_router_selected_expected": true,
+      "tensor_transfers_per_chunk": 1,
+      "total_tensor_transfers": 64,
+      "total_transferred_logical_tensor_bytes": 262144,
+      "transport": "cuda_ipc",
+      "transport_check_passed": true,
+      "transport_checks": {
+        "pooled_cuda_ipc_not_direct": true,
+        "receiver_content_check_passed": true,
+        "receiver_data_refs_selected_expected": true,
+        "receiver_measured_message_count_expected": true,
+        "receiver_message_count_expected": true,
+        "receiver_relay_type_expected": true,
+        "receiver_tensor_transfer_count_expected": true,
+        "sender_router_selected_expected": true
+      },
+      "warmup_chunks": 32
+    },
+    {
+      "ack_release_latency_ms": {
+        "count": 64,
+        "mad": 0.16284849999999995,
+        "mean": 4.79037140625,
+        "median": 4.6779735,
+        "p25": 4.5160845,
+        "p75": 4.8353695000000005,
+        "p95": 6.359340799999997
+      },
+      "arm": "C",
+      "concurrency": 1,
+      "direct_cuda_ipc_allowed": false,
+      "direction": "forward",
+      "end_to_end_drain_chunks_per_sec": 624.8925782807082,
+      "end_to_end_drain_wall_ms": 102.417603,
+      "final_ack_drain_ms": 1.478936,
+      "logical_tensor_bytes_per_chunk": 1,
+      "maximum_outstanding_transfer_count": 5,
+      "measure_chunks": 64,
+      "order_position": 2,
+      "producer_mode": "single_round_robin",
+      "publish_chunks_per_sec": 634.0483969339521,
+      "publish_latency_ms": {
+        "count": 64,
+        "mad": 0.07334600000000002,
+        "mean": 1.5652873125,
+        "median": 1.570182,
+        "p25": 1.4929745,
+        "p75": 1.6350574999999998,
+        "p95": 1.7782038999999998
+      },
+      "publish_wall_ms": 100.938667,
+      "receiver": {
+        "arm": "C",
+        "backend_bytes": 96,
+        "concurrency": 1,
+        "content_checks": 1,
+        "direction": "forward",
+        "logical_bytes": 96,
+        "measured_backend_bytes": 64,
+        "measured_logical_bytes": 64,
+        "measured_message_count": 64,
+        "message_count": 96,
+        "relay_types": [
+          "CudaIpcRelay"
+        ],
+        "round": 0,
+        "run_key": "forward-round0-c1-C",
+        "tensor_transfer_counts": [
+          1
+        ],
+        "transports": [
+          "cuda_ipc"
+        ]
+      },
+      "relay_type": "CudaIpcRelay",
+      "round": 0,
+      "run_key": "forward-round0-c1-C",
+      "sender_gpu": 0,
+      "sender_router_selected_expected": true,
+      "tensor_transfers_per_chunk": 1,
+      "total_tensor_transfers": 64,
+      "total_transferred_logical_tensor_bytes": 64,
+      "transport": "cuda_ipc",
+      "transport_check_passed": true,
+      "transport_checks": {
+        "pooled_cuda_ipc_not_direct": true,
+        "receiver_content_check_passed": true,
+        "receiver_data_refs_selected_expected": true,
+        "receiver_measured_message_count_expected": true,
+        "receiver_message_count_expected": true,
+        "receiver_relay_type_expected": true,
+        "receiver_tensor_transfer_count_expected": true,
+        "sender_router_selected_expected": true
+      },
+      "warmup_chunks": 32
+    },
+    {
+      "ack_release_latency_ms": {
+        "count": 64,
+        "mad": 0.26137350000000037,
+        "mean": 23.73953525,
+        "median": 4.3542685,
+        "p25": 4.14622825,
+        "p75": 4.6361815,
+        "p95": 5.892180849999996
+      },
+      "arm": "D",
+      "concurrency": 1,
+      "direct_cuda_ipc_allowed": false,
+      "direction": "forward",
+      "end_to_end_drain_chunks_per_sec": 124.72023886295426,
+      "end_to_end_drain_wall_ms": 513.148472,
+      "final_ack_drain_ms": 1.75233,
+      "logical_tensor_bytes_per_chunk": 8,
+      "maximum_outstanding_transfer_count": 2,
+      "measure_chunks": 64,
+      "order_position": 3,
+      "producer_mode": "single_round_robin",
+      "publish_chunks_per_sec": 125.14760035088413,
+      "publish_latency_ms": {
+        "count": 64,
+        "mad": 0.0812575000000001,
+        "mean": 7.97447609375,
+        "median": 1.4950365,
+        "p25": 1.414059,
+        "p75": 1.5777595,
+        "p95": 1.9310601499999995
+      },
+      "publish_wall_ms": 511.39614200000005,
+      "receiver": {
+        "arm": "D",
+        "backend_bytes": 768,
+        "concurrency": 1,
+        "content_checks": 1,
+        "direction": "forward",
+        "logical_bytes": 768,
+        "measured_backend_bytes": 512,
+        "measured_logical_bytes": 512,
+        "measured_message_count": 64,
+        "message_count": 96,
+        "relay_types": [
+          "ShmRelay"
+        ],
+        "round": 0,
+        "run_key": "forward-round0-c1-D",
+        "tensor_transfer_counts": [
+          1
+        ],
+        "transports": [
+          "shm"
+        ]
+      },
+      "relay_type": "ShmRelay",
+      "round": 0,
+      "run_key": "forward-round0-c1-D",
+      "sender_gpu": 0,
+      "sender_router_selected_expected": true,
+      "tensor_transfers_per_chunk": 1,
+      "total_tensor_transfers": 64,
+      "total_transferred_logical_tensor_bytes": 512,
+      "transport": "shm",
+      "transport_check_passed": true,
+      "transport_checks": {
+        "pooled_cuda_ipc_not_direct": true,
+        "receiver_content_check_passed": true,
+        "receiver_data_refs_selected_expected": true,
+        "receiver_measured_message_count_expected": true,
+        "receiver_message_count_expected": true,
+        "receiver_relay_type_expected": true,
+        "receiver_tensor_transfer_count_expected": true,
+        "sender_router_selected_expected": true
+      },
+      "warmup_chunks": 32
+    },
+    {
+      "ack_release_latency_ms": {
+        "count": 64,
+        "mad": 0.20860999999999996,
+        "mean": 3.835579890625,
+        "median": 3.8846439999999998,
+        "p25": 3.66508275,
+        "p75": 4.0726777499999995,
+        "p95": 4.29767545
+      },
+      "arm": "D",
+      "concurrency": 1,
+      "direct_cuda_ipc_allowed": false,
+      "direction": "reverse",
+      "end_to_end_drain_chunks_per_sec": 720.5228365885279,
+      "end_to_end_drain_wall_ms": 88.824388,
+      "final_ack_drain_ms": 1.235823,
+      "logical_tensor_bytes_per_chunk": 8,
+      "maximum_outstanding_transfer_count": 2,
+      "measure_chunks": 64,
+      "order_position": 0,
+      "producer_mode": "single_round_robin",
+      "publish_chunks_per_sec": 730.6889889108242,
+      "publish_latency_ms": {
+        "count": 64,
+        "mad": 0.17984699999999998,
+        "mean": 1.354552796875,
+        "median": 1.3245335,
+        "p25": 1.17938875,
+        "p75": 1.5059702499999998,
+        "p95": 1.72177075
+      },
+      "publish_wall_ms": 87.58856499999999,
+      "receiver": {
+        "arm": "D",
+        "backend_bytes": 768,
+        "concurrency": 1,
+        "content_checks": 1,
+        "direction": "reverse",
+        "logical_bytes": 768,
+        "measured_backend_bytes": 512,
+        "measured_logical_bytes": 512,
+        "measured_message_count": 64,
+        "message_count": 96,
+        "relay_types": [
+          "ShmRelay"
+        ],
+        "round": 0,
+        "run_key": "reverse-round0-c1-D",
+        "tensor_transfer_counts": [
+          1
+        ],
+        "transports": [
+          "shm"
+        ]
+      },
+      "relay_type": "ShmRelay",
+      "round": 0,
+      "run_key": "reverse-round0-c1-D",
+      "sender_gpu": 0,
+      "sender_router_selected_expected": true,
+      "tensor_transfers_per_chunk": 1,
+      "total_tensor_transfers": 64,
+      "total_transferred_logical_tensor_bytes": 512,
+      "transport": "shm",
+      "transport_check_passed": true,
+      "transport_checks": {
+        "pooled_cuda_ipc_not_direct": true,
+        "receiver_content_check_passed": true,
+        "receiver_data_refs_selected_expected": true,
+        "receiver_measured_message_count_expected": true,
+        "receiver_message_count_expected": true,
+        "receiver_relay_type_expected": true,
+        "receiver_tensor_transfer_count_expected": true,
+        "sender_router_selected_expected": true
+      },
+      "warmup_chunks": 32
+    },
+    {
+      "ack_release_latency_ms": {
+        "count": 64,
+        "mad": 0.3052514999999998,
+        "mean": 5.00814415625,
+        "median": 5.066871,
+        "p25": 4.730158,
+        "p75": 5.282611,
+        "p95": 5.6014956499999995
+      },
+      "arm": "C",
+      "concurrency": 1,
+      "direct_cuda_ipc_allowed": false,
+      "direction": "reverse",
+      "end_to_end_drain_chunks_per_sec": 555.6910245376139,
+      "end_to_end_drain_wall_ms": 115.171916,
+      "final_ack_drain_ms": 1.459469,
+      "logical_tensor_bytes_per_chunk": 1,
+      "maximum_outstanding_transfer_count": 3,
+      "measure_chunks": 64,
+      "order_position": 1,
+      "producer_mode": "single_round_robin",
+      "publish_chunks_per_sec": 562.823170976173,
+      "publish_latency_ms": {
+        "count": 64,
+        "mad": 0.1369395000000001,
+        "mean": 1.76352253125,
+        "median": 1.755604,
+        "p25": 1.642163,
+        "p75": 1.89657675,
+        "p95": 2.1388056
+      },
+      "publish_wall_ms": 113.712447,
+      "receiver": {
+        "arm": "C",
+        "backend_bytes": 96,
+        "concurrency": 1,
+        "content_checks": 1,
+        "direction": "reverse",
+        "logical_bytes": 96,
+        "measured_backend_bytes": 64,
+        "measured_logical_bytes": 64,
+        "measured_message_count": 64,
+        "message_count": 96,
+        "relay_types": [
+          "CudaIpcRelay"
+        ],
+        "round": 0,
+        "run_key": "reverse-round0-c1-C",
+        "tensor_transfer_counts": [
+          1
+        ],
+        "transports": [
+          "cuda_ipc"
+        ]
+      },
+      "relay_type": "CudaIpcRelay",
+      "round": 0,
+      "run_key": "reverse-round0-c1-C",
+      "sender_gpu": 0,
+      "sender_router_selected_expected": true,
+      "tensor_transfers_per_chunk": 1,
+      "total_tensor_transfers": 64,
+      "total_transferred_logical_tensor_bytes": 64,
+      "transport": "cuda_ipc",
+      "transport_check_passed": true,
+      "transport_checks": {
+        "pooled_cuda_ipc_not_direct": true,
+        "receiver_content_check_passed": true,
+        "receiver_data_refs_selected_expected": true,
+        "receiver_measured_message_count_expected": true,
+        "receiver_message_count_expected": true,
+        "receiver_relay_type_expected": true,
+        "receiver_tensor_transfer_count_expected": true,
+        "sender_router_selected_expected": true
+      },
+      "warmup_chunks": 32
+    },
+    {
+      "ack_release_latency_ms": {
+        "count": 64,
+        "mad": 0.116012,
+        "mean": 4.64640609375,
+        "median": 4.691886,
+        "p25": 4.58348425,
+        "p75": 4.80859025,
+        "p95": 4.8835774999999995
+      },
+      "arm": "B",
+      "concurrency": 1,
+      "direct_cuda_ipc_allowed": false,
+      "direction": "reverse",
+      "end_to_end_drain_chunks_per_sec": 615.0391230710679,
+      "end_to_end_drain_wall_ms": 104.058421,
+      "final_ack_drain_ms": 1.413086,
+      "logical_tensor_bytes_per_chunk": 4096,
+      "maximum_outstanding_transfer_count": 3,
+      "measure_chunks": 64,
+      "order_position": 2,
+      "producer_mode": "single_round_robin",
+      "publish_chunks_per_sec": 623.5061729790252,
+      "publish_latency_ms": {
+        "count": 64,
+        "mad": 0.05689249999999979,
+        "mean": 1.591783078125,
+        "median": 1.5886135000000001,
+        "p25": 1.5365955000000002,
+        "p75": 1.64685275,
+        "p95": 1.7221328999999999
+      },
+      "publish_wall_ms": 102.645335,
+      "receiver": {
+        "arm": "B",
+        "backend_bytes": 393216,
+        "concurrency": 1,
+        "content_checks": 1,
+        "direction": "reverse",
+        "logical_bytes": 393216,
+        "measured_backend_bytes": 262144,
+        "measured_logical_bytes": 262144,
+        "measured_message_count": 64,
+        "message_count": 96,
+        "relay_types": [
+          "CudaIpcRelay"
+        ],
+        "round": 0,
+        "run_key": "reverse-round0-c1-B",
+        "tensor_transfer_counts": [
+          1
+        ],
+        "transports": [
+          "cuda_ipc"
+        ]
+      },
+      "relay_type": "CudaIpcRelay",
+      "round": 0,
+      "run_key": "reverse-round0-c1-B",
+      "sender_gpu": 0,
+      "sender_router_selected_expected": true,
+      "tensor_transfers_per_chunk": 1,
+      "total_tensor_transfers": 64,
+      "total_transferred_logical_tensor_bytes": 262144,
+      "transport": "cuda_ipc",
+      "transport_check_passed": true,
+      "transport_checks": {
+        "pooled_cuda_ipc_not_direct": true,
+        "receiver_content_check_passed": true,
+        "receiver_data_refs_selected_expected": true,
+        "receiver_measured_message_count_expected": true,
+        "receiver_message_count_expected": true,
+        "receiver_relay_type_expected": true,
+        "receiver_tensor_transfer_count_expected": true,
+        "sender_router_selected_expected": true
+      },
+      "warmup_chunks": 32
+    },
+    {
+      "ack_release_latency_ms": {
+        "count": 64,
+        "mad": 0.31352,
+        "mean": 6.49764071875,
+        "median": 6.4876875,
+        "p25": 6.19161975,
+        "p75": 6.8289975,
+        "p95": 7.09812215
+      },
+      "arm": "A",
+      "concurrency": 1,
+      "direct_cuda_ipc_allowed": false,
+      "direction": "reverse",
+      "end_to_end_drain_chunks_per_sec": 385.8998257475367,
+      "end_to_end_drain_wall_ms": 165.846149,
+      "final_ack_drain_ms": 3.00942,
+      "logical_tensor_bytes_per_chunk": 8192,
+      "maximum_outstanding_transfer_count": 3,
+      "measure_chunks": 64,
+      "order_position": 3,
+      "producer_mode": "single_round_robin",
+      "publish_chunks_per_sec": 393.03172197717134,
+      "publish_latency_ms": {
+        "count": 64,
+        "mad": 0.16473549999999992,
+        "mean": 2.53204434375,
+        "median": 2.5169305,
+        "p25": 2.38753275,
+        "p75": 2.71664675,
+        "p95": 2.97067105
+      },
+      "publish_wall_ms": 162.83672900000002,
+      "receiver": {
+        "arm": "A",
+        "backend_bytes": 786432,
+        "concurrency": 1,
+        "content_checks": 1,
+        "direction": "reverse",
+        "logical_bytes": 786432,
+        "measured_backend_bytes": 524288,
+        "measured_logical_bytes": 524288,
+        "measured_message_count": 64,
+        "message_count": 96,
+        "relay_types": [
+          "CudaIpcRelay"
+        ],
+        "round": 0,
+        "run_key": "reverse-round0-c1-A",
+        "tensor_transfer_counts": [
+          2
+        ],
+        "transports": [
+          "cuda_ipc"
+        ]
+      },
+      "relay_type": "CudaIpcRelay",
+      "round": 0,
+      "run_key": "reverse-round0-c1-A",
+      "sender_gpu": 0,
+      "sender_router_selected_expected": true,
+      "tensor_transfers_per_chunk": 2,
+      "total_tensor_transfers": 128,
+      "total_transferred_logical_tensor_bytes": 524288,
+      "transport": "cuda_ipc",
+      "transport_check_passed": true,
+      "transport_checks": {
+        "pooled_cuda_ipc_not_direct": true,
+        "receiver_content_check_passed": true,
+        "receiver_data_refs_selected_expected": true,
+        "receiver_measured_message_count_expected": true,
+        "receiver_message_count_expected": true,
+        "receiver_relay_type_expected": true,
+        "receiver_tensor_transfer_count_expected": true,
+        "sender_router_selected_expected": true
+      },
+      "warmup_chunks": 32
+    }
+  ],
+  "schema_version": 1,
+  "sglang_omni_source": "/mnt/sglang-omni/sglang_omni/__init__.py",
+  "trace": {
+    "event_count": 4610,
+    "event_counts": {
+      "comm_send_enqueue": 768,
+      "comm_stream_send": 768,
+      "cuda_ipc_get_async": 768,
+      "cuda_ipc_get_wait_copy": 768,
+      "cuda_ipc_pool_alloc": 2,
+      "cuda_ipc_put_async": 768,
+      "cuda_ipc_put_wait_ack": 768
+    },
+    "runs": [
+      {
+        "event_counts": {
+          "cuda_ipc_get_async": 192,
+          "cuda_ipc_get_wait_copy": 192
+        },
+        "fields": {
+          "bytes": {
+            "count": 384,
+            "mad": 0.0,
+            "mean": 4096.0,
+            "median": 4096.0,
+            "p25": 4096.0,
+            "p75": 4096.0,
+            "p95": 4096.0
+          },
+          "receiver_copy_enqueue_ms": {
+            "count": 192,
+            "mad": 0.030969999999999984,
+            "mean": 0.24477730208333334,
+            "median": 0.1947475,
+            "p25": 0.1705495,
+            "p75": 0.29191174999999997,
+            "p95": 0.44031659999999995
+          },
+          "receiver_event_import_ms": {
+            "count": 192,
+            "mad": 0.0009805,
+            "mean": 0.008947015625,
+            "median": 0.007699,
+            "p25": 0.006952,
+            "p75": 0.010110000000000001,
+            "p95": 0.014872949999999996
+          },
+          "receiver_gpu_copy_wait_ms": {
+            "count": 192,
+            "mad": 0.005808000000000001,
+            "mean": 0.072095,
+            "median": 0.049280000000000004,
+            "p25": 0.045104000000000005,
+            "p75": 0.076488,
+            "p95": 0.18082399999999987
+          }
+        },
+        "run_key": "forward-round0-c1-A",
+        "trace_role": "receiver"
+      },
+      {
+        "event_counts": {
+          "comm_send_enqueue": 96,
+          "comm_stream_send": 96,
+          "cuda_ipc_put_async": 192,
+          "cuda_ipc_put_wait_ack": 192
+        },
+        "fields": {
+          "ack_resource_hold_ms": {
+            "count": 192,
+            "mad": 0.084421,
+            "mean": 0.116787203125,
+            "median": 0.1034545,
+            "p25": 0.021450999999999998,
+            "p75": 0.20157599999999998,
+            "p95": 0.2554312999999999
+          },
+          "bytes": {
+            "count": 384,
+            "mad": 0.0,
+            "mean": 4096.0,
+            "median": 4096.0,
+            "p25": 4096.0,
+            "p75": 4096.0,
+            "p95": 4096.0
+          },
+          "cuda_event_handle_ms": {
+            "count": 192,
+            "mad": 0.0001389999999999998,
+            "mean": 0.0023678177083333333,
+            "median": 0.0021260000000000003,
+            "p25": 0.00200275,
+            "p75": 0.0023367500000000003,
+            "p95": 0.0036124499999999993
+          },
+          "sender_copy_enqueue_ms": {
+            "count": 192,
+            "mad": 0.021167000000000005,
+            "mean": 0.22509636979166667,
+            "median": 0.1646185,
+            "p25": 0.1486805,
+            "p75": 0.2109475,
+            "p95": 0.3206908499999999
+          },
+          "slot_allocation_wait_ms": {
+            "count": 192,
+            "mad": 0.11016199999999998,
+            "mean": 0.3640341354166667,
+            "median": 0.2247855,
+            "p25": 0.13396625,
+            "p75": 0.592679,
+            "p95": 0.8226339999999999
+          }
+        },
+        "run_key": "forward-round0-c1-A",
+        "trace_role": "sender"
+      },
+      {
+        "event_counts": {
+          "cuda_ipc_get_async": 96,
+          "cuda_ipc_get_wait_copy": 96
+        },
+        "fields": {
+          "bytes": {
+            "count": 192,
+            "mad": 0.0,
+            "mean": 4096.0,
+            "median": 4096.0,
+            "p25": 4096.0,
+            "p75": 4096.0,
+            "p95": 4096.0
+          },
+          "receiver_copy_enqueue_ms": {
+            "count": 96,
+            "mad": 0.009290500000000007,
+            "mean": 0.1764355520833333,
+            "median": 0.1679215,
+            "p25": 0.16178425000000002,
+            "p75": 0.18683899999999998,
+            "p95": 0.20770375
+          },
+          "receiver_event_import_ms": {
+            "count": 96,
+            "mad": 0.00018350000000000007,
+            "mean": 0.007118625,
+            "median": 0.006835,
+            "p25": 0.006664000000000001,
+            "p75": 0.00703175,
+            "p95": 0.00835375
+          },
+          "receiver_gpu_copy_wait_ms": {
+            "count": 96,
+            "mad": 0.0021280000000000014,
+            "mean": 0.049079000000000005,
+            "median": 0.045759999999999995,
+            "p25": 0.043792,
+            "p75": 0.048624,
+            "p95": 0.068872
+          }
+        },
+        "run_key": "forward-round0-c1-B",
+        "trace_role": "receiver"
+      },
+      {
+        "event_counts": {
+          "comm_send_enqueue": 96,
+          "comm_stream_send": 96,
+          "cuda_ipc_put_async": 96,
+          "cuda_ipc_put_wait_ack": 96
+        },
+        "fields": {
+          "ack_resource_hold_ms": {
+            "count": 96,
+            "mad": 0.0019424999999999998,
+            "mean": 0.020242,
+            "median": 0.0186175,
+            "p25": 0.01685375,
+            "p75": 0.02108175,
+            "p95": 0.03106125
+          },
+          "bytes": {
+            "count": 192,
+            "mad": 0.0,
+            "mean": 4096.0,
+            "median": 4096.0,
+            "p25": 4096.0,
+            "p75": 4096.0,
+            "p95": 4096.0
+          },
+          "cuda_event_handle_ms": {
+            "count": 96,
+            "mad": 0.00016200000000000003,
+            "mean": 0.0023048645833333332,
+            "median": 0.0022345,
+            "p25": 0.0020757500000000003,
+            "p75": 0.0024100000000000002,
+            "p95": 0.0027827499999999996
+          },
+          "sender_copy_enqueue_ms": {
+            "count": 96,
+            "mad": 0.03774350000000001,
+            "mean": 0.20239101041666666,
+            "median": 0.19555450000000002,
+            "p25": 0.1621325,
+            "p75": 0.24039425,
+            "p95": 0.274853
+          },
+          "slot_allocation_wait_ms": {
+            "count": 96,
+            "mad": 0.06769800000000004,
+            "mean": 0.4826608645833333,
+            "median": 0.4806675,
+            "p25": 0.42202875,
+            "p75": 0.5609145,
+            "p95": 0.658515
+          }
+        },
+        "run_key": "forward-round0-c1-B",
+        "trace_role": "sender"
+      },
+      {
+        "event_counts": {
+          "cuda_ipc_get_async": 96,
+          "cuda_ipc_get_wait_copy": 96
+        },
+        "fields": {
+          "bytes": {
+            "count": 192,
+            "mad": 0.0,
+            "mean": 1.0,
+            "median": 1.0,
+            "p25": 1.0,
+            "p75": 1.0,
+            "p95": 1.0
+          },
+          "receiver_copy_enqueue_ms": {
+            "count": 96,
+            "mad": 0.003950999999999996,
+            "mean": 0.18900046874999998,
+            "median": 0.16250900000000001,
+            "p25": 0.15917050000000002,
+            "p75": 0.170315,
+            "p95": 0.19536975
+          },
+          "receiver_event_import_ms": {
+            "count": 96,
+            "mad": 0.0001479999999999997,
+            "mean": 0.0075082604166666666,
+            "median": 0.0067065,
+            "p25": 0.006562,
+            "p75": 0.00685475,
+            "p95": 0.008123749999999999
+          },
+          "receiver_gpu_copy_wait_ms": {
+            "count": 96,
+            "mad": 0.0013280000000000028,
+            "mean": 0.046835666666666664,
+            "median": 0.044432,
+            "p25": 0.043544,
+            "p75": 0.04637600000000001,
+            "p95": 0.064424
+          }
+        },
+        "run_key": "forward-round0-c1-C",
+        "trace_role": "receiver"
+      },
+      {
+        "event_counts": {
+          "comm_send_enqueue": 96,
+          "comm_stream_send": 96,
+          "cuda_ipc_put_async": 96,
+          "cuda_ipc_put_wait_ack": 96
+        },
+        "fields": {
+          "ack_resource_hold_ms": {
+            "count": 96,
+            "mad": 0.0004014999999999991,
+            "mean": 0.016968281249999998,
+            "median": 0.0164985,
+            "p25": 0.01608275,
+            "p75": 0.01682475,
+            "p95": 0.019663
+          },
+          "bytes": {
+            "count": 192,
+            "mad": 0.0,
+            "mean": 1.0,
+            "median": 1.0,
+            "p25": 1.0,
+            "p75": 1.0,
+            "p95": 1.0
+          },
+          "cuda_event_handle_ms": {
+            "count": 96,
+            "mad": 9.049999999999987e-05,
+            "mean": 0.0022051875,
+            "median": 0.002138,
+            "p25": 0.0020385,
+            "p75": 0.00222125,
+            "p95": 0.002557
+          },
+          "sender_copy_enqueue_ms": {
+            "count": 96,
+            "mad": 0.025465,
+            "mean": 0.19388769791666668,
+            "median": 0.186777,
+            "p25": 0.162982,
+            "p75": 0.21611,
+            "p95": 0.25887400000000005
+          },
+          "slot_allocation_wait_ms": {
+            "count": 96,
+            "mad": 0.021234499999999962,
+            "mean": 0.4181111041666667,
+            "median": 0.42530599999999996,
+            "p25": 0.40462675000000004,
+            "p75": 0.44598424999999997,
+            "p95": 0.5406875
+          }
+        },
+        "run_key": "forward-round0-c1-C",
+        "trace_role": "sender"
+      },
+      {
+        "event_counts": {
+          "comm_send_enqueue": 96,
+          "comm_stream_send": 96
+        },
+        "fields": {},
+        "run_key": "forward-round0-c1-D",
+        "trace_role": "sender"
+      },
+      {
+        "event_counts": {
+          "cuda_ipc_get_async": 192,
+          "cuda_ipc_get_wait_copy": 192
+        },
+        "fields": {
+          "bytes": {
+            "count": 384,
+            "mad": 0.0,
+            "mean": 4096.0,
+            "median": 4096.0,
+            "p25": 4096.0,
+            "p75": 4096.0,
+            "p95": 4096.0
+          },
+          "receiver_copy_enqueue_ms": {
+            "count": 192,
+            "mad": 0.022912000000000002,
+            "mean": 0.20834304687500002,
+            "median": 0.176013,
+            "p25": 0.156101,
+            "p75": 0.23291774999999998,
+            "p95": 0.36640134999999996
+          },
+          "receiver_event_import_ms": {
+            "count": 192,
+            "mad": 0.0005439999999999993,
+            "mean": 0.008662682291666666,
+            "median": 0.007035,
+            "p25": 0.0066795000000000005,
+            "p75": 0.008795,
+            "p95": 0.013692399999999999
+          },
+          "receiver_gpu_copy_wait_ms": {
+            "count": 192,
+            "mad": 0.0036640000000000006,
+            "mean": 0.06136,
+            "median": 0.04568,
+            "p25": 0.043088,
+            "p75": 0.065872,
+            "p95": 0.12467039999999997
+          }
+        },
+        "run_key": "reverse-round0-c1-A",
+        "trace_role": "receiver"
+      },
+      {
+        "event_counts": {
+          "comm_send_enqueue": 96,
+          "comm_stream_send": 96,
+          "cuda_ipc_put_async": 192,
+          "cuda_ipc_put_wait_ack": 192
+        },
+        "fields": {
+          "ack_resource_hold_ms": {
+            "count": 192,
+            "mad": 0.0722815,
+            "mean": 0.09580097916666667,
+            "median": 0.0881755,
+            "p25": 0.016813750000000002,
+            "p75": 0.17255525,
+            "p95": 0.19986595
+          },
+          "bytes": {
+            "count": 384,
+            "mad": 0.0,
+            "mean": 4096.0,
+            "median": 4096.0,
+            "p25": 4096.0,
+            "p75": 4096.0,
+            "p95": 4096.0
+          },
+          "cuda_event_handle_ms": {
+            "count": 192,
+            "mad": 7.600000000000011e-05,
+            "mean": 0.0024939166666666664,
+            "median": 0.0022069999999999998,
+            "p25": 0.002145,
+            "p75": 0.00230975,
+            "p95": 0.0040427499999999925
+          },
+          "sender_copy_enqueue_ms": {
+            "count": 192,
+            "mad": 0.02104600000000001,
+            "mean": 0.19075969791666667,
+            "median": 0.1658785,
+            "p25": 0.14982375,
+            "p75": 0.22367774999999998,
+            "p95": 0.29092524999999997
+          },
+          "slot_allocation_wait_ms": {
+            "count": 192,
+            "mad": 0.1859845,
+            "mean": 0.36422463541666666,
+            "median": 0.304949,
+            "p25": 0.1653365,
+            "p75": 0.5748759999999999,
+            "p95": 0.7019464500000001
+          }
+        },
+        "run_key": "reverse-round0-c1-A",
+        "trace_role": "sender"
+      },
+      {
+        "event_counts": {
+          "cuda_ipc_get_async": 96,
+          "cuda_ipc_get_wait_copy": 96
+        },
+        "fields": {
+          "bytes": {
+            "count": 192,
+            "mad": 0.0,
+            "mean": 4096.0,
+            "median": 4096.0,
+            "p25": 4096.0,
+            "p75": 4096.0,
+            "p95": 4096.0
+          },
+          "receiver_copy_enqueue_ms": {
+            "count": 96,
+            "mad": 0.0050665000000000154,
+            "mean": 0.16139664583333332,
+            "median": 0.15744350000000001,
+            "p25": 0.15278825000000001,
+            "p75": 0.16412525,
+            "p95": 0.18084774999999997
+          },
+          "receiver_event_import_ms": {
+            "count": 96,
+            "mad": 0.0001734999999999996,
+            "mean": 0.00695925,
+            "median": 0.0066975,
+            "p25": 0.006545,
+            "p75": 0.00692675,
+            "p95": 0.007307
+          },
+          "receiver_gpu_copy_wait_ms": {
+            "count": 96,
+            "mad": 0.0013279999999999959,
+            "mean": 0.044292,
+            "median": 0.043088,
+            "p25": 0.041912,
+            "p75": 0.04442399999999999,
+            "p95": 0.05236
+          }
+        },
+        "run_key": "reverse-round0-c1-B",
+        "trace_role": "receiver"
+      },
+      {
+        "event_counts": {
+          "comm_send_enqueue": 96,
+          "comm_stream_send": 96,
+          "cuda_ipc_put_async": 96,
+          "cuda_ipc_put_wait_ack": 96
+        },
+        "fields": {
+          "ack_resource_hold_ms": {
+            "count": 96,
+            "mad": 0.0006165000000000007,
+            "mean": 0.017779645833333333,
+            "median": 0.016813,
+            "p25": 0.01636625,
+            "p75": 0.017817999999999997,
+            "p95": 0.024261750000000002
+          },
+          "bytes": {
+            "count": 192,
+            "mad": 0.0,
+            "mean": 4096.0,
+            "median": 4096.0,
+            "p25": 4096.0,
+            "p75": 4096.0,
+            "p95": 4096.0
+          },
+          "cuda_event_handle_ms": {
+            "count": 96,
+            "mad": 8.999999999999959e-05,
+            "mean": 0.0024683958333333333,
+            "median": 0.0022849999999999997,
+            "p25": 0.002196,
+            "p75": 0.0023740000000000002,
+            "p95": 0.00262325
+          },
+          "sender_copy_enqueue_ms": {
+            "count": 96,
+            "mad": 0.0185675,
+            "mean": 0.17817028125,
+            "median": 0.1677575,
+            "p25": 0.15208649999999999,
+            "p75": 0.20244075,
+            "p95": 0.2249445
+          },
+          "slot_allocation_wait_ms": {
+            "count": 96,
+            "mad": 0.04962999999999998,
+            "mean": 0.33317988541666665,
+            "median": 0.41359650000000003,
+            "p25": 0.12919375,
+            "p75": 0.44768725000000004,
+            "p95": 0.49681025
+          }
+        },
+        "run_key": "reverse-round0-c1-B",
+        "trace_role": "sender"
+      },
+      {
+        "event_counts": {
+          "cuda_ipc_get_async": 96,
+          "cuda_ipc_get_wait_copy": 96
+        },
+        "fields": {
+          "bytes": {
+            "count": 192,
+            "mad": 0.0,
+            "mean": 1.0,
+            "median": 1.0,
+            "p25": 1.0,
+            "p75": 1.0,
+            "p95": 1.0
+          },
+          "receiver_copy_enqueue_ms": {
+            "count": 96,
+            "mad": 0.0063794999999999685,
+            "mean": 0.168667625,
+            "median": 0.15936099999999997,
+            "p25": 0.15437774999999998,
+            "p75": 0.174342,
+            "p95": 0.19593225
+          },
+          "receiver_event_import_ms": {
+            "count": 96,
+            "mad": 0.00015649999999999996,
+            "mean": 0.006965364583333334,
+            "median": 0.006816,
+            "p25": 0.0066437499999999995,
+            "p75": 0.006934,
+            "p95": 0.00754525
+          },
+          "receiver_gpu_copy_wait_ms": {
+            "count": 96,
+            "mad": 0.001455999999999999,
+            "mean": 0.045878,
+            "median": 0.043376,
+            "p25": 0.041976,
+            "p75": 0.04496,
+            "p95": 0.063176
+          }
+        },
+        "run_key": "reverse-round0-c1-C",
+        "trace_role": "receiver"
+      },
+      {
+        "event_counts": {
+          "comm_send_enqueue": 96,
+          "comm_stream_send": 96,
+          "cuda_ipc_put_async": 96,
+          "cuda_ipc_put_wait_ack": 96
+        },
+        "fields": {
+          "ack_resource_hold_ms": {
+            "count": 96,
+            "mad": 0.0019695000000000008,
+            "mean": 0.01991221875,
+            "median": 0.0179985,
+            "p25": 0.016582,
+            "p75": 0.021486250000000002,
+            "p95": 0.027637000000000002
+          },
+          "bytes": {
+            "count": 192,
+            "mad": 0.0,
+            "mean": 1.0,
+            "median": 1.0,
+            "p25": 1.0,
+            "p75": 1.0,
+            "p95": 1.0
+          },
+          "cuda_event_handle_ms": {
+            "count": 96,
+            "mad": 0.00016649999999999998,
+            "mean": 0.0028608645833333337,
+            "median": 0.0023615,
+            "p25": 0.0021975,
+            "p75": 0.0025382499999999997,
+            "p95": 0.004883500000000001
+          },
+          "sender_copy_enqueue_ms": {
+            "count": 96,
+            "mad": 0.03750600000000001,
+            "mean": 0.23599291666666666,
+            "median": 0.196892,
+            "p25": 0.160218,
+            "p75": 0.23455875,
+            "p95": 0.286011
+          },
+          "slot_allocation_wait_ms": {
+            "count": 96,
+            "mad": 0.11086900000000005,
+            "mean": 0.35055862499999996,
+            "median": 0.41842599999999996,
+            "p25": 0.13481174999999998,
+            "p75": 0.48167125,
+            "p95": 0.6053584999999999
+          }
+        },
+        "run_key": "reverse-round0-c1-C",
+        "trace_role": "sender"
+      },
+      {
+        "event_counts": {
+          "comm_send_enqueue": 96,
+          "comm_stream_send": 96
+        },
+        "fields": {},
+        "run_key": "reverse-round0-c1-D",
+        "trace_role": "sender"
+      },
+      {
+        "event_counts": {
+          "cuda_ipc_pool_alloc": 2
+        },
+        "fields": {
+          "slot_count": {
+            "count": 2,
+            "mad": 0.0,
+            "mean": 16384.0,
+            "median": 16384.0,
+            "p25": 16384.0,
+            "p75": 16384.0,
+            "p95": 16384.0
+          }
+        },
+        "run_key": "unscoped",
+        "trace_role": "sender"
+      }
+    ]
+  },
+  "trace_enabled": true
+}
