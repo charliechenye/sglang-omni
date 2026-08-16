@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
 """Two-GPU transport probe for Qwen3-Omni RFC #1018 Track 2.2.
 
@@ -36,18 +35,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
-import torch
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
 
-from sglang_omni.comm.data_ref import DataRef, TransportKind
-from sglang_omni.comm.engine import CommEngine
-from sglang_omni.comm.router import CommRouter
-from sglang_omni.pipeline.control_plane import (
-    ControlPlaneContext,
-    PullSocket,
-    PushSocket,
-)
-from sglang_omni.proto import DataAckMessage, DataReadyMessage
+import sglang_omni
 
+_SGLANG_OMNI_SOURCE = Path(sglang_omni.__file__).resolve()
+try:
+    _SGLANG_OMNI_SOURCE.relative_to(_REPOSITORY_ROOT / "sglang_omni")
+except ValueError as exc:
+    raise RuntimeError(
+        "benchmark imported sglang_omni outside the checked-out repository: "
+        f"{_SGLANG_OMNI_SOURCE}"
+    ) from exc
 
 _BENCHMARK_NAME = "qwen3_omni_track_2_2_transport"
 _DEFAULT_WARMUP_CHUNKS = 100
@@ -58,10 +59,21 @@ _TRACE_MEASURE_CHUNKS = 100
 _TRACE_ROUNDS = 1
 _DEFAULT_CONCURRENCIES = (1, 8, 32)
 _DEFAULT_CUDA_IPC_SLOT_KB = 64
-_DEFAULT_CUDA_IPC_POOL_MB = 64
 _DEFAULT_RELAY_CREDITS = 2
 _DEFAULT_TIMEOUT_S = 1_800.0
 _MATERIAL_CHANGE_PCT = 5.0
+_MIN_STABLE_IMPROVEMENT_FRACTION = 0.60
+
+torch: Any = None
+CommEngine: Any = None
+CommRouter: Any = None
+ControlPlaneContext: Any = None
+DataAckMessage: Any = None
+DataReadyMessage: Any = None
+DataRef: Any = None
+PullSocket: Any = None
+PushSocket: Any = None
+TransportKind: Any = None
 
 
 @dataclass(frozen=True)
@@ -69,9 +81,9 @@ class ArmSpec:
     name: str
     description: str
     primary_shape: tuple[int, ...]
-    primary_dtype: torch.dtype
+    primary_dtype: str
     metadata_layer_hidden: bool
-    expected_transport: TransportKind
+    expected_transport: str
     logical_bytes_per_chunk: int
     tensor_transfers_per_chunk: int
 
@@ -81,9 +93,9 @@ ARM_SPECS: dict[str, ArmSpec] = {
         name="A",
         description="BF16 primary [2048] plus BF16 layer_hidden [2048] metadata",
         primary_shape=(2048,),
-        primary_dtype=torch.bfloat16,
+        primary_dtype="torch.bfloat16",
         metadata_layer_hidden=True,
-        expected_transport=TransportKind.CUDA_IPC,
+        expected_transport="cuda_ipc",
         logical_bytes_per_chunk=8_192,
         tensor_transfers_per_chunk=2,
     ),
@@ -91,9 +103,9 @@ ARM_SPECS: dict[str, ArmSpec] = {
         name="B",
         description="BF16 primary [2048] plus token_id metadata",
         primary_shape=(2048,),
-        primary_dtype=torch.bfloat16,
+        primary_dtype="torch.bfloat16",
         metadata_layer_hidden=False,
-        expected_transport=TransportKind.CUDA_IPC,
+        expected_transport="cuda_ipc",
         logical_bytes_per_chunk=4_096,
         tensor_transfers_per_chunk=1,
     ),
@@ -101,9 +113,9 @@ ARM_SPECS: dict[str, ArmSpec] = {
         name="C",
         description="persistent CUDA uint8 carrier [1] plus token_id metadata",
         primary_shape=(1,),
-        primary_dtype=torch.uint8,
+        primary_dtype="torch.uint8",
         metadata_layer_hidden=False,
-        expected_transport=TransportKind.CUDA_IPC,
+        expected_transport="cuda_ipc",
         logical_bytes_per_chunk=1,
         tensor_transfers_per_chunk=1,
     ),
@@ -111,13 +123,52 @@ ARM_SPECS: dict[str, ArmSpec] = {
         name="D",
         description="CPU torch.long carrier [1] plus token_id metadata",
         primary_shape=(1,),
-        primary_dtype=torch.int64,
+        primary_dtype="torch.int64",
         metadata_layer_hidden=False,
-        expected_transport=TransportKind.SHM,
+        expected_transport="shm",
         logical_bytes_per_chunk=8,
         tensor_transfers_per_chunk=1,
     ),
 }
+
+
+def _load_runtime() -> None:
+    """Load CUDA/runtime dependencies only after CLI qualification succeeds."""
+
+    global CommEngine, CommRouter, ControlPlaneContext, DataAckMessage
+    global DataReadyMessage, DataRef, PullSocket, PushSocket, TransportKind, torch
+    if torch is not None:
+        return
+    import torch as torch_module
+
+    from sglang_omni.comm.data_ref import DataRef as data_ref
+    from sglang_omni.comm.data_ref import TransportKind as transport_kind
+    from sglang_omni.comm.engine import CommEngine as comm_engine
+    from sglang_omni.comm.router import CommRouter as comm_router
+    from sglang_omni.pipeline.control_plane import (
+        ControlPlaneContext as control_plane_context,
+    )
+    from sglang_omni.pipeline.control_plane import PullSocket as pull_socket
+    from sglang_omni.pipeline.control_plane import PushSocket as push_socket
+    from sglang_omni.proto import DataAckMessage as data_ack_message
+    from sglang_omni.proto import DataReadyMessage as data_ready_message
+
+    torch = torch_module
+    CommEngine = comm_engine
+    CommRouter = comm_router
+    ControlPlaneContext = control_plane_context
+    DataAckMessage = data_ack_message
+    DataReadyMessage = data_ready_message
+    DataRef = data_ref
+    PullSocket = pull_socket
+    PushSocket = push_socket
+    TransportKind = transport_kind
+
+
+def _torch_dtype(dtype_name: str) -> Any:
+    _load_runtime()
+    _, attribute = dtype_name.split(".", 1)
+    return getattr(torch, attribute)
 
 
 @dataclass(frozen=True)
@@ -134,6 +185,15 @@ class RunSpec:
     @property
     def total_chunks(self) -> int:
         return self.warmup_chunks + self.measure_chunks
+
+
+@dataclass(frozen=True)
+class _PendingSend:
+    object_id: str
+    start_ns: int
+    publish_end_ns: int
+    phase: str
+    completion: asyncio.Future[None]
 
 
 class _TraceQueueHandler(logging.Handler):
@@ -191,8 +251,11 @@ class _BenchmarkControlPlane:
         self._outgoing = PushSocket(outgoing_endpoint)
         self._incoming = PullSocket(incoming_endpoint, bind=bind_incoming)
         self._object_ids: dict[tuple[str, int], str] = {}
+        self._object_keys: dict[str, tuple[str, int]] = {}
         self._ready: dict[str, asyncio.Future[None]] = {}
         self._complete: dict[str, asyncio.Future[None]] = {}
+        self._outstanding: set[str] = set()
+        self._max_outstanding = 0
         self._fatal: asyncio.Future[None] | None = None
 
     async def start(self) -> None:
@@ -221,6 +284,7 @@ class _BenchmarkControlPlane:
                 raise RuntimeError(f"duplicate benchmark data key {key!r}")
             loop = asyncio.get_running_loop()
             self._object_ids[key] = object_id
+            self._object_keys[object_id] = key
             self._ready[object_id] = loop.create_future()
             self._complete[object_id] = loop.create_future()
         await self._outgoing.send(message)
@@ -233,27 +297,44 @@ class _BenchmarkControlPlane:
                 f"no published object for {request_id}:{chunk_id}"
             ) from exc
 
-    async def mark_ready_and_wait(
-        self,
-        object_id: str,
-        timeout_s: float,
-    ) -> None:
-        ready = self._ready[object_id]
+    def mark_ready(self, object_id: str) -> asyncio.Future[None]:
+        try:
+            ready = self._ready[object_id]
+            completion = self._complete[object_id]
+        except KeyError as exc:
+            raise RuntimeError(f"unknown benchmark object {object_id!r}") from exc
         if not ready.done():
             ready.set_result(None)
-        completion = self._complete[object_id]
-        fatal = self._fatal
-        if fatal is None:
-            await asyncio.wait_for(completion, timeout=timeout_s)
-            return
-        done, _ = await asyncio.wait(
-            {completion, fatal}, return_when=asyncio.FIRST_COMPLETED
-        )
-        if fatal in done:
-            error = fatal.exception()
-            if error is not None:
-                raise error
-        await asyncio.wait_for(completion, timeout=timeout_s)
+        self._outstanding.add(object_id)
+        self._max_outstanding = max(self._max_outstanding, len(self._outstanding))
+        return completion
+
+    def fatal_future(self) -> asyncio.Future[None] | None:
+        return self._fatal
+
+    @property
+    def max_outstanding(self) -> int:
+        return self._max_outstanding
+
+    def reset_max_outstanding(self) -> None:
+        if self._outstanding:
+            raise RuntimeError("cannot reset outstanding count with live objects")
+        self._max_outstanding = 0
+
+    def retire(self, object_id: str) -> None:
+        completion = self._complete.get(object_id)
+        if completion is None:
+            raise RuntimeError(f"unknown benchmark object {object_id!r}")
+        if not completion.done():
+            raise RuntimeError(
+                f"cannot retire incomplete benchmark object {object_id!r}"
+            )
+        key = self._object_keys.pop(object_id, None)
+        if key is not None:
+            self._object_ids.pop(key, None)
+        self._ready.pop(object_id, None)
+        self._complete.pop(object_id, None)
+        self._outstanding.discard(object_id)
 
     async def ack_loop(self, engine: CommEngine) -> None:
         self._fatal = asyncio.get_running_loop().create_future()
@@ -281,9 +362,7 @@ class _BenchmarkControlPlane:
             if handlers:
                 await asyncio.gather(*handlers, return_exceptions=True)
 
-    async def _resolve_ack(
-        self, message: DataAckMessage, engine: CommEngine
-    ) -> None:
+    async def _resolve_ack(self, message: DataAckMessage, engine: CommEngine) -> None:
         object_id = message.object_id
         ready = self._ready.get(object_id)
         completion = self._complete.get(object_id)
@@ -315,6 +394,11 @@ class _BenchmarkControlPlane:
     def close(self) -> None:
         self._incoming.close()
         self._outgoing.close()
+        self._object_ids.clear()
+        self._object_keys.clear()
+        self._ready.clear()
+        self._complete.clear()
+        self._outstanding.clear()
 
 
 def _distribute_chunks(total: int, concurrency: int) -> list[int]:
@@ -325,6 +409,24 @@ def _distribute_chunks(total: int, concurrency: int) -> list[int]:
         )
     base, remainder = divmod(total, concurrency)
     return [base + int(index < remainder) for index in range(concurrency)]
+
+
+def _round_robin_chunk_plan(
+    counts: list[int], chunk_offsets: list[int] | None = None
+) -> list[tuple[int, int]]:
+    """Return one producer's request/chunk order without creating workers."""
+
+    if not counts:
+        return []
+    offsets = [0] * len(counts) if chunk_offsets is None else chunk_offsets
+    if len(offsets) != len(counts):
+        raise ValueError("chunk offsets must match request count")
+    return [
+        (request_index, offsets[request_index] + local_index)
+        for local_index in range(max(counts))
+        for request_index, request_count in enumerate(counts)
+        if local_index < request_count
+    ]
 
 
 def _build_run_specs(
@@ -357,35 +459,38 @@ def _build_run_specs(
 
 
 def _make_buffers(arm: ArmSpec, *, sender_gpu: int) -> dict[str, torch.Tensor]:
+    _load_runtime()
+    dtype = _torch_dtype(arm.primary_dtype)
     device = (
         torch.device(f"cuda:{sender_gpu}")
-        if arm.expected_transport is TransportKind.CUDA_IPC
+        if arm.expected_transport == "cuda_ipc"
         else torch.device("cpu")
     )
     if arm.name in {"A", "B"}:
-        primary = torch.arange(2048, dtype=torch.bfloat16, device=device)
+        primary = torch.arange(2048, dtype=dtype, device=device)
     elif arm.name == "C":
-        primary = torch.tensor([17], dtype=torch.uint8, device=device)
+        primary = torch.tensor([17], dtype=dtype, device=device)
     else:
-        primary = torch.tensor([17], dtype=torch.int64, device=device)
+        primary = torch.tensor([17], dtype=dtype, device=device)
     buffers = {"primary": primary}
     if arm.metadata_layer_hidden:
         buffers["layer_hidden"] = torch.arange(
-            2048, dtype=torch.bfloat16, device=device
+            2048, dtype=_torch_dtype("torch.bfloat16"), device=device
         )
     return buffers
 
 
 def _comm_config(
-    role: str, *, pool_mb: int, slot_kb: int, credits: int
+    role: str, *, pool_mb: int | None, slot_kb: int, credits: int
 ) -> dict[str, Any]:
-    return {
+    config = {
         "worker_id": f"qwen3_track_2_2_{role}_{os.getpid()}",
         "cuda_ipc_slot_size_kb": slot_kb,
-        "cuda_ipc_pool_size_mb": pool_mb,
         "credits": credits,
-        "slot_size_mb": 64,
     }
+    if pool_mb is not None:
+        config["cuda_ipc_pool_size_mb"] = pool_mb
+    return config
 
 
 def _make_router(
@@ -425,6 +530,7 @@ def _validate_received_payload(
     receiver_gpu: int,
     check_contents: bool,
 ) -> None:
+    _load_runtime()
     if not isinstance(metadata, dict):
         raise AssertionError("stream metadata must be a dict")
     if type(metadata.get("token_id")) is not int:
@@ -433,9 +539,9 @@ def _validate_received_payload(
         raise AssertionError(
             f"primary shape {tuple(data.shape)} != {arm.primary_shape}"
         )
-    if data.dtype != arm.primary_dtype:
+    if data.dtype != _torch_dtype(arm.primary_dtype):
         raise AssertionError(f"primary dtype {data.dtype} != {arm.primary_dtype}")
-    if arm.expected_transport is TransportKind.CUDA_IPC:
+    if arm.expected_transport == "cuda_ipc":
         if data.device.type != "cuda" or data.device.index != receiver_gpu:
             raise AssertionError(
                 f"CUDA primary arrived on {data.device}, expected cuda:{receiver_gpu}"
@@ -449,7 +555,7 @@ def _validate_received_payload(
             raise AssertionError("layer_hidden metadata tensor is missing")
         if tuple(layer_hidden.shape) != (2048,):
             raise AssertionError("layer_hidden shape is not [2048]")
-        if layer_hidden.dtype != torch.bfloat16:
+        if layer_hidden.dtype != _torch_dtype("torch.bfloat16"):
             raise AssertionError("layer_hidden dtype is not BF16")
         if (
             layer_hidden.device.type != "cuda"
@@ -492,13 +598,14 @@ async def _sender_process_async(
     ack_endpoint: str,
     sender_gpu: int,
     receiver_gpu: int,
-    pool_mb: int,
+    pool_mb: int | None,
     slot_kb: int,
     credits: int,
     timeout_s: float,
     ready_queue: Any,
     start_event: Any,
 ) -> dict[str, Any]:
+    _load_runtime()
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         raise RuntimeError("two visible CUDA devices are required")
     torch.cuda.set_device(sender_gpu)
@@ -521,43 +628,37 @@ async def _sender_process_async(
     await asyncio.to_thread(start_event.wait)
     ack_task = asyncio.create_task(control.ack_loop(engine))
     buffers = {
-        arm: _make_buffers(ARM_SPECS[arm], sender_gpu=sender_gpu)
-        for arm in ARM_SPECS
+        arm: _make_buffers(ARM_SPECS[arm], sender_gpu=sender_gpu) for arm in ARM_SPECS
     }
     direct_cuda_ipc_allowed = router.can_use_direct_cuda_ipc("talker")
 
     async def send_run(spec: RunSpec) -> dict[str, Any]:
+        control.reset_max_outstanding()
         arm = ARM_SPECS[spec.arm]
         transport, relay = router.relay_for_stream(
             "talker", buffers[spec.arm]["primary"]
         )
-        if transport is not arm.expected_transport:
+        if transport.value != arm.expected_transport:
             raise AssertionError(
                 f"router selected {transport.value} for arm {arm.name}, expected "
-                f"{arm.expected_transport.value}"
+                f"{arm.expected_transport}"
             )
-        if transport is TransportKind.CUDA_IPC and direct_cuda_ipc_allowed:
+        if transport.value == "cuda_ipc" and direct_cuda_ipc_allowed:
             raise AssertionError(
                 "benchmark topology unexpectedly permits direct same-GPU CUDA IPC"
             )
 
         warmup_counts = _distribute_chunks(spec.warmup_chunks, spec.concurrency)
         measure_counts = _distribute_chunks(spec.measure_chunks, spec.concurrency)
-        latencies_ms: list[float] = []
-        warmup_remaining = spec.concurrency
-        warmup_finished = asyncio.Event()
-        measure_finished = asyncio.Event()
-        measure_start_ns = 0
-        measure_end_ns = 0
-        measure_done = 0
-        state_lock = asyncio.Lock()
+        publish_latencies_ms: list[float] = []
+        ack_release_latencies_ms: list[float] = []
 
         async def send_chunk(
             request_index: int,
             chunk_id: int,
             *,
-            collect_latency: bool,
-        ) -> None:
+            phase: str,
+        ) -> _PendingSend:
             request_id = f"{spec.run_key}:req{request_index}"
             metadata: dict[str, Any] = {
                 "token_id": int(1_000_000 * request_index + chunk_id)
@@ -577,41 +678,85 @@ async def _sender_process_async(
                 metadata=metadata,
                 transport=transport,
             )
+            publish_end_ns = time.perf_counter_ns()
             object_id = control.object_id_for(request_id, chunk_id)
-            await control.mark_ready_and_wait(object_id, timeout_s)
-            if collect_latency:
-                latencies_ms.append(
-                    (time.perf_counter_ns() - start_ns) / 1_000_000.0
-                )
+            completion = control.mark_ready(object_id)
+            if phase == "measure":
+                publish_latencies_ms.append((publish_end_ns - start_ns) / 1_000_000.0)
+            return _PendingSend(
+                object_id=object_id,
+                start_ns=start_ns,
+                publish_end_ns=publish_end_ns,
+                phase=phase,
+                completion=completion,
+            )
 
-        async def request_worker(request_index: int) -> None:
-            nonlocal warmup_remaining, measure_start_ns, measure_done, measure_end_ns
-            for chunk_id in range(warmup_counts[request_index]):
-                await send_chunk(request_index, chunk_id, collect_latency=False)
-            async with state_lock:
-                warmup_remaining -= 1
-                if warmup_remaining == 0:
-                    measure_start_ns = time.perf_counter_ns()
-                    warmup_finished.set()
-            await warmup_finished.wait()
-            for local_index in range(measure_counts[request_index]):
-                await send_chunk(
-                    request_index,
-                    warmup_counts[request_index] + local_index,
-                    collect_latency=True,
+        async def produce_phase(
+            counts: list[int], *, chunk_offsets: list[int], phase: str
+        ) -> tuple[list[_PendingSend], int, int]:
+            records: list[_PendingSend] = []
+            phase_start_ns = time.perf_counter_ns()
+            for request_index, chunk_id in _round_robin_chunk_plan(
+                counts, chunk_offsets
+            ):
+                records.append(
+                    await send_chunk(
+                        request_index,
+                        chunk_id,
+                        phase=phase,
+                    )
                 )
-            async with state_lock:
-                measure_done += 1
-                if measure_done == spec.concurrency:
-                    measure_end_ns = time.perf_counter_ns()
-                    measure_finished.set()
+            return records, phase_start_ns, time.perf_counter_ns()
 
-        await asyncio.gather(
-            *(request_worker(index) for index in range(spec.concurrency))
+        async def drain(records: list[_PendingSend]) -> int:
+            pending = {record.completion: record for record in records}
+            while pending:
+                fatal = control.fatal_future()
+                waitables: set[asyncio.Future[None]] = set(pending)
+                if fatal is not None:
+                    waitables.add(fatal)
+                done, _ = await asyncio.wait(
+                    waitables, return_when=asyncio.FIRST_COMPLETED
+                )
+                if fatal is not None and fatal in done:
+                    error = fatal.exception()
+                    if error is not None:
+                        raise error
+                    raise RuntimeError("benchmark ACK loop failed without an error")
+                for completion in done:
+                    record = pending.pop(completion)
+                    completion.result()
+                    completed_ns = time.perf_counter_ns()
+                    control.retire(record.object_id)
+                    if record.phase == "measure":
+                        ack_release_latencies_ms.append(
+                            (completed_ns - record.start_ns) / 1_000_000.0
+                        )
+            return time.perf_counter_ns()
+
+        warmup_records, _, _ = await produce_phase(
+            warmup_counts, chunk_offsets=[0] * spec.concurrency, phase="warmup"
         )
-        await measure_finished.wait()
-        elapsed_s = max(
-            (measure_end_ns - measure_start_ns) / 1_000_000_000.0, 1e-12
+        await asyncio.wait_for(drain(warmup_records), timeout=timeout_s)
+
+        measure_start_ns = time.perf_counter_ns()
+        measure_records, _, measure_publish_end_ns = await produce_phase(
+            measure_counts, chunk_offsets=warmup_counts, phase="measure"
+        )
+        measure_drain_end_ns = await asyncio.wait_for(
+            drain(measure_records), timeout=timeout_s
+        )
+        publish_elapsed_s = max(
+            (measure_publish_end_ns - measure_start_ns) / 1_000_000_000.0,
+            1e-12,
+        )
+        end_to_end_elapsed_s = max(
+            (measure_drain_end_ns - measure_start_ns) / 1_000_000_000.0,
+            1e-12,
+        )
+        final_ack_drain_ms = max(
+            (measure_drain_end_ns - measure_publish_end_ns) / 1_000_000.0,
+            0.0,
         )
         return {
             "run_key": spec.run_key,
@@ -632,11 +777,17 @@ async def _sender_process_async(
             "total_tensor_transfers": (
                 arm.tensor_transfers_per_chunk * spec.measure_chunks
             ),
-            "latency_sample_count": len(latencies_ms),
-            "median_latency_ms": _percentile(latencies_ms, 0.50),
-            "p95_latency_ms": _percentile(latencies_ms, 0.95),
-            "chunks_per_sec": spec.measure_chunks / elapsed_s,
-            "measure_wall_ms": elapsed_s * 1_000.0,
+            "publish_latency_ms": _numeric_stats(publish_latencies_ms),
+            "ack_release_latency_ms": _numeric_stats(ack_release_latencies_ms),
+            "publish_chunks_per_sec": spec.measure_chunks / publish_elapsed_s,
+            "end_to_end_drain_chunks_per_sec": (
+                spec.measure_chunks / end_to_end_elapsed_s
+            ),
+            "publish_wall_ms": publish_elapsed_s * 1_000.0,
+            "end_to_end_drain_wall_ms": end_to_end_elapsed_s * 1_000.0,
+            "final_ack_drain_ms": final_ack_drain_ms,
+            "maximum_outstanding_transfer_count": control.max_outstanding,
+            "producer_mode": "single_round_robin",
             "sender_router_selected_expected": True,
             "direct_cuda_ipc_allowed": direct_cuda_ipc_allowed,
         }
@@ -666,12 +817,13 @@ async def _receiver_process_async(
     ack_endpoint: str,
     sender_gpu: int,
     receiver_gpu: int,
-    pool_mb: int,
+    pool_mb: int | None,
     slot_kb: int,
     credits: int,
     ready_queue: Any,
     start_event: Any,
 ) -> dict[str, Any]:
+    _load_runtime()
     if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
         raise RuntimeError("two visible CUDA devices are required")
     torch.cuda.set_device(receiver_gpu)
@@ -733,10 +885,10 @@ async def _receiver_process_async(
             raise ValueError(f"unknown benchmark run key {run_key!r}")
         arm = ARM_SPECS[spec.arm]
         data_ref = DataRef.from_dict(message.data_ref)
-        if data_ref.transport is not arm.expected_transport:
+        if data_ref.transport.value != arm.expected_transport:
             raise AssertionError(
                 f"receiver saw {data_ref.transport.value} for arm {arm.name}, "
-                f"expected {arm.expected_transport.value}"
+                f"expected {arm.expected_transport}"
             )
         if data_ref.kind.value != "stream_chunk":
             raise AssertionError(
@@ -773,9 +925,7 @@ async def _receiver_process_async(
         observation["measured_message_count"] += int(is_measured)
         observation["transports"].add(data_ref.transport.value)
         observation["relay_types"].add(type(relay).__name__)
-        observation["tensor_transfer_counts"].add(
-            1 + len(data_ref.metadata_tensors)
-        )
+        observation["tensor_transfer_counts"].add(1 + len(data_ref.metadata_tensors))
         backend_bytes = _backend_length(data_ref)
         logical_bytes = int(data.numel() * data.element_size())
         if metadata is not None:
@@ -874,7 +1024,7 @@ def _sender_process_entry(
     ack_endpoint: str,
     sender_gpu: int,
     receiver_gpu: int,
-    pool_mb: int,
+    pool_mb: int | None,
     slot_kb: int,
     credits: int,
     timeout_s: float,
@@ -921,7 +1071,7 @@ def _receiver_process_entry(
     ack_endpoint: str,
     sender_gpu: int,
     receiver_gpu: int,
-    pool_mb: int,
+    pool_mb: int | None,
     slot_kb: int,
     credits: int,
     trace_enabled: bool,
@@ -983,10 +1133,15 @@ def _trace_run_key(event: dict[str, Any]) -> str:
 def _numeric_stats(values: list[float]) -> dict[str, Any] | None:
     if not values:
         return None
+    median = _percentile(values, 0.50)
+    deviations = [abs(float(value) - median) for value in values]
     return {
         "count": len(values),
-        "median": _percentile(values, 0.50),
+        "median": median,
+        "p25": _percentile(values, 0.25),
+        "p75": _percentile(values, 0.75),
         "p95": _percentile(values, 0.95),
+        "mad": _percentile(deviations, 0.50),
         "mean": statistics.fmean(values),
     }
 
@@ -1091,7 +1246,7 @@ def _run_direction(
     direction: str,
     sender_gpu: int,
     receiver_gpu: int,
-    pool_mb: int,
+    pool_mb: int | None,
     slot_kb: int,
     credits: int,
     timeout_s: float,
@@ -1225,7 +1380,7 @@ def _merge_results(
         receiver_run = receiver_by_key.get(run["run_key"])
         if receiver_run is None:
             raise RuntimeError(f"missing receiver result for {run['run_key']}")
-        expected_transport = ARM_SPECS[run["arm"]].expected_transport.value
+        expected_transport = ARM_SPECS[run["arm"]].expected_transport
         expected_relay = (
             "CudaIpcRelay" if expected_transport == "cuda_ipc" else "ShmRelay"
         )
@@ -1235,8 +1390,7 @@ def _merge_results(
                 and run["transport"] == expected_transport
             ),
             "pooled_cuda_ipc_not_direct": bool(
-                run["transport"] != TransportKind.CUDA_IPC.value
-                or not run["direct_cuda_ipc_allowed"]
+                run["transport"] != "cuda_ipc" or not run["direct_cuda_ipc_allowed"]
             ),
             "receiver_data_refs_selected_expected": receiver_run["transports"]
             == [expected_transport],
@@ -1265,6 +1419,18 @@ def _merge_results(
     return merged
 
 
+def _aggregate_latency_metric(
+    cells: list[dict[str, Any]], metric: str
+) -> dict[str, float]:
+    medians = [float(cell[metric]["median"]) for cell in cells]
+    p95s = [float(cell[metric]["p95"]) for cell in cells]
+    return {
+        "median": statistics.median(medians),
+        "p95": statistics.median(p95s),
+        "run_median_mad": float(_numeric_stats(medians)["mad"]),
+    }
+
+
 def _aggregate_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, int], list[dict[str, Any]]] = collections.defaultdict(list)
     for run in runs:
@@ -1277,20 +1443,30 @@ def _aggregate_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "concurrency": concurrency,
                 "runs": len(cells),
                 "directions": sorted({cell["direction"] for cell in cells}),
-                "median_latency_ms": statistics.median(
-                    cell["median_latency_ms"] for cell in cells
+                "publish_latency_ms": _aggregate_latency_metric(
+                    cells, "publish_latency_ms"
                 ),
-                "p95_latency_ms": statistics.median(
-                    cell["p95_latency_ms"] for cell in cells
+                "ack_release_latency_ms": _aggregate_latency_metric(
+                    cells, "ack_release_latency_ms"
                 ),
-                "chunks_per_sec": statistics.median(
-                    cell["chunks_per_sec"] for cell in cells
+                "publish_chunks_per_sec": statistics.median(
+                    cell["publish_chunks_per_sec"] for cell in cells
+                ),
+                "end_to_end_drain_chunks_per_sec": statistics.median(
+                    cell["end_to_end_drain_chunks_per_sec"] for cell in cells
+                ),
+                "final_ack_drain_ms": statistics.median(
+                    cell["final_ack_drain_ms"] for cell in cells
+                ),
+                "maximum_outstanding_transfer_count": max(
+                    cell["maximum_outstanding_transfer_count"] for cell in cells
                 ),
                 "logical_tensor_bytes_per_chunk": cells[0][
                     "logical_tensor_bytes_per_chunk"
                 ],
                 "tensor_transfers_per_chunk": cells[0]["tensor_transfers_per_chunk"],
                 "transport": cells[0]["transport"],
+                "producer_modes": sorted({cell["producer_mode"] for cell in cells}),
                 "all_transport_checks_passed": all(
                     cell["transport_check_passed"] for cell in cells
                 ),
@@ -1299,10 +1475,159 @@ def _aggregate_runs(runs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return aggregates
 
 
-def _relative_change(candidate: float, baseline: float) -> float:
+_PAIRED_METRICS = (
+    "publish_latency_ms",
+    "ack_release_latency_ms",
+    "publish_chunks_per_sec",
+    "end_to_end_drain_chunks_per_sec",
+)
+_LATENCY_METRICS = {"publish_latency_ms", "ack_release_latency_ms"}
+
+
+def _run_metric_value(run: dict[str, Any], metric: str) -> float:
+    value = run[metric]
+    if isinstance(value, dict):
+        return float(value["median"])
+    return float(value)
+
+
+def _paired_runs(
+    runs: list[dict[str, Any]],
+    baseline_arm: str,
+    candidate_arm: str,
+    concurrency: int | None = None,
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    by_key: dict[tuple[str, int, int, str], dict[str, Any]] = {}
+    for run in runs:
+        run_concurrency = int(run["concurrency"])
+        if concurrency is not None and run_concurrency != concurrency:
+            continue
+        key = (
+            str(run["direction"]),
+            int(run["round"]),
+            run_concurrency,
+            str(run["arm"]),
+        )
+        by_key[key] = run
+    paired: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    keys = sorted(
+        {key[:3] for key in by_key if key[3] in {baseline_arm, candidate_arm}}
+    )
+    for direction, round_index, run_concurrency in keys:
+        baseline = by_key.get((direction, round_index, run_concurrency, baseline_arm))
+        candidate = by_key.get((direction, round_index, run_concurrency, candidate_arm))
+        if baseline is not None and candidate is not None:
+            paired.append((baseline, candidate))
+    return paired
+
+
+def _paired_delta(candidate: float, baseline: float, metric: str) -> float:
     if baseline == 0:
         return 0.0 if candidate == 0 else math.inf
+    if metric in _LATENCY_METRICS:
+        return (1.0 - candidate / baseline) * 100.0
     return (candidate / baseline - 1.0) * 100.0
+
+
+def _paired_metric_stats(
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]], metric: str
+) -> dict[str, Any]:
+    deltas = [
+        _paired_delta(
+            _run_metric_value(candidate, metric),
+            _run_metric_value(baseline, metric),
+            metric,
+        )
+        for baseline, candidate in pairs
+    ]
+    summary = _numeric_stats(deltas)
+    if summary is None:
+        return {
+            "paired_observations": 0,
+            "median_paired_percentage_delta": None,
+            "p25_paired_percentage_delta": None,
+            "p75_paired_percentage_delta": None,
+            "mad_paired_percentage_delta": None,
+            "improvement_count": 0,
+            "improvement_fraction": None,
+            "regression_count": 0,
+            "stable_effect": False,
+        }
+    improvement_count = sum(delta >= _MATERIAL_CHANGE_PCT for delta in deltas)
+    regression_count = sum(delta <= -_MATERIAL_CHANGE_PCT for delta in deltas)
+    return {
+        "paired_observations": len(deltas),
+        "median_paired_percentage_delta": summary["median"],
+        "p25_paired_percentage_delta": summary["p25"],
+        "p75_paired_percentage_delta": summary["p75"],
+        "mad_paired_percentage_delta": summary["mad"],
+        "improvement_count": improvement_count,
+        "improvement_fraction": improvement_count / len(deltas),
+        "regression_count": regression_count,
+        "stable_effect": abs(summary["median"]) > summary["mad"],
+    }
+
+
+def _stable_improvement(stats: dict[str, Any]) -> bool:
+    median = stats["median_paired_percentage_delta"]
+    mad = stats["mad_paired_percentage_delta"]
+    fraction = stats["improvement_fraction"]
+    return bool(
+        median is not None
+        and mad is not None
+        and fraction is not None
+        and median >= _MATERIAL_CHANGE_PCT
+        and fraction >= _MIN_STABLE_IMPROVEMENT_FRACTION
+        and median > mad
+    )
+
+
+def _stable_regression(stats: dict[str, Any]) -> bool:
+    median = stats["median_paired_percentage_delta"]
+    mad = stats["mad_paired_percentage_delta"]
+    if median is None or mad is None:
+        return False
+    observations = int(stats["paired_observations"])
+    regressions = int(stats["regression_count"])
+    return (
+        median <= -_MATERIAL_CHANGE_PCT
+        and observations > 0
+        and regressions / observations >= _MIN_STABLE_IMPROVEMENT_FRACTION
+        and -median > mad
+    )
+
+
+def _stable_non_regression(stats: dict[str, Any]) -> bool:
+    median = stats["median_paired_percentage_delta"]
+    mad = stats["mad_paired_percentage_delta"]
+    if median is None or mad is None or median < -_MATERIAL_CHANGE_PCT:
+        return False
+    return median >= 0 or median > mad
+
+
+def _paired_metrics(
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]]
+) -> dict[str, dict[str, Any]]:
+    return {metric: _paired_metric_stats(pairs, metric) for metric in _PAIRED_METRICS}
+
+
+def _status_for_paired_metrics(metrics: dict[str, dict[str, Any]]) -> str:
+    latency_good = all(
+        _stable_improvement(metrics[metric]) for metric in _LATENCY_METRICS
+    )
+    throughput_good = all(
+        _stable_non_regression(metrics[metric])
+        for metric in (
+            "publish_chunks_per_sec",
+            "end_to_end_drain_chunks_per_sec",
+        )
+    )
+    if latency_good and throughput_good:
+        return "GO"
+    has_stable_regression = any(
+        _stable_regression(metrics[metric]) for metric in _PAIRED_METRICS
+    )
+    return "NO-GO" if has_stable_regression else "MAYBE"
 
 
 def _decision_for_transition(comparisons: list[dict[str, Any]]) -> str:
@@ -1315,79 +1640,143 @@ def _decision_for_transition(comparisons: list[dict[str, Any]]) -> str:
     return "MAYBE"
 
 
-def _build_comparisons(aggregates: list[dict[str, Any]]) -> dict[str, Any]:
-    by_key = {(cell["arm"], cell["concurrency"]): cell for cell in aggregates}
-    transitions = (("A", "B"), ("B", "C"), ("C", "D"))
-    output: dict[str, Any] = {}
-    for source, candidate in transitions:
-        cells: list[dict[str, Any]] = []
-        for concurrency in sorted({cell["concurrency"] for cell in aggregates}):
-            baseline = by_key.get((source, concurrency))
-            comparison = by_key.get((candidate, concurrency))
-            if baseline is None or comparison is None:
-                continue
-            latency_change = _relative_change(
-                comparison["median_latency_ms"], baseline["median_latency_ms"]
-            )
-            p95_change = _relative_change(
-                comparison["p95_latency_ms"], baseline["p95_latency_ms"]
-            )
-            throughput_change = _relative_change(
-                comparison["chunks_per_sec"], baseline["chunks_per_sec"]
-            )
-            if (
-                latency_change <= -_MATERIAL_CHANGE_PCT
-                and p95_change <= -_MATERIAL_CHANGE_PCT
-                and throughput_change >= -_MATERIAL_CHANGE_PCT
-            ):
-                status = "GO"
-            elif (
-                latency_change >= _MATERIAL_CHANGE_PCT
-                or p95_change >= _MATERIAL_CHANGE_PCT
-                or throughput_change <= -_MATERIAL_CHANGE_PCT
-            ):
-                status = "NO-GO"
-            else:
-                status = "MAYBE"
-            cells.append(
-                {
-                    "concurrency": concurrency,
-                    "baseline": source,
-                    "candidate": candidate,
-                    "baseline_median_latency_ms": baseline["median_latency_ms"],
-                    "candidate_median_latency_ms": comparison["median_latency_ms"],
-                    "median_latency_change_pct": latency_change,
-                    "p95_latency_change_pct": p95_change,
-                    "throughput_change_pct": throughput_change,
-                    "status": status,
-                }
-            )
-        output[f"{source}->{candidate}"] = {
-            "cells": cells,
-            "decision": _decision_for_transition(cells) if cells else "MAYBE",
-        }
-    decisions = [item["decision"] for item in output.values()]
-    overall = (
-        "GO"
-        if decisions and all(decision == "GO" for decision in decisions)
-        else "NO-GO"
-        if any(decision == "NO-GO" for decision in decisions)
-        else "MAYBE"
+def _build_transition(
+    runs: list[dict[str, Any]], baseline_arm: str, candidate_arm: str
+) -> dict[str, Any]:
+    concurrencies = sorted({int(run["concurrency"]) for run in runs})
+    cells: list[dict[str, Any]] = []
+    for concurrency in concurrencies:
+        pairs = _paired_runs(runs, baseline_arm, candidate_arm, concurrency=concurrency)
+        metrics = _paired_metrics(pairs)
+        cells.append(
+            {
+                "concurrency": concurrency,
+                "baseline": baseline_arm,
+                "candidate": candidate_arm,
+                "paired_observations": len(pairs),
+                "metrics": metrics,
+                "status": _status_for_paired_metrics(metrics),
+            }
+        )
+    all_pairs = _paired_runs(runs, baseline_arm, candidate_arm)
+    return {
+        "baseline": baseline_arm,
+        "candidate": candidate_arm,
+        "cells": cells,
+        "overall_paired": {
+            "paired_observations": len(all_pairs),
+            "metrics": _paired_metrics(all_pairs),
+        },
+        "decision": _decision_for_transition(cells) if cells else "MAYBE",
+    }
+
+
+def _recommend_candidate(direct_from_a: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    scores: list[dict[str, Any]] = []
+    for transition_name, transition in direct_from_a.items():
+        metrics = transition["overall_paired"]["metrics"]
+        publish_delta = metrics["publish_latency_ms"]["median_paired_percentage_delta"]
+        ack_delta = metrics["ack_release_latency_ms"]["median_paired_percentage_delta"]
+        publish_throughput = metrics["publish_chunks_per_sec"][
+            "median_paired_percentage_delta"
+        ]
+        drain_throughput = metrics["end_to_end_drain_chunks_per_sec"][
+            "median_paired_percentage_delta"
+        ]
+        latency_score = (
+            min(publish_delta, ack_delta)
+            if publish_delta is not None and ack_delta is not None
+            else None
+        )
+        throughput_score = (
+            min(publish_throughput, drain_throughput)
+            if publish_throughput is not None and drain_throughput is not None
+            else None
+        )
+        scores.append(
+            {
+                "candidate": transition["candidate"],
+                "transition": transition_name,
+                "decision": transition["decision"],
+                "latency_score_pct": latency_score,
+                "throughput_score_pct": throughput_score,
+                "paired_observations": transition["overall_paired"][
+                    "paired_observations"
+                ],
+            }
+        )
+    rank = {"GO": 2, "MAYBE": 1, "NO-GO": 0}
+    scores.sort(
+        key=lambda item: (
+            rank[item["decision"]],
+            (
+                item["latency_score_pct"]
+                if item["latency_score_pct"] is not None
+                else float("-inf")
+            ),
+            (
+                item["throughput_score_pct"]
+                if item["throughput_score_pct"] is not None
+                else float("-inf")
+            ),
+        ),
+        reverse=True,
     )
+    best = scores[0] if scores else None
+    if best is None or best["decision"] == "NO-GO":
+        return {
+            "best_candidate_relative_to_A": best["candidate"] if best else None,
+            "recommended_candidate": "A",
+            "decision": "NO-GO" if best else "MAYBE",
+            "candidate_scores": scores,
+            "rationale": "No candidate has a stable direct improvement over A.",
+        }
+    return {
+        "best_candidate_relative_to_A": best["candidate"],
+        "recommended_candidate": best["candidate"],
+        "decision": best["decision"],
+        "candidate_scores": scores,
+        "rationale": (
+            "Recommendation uses direct A-baseline evidence; incremental C->D "
+            "regression does not override a stable A->C result."
+        ),
+    }
+
+
+def _build_comparisons(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    incremental_pairs = (("A", "B"), ("B", "C"), ("C", "D"))
+    direct_pairs = (("A", "B"), ("A", "C"), ("A", "D"))
+    incremental = {
+        f"{baseline}->{candidate}": _build_transition(runs, baseline, candidate)
+        for baseline, candidate in incremental_pairs
+    }
+    direct_from_a = {
+        f"{baseline}->{candidate}": _build_transition(runs, baseline, candidate)
+        for baseline, candidate in direct_pairs
+    }
+    recommendation = _recommend_candidate(direct_from_a)
     return {
         "material_change_threshold_pct": _MATERIAL_CHANGE_PCT,
+        "minimum_stable_improvement_fraction": _MIN_STABLE_IMPROVEMENT_FRACTION,
         "rubric": {
             "GO": (
-                "at least 2 of 3 concurrency cells improve median and p95 by >=5% "
-                "without a >=5% throughput regression"
+                "paired median publish and ACK/resource latencies improve by >=5%, "
+                "at least 60% of paired observations improve, the median effect "
+                "exceeds MAD, and neither throughput metric materially regresses"
             ),
-            "MAYBE": "mixed, marginal, or insufficiently repeatable cells",
+            "MAYBE": (
+                "effect is marginal, mixed, or ordinary paired variation is "
+                "comparable to the nominal effect"
+            ),
             "NO-GO": (
-                "at least 2 of 3 cells regress or show no material transport benefit"
+                "the compared candidate has a stable material regression; this "
+                "only rejects that candidate relative to its baseline"
             ),
         },
-        "transitions": output,
-        "overall": overall,
+        "incremental": incremental,
+        "direct_from_A": direct_from_a,
+        "recommendation": recommendation,
+        "overall": recommendation["decision"],
     }
 
 
@@ -1415,11 +1804,14 @@ def _print_summary(
         [
             cell["arm"],
             str(cell["concurrency"]),
-            f"{cell['median_latency_ms']:.3f}",
-            f"{cell['p95_latency_ms']:.3f}",
-            f"{cell['chunks_per_sec']:.1f}",
+            f"{cell['publish_latency_ms']['median']:.3f}",
+            f"{cell['publish_latency_ms']['p95']:.3f}",
+            f"{cell['ack_release_latency_ms']['median']:.3f}",
+            f"{cell['publish_chunks_per_sec']:.1f}",
+            f"{cell['end_to_end_drain_chunks_per_sec']:.1f}",
             str(cell["logical_tensor_bytes_per_chunk"]),
             str(cell["tensor_transfers_per_chunk"]),
+            str(cell["maximum_outstanding_transfer_count"]),
             cell["transport"],
             str(cell["runs"]),
         ]
@@ -1431,11 +1823,14 @@ def _print_summary(
             [
                 "arm",
                 "reqs",
-                "median ms",
-                "p95 ms",
-                "chunks/s",
+                "pub med ms",
+                "pub p95 ms",
+                "ACK med ms",
+                "publish/s",
+                "drain/s",
                 "logical B/chunk",
                 "tensors/chunk",
+                "max out",
                 "transport",
                 "cells",
             ],
@@ -1444,24 +1839,48 @@ def _print_summary(
     )
     print("\nAttribution comparisons:")
     comparison_rows: list[list[str]] = []
-    for transition, result in comparisons["transitions"].items():
-        for cell in result["cells"]:
+    for group_name in ("incremental", "direct_from_A"):
+        for transition, result in comparisons[group_name].items():
+            for cell in result["cells"]:
+                metrics = cell["metrics"]
+                comparison_rows.append(
+                    [
+                        group_name,
+                        transition,
+                        str(cell["concurrency"]),
+                        f"{metrics['publish_latency_ms']['median_paired_percentage_delta']:+.2f}%",
+                        f"{metrics['ack_release_latency_ms']['median_paired_percentage_delta']:+.2f}%",
+                        f"{metrics['end_to_end_drain_chunks_per_sec']['median_paired_percentage_delta']:+.2f}%",
+                        f"{metrics['publish_latency_ms']['mad_paired_percentage_delta']:.2f}%",
+                        f"{metrics['publish_latency_ms']['improvement_count']}/{metrics['publish_latency_ms']['paired_observations']}",
+                        cell["status"],
+                    ]
+                )
             comparison_rows.append(
-                [
-                    transition,
-                    str(cell["concurrency"]),
-                    f"{cell['median_latency_change_pct']:+.2f}%",
-                    f"{cell['p95_latency_change_pct']:+.2f}%",
-                    f"{cell['throughput_change_pct']:+.2f}%",
-                    cell["status"],
-                ]
+                [group_name, transition, "all", "", "", "", "", "", result["decision"]]
             )
-        comparison_rows.append([transition, "all", "", "", "", result["decision"]])
     print(
         _format_table(
-            ["transition", "reqs", "median Δ", "p95 Δ", "throughput Δ", "decision"],
+            [
+                "comparison",
+                "transition",
+                "reqs",
+                "publish Δ",
+                "ACK Δ",
+                "drain/s Δ",
+                "publish MAD",
+                "improve",
+                "decision",
+            ],
             comparison_rows,
         )
+    )
+    recommendation = comparisons["recommendation"]
+    print(
+        "\nRecommendation: "
+        f"{recommendation['recommended_candidate']} "
+        f"({recommendation['decision']}); "
+        f"best direct candidate={recommendation['best_candidate_relative_to_A']}"
     )
     print(
         "\nInterpret logical bytes only alongside measured transfer count, slot "
@@ -1507,7 +1926,13 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--cuda-ipc-slot-kb", type=int, default=_DEFAULT_CUDA_IPC_SLOT_KB
     )
     parser.add_argument(
-        "--cuda-ipc-pool-mb", type=int, default=_DEFAULT_CUDA_IPC_POOL_MB
+        "--cuda-ipc-pool-mb",
+        type=int,
+        default=None,
+        help=(
+            "optional CUDA IPC pool size in MiB; unset preserves the production "
+            "relay default (1 GiB)"
+        ),
     )
     parser.add_argument("--relay-credits", type=int, default=_DEFAULT_RELAY_CREDITS)
     parser.add_argument("--timeout-s", type=float, default=_DEFAULT_TIMEOUT_S)
@@ -1537,12 +1962,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("warmup-chunks must be >= the largest concurrency")
     if args.measure_chunks < max(args.concurrency):
         parser.error("measure-chunks must be >= the largest concurrency")
-    if (
-        args.cuda_ipc_slot_kb <= 0
-        or args.cuda_ipc_pool_mb <= 0
-        or args.relay_credits <= 0
-    ):
+    if args.cuda_ipc_slot_kb <= 0 or args.relay_credits <= 0:
         parser.error("relay sizes and credits must be positive")
+    if args.cuda_ipc_pool_mb is not None and args.cuda_ipc_pool_mb <= 0:
+        parser.error("cuda-ipc-pool-mb must be positive when provided")
     if args.timeout_s <= 0:
         parser.error("timeout-s must be positive")
     return args
@@ -1550,6 +1973,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
+    _load_runtime()
     trace_enabled = args.mode == "trace"
     os.environ["SGLANG_OMNI_COMM_TRACE"] = "1" if trace_enabled else "0"
     forward_specs = _build_run_specs(
@@ -1588,11 +2012,13 @@ def main(argv: list[str] | None = None) -> int:
         all_trace_events.extend(trace_events)
 
     aggregates = _aggregate_runs(all_runs)
-    comparisons = _build_comparisons(aggregates)
+    comparisons = _build_comparisons(all_runs)
     output = {
         "schema_version": 1,
         "benchmark": _BENCHMARK_NAME,
         "git_commit": _git_commit(),
+        "repository_root": str(_REPOSITORY_ROOT),
+        "sglang_omni_source": str(_SGLANG_OMNI_SOURCE),
         "mode": args.mode,
         "trace_enabled": trace_enabled,
         "architecture": {
@@ -1606,6 +2032,11 @@ def main(argv: list[str] | None = None) -> int:
                 "stage_io.write_stream_chunk/read_stream_chunk"
             ),
             "cuda_ipc_pool_mb": args.cuda_ipc_pool_mb,
+            "cuda_ipc_pool_policy": (
+                "explicit override"
+                if args.cuda_ipc_pool_mb is not None
+                else "production relay default (1 GiB)"
+            ),
             "cuda_ipc_slot_kb": args.cuda_ipc_slot_kb,
             "relay_credits": args.relay_credits,
             "model_weights_loaded": False,
@@ -1616,15 +2047,16 @@ def main(argv: list[str] | None = None) -> int:
             "rounds": args.rounds,
             "concurrency": list(args.concurrency),
             "orders": ["A B C D", "D C B A"],
+            "producer_mode": "single_round_robin",
             "timeout_s": args.timeout_s,
         },
         "arms": {
             arm.name: {
                 "description": arm.description,
                 "primary_shape": list(arm.primary_shape),
-                "primary_dtype": str(arm.primary_dtype),
+                "primary_dtype": arm.primary_dtype,
                 "metadata_layer_hidden": arm.metadata_layer_hidden,
-                "expected_transport": arm.expected_transport.value,
+                "expected_transport": arm.expected_transport,
                 "logical_bytes_per_chunk": arm.logical_bytes_per_chunk,
                 "tensor_transfers_per_chunk": arm.tensor_transfers_per_chunk,
             }
@@ -1633,9 +2065,9 @@ def main(argv: list[str] | None = None) -> int:
         "runs": all_runs,
         "aggregates": aggregates,
         "comparisons": comparisons,
-        "trace": _summarize_trace(all_trace_events)
-        if trace_enabled
-        else {"event_count": 0},
+        "trace": (
+            _summarize_trace(all_trace_events) if trace_enabled else {"event_count": 0}
+        ),
         "host": {
             "python": sys.version,
             "platform": platform.platform(),
