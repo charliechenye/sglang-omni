@@ -169,6 +169,42 @@ class S2ProDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
+class _S2ProTransformerView:
+    """Unregistered transformer-body view used by SGLang BCG discovery.
+
+    Fish keeps the transformer stack and its eager sampling tail in one model
+    class. The shared breakable-prefill runner captures the discovered layer
+    model and runs the outer model tail eagerly, so expose a lightweight view
+    without registering a second module path or duplicating parameters.
+    """
+
+    # ``PrefillCudaGraphRunner`` temporarily replaces ``forward`` during
+    # replay, so the view needs an instance dictionary in addition to its
+    # single owner reference.
+    __slots__ = ("_owner", "__dict__")
+
+    def __init__(self, owner: "S2ProSGLangTextModel") -> None:
+        self._owner = owner
+
+    @property
+    def layers(self):
+        return self._owner.layers
+
+    def forward(
+        self,
+        input_ids: Tensor,
+        positions: Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[Tensor] = None,
+    ) -> Tensor:
+        return self._owner._forward_transformer(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+        )
+
+
 class S2ProSGLangTextModel(nn.Module):
 
     def __init__(
@@ -238,6 +274,13 @@ class S2ProSGLangTextModel(nn.Module):
             from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 
             self.lm_head = ParallelLMHead(vocab_size, hidden_size)
+
+        self._transformer_view = _S2ProTransformerView(self)
+
+    @property
+    def model(self) -> _S2ProTransformerView:
+        """Expose the transformer body for shared prefill graph discovery."""
+        return self._transformer_view
 
     def setup_vq_decode(
         self,
@@ -335,7 +378,43 @@ class S2ProSGLangTextModel(nn.Module):
         positions: Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[Tensor] = None,
+        omni_prefill_rids: list[str] | tuple[str, ...] | None = None,
     ) -> LogitsProcessorOutput:
+        del omni_prefill_rids
+        hidden_states = self.model.forward(
+            input_ids,
+            positions,
+            forward_batch,
+            input_embeds,
+        )
+
+        # Extend: prune to last-token positions
+        if forward_batch.forward_mode.is_extend():
+            last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
+            hidden_states = hidden_states[last_index]
+
+        # Logits
+        if self.tie_word_embeddings:
+            logits = torch.nn.functional.linear(hidden_states, self.embed_tokens.weight)
+        else:
+            logits = self.lm_head(hidden_states)
+
+        # Codebook decode: constrained sampling + batched codebook loop
+        if self._vq_ready:
+            self._decode_codebooks(logits, hidden_states)
+
+        return LogitsProcessorOutput(
+            next_token_logits=logits,
+            hidden_states=hidden_states,
+        )
+
+    def _forward_transformer(
+        self,
+        input_ids: Tensor,
+        positions: Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[Tensor] = None,
+    ) -> Tensor:
         if input_embeds is None and forward_batch.input_embeds is not None:
             input_embeds = forward_batch.input_embeds
 
@@ -358,33 +437,13 @@ class S2ProSGLangTextModel(nn.Module):
                     vq_mask.unsqueeze(-1), combined, hidden_states
                 )
 
-        # Transformer
         residual = None
         for layer_idx in range(self.start_layer, self.end_layer):
             hidden_states, residual = self.layers[layer_idx](
                 positions, hidden_states, forward_batch, residual
             )
         hidden_states, _ = self.norm(hidden_states, residual)
-
-        # Extend: prune to last-token positions
-        if forward_batch.forward_mode.is_extend():
-            last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
-            hidden_states = hidden_states[last_index]
-
-        # Logits
-        if self.tie_word_embeddings:
-            logits = torch.nn.functional.linear(hidden_states, self.embed_tokens.weight)
-        else:
-            logits = self.lm_head(hidden_states)
-
-        # Codebook decode: constrained sampling + batched codebook loop
-        if self._vq_ready:
-            self._decode_codebooks(logits, hidden_states)
-
-        return LogitsProcessorOutput(
-            next_token_logits=logits,
-            hidden_states=hidden_states,
-        )
+        return hidden_states
 
     @torch.no_grad()
     def _decode_codebooks(self, logits: Tensor, hidden_states: Tensor) -> None:

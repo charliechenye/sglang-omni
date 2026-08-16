@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
 from sglang_omni.models.fishaudio_s2_pro.model_runner import (
     FishS2ProModelRunner,
     collect_s2pro_step_outputs,
@@ -257,7 +258,11 @@ def test_fish_s2pro_before_prefill_syncs_decode_state() -> None:
         _prev_tokens=torch.full((2, 4), 999, dtype=torch.long),
         _prev_token_count=torch.full((2,), 99, dtype=torch.long),
     )
-    forward_batch = SimpleNamespace(input_ids=torch.tensor([10, 11]))
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor([10, 11]),
+        input_embeds=None,
+        replace_embeds=None,
+    )
 
     runner.before_prefill(
         forward_batch,
@@ -268,7 +273,10 @@ def test_fish_s2pro_before_prefill_syncs_decode_state() -> None:
         ],
     )
 
-    assert hasattr(forward_batch, "input_embeds")
+    prefill_inputs = get_omni_prefill_inputs(forward_batch)
+    assert prefill_inputs is not None
+    assert forward_batch.input_embeds is None
+    assert prefill_inputs.input_embeds.shape == (2, 2)
     assert torch.equal(runner.model._prev_tokens[0], torch.zeros(4, dtype=torch.long))
     assert int(runner.model._prev_token_count[0].item()) == 0
     assert torch.equal(
