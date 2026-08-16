@@ -19,10 +19,7 @@ from sglang_omni.models.qwen3_omni.components.talker_input import (
     build_user_part,
     segment_chat_template,
 )
-from sglang_omni.models.qwen3_omni.components.talker_prefill import (
-    TalkerPrefillBuilder,
-)
-
+from sglang_omni.models.qwen3_omni.components.talker_prefill import TalkerPrefillBuilder
 
 HIDDEN = 4
 IM_START = 1
@@ -48,6 +45,12 @@ def _fake_prefill_builder() -> TalkerPrefillBuilder:
     builder._system_token_id = 4
     builder._user_token_id = USER
     builder._assistant_token_id = ASSISTANT
+    builder._tts_pad_token_id = 10
+    builder._codec_nothink_id = 5
+    builder._codec_think_bos_id = 6
+    builder._codec_think_eos_id = 7
+    builder._codec_pad_id = 8
+    builder._codec_bos_id = 9
 
     def embedding_rows(token_ids: torch.Tensor) -> torch.Tensor:
         rows = token_ids.to(dtype=torch.float32).reshape(-1, 1)
@@ -135,9 +138,7 @@ def _assert_prefill_equal(left: dict, right: dict) -> None:
 
 def _mixed_prompt_inputs(
     builder: TalkerPrefillBuilder,
-) -> tuple[
-    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Return one mixed user prompt followed by a multi-token assistant turn."""
     thinker_input_ids = torch.tensor(
         [
@@ -312,9 +313,7 @@ def test_multimodal_prompt_hidden_rows_change_corresponding_talker_rows() -> Non
     assert torch.equal(normal["input_ids"], changed["input_ids"])
     assert torch.equal(normal["future_text_rows"], changed["future_text_rows"])
     changed_rows = (normal["input_embeds"] != changed["input_embeds"]).any(dim=1)
-    multimodal_rows = _user_multimodal_output_rows(
-        thinker_input_ids, multimodal_mask
-    )
+    multimodal_rows = _user_multimodal_output_rows(thinker_input_ids, multimodal_mask)
     assert changed_rows.nonzero(as_tuple=True)[0].tolist() == multimodal_rows
 
 
