@@ -1,4 +1,4 @@
-name: "MOSS-TTS BCG CPU validation"
+name: "Voxtral-TTS BCG CPU validation"
 
 on:
   push:
@@ -10,22 +10,22 @@ permissions:
   contents: read
 
 env:
-  # Exact MOSS-TTS BCG candidate under validation.
-  TARGET_SHA: 40f2d8892000b639ab5524628e83e0d97801b34a
-  # Exact base before the MOSS-TTS adopter commits.
+  # Exact Voxtral-TTS BCG candidate under validation.
+  TARGET_SHA: 7476a84cc7bdbba87d19e292cbd2b7d420c3ae7e
+  # Exact upstream main parent before the Voxtral adopter commit.
   BASE_SHA: 9bc2cd7d91059c88565c163344d9a094d4cbd5d3
   TEST_VENV: /tmp/sglang-omni-cpu-venv
 
 jobs:
-  moss-tts-cpu:
-    name: "MOSS-TTS BCG CPU gate"
+  voxtral-tts-cpu:
+    name: "Voxtral-TTS BCG CPU gate"
     runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
       image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
 
     steps:
-      - name: Checkout exact MOSS-TTS candidate
+      - name: Checkout exact Voxtral-TTS candidate
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_SHA }}
@@ -44,7 +44,7 @@ jobs:
           ACTUAL="$(git rev-parse HEAD)"
           test "${ACTUAL}" = "${TARGET_SHA}"
           git cat-file -e "${BASE_SHA}^{commit}"
-          git merge-base --is-ancestor "${BASE_SHA}" "${TARGET_SHA}"
+          test "$(git rev-parse "${TARGET_SHA}^")" = "${BASE_SHA}"
           echo "=== Candidate commits ==="
           git log --oneline "${BASE_SHA}..${TARGET_SHA}"
           echo "=== Candidate diff stat ==="
@@ -94,27 +94,69 @@ jobs:
           print("transformers:", transformers.__version__)
           PY
 
-      - name: MOSS prefill sidecar contract
-        id: sidecar
+      - name: Voxtral prefill adopter contract
+        id: contract
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
           "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/moss_tts/test_pipeline.py::test_moss_prefill_forward_uses_prompt_row_embeds \
-            tests/unit_test/moss_tts/test_pipeline.py::test_moss_prefill_sidecar_transport_reaches_model_forward \
-            tests/unit_test/model_runner/test_prefill_inputs.py \
-            tests/unit_test/model_runner/test_prefill_forward_kwargs.py
+            tests/unit_test/voxtral_tts/test_prefill_cuda_graph_contract.py
 
-      - name: MOSS BCG capability contract
-        id: capability
+      - name: Padded BCG hidden-row contract
+        id: padded_hidden
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
-          "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/moss_tts/test_sampling_cuda_graph.py::test_engine_builder_allows_breakable_prefill_as_an_opt_in \
-            tests/unit_test/models/test_model_capabilities.py
+          "${TEST_VENV}/bin/python" - <<'PY'
+          from types import SimpleNamespace
+          import torch
+          from sglang_omni.models.voxtral_tts.sglang_model import VoxtralSGLangTTSModel
+
+          HIDDEN = 4
+          padded_hidden = torch.arange(8 * HIDDEN, dtype=torch.float32).reshape(8, HIDDEN) + 1000
+          raw_input_embeds = torch.arange(5 * HIDDEN, dtype=torch.float32).reshape(5, HIDDEN)
+          seen = {}
+
+          class FakeLanguageModel(torch.nn.Module):
+              def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+                  seen["input_ids_rows"] = int(input_ids.shape[0])
+                  seen["input_embeds_rows"] = int(input_embeds.shape[0])
+                  seen["forward_batch"] = forward_batch
+                  return padded_hidden.clone()
+
+          model = VoxtralSGLangTTSModel.__new__(VoxtralSGLangTTSModel)
+          torch.nn.Module.__init__(model)
+          model.language_model = FakeLanguageModel()
+          model._decode_input_embed_buffer = torch.zeros((2, HIDDEN))
+
+          forward_batch = SimpleNamespace(
+              input_ids=torch.arange(8, dtype=torch.long),
+              extend_seq_lens=torch.tensor([2, 3], dtype=torch.long),
+              forward_mode=SimpleNamespace(
+                  is_decode=lambda: False,
+                  is_extend=lambda: True,
+              ),
+          )
+
+          output = model.forward(
+              forward_batch.input_ids,
+              torch.arange(8, dtype=torch.long),
+              forward_batch,
+              input_embeds=raw_input_embeds,
+              omni_prefill_rids=["request-one", "request-two"],
+          )
+
+          assert seen["input_ids_rows"] == 8, seen
+          assert seen["input_embeds_rows"] == 5, seen
+          torch.testing.assert_close(output.hidden_states, padded_hidden[[1, 4]])
+          assert output.next_token_logits.shape == (2, 1)
+          print("padded BCG hidden-row contract: OK")
+          print("live input embeds rows:", seen["input_embeds_rows"])
+          print("padded hidden rows:", padded_hidden.shape[0])
+          print("selected request endpoints: [1, 4]")
+          PY
 
       - name: Late-bound model forward compatibility
         id: forward_contract
@@ -124,29 +166,26 @@ jobs:
           set -euxo pipefail
           "${TEST_VENV}/bin/python" - <<'PY'
           import inspect
-          from sglang_omni.models.moss_tts.sglang_model import MossTTSDelaySGLangModel
+          from sglang_omni.models.voxtral_tts.sglang_model import VoxtralSGLangTTSModel
 
-          params = inspect.signature(MossTTSDelaySGLangModel.forward).parameters
-          accepts_kwargs = any(
-              p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()
-          )
-          print("MossTTSDelaySGLangModel.forward parameters:", list(params))
+          params = inspect.signature(VoxtralSGLangTTSModel.forward).parameters
+          print("VoxtralSGLangTTSModel.forward parameters:", list(params))
           for required in ("input_embeds", "omni_prefill_rids"):
-              if required not in params and not accepts_kwargs:
+              if required not in params:
                   raise AssertionError(
                       f"late-bound Omni prefill kwarg {required!r} is not accepted "
-                      "by MossTTSDelaySGLangModel.forward"
+                      "by VoxtralSGLangTTSModel.forward"
                   )
           print("late-bound forward contract: OK")
           PY
 
-      - name: CPU-compatible MOSS-TTS unit suite
-        id: moss_cpu
+      - name: CPU-compatible Voxtral-TTS unit suite
+        id: voxtral_cpu
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
-          "${TEST_VENV}/bin/python" -m pytest -q tests/unit_test/moss_tts
+          "${TEST_VENV}/bin/python" -m pytest -q tests/unit_test/voxtral_tts
 
       - name: Shared prefill infrastructure regression
         id: shared_prefill
@@ -157,9 +196,11 @@ jobs:
           "${TEST_VENV}/bin/python" -m pytest -q \
             tests/unit_test/model_runner/test_prefill_inputs.py \
             tests/unit_test/model_runner/test_prefill_forward_kwargs.py \
-            tests/unit_test/model_runner/test_cuda_graph_batch_validator.py
+            tests/unit_test/model_runner/test_cuda_graph_batch_validator.py \
+            tests/unit_test/scheduling/test_prefill_graph_policy.py \
+            tests/unit_test/models/test_model_capabilities.py
 
-      - name: Verify MOSS-TTS candidate patch scope
+      - name: Verify Voxtral-TTS candidate patch scope
         id: scope
         continue-on-error: true
         shell: bash
@@ -167,13 +208,12 @@ jobs:
           set -euxo pipefail
           actual="$(git diff --name-only "${BASE_SHA}...${TARGET_SHA}" | sort)"
           expected="$(printf '%s\n' \
-            'sglang_omni/models/moss_tts/__init__.py' \
-            'sglang_omni/models/moss_tts/engine_builder.py' \
-            'sglang_omni/models/moss_tts/model_runner.py' \
-            'sglang_omni/models/moss_tts/sglang_model.py' \
+            'sglang_omni/models/voxtral_tts/__init__.py' \
+            'sglang_omni/models/voxtral_tts/model_runner.py' \
+            'sglang_omni/models/voxtral_tts/pipeline/engine_builder.py' \
+            'sglang_omni/models/voxtral_tts/sglang_model.py' \
             'tests/unit_test/models/test_model_capabilities.py' \
-            'tests/unit_test/moss_tts/test_pipeline.py' \
-            'tests/unit_test/moss_tts/test_sampling_cuda_graph.py' \
+            'tests/unit_test/voxtral_tts/test_prefill_cuda_graph_contract.py' \
             | sort)"
           echo "=== Expected ==="
           printf '%s\n' "${expected}"
@@ -188,13 +228,12 @@ jobs:
         run: |
           set -euxo pipefail
           "${TEST_VENV}/bin/python" -m pre_commit run --files \
-            sglang_omni/models/moss_tts/__init__.py \
-            sglang_omni/models/moss_tts/engine_builder.py \
-            sglang_omni/models/moss_tts/model_runner.py \
-            sglang_omni/models/moss_tts/sglang_model.py \
+            sglang_omni/models/voxtral_tts/__init__.py \
+            sglang_omni/models/voxtral_tts/model_runner.py \
+            sglang_omni/models/voxtral_tts/pipeline/engine_builder.py \
+            sglang_omni/models/voxtral_tts/sglang_model.py \
             tests/unit_test/models/test_model_capabilities.py \
-            tests/unit_test/moss_tts/test_pipeline.py \
-            tests/unit_test/moss_tts/test_sampling_cuda_graph.py \
+            tests/unit_test/voxtral_tts/test_prefill_cuda_graph_contract.py \
             --show-diff-on-failure
 
       - name: Diff and working-tree sanity
@@ -211,30 +250,30 @@ jobs:
         if: always()
         shell: bash
         run: |
-          echo "## MOSS-TTS BCG CPU validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Voxtral-TTS BCG CPU validation" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Candidate: \`${TARGET_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Base: \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check | Outcome |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Prefill sidecar | ${{ steps.sidecar.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| BCG capability | ${{ steps.capability.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Voxtral adopter contract | ${{ steps.contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Padded hidden-row contract | ${{ steps.padded_hidden.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Late-bound model forward | ${{ steps.forward_contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| MOSS-TTS CPU suite | ${{ steps.moss_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Voxtral-TTS CPU suite | ${{ steps.voxtral_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Shared prefill infrastructure | ${{ steps.shared_prefill.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Exact candidate scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Pre-commit | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Diff sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Final MOSS-TTS CPU validation gate
+      - name: Final Voxtral-TTS CPU validation gate
         if: always()
         shell: bash
         env:
-          SIDECAR: ${{ steps.sidecar.outcome }}
-          CAPABILITY: ${{ steps.capability.outcome }}
+          CONTRACT: ${{ steps.contract.outcome }}
+          PADDED_HIDDEN: ${{ steps.padded_hidden.outcome }}
           FORWARD_CONTRACT: ${{ steps.forward_contract.outcome }}
-          MOSS_CPU: ${{ steps.moss_cpu.outcome }}
+          VOXTRAL_CPU: ${{ steps.voxtral_cpu.outcome }}
           SHARED_PREFILL: ${{ steps.shared_prefill.outcome }}
           SCOPE: ${{ steps.scope.outcome }}
           PRECOMMIT: ${{ steps.precommit.outcome }}
@@ -252,16 +291,16 @@ jobs:
               echo "${name}: success"
             fi
           }
-          check "prefill-sidecar" "${SIDECAR}"
-          check "bcg-capability" "${CAPABILITY}"
+          check "voxtral-adopter-contract" "${CONTRACT}"
+          check "padded-hidden-row-contract" "${PADDED_HIDDEN}"
           check "late-bound-forward" "${FORWARD_CONTRACT}"
-          check "moss-cpu-suite" "${MOSS_CPU}"
+          check "voxtral-cpu-suite" "${VOXTRAL_CPU}"
           check "shared-prefill" "${SHARED_PREFILL}"
           check "patch-scope" "${SCOPE}"
           check "precommit" "${PRECOMMIT}"
           check "diff-sanity" "${DIFF_SANITY}"
           if [[ "${failed}" -ne 0 ]]; then
-            echo "One or more MOSS-TTS CPU validation checks failed."
+            echo "One or more Voxtral-TTS CPU validation checks failed."
             exit 1
           fi
-          echo "All MOSS-TTS CPU validation checks passed."
+          echo "All Voxtral-TTS CPU validation checks passed."
