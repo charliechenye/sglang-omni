@@ -13,6 +13,7 @@ pytest.importorskip("sglang")
 
 from torch import nn
 
+import sglang_omni.models.fishaudio_s2_pro.engine_builder as fish_engine_builder
 from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
@@ -158,7 +159,7 @@ def test_fish_before_prefill_transports_old_embedding_result_through_sidecar() -
     assert prefill_inputs is not None
     assert prefill_inputs.input_embeds.shape == (3, 2)
     assert prefill_inputs.input_embeds.dtype == expected_old_field.dtype
-    torch.testing.assert_close(prefill_inputs.input_embeds, expected_old_field)
+    assert torch.equal(prefill_inputs.input_embeds, expected_old_field)
 
 
 def test_fish_vq_prefill_composition_preserves_request_offsets_and_prefixes() -> None:
@@ -192,7 +193,7 @@ def test_fish_vq_prefill_composition_preserves_request_offsets_and_prefixes() ->
             [1050.0, 1051.0],
         ]
     )
-    torch.testing.assert_close(embeds, expected)
+    assert torch.equal(embeds, expected)
 
 
 def test_fish_transformer_view_matches_sglang_discovery_contract() -> None:
@@ -231,7 +232,7 @@ def test_fish_transformer_view_supports_sglang_monkeypatch_lifecycle() -> None:
             batch.input_embeds,
         )
         assert replay_calls == [(2, HIDDEN)]
-        torch.testing.assert_close(replayed, torch.full((2, HIDDEN), 77.0))
+        assert torch.equal(replayed, torch.full((2, HIDDEN), 77.0))
     finally:
         view.forward = original
 
@@ -322,7 +323,7 @@ def test_fish_padded_bcg_body_feeds_logical_rows_to_eager_tail() -> None:
     expected_logits = torch.nn.functional.linear(
         expected_hidden, model.embed_tokens.weight
     )
-    torch.testing.assert_close(output.hidden_states, expected_hidden)
+    assert torch.equal(output.hidden_states, expected_hidden)
     torch.testing.assert_close(output.next_token_logits, expected_logits)
 
 
@@ -361,9 +362,9 @@ def test_fish_codebook_tail_receives_only_logical_padded_rows() -> None:
         expected_hidden, model.embed_tokens.weight
     )
     assert seen["hidden_states"].shape == (2, HIDDEN)
-    torch.testing.assert_close(seen["hidden_states"], expected_hidden)
+    assert torch.equal(seen["hidden_states"], expected_hidden)
     torch.testing.assert_close(seen["logits"], expected_logits)
-    torch.testing.assert_close(output.hidden_states, expected_hidden)
+    assert torch.equal(output.hidden_states, expected_hidden)
 
 
 def test_fish_forward_accepts_late_bound_prefill_kwargs() -> None:
@@ -518,19 +519,34 @@ def test_fish_prefill_uses_shared_fail_closed_sidecar_validation() -> None:
     first = OmniPrefillInputs(input_embeds=torch.zeros(3, HIDDEN))
     second = OmniPrefillInputs(input_embeds=torch.ones(3, HIDDEN))
     attach_omni_prefill_inputs(mismatch_batch, first)
-    attach_omni_prefill_inputs(mismatch_batch, second)
-    assert get_omni_prefill_inputs(mismatch_batch) is second
+    with pytest.raises(RuntimeError, match="already attached"):
+        attach_omni_prefill_inputs(mismatch_batch, second)
+    assert get_omni_prefill_inputs(mismatch_batch) is first
     clear_omni_prefill_inputs(mismatch_batch)
 
 
-def test_fish_declares_bcg_capability_without_a_default_or_guessed_ladder() -> None:
+def test_fish_declares_bcg_capability_without_a_default_or_guessed_ladder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     assert CAPABILITIES.supports_breakable_prefill_cuda_graph is True
     assert FishS2ProEngineBuilder.supports_breakable_prefill_cuda_graph is True
 
-    defaults = FishS2ProEngineBuilder(
-        max_new_tokens=16,
-        ras_window=4,
-    ).generation_defaults(dtype="bfloat16")
+    seen_gpu_ids: list[int] = []
+
+    def fake_get_visible_gpu_sm_version(gpu_id: int) -> int:
+        seen_gpu_ids.append(gpu_id)
+        return 90
+
+    monkeypatch.setattr(
+        fish_engine_builder,
+        "get_visible_gpu_sm_version",
+        fake_get_visible_gpu_sm_version,
+    )
+
+    builder = FishS2ProEngineBuilder(max_new_tokens=16, ras_window=4)
+    builder.gpu_id = 0
+    defaults = builder.generation_defaults(dtype="bfloat16")
+    assert seen_gpu_ids == [0]
     assert "cuda_graph_backend_prefill" not in defaults
     assert "cuda_graph_bs_prefill" not in defaults
     assert "cuda_graph_max_bs_prefill" not in defaults
