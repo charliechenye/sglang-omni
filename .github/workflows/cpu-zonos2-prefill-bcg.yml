@@ -1,0 +1,218 @@
+name: "ZONOS2 BCG CPU validation"
+
+on:
+  push:
+    branches:
+      - cpu-validation/zonos2-prefill-bcg
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TARGET_SHA: c35d14a0cdec5fc1a01deca12c33dfb452119655
+  BASE_SHA: 3bd136af04860b244abc056a714c7659999a8cad
+  TEST_VENV: /tmp/sglang-omni-cpu-venv
+
+jobs:
+  zonos2-cpu:
+    name: "ZONOS2 BCG CPU gate"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
+
+    steps:
+      - name: Checkout exact ZONOS2 candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify candidate provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
+          git cat-file -e "${BASE_SHA}^{commit}"
+          test "$(git merge-base "${BASE_SHA}" "${TARGET_SHA}")" = "${BASE_SHA}"
+          test "$(git rev-list --count "${BASE_SHA}..${TARGET_SHA}")" = "3"
+          git log --oneline "${BASE_SHA}..${TARGET_SHA}"
+          git diff --stat "${BASE_SHA}...${TARGET_SHA}"
+          git diff --name-only "${BASE_SHA}...${TARGET_SHA}"
+
+      - name: Inspect preinstalled runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import sglang, torch, transformers
+          print("torch", torch.__version__)
+          print("sglang", getattr(sglang, "__version__", "unknown"))
+          print("transformers", transformers.__version__)
+          print("cuda", torch.cuda.is_available())
+          assert torch.cuda.is_available() is False
+          PY
+
+      - name: Create CPU test virtualenv
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! python -m venv --system-site-packages "${TEST_VENV}"; then
+            apt-get update
+            apt-get install -y --no-install-recommends python3.12-venv
+            rm -rf "${TEST_VENV}"
+            python -m venv --system-site-packages "${TEST_VENV}"
+          fi
+          "${TEST_VENV}/bin/python" - <<'PY'
+          import pre_commit, pytest, sglang, torch, transformers
+          print("pytest:", pytest.__version__)
+          print("pre_commit:", pre_commit.__file__)
+          print("sglang:", getattr(sglang, "__version__", "unknown"))
+          print("torch:", torch.__version__)
+          print("transformers:", transformers.__version__)
+          PY
+
+      - name: ZONOS2 prefill BCG contract with zero skips
+        id: contract
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          report="${RUNNER_TEMP}/zonos2-prefill-bcg.xml"
+          "${TEST_VENV}/bin/python" -m pytest -q -rs \
+            --junitxml="${report}" \
+            tests/unit_test/zonos2/test_prefill_bcg.py
+          "${TEST_VENV}/bin/python" - "${report}" <<'PY'
+          import sys
+          import xml.etree.ElementTree as ET
+          root = ET.parse(sys.argv[1]).getroot()
+          suites = [root] if root.tag == "testsuite" else list(root.findall("testsuite"))
+          tests = sum(int(s.attrib.get("tests", 0)) for s in suites)
+          failures = sum(int(s.attrib.get("failures", 0)) for s in suites)
+          errors = sum(int(s.attrib.get("errors", 0)) for s in suites)
+          skipped = sum(int(s.attrib.get("skipped", 0)) for s in suites)
+          print(f"ZONOS2 BCG contract: tests={tests} failures={failures} errors={errors} skipped={skipped}")
+          if tests < 13:
+              raise AssertionError(f"expected at least 13 BCG contract tests, got {tests}")
+          if failures or errors or skipped:
+              raise AssertionError(
+                  f"BCG contract must be fully exercised: failures={failures}, errors={errors}, skipped={skipped}"
+              )
+          PY
+
+      - name: CPU-compatible ZONOS2 unit suite
+        id: zonos2_cpu
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pytest -q tests/unit_test/zonos2
+
+      - name: Shared prefill infrastructure regression
+        id: shared
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/model_runner/test_prefill_inputs.py \
+            tests/unit_test/model_runner/test_prefill_forward_kwargs.py \
+            tests/unit_test/model_runner/test_cuda_graph_batch_validator.py \
+            tests/unit_test/scheduling/test_prefill_graph_policy.py \
+            tests/unit_test/scheduling/test_engine_factory.py \
+            tests/unit_test/models/test_model_capabilities.py
+
+      - name: Verify ZONOS2 candidate patch scope
+        id: scope
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          actual="$(git diff --name-only "${BASE_SHA}...${TARGET_SHA}" | sort)"
+          expected="$(printf '%s\n' \
+            'sglang_omni/models/zonos2/__init__.py' \
+            'sglang_omni/models/zonos2/callbacks.py' \
+            'sglang_omni/models/zonos2/engine_builder.py' \
+            'sglang_omni/models/zonos2/sglang_model.py' \
+            'tests/unit_test/models/test_model_capabilities.py' \
+            'tests/unit_test/zonos2/test_prefill_bcg.py' \
+            | sort)"
+          diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}")
+
+      - name: Pre-commit on changed files
+        id: precommit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pre_commit run --files \
+            sglang_omni/models/zonos2/__init__.py \
+            sglang_omni/models/zonos2/callbacks.py \
+            sglang_omni/models/zonos2/engine_builder.py \
+            sglang_omni/models/zonos2/sglang_model.py \
+            tests/unit_test/models/test_model_capabilities.py \
+            tests/unit_test/zonos2/test_prefill_bcg.py \
+            --show-diff-on-failure
+
+      - name: Diff and working-tree sanity
+        id: diff_sanity
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check "${BASE_SHA}...${TARGET_SHA}"
+          test -z "$(git status --porcelain)"
+
+      - name: Validation summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## ZONOS2 BCG CPU validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate: \`${TARGET_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Base: \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Outcome |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ZONOS2 BCG contract, zero skips | ${{ steps.contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| ZONOS2 CPU suite | ${{ steps.zonos2_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Shared prefill infrastructure | ${{ steps.shared.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Exact candidate scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pre-commit | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Diff sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Final ZONOS2 CPU validation gate
+        if: always()
+        shell: bash
+        env:
+          CONTRACT: ${{ steps.contract.outcome }}
+          ZONOS2_CPU: ${{ steps.zonos2_cpu.outcome }}
+          SHARED_PREFILL: ${{ steps.shared.outcome }}
+          SCOPE: ${{ steps.scope.outcome }}
+          PRECOMMIT: ${{ steps.precommit.outcome }}
+          DIFF_SANITY: ${{ steps.diff_sanity.outcome }}
+        run: |
+          set -euxo pipefail
+          failed=0
+          check() {
+            local name="$1"
+            local outcome="$2"
+            if [[ "${outcome}" != "success" ]]; then
+              echo "::error::${name} outcome=${outcome}"
+              failed=1
+            else
+              echo "${name}: success"
+            fi
+          }
+          check "zonos2-bcg-contract-zero-skips" "${CONTRACT}"
+          check "zonos2-cpu-suite" "${ZONOS2_CPU}"
+          check "shared-prefill" "${SHARED_PREFILL}"
+          check "patch-scope" "${SCOPE}"
+          check "precommit" "${PRECOMMIT}"
+          check "diff-sanity" "${DIFF_SANITY}"
+          if [[ "${failed}" -ne 0 ]]; then
+            echo "One or more ZONOS2 CPU validation checks failed."
+            exit 1
+          fi
+          echo "All ZONOS2 CPU validation checks passed."
