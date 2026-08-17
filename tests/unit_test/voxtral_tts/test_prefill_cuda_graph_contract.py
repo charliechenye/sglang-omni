@@ -146,8 +146,9 @@ def test_prefill_tail_selects_logical_request_endpoints_from_padded_bcg_output()
     captured_hidden = torch.arange(8 * HIDDEN, dtype=torch.float32).reshape(8, HIDDEN)
 
     def fake_language_model(input_ids, positions, forward_batch, input_embeds=None):
-        del positions, forward_batch
-        assert input_ids.shape == (5,)
+        del forward_batch
+        assert input_ids.shape == (8,)
+        assert positions.shape == (8,)
         assert input_embeds is not None
         assert input_embeds.shape == (5, HIDDEN)
         seen["input_embeds"] = input_embeds
@@ -156,9 +157,9 @@ def test_prefill_tail_selects_logical_request_endpoints_from_padded_bcg_output()
     model.language_model = fake_language_model
     model._decode_input_embed_buffer = torch.zeros((2, HIDDEN))
     forward_batch = SimpleNamespace(
-        # The live prefill has five tokens, while BCG replays an eight-token
-        # bucket. Endpoint selection must use logical request lengths.
-        input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.long),
+        # The outer BCG replay sees the padded static batch, while the sidecar
+        # still carries only the live extend-window embeddings.
+        input_ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.long),
         extend_seq_lens=torch.tensor([2, 3], dtype=torch.long),
         forward_mode=SimpleNamespace(
             is_decode=lambda: False,
@@ -169,7 +170,7 @@ def test_prefill_tail_selects_logical_request_endpoints_from_padded_bcg_output()
 
     output = model.forward(
         forward_batch.input_ids,
-        torch.arange(5, dtype=torch.long),
+        torch.arange(8, dtype=torch.long),
         forward_batch,
         input_embeds=input_embeds,
         omni_prefill_rids=["request-one", "request-two"],
@@ -178,8 +179,6 @@ def test_prefill_tail_selects_logical_request_endpoints_from_padded_bcg_output()
     expected_hidden = captured_hidden[[1, 4]]
     torch.testing.assert_close(output.hidden_states, expected_hidden)
     assert seen["input_embeds"] is input_embeds
-    for padded_rows in ((5, 6), (5, 7), (6, 7)):
-        assert not torch.equal(output.hidden_states, captured_hidden[list(padded_rows)])
     assert output.next_token_logits.shape == (2, 1)
     assert output.next_token_logits.dtype == output.hidden_states.dtype
 

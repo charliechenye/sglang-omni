@@ -454,8 +454,26 @@ def test_voxtral_forward_returns_graph_compatible_logits() -> None:
     assert output.next_token_logits.device == output.hidden_states.device
 
 
+@pytest.mark.parametrize(
+    ("server_args_overrides", "expected_prefill_backend", "expected_prefill_bs"),
+    [
+        pytest.param(None, "disabled", None, id="default-prefill"),
+        pytest.param(
+            {
+                "cuda_graph_backend_prefill": "breakable",
+                "cuda_graph_bs_prefill": [4, 8, 16],
+            },
+            "breakable",
+            [4, 8, 16],
+            id="explicit-breakable-prefill",
+        ),
+    ],
+)
 def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
+    server_args_overrides: dict | None,
+    expected_prefill_backend: str,
+    expected_prefill_bs: list[int] | None,
 ) -> None:
     from sglang_omni.models.voxtral_tts import model_runner as model_runner_mod
     from sglang_omni.models.voxtral_tts import request_builders
@@ -464,11 +482,13 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     from sglang_omni.scheduling import engine_factory
     from sglang_omni.scheduling import omni_scheduler as scheduler_mod
     from sglang_omni.scheduling import sglang_backend
+    from sglang_omni.utils import cuda_graph_batch_validator
 
     build_kwargs: dict = {}
     infrastructure_saw_graph_disabled: list[bool] = []
     infrastructure_kwargs: list[dict] = []
     init_graph_calls: list[bool] = []
+    attest_calls: list[tuple[object, object]] = []
 
     class FakeModel:
         pass
@@ -511,6 +531,11 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
         del model_path, context_length
         build_kwargs.update(kwargs)
         prefill_bs = kwargs.get("cuda_graph_bs_prefill")
+        prefill_locks = set()
+        if "cuda_graph_backend_prefill" in kwargs:
+            prefill_locks.add(("prefill", "backend"))
+        if "cuda_graph_bs_prefill" in kwargs:
+            prefill_locks.add(("prefill", "bs"))
         return FakeServerArgs(
             cuda_graph_bs=kwargs["cuda_graph_bs"],
             cuda_graph_max_bs=kwargs["cuda_graph_max_bs"],
@@ -533,9 +558,12 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
             max_prefill_tokens=kwargs["max_prefill_tokens"],
             max_running_requests=kwargs["max_running_requests"],
             torch_compile_max_bs=kwargs["torch_compile_max_bs"],
-            _cuda_graph_config_locked=frozenset(
-                {("prefill", "backend"), ("prefill", "bs")} if prefill_bs else set()
-            ),
+            attn_cp_size=1,
+            dcp_size=1,
+            lora_paths=None,
+            enable_lora=False,
+            moe_a2a_backend="none",
+            _cuda_graph_config_locked=frozenset(prefill_locks),
         )
 
     def fake_create_sglang_infrastructure(server_args, gpu_id, **kwargs):
@@ -552,6 +580,9 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
             SimpleNamespace(),
         )
 
+    def fake_attest_prefill_cuda_graphs(model_runner, server_args) -> None:
+        attest_calls.append((model_runner, server_args))
+
     monkeypatch.setattr(
         sglang_backend,
         "build_sglang_server_args",
@@ -561,6 +592,11 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
         bootstrap_mod,
         "create_sglang_infrastructure",
         fake_create_sglang_infrastructure,
+    )
+    monkeypatch.setattr(
+        cuda_graph_batch_validator,
+        "attest_prefill_cuda_graphs",
+        fake_attest_prefill_cuda_graphs,
     )
     monkeypatch.setattr(
         sglang_backend,
@@ -581,10 +617,7 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     scheduler = stages.create_generation_executor(
         "model",
         device="cuda:0",
-        server_args_overrides={
-            "cuda_graph_backend_prefill": "breakable",
-            "cuda_graph_bs_prefill": [4, 8, 16],
-        },
+        server_args_overrides=server_args_overrides,
     )
 
     assert build_kwargs["disable_cuda_graph"] is False
@@ -593,18 +626,34 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     assert build_kwargs["enable_torch_compile"] is True
     assert build_kwargs["sampling_backend"] == "pytorch"
     assert build_kwargs["torch_compile_max_bs"] == 16
-    assert build_kwargs["cuda_graph_backend_prefill"] == "breakable"
-    assert build_kwargs["cuda_graph_bs_prefill"] == [4, 8, 16]
+    assert scheduler.server_args.cuda_graph_config.prefill.backend == (
+        expected_prefill_backend
+    )
+    assert scheduler.server_args.cuda_graph_config.prefill.bs == expected_prefill_bs
+    assert scheduler.server_args.cuda_graph_config.prefill.max_bs == (
+        16 if expected_prefill_bs is not None else None
+    )
     assert infrastructure_saw_graph_disabled == [True]
-    assert infrastructure_kwargs[0]["enable_prefill_input_embeds"] is True
     assert init_graph_calls == [True]
-    assert scheduler.server_args.cuda_graph_config.prefill.backend == "breakable"
-    assert scheduler.server_args.cuda_graph_config.prefill.bs == [4, 8, 16]
     assert scheduler.server_args.cuda_graph_bs == [1, 2, 4, 8, 12, 16]
     assert scheduler.server_args.cuda_graph_max_bs == 16
     assert scheduler.server_args.disable_cuda_graph is False
     assert scheduler.server_args.enable_torch_compile is True
     assert scheduler.server_args.torch_compile_max_bs == 16
+
+    if expected_prefill_bs is None:
+        assert "cuda_graph_backend_prefill" not in build_kwargs
+        assert "cuda_graph_bs_prefill" not in build_kwargs
+        assert "enable_prefill_input_embeds" not in infrastructure_kwargs[0]
+        assert attest_calls == []
+    else:
+        assert build_kwargs["cuda_graph_backend_prefill"] == "breakable"
+        assert build_kwargs["cuda_graph_bs_prefill"] == [4, 8, 16]
+        assert build_kwargs["cuda_graph_max_bs_prefill"] == 16
+        assert infrastructure_kwargs[0]["enable_prefill_input_embeds"] is True
+        assert len(attest_calls) == 1
+        assert attest_calls[0][0] is scheduler.model_runner
+        assert attest_calls[0][1] is scheduler.server_args
 
 
 def test_enable_inductor_gemm_autotune_sets_per_shape_autotuning() -> None:
