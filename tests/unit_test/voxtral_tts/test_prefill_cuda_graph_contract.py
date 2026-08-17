@@ -64,6 +64,8 @@ def _batch(requests: list[SimpleNamespace]) -> SimpleNamespace:
         replace_embeds=None,
         mm_inputs=object(),
         positions=torch.arange(input_ids.numel(), dtype=torch.long),
+        batch_size=len(requests),
+        rids=[f"request-{idx}" for idx in range(len(requests))],
     )
 
 
@@ -136,10 +138,84 @@ def test_sidecar_rejects_incompatible_replacement_inputs():
     assert forward_batch.input_embeds is None
 
 
-def test_forward_accepts_late_bound_request_ids_and_preserves_hidden_rows():
+def test_prefill_tail_selects_logical_request_endpoints_from_padded_bcg_output():
     from sglang_omni.models.voxtral_tts.sglang_model import VoxtralSGLangTTSModel
 
     model = VoxtralSGLangTTSModel.__new__(VoxtralSGLangTTSModel)
+    seen: dict[str, object] = {}
+    captured_hidden = torch.arange(8 * HIDDEN, dtype=torch.float32).reshape(8, HIDDEN)
+
+    def fake_language_model(input_ids, positions, forward_batch, input_embeds=None):
+        del positions, forward_batch
+        assert input_ids.shape == (5,)
+        assert input_embeds is not None
+        assert input_embeds.shape == (5, HIDDEN)
+        seen["input_embeds"] = input_embeds
+        return captured_hidden
+
+    model.language_model = fake_language_model
+    model._decode_input_embed_buffer = torch.zeros((2, HIDDEN))
+    forward_batch = SimpleNamespace(
+        # The live prefill has five tokens, while BCG replays an eight-token
+        # bucket. Endpoint selection must use logical request lengths.
+        input_ids=torch.tensor([1, 2, 3, 4, 5], dtype=torch.long),
+        extend_seq_lens=torch.tensor([2, 3], dtype=torch.long),
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False,
+            is_extend=lambda: True,
+        ),
+    )
+    input_embeds = torch.arange(5 * HIDDEN, dtype=torch.float32).reshape(5, HIDDEN)
+
+    output = model.forward(
+        forward_batch.input_ids,
+        torch.arange(5, dtype=torch.long),
+        forward_batch,
+        input_embeds=input_embeds,
+        omni_prefill_rids=["request-one", "request-two"],
+    )
+
+    expected_hidden = captured_hidden[[1, 4]]
+    torch.testing.assert_close(output.hidden_states, expected_hidden)
+    assert seen["input_embeds"] is input_embeds
+    for padded_rows in ((5, 6), (5, 7), (6, 7)):
+        assert not torch.equal(output.hidden_states, captured_hidden[list(padded_rows)])
+    assert output.next_token_logits.shape == (2, 1)
+    assert output.next_token_logits.dtype == output.hidden_states.dtype
+
+
+def test_voxtral_prefill_sidecar_round_trips_through_eager_forward_kwargs():
+    from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
+    from sglang_omni.models.voxtral_tts.sglang_model import VoxtralSGLangTTSModel
+
+    runner = _runner()
+    requests = [
+        _request(
+            [7, AUDIO_TOKEN_ID, 9],
+            voice_embedding=torch.arange(8, dtype=torch.float32).reshape(2, HIDDEN),
+        )
+    ]
+    forward_batch = _batch(requests)
+    expected = runner._build_prefill_input_embeds(forward_batch, requests).clone()
+
+    runner.before_prefill(forward_batch, None, requests)
+    sidecar = get_omni_prefill_inputs(forward_batch)
+    assert sidecar is not None
+    torch.testing.assert_close(sidecar.input_embeds, expected)
+    assert forward_batch.input_embeds is None
+
+    eager_runner = SGLModelRunner.__new__(SGLModelRunner)
+    eager_runner.support_pp = False
+    eager_runner.is_generation = True
+    kwargs = eager_runner._extend_forward_kwargs(forward_batch, object())
+
+    assert kwargs["input_embeds"] is sidecar.input_embeds
+    torch.testing.assert_close(kwargs["input_embeds"], expected)
+    assert kwargs["omni_prefill_rids"] is forward_batch.rids
+    assert forward_batch.input_embeds is None
+
+    model = VoxtralSGLangTTSModel.__new__(VoxtralSGLangTTSModel)
+    model._decode_input_embed_buffer = torch.zeros((1, HIDDEN))
     seen: dict[str, object] = {}
 
     def fake_language_model(input_ids, positions, forward_batch, input_embeds=None):
@@ -148,32 +224,21 @@ def test_forward_accepts_late_bound_request_ids_and_preserves_hidden_rows():
         return input_embeds + 1
 
     model.language_model = fake_language_model
-    model._decode_input_embed_buffer = torch.zeros((2, HIDDEN))
-    forward_batch = SimpleNamespace(
-        # The padded BCG tail can carry more rows than the live extend window;
-        # request endpoints still come from the unpadded per-request lengths.
-        input_ids=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.long),
-        extend_seq_lens=torch.tensor([2, 3], dtype=torch.long),
-        forward_mode=SimpleNamespace(
-            is_decode=lambda: False,
-            is_extend=lambda: True,
-        ),
+    forward_batch.extend_seq_lens = torch.tensor([3], dtype=torch.long)
+    forward_batch.forward_mode = SimpleNamespace(
+        is_decode=lambda: False,
+        is_extend=lambda: True,
     )
-    input_embeds = torch.arange(8 * HIDDEN, dtype=torch.float32).reshape(8, HIDDEN)
-
     output = model.forward(
         forward_batch.input_ids,
-        torch.arange(8, dtype=torch.long),
+        forward_batch.positions,
         forward_batch,
-        input_embeds=input_embeds,
-        omni_prefill_rids=["request-one", "request-two"],
+        input_embeds=kwargs["input_embeds"],
+        omni_prefill_rids=kwargs["omni_prefill_rids"],
     )
 
-    expected_hidden = (input_embeds + 1)[[1, 4]]
-    torch.testing.assert_close(output.hidden_states, expected_hidden)
-    assert seen["input_embeds"] is input_embeds
-    assert output.next_token_logits.shape == (2, 1)
-    assert output.next_token_logits.dtype == output.hidden_states.dtype
+    assert seen["input_embeds"] is sidecar.input_embeds
+    torch.testing.assert_close(output.hidden_states, (expected + 1)[-1:])
 
 
 def test_capability_and_builder_adoption_are_synchronized_without_default_enablement():
@@ -234,4 +299,129 @@ def test_explicit_breakable_override_is_accepted_by_shared_policy():
     validate_generation_batch_policy(
         model_name="Voxtral TTS",
         server_args=server_args,
+    )
+
+
+def test_voxtral_builder_wires_explicit_breakable_prefill_infrastructure(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    from sglang_omni.models.voxtral_tts.pipeline import stages as voxtral_stages
+    from sglang_omni.scheduling import bootstrap, sglang_backend
+
+    builder = VoxtralTtsEngineBuilder()
+    captured: dict[str, object] = {}
+    model_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(model=SimpleNamespace()),
+    )
+
+    monkeypatch.setattr(builder, "resolve_checkpoint", lambda path: path)
+    monkeypatch.setattr(builder, "pre_infra_setup", lambda checkpoint_dir: None)
+    monkeypatch.setattr(builder, "setup_model", lambda **kwargs: None)
+    monkeypatch.setattr(builder, "make_model_runner", lambda *args: object())
+    monkeypatch.setattr(builder, "make_adapters", lambda model: (None, None))
+    monkeypatch.setattr(
+        builder,
+        "make_scheduler",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+    monkeypatch.setattr(
+        voxtral_stages,
+        "_enable_inductor_gemm_autotune",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        sglang_backend,
+        "build_sglang_server_args",
+        lambda checkpoint_dir, *, context_length, **overrides: _fake_voxtral_server_args(
+            captured,
+            checkpoint_dir,
+            context_length,
+            overrides,
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "create_sglang_infrastructure_defer_cuda_graph",
+        lambda server_args, gpu_id, **kwargs: (
+            captured.update(
+                server_args=server_args,
+                gpu_id=gpu_id,
+                infra_kwargs=dict(kwargs),
+            ),
+            (True, (model_worker, None, None, None, None, None, None)),
+        )[1],
+    )
+    monkeypatch.setattr(bootstrap, "init_sglang_cuda_graphs", lambda worker: None)
+    monkeypatch.setattr(
+        "sglang_omni.utils.cuda_graph_batch_validator.attest_prefill_cuda_graphs",
+        lambda model_runner, server_args: captured.update(
+            attest=(model_runner, server_args)
+        ),
+    )
+    monkeypatch.setattr(
+        sglang_backend,
+        "SGLangOutputProcessor",
+        lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    builder.build(
+        "dummy",
+        device="cpu",
+        server_args_overrides={
+            "cuda_graph_backend_prefill": "breakable",
+            "cuda_graph_bs_prefill": [4, 8, 16],
+        },
+    )
+
+    overrides = captured["overrides"]
+    server_args = captured["server_args"]
+    assert overrides["cuda_graph_backend_prefill"] == "breakable"
+    assert overrides["cuda_graph_bs_prefill"] == [4, 8, 16]
+    assert server_args.cuda_graph_config.prefill.bs == [4, 8, 16]
+    assert server_args.cuda_graph_config.prefill.backend == "breakable"
+    assert server_args.cuda_graph_config.decode.bs == [1, 2, 4, 8, 12, 16]
+    assert server_args.cuda_graph_config.decode.max_bs == 16
+    assert captured["infra_kwargs"]["enable_prefill_input_embeds"] is True
+
+
+def _fake_voxtral_server_args(
+    captured: dict[str, object],
+    checkpoint_dir: str,
+    context_length: int,
+    overrides: dict[str, object],
+) -> SimpleNamespace:
+    captured.update(
+        checkpoint_dir=checkpoint_dir,
+        context_length=context_length,
+        overrides=overrides,
+    )
+    return SimpleNamespace(
+        max_running_requests=overrides["max_running_requests"],
+        disable_cuda_graph=overrides["disable_cuda_graph"],
+        enable_torch_compile=overrides["enable_torch_compile"],
+        torch_compile_max_bs=overrides["torch_compile_max_bs"],
+        chunked_prefill_size=overrides["max_prefill_tokens"],
+        max_prefill_tokens=overrides["max_prefill_tokens"],
+        attn_cp_size=1,
+        dcp_size=1,
+        lora_paths=None,
+        enable_lora=None,
+        moe_a2a_backend="none",
+        cuda_graph_config=SimpleNamespace(
+            decode=SimpleNamespace(
+                max_bs=overrides["cuda_graph_max_bs"],
+                bs=overrides["cuda_graph_bs"],
+            ),
+            prefill=SimpleNamespace(
+                backend=overrides["cuda_graph_backend_prefill"],
+                bs=overrides["cuda_graph_bs_prefill"],
+                max_bs=overrides["cuda_graph_max_bs_prefill"],
+            ),
+        ),
+        _cuda_graph_config_locked=frozenset(
+            {
+                ("prefill", "backend"),
+                ("prefill", "bs"),
+            }
+        ),
     )
