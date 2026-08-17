@@ -10,9 +10,7 @@ permissions:
   contents: read
 
 env:
-  # Exact FishAudio S2-Pro BCG candidate under validation.
-  TARGET_SHA: 9598314b57bfe40b4fbfc3132c90df2614908c7d
-  # Exact upstream main parent before the FishAudio adopter commit.
+  TARGET_SHA: 4c8d337f332dfb00e2f105ca7c6fed7b6e898afe
   BASE_SHA: 9bc2cd7d91059c88565c163344d9a094d4cbd5d3
   TEST_VENV: /tmp/sglang-omni-cpu-venv
 
@@ -25,57 +23,40 @@ jobs:
       image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
 
     steps:
-      - name: Checkout exact FishAudio candidate
+      - name: Checkout exact candidate
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
 
-      - name: Configure Git safe directory
-        shell: bash
-        run: |
-          set -euxo pipefail
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
       - name: Verify candidate provenance
         shell: bash
         run: |
           set -euxo pipefail
-          ACTUAL="$(git rev-parse HEAD)"
-          test "${ACTUAL}" = "${TARGET_SHA}"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
           git cat-file -e "${BASE_SHA}^{commit}"
-          test "$(git rev-parse "${TARGET_SHA}^")" = "${BASE_SHA}"
-          echo "=== Candidate commits ==="
+          test "$(git merge-base "${BASE_SHA}" "${TARGET_SHA}")" = "${BASE_SHA}"
+          test "$(git rev-list --count "${BASE_SHA}..${TARGET_SHA}")" = "2"
           git log --oneline "${BASE_SHA}..${TARGET_SHA}"
-          echo "=== Candidate diff stat ==="
           git diff --stat "${BASE_SHA}...${TARGET_SHA}"
-          echo "=== Candidate changed files ==="
           git diff --name-only "${BASE_SHA}...${TARGET_SHA}"
-          echo "=== Runtime ==="
-          uname -a
-          python --version
 
-      - name: Inspect preinstalled runtime
+      - name: Verify pinned CPU runtime
         shell: bash
         run: |
           set -euxo pipefail
           python - <<'PY'
-          import sys
-          import numpy
-          import pydantic
-          import sglang
-          import torch
-          import transformers
-          print("python:", sys.version)
-          print("torch:", torch.__version__)
-          print("transformers:", transformers.__version__)
-          print("sglang:", getattr(sglang, "__version__", "unknown"))
-          print("numpy:", numpy.__version__)
-          print("pydantic:", pydantic.__version__)
-          print("torch.cuda.is_available:", torch.cuda.is_available())
+          import sglang, torch, transformers
+          print("torch", torch.__version__)
+          print("sglang", getattr(sglang, "__version__", "unknown"))
+          print("transformers", transformers.__version__)
+          print("cuda", torch.cuda.is_available())
+          assert getattr(sglang, "__version__", None) == "0.5.16"
+          assert torch.cuda.is_available() is False
           PY
 
-      - name: Create CPU test virtualenv
+      - name: Create test environment
         shell: bash
         run: |
           set -euxo pipefail
@@ -85,17 +66,19 @@ jobs:
             rm -rf "${TEST_VENV}"
             python -m venv --system-site-packages "${TEST_VENV}"
           fi
-          "${TEST_VENV}/bin/python" - <<'PY'
-          import pre_commit, pytest, sglang, torch, transformers
-          print("pytest:", pytest.__version__)
-          print("pre_commit:", pre_commit.__file__)
-          print("sglang:", getattr(sglang, "__version__", "unknown"))
-          print("torch:", torch.__version__)
-          print("transformers:", transformers.__version__)
-          PY
+          "${TEST_VENV}/bin/python" -c 'import pytest, pre_commit, sglang, torch'
 
-      - name: FishAudio S2-Pro unit suite
-        id: fish_cpu
+      - name: Fish durable BCG contract tests
+        id: contract
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py
+
+      - name: Full FishAudio S2-Pro CPU suite
+        id: fish
         continue-on-error: true
         shell: bash
         run: |
@@ -103,7 +86,7 @@ jobs:
           "${TEST_VENV}/bin/python" -m pytest -q tests/unit_test/fishaudio_s2_pro
 
       - name: Shared prefill infrastructure regression
-        id: shared_prefill
+        id: shared
         continue-on-error: true
         shell: bash
         run: |
@@ -115,181 +98,7 @@ jobs:
             tests/unit_test/scheduling/test_prefill_graph_policy.py \
             tests/unit_test/models/test_model_capabilities.py
 
-      - name: Fish transformer discovery and monkey-patch contract
-        id: discovery
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euxo pipefail
-          "${TEST_VENV}/bin/python" - <<'PY'
-          import inspect
-          from types import SimpleNamespace
-
-          import torch
-
-          from sglang_omni.models.fishaudio_s2_pro.sglang_model import (
-              S2ProSGLangTextModel,
-              _S2ProTransformerView,
-          )
-
-          params = inspect.signature(_S2ProTransformerView.forward).parameters
-          assert "input_embeds" in params, params
-
-          calls = []
-
-          def transformer_forward(input_ids, positions, forward_batch, input_embeds=None):
-              calls.append((input_ids, positions, forward_batch, input_embeds))
-              return input_embeds
-
-          owner = SimpleNamespace(
-              layers=["sentinel-layer"],
-              _forward_transformer=transformer_forward,
-          )
-          view = _S2ProTransformerView(owner)
-          assert view.layers is owner.layers
-
-          embeds = torch.arange(12, dtype=torch.float32).reshape(3, 4)
-          out = view.forward(
-              torch.tensor([1, 2, 3]),
-              torch.tensor([0, 1, 2]),
-              SimpleNamespace(),
-              embeds,
-          )
-          assert out is embeds
-          assert len(calls) == 1
-
-          # SGLang's PrefillCudaGraphRunner temporarily monkey-patches
-          # layer_model.forward during replay. The view must allow that.
-          original_forward = view.forward
-          replay_calls = []
-
-          def replay_forward(*args, **kwargs):
-              replay_calls.append((args, kwargs))
-              return torch.full((3, 4), 7.0)
-
-          view.forward = replay_forward
-          replay_out = view.forward(None, None, None, embeds)
-          assert torch.equal(replay_out, torch.full((3, 4), 7.0))
-          assert len(replay_calls) == 1
-          view.forward = original_forward
-
-          # The view must remain an unregistered facade. Registering the same
-          # transformer twice would duplicate module/state_dict paths.
-          model = S2ProSGLangTextModel.__new__(S2ProSGLangTextModel)
-          torch.nn.Module.__init__(model)
-          model.layers = torch.nn.ModuleList([torch.nn.Linear(2, 2)])
-          model._transformer_view = _S2ProTransformerView(model)
-
-          module_names = [name for name, _ in model.named_modules()]
-          parameter_names = [name for name, _ in model.named_parameters()]
-          state_names = list(model.state_dict())
-          assert "_transformer_view" not in module_names, module_names
-          assert not any(name.startswith("_transformer_view") for name in parameter_names)
-          assert not any(name.startswith("_transformer_view") for name in state_names)
-          assert model.model is model._transformer_view
-          assert model.model.layers is model.layers
-
-          print("Fish transformer discovery contract: OK")
-          print("registered modules:", module_names)
-          print("parameter names:", parameter_names)
-          PY
-
-      - name: Fish eager-tail split contract
-        id: eager_tail
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -euxo pipefail
-          "${TEST_VENV}/bin/python" - <<'PY'
-          import types
-          from types import SimpleNamespace
-
-          import torch
-
-          from sglang_omni.models.fishaudio_s2_pro.sglang_model import (
-              S2ProSGLangTextModel,
-              _S2ProTransformerView,
-          )
-
-          hidden_dim = 4
-          vocab = 6
-          padded_hidden = (
-              torch.arange(8 * hidden_dim, dtype=torch.float32).reshape(8, hidden_dim)
-              + 1000
-          )
-
-          model = S2ProSGLangTextModel.__new__(S2ProSGLangTextModel)
-          torch.nn.Module.__init__(model)
-          model.tie_word_embeddings = False
-          model.lm_head = torch.nn.Linear(hidden_dim, vocab, bias=False)
-          with torch.no_grad():
-              model.lm_head.weight.copy_(
-                  torch.arange(vocab * hidden_dim, dtype=torch.float32).reshape(
-                      vocab, hidden_dim
-                  )
-                  / 10
-              )
-          model._vq_ready = True
-          model._transformer_view = _S2ProTransformerView(model)
-
-          replay_seen = {}
-
-          def replay_forward(input_ids, positions, forward_batch, input_embeds=None):
-              replay_seen["input_ids_rows"] = int(input_ids.shape[0])
-              replay_seen["input_embeds_rows"] = int(input_embeds.shape[0])
-              return padded_hidden.clone()
-
-          # This is exactly the mutation PrefillCudaGraphRunner performs while
-          # executing the eager outer tail around a captured body replay.
-          model._transformer_view.forward = replay_forward
-
-          decoded = {}
-
-          def fake_decode(self, logits, hidden_states):
-              decoded["logits"] = logits.detach().clone()
-              decoded["hidden_states"] = hidden_states.detach().clone()
-
-          object.__setattr__(
-              model,
-              "_decode_codebooks",
-              types.MethodType(fake_decode, model),
-          )
-
-          forward_batch = SimpleNamespace(
-              forward_mode=SimpleNamespace(is_extend=lambda: True),
-              extend_seq_lens=torch.tensor([2, 3], dtype=torch.long),
-          )
-          live_embeds = torch.arange(5 * hidden_dim, dtype=torch.float32).reshape(
-              5, hidden_dim
-          )
-
-          output = model.forward(
-              torch.arange(8, dtype=torch.long),
-              torch.arange(8, dtype=torch.long),
-              forward_batch,
-              input_embeds=live_embeds,
-              omni_prefill_rids=("request-a", "request-b"),
-          )
-
-          # Logical request endpoints are rows 1 and 4 even though the captured
-          # body returned a bucket-padded 8-row tensor.
-          expected_hidden = padded_hidden[[1, 4]]
-          expected_logits = torch.nn.functional.linear(
-              expected_hidden, model.lm_head.weight
-          )
-          torch.testing.assert_close(output.hidden_states, expected_hidden)
-          torch.testing.assert_close(output.next_token_logits, expected_logits)
-          torch.testing.assert_close(decoded["hidden_states"], expected_hidden)
-          torch.testing.assert_close(decoded["logits"], expected_logits)
-          assert replay_seen == {"input_ids_rows": 8, "input_embeds_rows": 5}, replay_seen
-
-          print("Fish eager-tail split contract: OK")
-          print("captured/padded rows:", padded_hidden.shape[0])
-          print("live embedding rows:", live_embeds.shape[0])
-          print("logical hidden rows:", output.hidden_states.shape[0])
-          PY
-
-      - name: Verify FishAudio candidate patch scope
+      - name: Verify candidate patch scope
         id: scope
         continue-on-error: true
         shell: bash
@@ -301,16 +110,13 @@ jobs:
             'sglang_omni/models/fishaudio_s2_pro/engine_builder.py' \
             'sglang_omni/models/fishaudio_s2_pro/model_runner.py' \
             'sglang_omni/models/fishaudio_s2_pro/sglang_model.py' \
+            'tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py' \
             'tests/unit_test/fishaudio_s2_pro/test_tts.py' \
             'tests/unit_test/models/test_model_capabilities.py' \
             | sort)"
-          echo "=== Expected ==="
-          printf '%s\n' "${expected}"
-          echo "=== Actual ==="
-          printf '%s\n' "${actual}"
           diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}")
 
-      - name: Pre-commit on changed files
+      - name: Pre-commit on candidate files
         id: precommit
         continue-on-error: true
         shell: bash
@@ -321,59 +127,49 @@ jobs:
             sglang_omni/models/fishaudio_s2_pro/engine_builder.py \
             sglang_omni/models/fishaudio_s2_pro/model_runner.py \
             sglang_omni/models/fishaudio_s2_pro/sglang_model.py \
+            tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py \
             tests/unit_test/fishaudio_s2_pro/test_tts.py \
             tests/unit_test/models/test_model_capabilities.py \
             --show-diff-on-failure
 
-      - name: Diff and working-tree sanity
-        id: diff_sanity
+      - name: Diff sanity
+        id: diff
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
           git diff --check "${BASE_SHA}...${TARGET_SHA}"
-          git status --short
           test -z "$(git status --porcelain)"
 
-      - name: CPU validation summary
+      - name: Validation summary
         if: always()
         shell: bash
         run: |
           echo "## FishAudio S2-Pro BCG CPU validation" >> "$GITHUB_STEP_SUMMARY"
-          echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "Candidate: \`${TARGET_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Base: \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check | Outcome |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| FishAudio unit suite | ${{ steps.fish_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Shared prefill infrastructure | ${{ steps.shared_prefill.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Transformer discovery / monkey-patch contract | ${{ steps.discovery.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Eager-tail split contract | ${{ steps.eager_tail.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Candidate patch scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Durable BCG contract | ${{ steps.contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Full Fish CPU suite | ${{ steps.fish.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Shared prefill infrastructure | ${{ steps.shared.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Patch scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Pre-commit | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Diff sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Diff sanity | ${{ steps.diff.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Enforce CPU gate
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-          failed=0
           for outcome in \
-            "${{ steps.fish_cpu.outcome }}" \
-            "${{ steps.shared_prefill.outcome }}" \
-            "${{ steps.discovery.outcome }}" \
-            "${{ steps.eager_tail.outcome }}" \
+            "${{ steps.contract.outcome }}" \
+            "${{ steps.fish.outcome }}" \
+            "${{ steps.shared.outcome }}" \
             "${{ steps.scope.outcome }}" \
             "${{ steps.precommit.outcome }}" \
-            "${{ steps.diff_sanity.outcome }}"; do
-            if [[ "${outcome}" != "success" ]]; then
-              failed=1
-            fi
+            "${{ steps.diff.outcome }}"; do
+            test "${outcome}" = "success"
           done
-          if [[ "${failed}" -ne 0 ]]; then
-            echo "FishAudio S2-Pro BCG CPU validation failed; inspect the step outcomes above."
-            exit 1
-          fi
-          echo "FishAudio S2-Pro BCG CPU validation passed."
+          echo "FishAudio S2-Pro BCG CPU validation passed for ${TARGET_SHA}."
