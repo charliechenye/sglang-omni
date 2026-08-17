@@ -1,4 +1,4 @@
-name: "FishAudio S2-Pro BCG CPU validation"
+name: "Voxtral-TTS BCG CPU validation"
 
 on:
   push:
@@ -10,20 +10,22 @@ permissions:
   contents: read
 
 env:
-  TARGET_SHA: 4c8d337f332dfb00e2f105ca7c6fed7b6e898afe
+  # Exact Voxtral-TTS BCG candidate under validation.
+  TARGET_SHA: 814aee83a467c244cc598111945f3e928ef7a4da
+  # Exact upstream main base before the Voxtral adopter commits.
   BASE_SHA: 9bc2cd7d91059c88565c163344d9a094d4cbd5d3
   TEST_VENV: /tmp/sglang-omni-cpu-venv
 
 jobs:
-  fish-s2pro-cpu:
-    name: "FishAudio S2-Pro BCG CPU gate"
+  voxtral-tts-cpu:
+    name: "Voxtral-TTS BCG CPU gate"
     runs-on: ubuntu-latest
     timeout-minutes: 90
     container:
       image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
 
     steps:
-      - name: Checkout exact candidate
+      - name: Checkout exact Voxtral-TTS candidate
         uses: actions/checkout@v4
         with:
           ref: ${{ env.TARGET_SHA }}
@@ -37,12 +39,12 @@ jobs:
           test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
           git cat-file -e "${BASE_SHA}^{commit}"
           test "$(git merge-base "${BASE_SHA}" "${TARGET_SHA}")" = "${BASE_SHA}"
-          test "$(git rev-list --count "${BASE_SHA}..${TARGET_SHA}")" = "2"
+          test "$(git rev-list --count "${BASE_SHA}..${TARGET_SHA}")" = "4"
           git log --oneline "${BASE_SHA}..${TARGET_SHA}"
           git diff --stat "${BASE_SHA}...${TARGET_SHA}"
           git diff --name-only "${BASE_SHA}...${TARGET_SHA}"
 
-      - name: Verify pinned CPU runtime
+      - name: Inspect preinstalled runtime
         shell: bash
         run: |
           set -euxo pipefail
@@ -52,11 +54,10 @@ jobs:
           print("sglang", getattr(sglang, "__version__", "unknown"))
           print("transformers", transformers.__version__)
           print("cuda", torch.cuda.is_available())
-          assert getattr(sglang, "__version__", None) == "0.5.16"
           assert torch.cuda.is_available() is False
           PY
 
-      - name: Create test environment
+      - name: Create CPU test virtualenv
         shell: bash
         run: |
           set -euxo pipefail
@@ -66,24 +67,52 @@ jobs:
             rm -rf "${TEST_VENV}"
             python -m venv --system-site-packages "${TEST_VENV}"
           fi
-          "${TEST_VENV}/bin/python" -c 'import pytest, pre_commit, sglang, torch'
+          "${TEST_VENV}/bin/python" - <<'PY'
+          import pre_commit, pytest, sglang, torch, transformers
+          print("pytest:", pytest.__version__)
+          print("pre_commit:", pre_commit.__file__)
+          print("sglang:", getattr(sglang, "__version__", "unknown"))
+          print("torch:", torch.__version__)
+          print("transformers:", transformers.__version__)
+          PY
 
-      - name: Fish durable BCG contract tests
+      - name: Voxtral prefill adopter contract
         id: contract
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
           "${TEST_VENV}/bin/python" -m pytest -q \
-            tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py
+            tests/unit_test/voxtral_tts/test_prefill_cuda_graph_contract.py
 
-      - name: Full FishAudio S2-Pro CPU suite
-        id: fish
+      - name: Late-bound model forward compatibility
+        id: forward_contract
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
-          "${TEST_VENV}/bin/python" -m pytest -q tests/unit_test/fishaudio_s2_pro
+          "${TEST_VENV}/bin/python" - <<'PY'
+          import inspect
+          from sglang_omni.models.voxtral_tts.sglang_model import VoxtralSGLangTTSModel
+
+          params = inspect.signature(VoxtralSGLangTTSModel.forward).parameters
+          print("VoxtralSGLangTTSModel.forward parameters:", list(params))
+          for required in ("input_embeds", "omni_prefill_rids"):
+              if required not in params:
+                  raise AssertionError(
+                      f"late-bound Omni prefill kwarg {required!r} is not accepted "
+                      "by VoxtralSGLangTTSModel.forward"
+                  )
+          print("late-bound forward contract: OK")
+          PY
+
+      - name: CPU-compatible Voxtral-TTS unit suite
+        id: voxtral_cpu
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pytest -q tests/unit_test/voxtral_tts
 
       - name: Shared prefill infrastructure regression
         id: shared
@@ -96,9 +125,10 @@ jobs:
             tests/unit_test/model_runner/test_prefill_forward_kwargs.py \
             tests/unit_test/model_runner/test_cuda_graph_batch_validator.py \
             tests/unit_test/scheduling/test_prefill_graph_policy.py \
+            tests/unit_test/scheduling/test_engine_factory.py \
             tests/unit_test/models/test_model_capabilities.py
 
-      - name: Verify candidate patch scope
+      - name: Verify Voxtral-TTS candidate patch scope
         id: scope
         continue-on-error: true
         shell: bash
@@ -106,34 +136,34 @@ jobs:
           set -euxo pipefail
           actual="$(git diff --name-only "${BASE_SHA}...${TARGET_SHA}" | sort)"
           expected="$(printf '%s\n' \
-            'sglang_omni/models/fishaudio_s2_pro/__init__.py' \
-            'sglang_omni/models/fishaudio_s2_pro/engine_builder.py' \
-            'sglang_omni/models/fishaudio_s2_pro/model_runner.py' \
-            'sglang_omni/models/fishaudio_s2_pro/sglang_model.py' \
-            'tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py' \
-            'tests/unit_test/fishaudio_s2_pro/test_tts.py' \
+            'sglang_omni/models/voxtral_tts/__init__.py' \
+            'sglang_omni/models/voxtral_tts/model_runner.py' \
+            'sglang_omni/models/voxtral_tts/pipeline/engine_builder.py' \
+            'sglang_omni/models/voxtral_tts/sglang_model.py' \
+            'tests/unit_test/voxtral_tts/test_pipeline.py' \
+            'tests/unit_test/voxtral_tts/test_prefill_cuda_graph_contract.py' \
             'tests/unit_test/models/test_model_capabilities.py' \
             | sort)"
           diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}")
 
-      - name: Pre-commit on candidate files
+      - name: Pre-commit on changed files
         id: precommit
         continue-on-error: true
         shell: bash
         run: |
           set -euxo pipefail
           "${TEST_VENV}/bin/python" -m pre_commit run --files \
-            sglang_omni/models/fishaudio_s2_pro/__init__.py \
-            sglang_omni/models/fishaudio_s2_pro/engine_builder.py \
-            sglang_omni/models/fishaudio_s2_pro/model_runner.py \
-            sglang_omni/models/fishaudio_s2_pro/sglang_model.py \
-            tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py \
-            tests/unit_test/fishaudio_s2_pro/test_tts.py \
+            sglang_omni/models/voxtral_tts/__init__.py \
+            sglang_omni/models/voxtral_tts/model_runner.py \
+            sglang_omni/models/voxtral_tts/pipeline/engine_builder.py \
+            sglang_omni/models/voxtral_tts/sglang_model.py \
+            tests/unit_test/voxtral_tts/test_pipeline.py \
+            tests/unit_test/voxtral_tts/test_prefill_cuda_graph_contract.py \
             tests/unit_test/models/test_model_capabilities.py \
             --show-diff-on-failure
 
-      - name: Diff sanity
-        id: diff
+      - name: Diff and working-tree sanity
+        id: diff_sanity
         continue-on-error: true
         shell: bash
         run: |
@@ -145,31 +175,53 @@ jobs:
         if: always()
         shell: bash
         run: |
-          echo "## FishAudio S2-Pro BCG CPU validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "## Voxtral-TTS BCG CPU validation" >> "$GITHUB_STEP_SUMMARY"
           echo "Candidate: \`${TARGET_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "Base: \`${BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| Check | Outcome |" >> "$GITHUB_STEP_SUMMARY"
           echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Durable BCG contract | ${{ steps.contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Full Fish CPU suite | ${{ steps.fish.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Voxtral adopter contract | ${{ steps.contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Late-bound model forward | ${{ steps.forward_contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Voxtral-TTS CPU suite | ${{ steps.voxtral_cpu.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Shared prefill infrastructure | ${{ steps.shared.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Patch scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Exact candidate scope | ${{ steps.scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
           echo "| Pre-commit | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
-          echo "| Diff sanity | ${{ steps.diff.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Diff sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Enforce CPU gate
+      - name: Final Voxtral-TTS CPU validation gate
         if: always()
         shell: bash
+        env:
+          CONTRACT: ${{ steps.contract.outcome }}
+          FORWARD_CONTRACT: ${{ steps.forward_contract.outcome }}
+          VOXTRAL_CPU: ${{ steps.voxtral_cpu.outcome }}
+          SHARED_PREFILL: ${{ steps.shared.outcome }}
+          SCOPE: ${{ steps.scope.outcome }}
+          PRECOMMIT: ${{ steps.precommit.outcome }}
+          DIFF_SANITY: ${{ steps.diff_sanity.outcome }}
         run: |
-          set -euo pipefail
-          for outcome in \
-            "${{ steps.contract.outcome }}" \
-            "${{ steps.fish.outcome }}" \
-            "${{ steps.shared.outcome }}" \
-            "${{ steps.scope.outcome }}" \
-            "${{ steps.precommit.outcome }}" \
-            "${{ steps.diff.outcome }}"; do
-            test "${outcome}" = "success"
-          done
-          echo "FishAudio S2-Pro BCG CPU validation passed for ${TARGET_SHA}."
+          set -euxo pipefail
+          failed=0
+          check() {
+            local name="$1"
+            local outcome="$2"
+            if [[ "${outcome}" != "success" ]]; then
+              echo "::error::${name} outcome=${outcome}"
+              failed=1
+            else
+              echo "${name}: success"
+            fi
+          }
+          check "voxtral-adopter-contract" "${CONTRACT}"
+          check "late-bound-forward" "${FORWARD_CONTRACT}"
+          check "voxtral-cpu-suite" "${VOXTRAL_CPU}"
+          check "shared-prefill" "${SHARED_PREFILL}"
+          check "patch-scope" "${SCOPE}"
+          check "precommit" "${PRECOMMIT}"
+          check "diff-sanity" "${DIFF_SANITY}"
+          if [[ "${failed}" -ne 0 ]]; then
+            echo "One or more Voxtral-TTS CPU validation checks failed."
+            exit 1
+          fi
+          echo "All Voxtral-TTS CPU validation checks passed."
