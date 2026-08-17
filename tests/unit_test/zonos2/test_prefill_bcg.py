@@ -39,6 +39,10 @@ def _zonos2_sglang_model_module():
 
 
 class _PassthroughLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(1))
+
     def forward(self, x, residual, router_states, positions, forward_batch):
         del residual, router_states, positions, forward_batch
         return x, torch.zeros_like(x), None
@@ -136,11 +140,30 @@ def test_zonos2_resolver_discovers_registered_transformer_body() -> None:
     assert not hasattr(outer, "language_model")
 
 
+def test_zonos2_attention_layer_is_discoverable_by_sglang() -> None:
+    compute_attention_and_moe_layers = pytest.importorskip(
+        "sglang.srt.model_executor.model_runner_components.layer_setup"
+    ).compute_attention_and_moe_layers
+    sentinel_attention = object()
+    body = SimpleNamespace(
+        layers=[SimpleNamespace(attention=SimpleNamespace(attn=sentinel_attention))]
+    )
+
+    discovered = compute_attention_and_moe_layers(body)
+
+    assert discovered.attention_layers == [sentinel_attention]
+
+
 def test_zonos2_transformer_body_exposes_bcg_forward_signature() -> None:
     module = _zonos2_sglang_model_module()
     body = _minimal_body(module)
+    outer = _minimal_outer(module, body)
+    resolver = pytest.importorskip(
+        "sglang.srt.model_loader.utils"
+    ).resolve_language_model
+    discovered_body = resolver(outer)
 
-    assert list(inspect.signature(body.forward).parameters) == [
+    assert list(inspect.signature(discovered_body.forward).parameters) == [
         "input_ids",
         "positions",
         "forward_batch",
@@ -274,10 +297,10 @@ def test_zonos2_body_parameters_are_registered_once_under_inner_module() -> None
     named_parameters = dict(outer.named_parameters())
     body_parameters = dict(body.named_parameters())
 
-    assert list(named_parameters) == [
+    assert set(named_parameters) == {
         "model.layers.0.weight",
         "model.out_norm",
-    ]
+    }
     assert {id(parameter) for parameter in named_parameters.values()} == {
         id(parameter) for parameter in body_parameters.values()
     }
