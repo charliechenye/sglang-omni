@@ -11,6 +11,7 @@ import torch
 from sglang_omni.model_runner.prefill_inputs import (
     OmniPrefillInputs,
     attach_omni_prefill_inputs,
+    clear_omni_prefill_inputs,
     get_omni_prefill_inputs,
 )
 
@@ -57,3 +58,26 @@ def test_attach_rejects_token_row_mismatch() -> None:
 
     with pytest.raises(RuntimeError, match="extend-window tokens"):
         attach_omni_prefill_inputs(forward_batch, _payload(rows=4))
+
+
+def test_attach_rejects_existing_sidecar_and_allows_reattach_after_clear() -> None:
+    forward_batch = _forward_batch()
+    first = _payload()
+    second = _payload()
+
+    attach_omni_prefill_inputs(forward_batch, first)
+
+    with pytest.raises(RuntimeError, match="already attached"):
+        attach_omni_prefill_inputs(forward_batch, second)
+
+    assert get_omni_prefill_inputs(forward_batch) is first
+
+    clear_omni_prefill_inputs(forward_batch)
+
+    assert get_omni_prefill_inputs(forward_batch) is None
+
+    attach_omni_prefill_inputs(forward_batch, second)
+
+    assert get_omni_prefill_inputs(forward_batch) is second
+
+    clear_omni_prefill_inputs(forward_batch)
