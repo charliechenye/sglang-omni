@@ -282,6 +282,15 @@ class S2ProSGLangTextModel(nn.Module):
         """Expose the transformer body for shared prefill graph discovery."""
         return self._transformer_view
 
+    @model.setter
+    def model(self, value: _S2ProTransformerView) -> None:
+        # SGLang prefill graph discovery writes the resolved language model
+        # back to ``.model``; Fish permits only this identity-preserving write.
+        if value is not self._transformer_view:
+            raise ValueError(
+                "Fish S2-Pro transformer view may only be reassigned to itself"
+            )
+
     def setup_vq_decode(
         self,
         audio_decoder: nn.Module,

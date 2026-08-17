@@ -206,6 +206,23 @@ def test_fish_transformer_view_matches_sglang_discovery_contract() -> None:
     assert parameters["input_embeds"].default is None
 
 
+def test_fish_transformer_view_accepts_sglang_prefill_graph_discovery_writeback() -> (
+    None
+):
+    model = _minimal_model()
+    view = model.model
+
+    model.model = view
+
+    assert model.model is view
+    assert model._transformer_view is view
+
+    with pytest.raises(ValueError, match="transformer view"):
+        model.model = object()
+
+    assert model.model is view
+
+
 def test_fish_transformer_view_supports_sglang_monkeypatch_lifecycle() -> None:
     model = _minimal_model()
     view = model.model
