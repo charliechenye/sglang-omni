@@ -1,0 +1,299 @@
+name: "FishAudio S2-Pro BCG CPU validation (dedicated)"
+
+on:
+  push:
+    branches:
+      - cpu-validation/fishaudio-s2pro-bcg-v1
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Exact current upstream main used for the stacked candidate.
+  UPSTREAM_BASE_SHA: 8361c9dfa62d6d28bfd3db19158adbe31dbbb423
+  # Generic prerequisite containing only the shared sidecar hardening.
+  SIDECAR_SHA: f37d561c38255c15678e9204535e78450b821f27
+  # Exact FishAudio S2-Pro candidate under validation.
+  TARGET_SHA: 61e7e80fac0303fc3f23c42b71e02d79890a97cb
+  EXPECTED_SGLANG_VERSION: 0.5.16
+  TEST_VENV: /tmp/sglang-omni-cpu-venv
+
+jobs:
+  fish-s2pro-cpu:
+    name: "FishAudio S2-Pro BCG dedicated CPU gate"
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: hongccc/sglang-omni@sha256:374d0b1c30b2bff685b1716fc64a02ad3b3d0a90fe2ce73ce9861a6992c28101
+
+    steps:
+      - name: Checkout exact FishAudio S2-Pro candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify stacked candidate provenance
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(git rev-parse HEAD)" = "${TARGET_SHA}"
+          git cat-file -e "${UPSTREAM_BASE_SHA}^{commit}"
+          git cat-file -e "${SIDECAR_SHA}^{commit}"
+          git cat-file -e "${TARGET_SHA}^{commit}"
+          test "$(git merge-base "${UPSTREAM_BASE_SHA}" "${SIDECAR_SHA}")" = "${UPSTREAM_BASE_SHA}"
+          test "$(git merge-base "${SIDECAR_SHA}" "${TARGET_SHA}")" = "${SIDECAR_SHA}"
+          echo "upstream -> sidecar -> Fish ancestry: OK"
+          echo "upstream commit count to sidecar:"
+          git rev-list --count "${UPSTREAM_BASE_SHA}..${SIDECAR_SHA}"
+          echo "sidecar commit count to Fish:"
+          git rev-list --count "${SIDECAR_SHA}..${TARGET_SHA}"
+          echo "stacked history:"
+          git log --oneline "${UPSTREAM_BASE_SHA}..${TARGET_SHA}"
+
+      - name: Inspect preinstalled runtime
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python - <<'PY'
+          import importlib.metadata
+          import os
+          import re
+          from pathlib import Path
+
+          import sglang
+          import torch
+          import transformers
+
+          expected = os.environ["EXPECTED_SGLANG_VERSION"]
+          project_text = Path("pyproject.toml").read_text()
+          project_match = re.search(r'"sglang==([^"\\]+)"', project_text)
+          if project_match is None:
+              raise AssertionError("pyproject.toml has no exact sglang pin")
+          project_version = project_match.group(1)
+          installed_version = importlib.metadata.version("sglang")
+          module_version = getattr(sglang, "__version__", "unknown")
+          print("python:", os.sys.version)
+          print("torch:", torch.__version__)
+          print("transformers:", transformers.__version__)
+          print("sglang distribution:", installed_version)
+          print("sglang module:", module_version)
+          print("torch.cuda.is_available():", torch.cuda.is_available())
+          print("TARGET_SHA:", os.environ["TARGET_SHA"])
+          print("SIDECAR_SHA:", os.environ["SIDECAR_SHA"])
+          print("UPSTREAM_BASE_SHA:", os.environ["UPSTREAM_BASE_SHA"])
+          assert project_version == expected, (project_version, expected)
+          assert installed_version == expected, (installed_version, expected)
+          assert module_version == expected, (module_version, expected)
+          assert not torch.cuda.is_available()
+          PY
+
+      - name: Create CPU test virtualenv
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if ! python -m venv --system-site-packages "${TEST_VENV}"; then
+            apt-get update
+            apt-get install -y --no-install-recommends python3.12-venv
+            rm -rf "${TEST_VENV}"
+            python -m venv --system-site-packages "${TEST_VENV}"
+          fi
+          "${TEST_VENV}/bin/python" - <<'PY'
+          import importlib.metadata
+          import pre_commit
+          import pytest
+          import sglang
+          import torch
+          import transformers
+
+          print("pytest:", pytest.__version__)
+          print("pre_commit:", pre_commit.__file__)
+          print("sglang:", importlib.metadata.version("sglang"))
+          print("torch:", torch.__version__)
+          print("transformers:", transformers.__version__)
+          PY
+
+      - name: Fish durable BCG contract tests
+        id: contract
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py
+
+      - name: Late-bound model forward compatibility
+        id: forward_contract
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" - <<'PY'
+          import inspect
+
+          from sglang_omni.models.fishaudio_s2_pro.sglang_model import (
+              S2ProSGLangTextModel,
+          )
+
+          params = inspect.signature(S2ProSGLangTextModel.forward).parameters
+          print("S2ProSGLangTextModel.forward parameters:", list(params))
+          for required in ("input_embeds", "omni_prefill_rids"):
+              if required not in params:
+                  raise AssertionError(
+                      f"late-bound Omni prefill kwarg {required!r} is not accepted "
+                      "by S2ProSGLangTextModel.forward"
+                  )
+          print("late-bound forward contract: OK")
+          PY
+
+      - name: Full FishAudio S2-Pro CPU suite
+        id: fish
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pytest -q tests/unit_test/fishaudio_s2_pro
+
+      - name: Shared prefill and capability regression
+        id: shared
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pytest -q \
+            tests/unit_test/model_runner/test_prefill_inputs.py \
+            tests/unit_test/model_runner/test_prefill_forward_kwargs.py \
+            tests/unit_test/model_runner/test_cuda_graph_batch_validator.py \
+            tests/unit_test/scheduling/test_prefill_graph_policy.py \
+            tests/unit_test/scheduling/test_engine_factory.py \
+            tests/unit_test/models/test_model_capabilities.py
+
+      - name: Verify full stacked candidate scope
+        id: full_scope
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          actual="$(git diff --name-only "${UPSTREAM_BASE_SHA}...${TARGET_SHA}" | sort)"
+          expected="$(printf '%s\n' \
+            'sglang_omni/model_runner/prefill_inputs.py' \
+            'sglang_omni/models/fishaudio_s2_pro/__init__.py' \
+            'sglang_omni/models/fishaudio_s2_pro/engine_builder.py' \
+            'sglang_omni/models/fishaudio_s2_pro/model_runner.py' \
+            'sglang_omni/models/fishaudio_s2_pro/sglang_model.py' \
+            'tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py' \
+            'tests/unit_test/fishaudio_s2_pro/test_tts.py' \
+            'tests/unit_test/model_runner/test_prefill_inputs.py' \
+            'tests/unit_test/models/test_model_capabilities.py' \
+            | sort)"
+          diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}")
+
+      - name: Verify Fish-only candidate scope
+        id: fish_scope
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          actual="$(git diff --name-only "${SIDECAR_SHA}...${TARGET_SHA}" | sort)"
+          expected="$(printf '%s\n' \
+            'sglang_omni/models/fishaudio_s2_pro/__init__.py' \
+            'sglang_omni/models/fishaudio_s2_pro/engine_builder.py' \
+            'sglang_omni/models/fishaudio_s2_pro/model_runner.py' \
+            'sglang_omni/models/fishaudio_s2_pro/sglang_model.py' \
+            'tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py' \
+            'tests/unit_test/fishaudio_s2_pro/test_tts.py' \
+            'tests/unit_test/models/test_model_capabilities.py' \
+            | sort)"
+          diff -u <(printf '%s\n' "${expected}") <(printf '%s\n' "${actual}")
+          test -z "$(git diff --name-only "${SIDECAR_SHA}...${TARGET_SHA}" -- \
+            sglang_omni/model_runner/prefill_inputs.py \
+            tests/unit_test/model_runner/test_prefill_inputs.py)"
+
+      - name: Pre-commit on stacked candidate files
+        id: precommit
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          "${TEST_VENV}/bin/python" -m pre_commit run --files \
+            sglang_omni/model_runner/prefill_inputs.py \
+            sglang_omni/models/fishaudio_s2_pro/__init__.py \
+            sglang_omni/models/fishaudio_s2_pro/engine_builder.py \
+            sglang_omni/models/fishaudio_s2_pro/model_runner.py \
+            sglang_omni/models/fishaudio_s2_pro/sglang_model.py \
+            tests/unit_test/fishaudio_s2_pro/test_prefill_cuda_graph_contract.py \
+            tests/unit_test/fishaudio_s2_pro/test_tts.py \
+            tests/unit_test/model_runner/test_prefill_inputs.py \
+            tests/unit_test/models/test_model_capabilities.py \
+            --show-diff-on-failure
+
+      - name: Diff and working-tree sanity
+        id: diff_sanity
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euxo pipefail
+          git diff --check "${UPSTREAM_BASE_SHA}...${TARGET_SHA}"
+          test -z "$(git status --porcelain)"
+
+      - name: Validation summary
+        if: always()
+        shell: bash
+        run: |
+          echo "## FishAudio S2-Pro BCG dedicated CPU validation" >> "$GITHUB_STEP_SUMMARY"
+          echo "Candidate: \`${TARGET_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Sidecar prerequisite: \`${SIDECAR_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Upstream base: \`${UPSTREAM_BASE_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "Expected SGLang: \`${EXPECTED_SGLANG_VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Check | Outcome |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Fish durable BCG contract | ${{ steps.contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Late-bound model forward | ${{ steps.forward_contract.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Full Fish CPU suite | ${{ steps.fish.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Shared prefill/capability suite | ${{ steps.shared.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Full stacked scope | ${{ steps.full_scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Fish-only scope | ${{ steps.fish_scope.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Pre-commit | ${{ steps.precommit.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Diff sanity | ${{ steps.diff_sanity.outcome }} |" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Final FishAudio S2-Pro CPU validation gate
+        if: always()
+        shell: bash
+        env:
+          CONTRACT: ${{ steps.contract.outcome }}
+          FORWARD_CONTRACT: ${{ steps.forward_contract.outcome }}
+          FISH_CPU: ${{ steps.fish.outcome }}
+          SHARED_PREFILL: ${{ steps.shared.outcome }}
+          FULL_SCOPE: ${{ steps.full_scope.outcome }}
+          FISH_SCOPE: ${{ steps.fish_scope.outcome }}
+          PRECOMMIT: ${{ steps.precommit.outcome }}
+          DIFF_SANITY: ${{ steps.diff_sanity.outcome }}
+        run: |
+          set -euxo pipefail
+          failed=0
+          check() {
+            local name="$1"
+            local outcome="$2"
+            if [[ "${outcome}" != "success" ]]; then
+              echo "::error::${name} outcome=${outcome}"
+              failed=1
+            else
+              echo "${name}: success"
+            fi
+          }
+          check "fish-adopter-contract" "${CONTRACT}"
+          check "late-bound-forward" "${FORWARD_CONTRACT}"
+          check "fish-cpu-suite" "${FISH_CPU}"
+          check "shared-prefill-capability" "${SHARED_PREFILL}"
+          check "full-stacked-scope" "${FULL_SCOPE}"
+          check "fish-only-scope" "${FISH_SCOPE}"
+          check "precommit" "${PRECOMMIT}"
+          check "diff-sanity" "${DIFF_SANITY}"
+          if [[ "${failed}" -ne 0 ]]; then
+            echo "One or more dedicated FishAudio S2-Pro CPU validation checks failed."
+            exit 1
+          fi
+          echo "All dedicated FishAudio S2-Pro CPU validation checks passed."
