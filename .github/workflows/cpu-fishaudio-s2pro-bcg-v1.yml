@@ -15,7 +15,7 @@ env:
   # Generic prerequisite containing only the shared sidecar hardening.
   SIDECAR_SHA: f37d561c38255c15678e9204535e78450b821f27
   # Exact FishAudio S2-Pro candidate under validation.
-  TARGET_SHA: 61e7e80fac0303fc3f23c42b71e02d79890a97cb
+  TARGET_SHA: 66267699991df6206a3b36dffb89326856de3977
   EXPECTED_SGLANG_VERSION: 0.5.16
   TEST_VENV: /tmp/sglang-omni-cpu-venv
 
