@@ -487,6 +487,7 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     build_kwargs: dict = {}
     infrastructure_saw_graph_disabled: list[bool] = []
     infrastructure_kwargs: list[dict] = []
+    infrastructure_workers: list[object] = []
     init_graph_calls: list[bool] = []
     attest_calls: list[tuple[object, object]] = []
 
@@ -570,8 +571,10 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
         del gpu_id
         infrastructure_kwargs.append(dict(kwargs))
         infrastructure_saw_graph_disabled.append(bool(server_args.disable_cuda_graph))
+        worker = FakeWorker(server_args)
+        infrastructure_workers.append(worker)
         return (
-            FakeWorker(server_args),
+            worker,
             object(),
             object(),
             object(),
@@ -652,7 +655,7 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
         assert build_kwargs["cuda_graph_max_bs_prefill"] == 16
         assert infrastructure_kwargs[0]["enable_prefill_input_embeds"] is True
         assert len(attest_calls) == 1
-        assert attest_calls[0][0] is scheduler.model_runner
+        assert attest_calls[0][0] is infrastructure_workers[0].model_runner
         assert attest_calls[0][1] is scheduler.server_args
 
 
