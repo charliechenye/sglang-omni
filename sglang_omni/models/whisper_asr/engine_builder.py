@@ -11,10 +11,15 @@ from sglang_omni.models.whisper_asr.encoder_service import (
     build_cache_namespace,
 )
 from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
+    build_default_prefill_cuda_graph_bs,
+)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ENCODER_GRAPH_BATCH_BUCKETS = (1, 2, 4, 8, 12, 16)
+_WHISPER_PREFILL_GRAPH_MAX_TOKENS = 256
 
 
 def _normalize_encoder_graph_buckets(buckets: list[int] | None) -> tuple[int, ...]:
@@ -62,6 +67,7 @@ def _resolve_encoder_graph_buckets(
 class WhisperASREngineBuilder(AsrEngineBuilder):
     model_name = "Whisper ASR"
     model_arch_override = "WhisperForConditionalGeneration"
+    supports_breakable_prefill_cuda_graph = True
 
     def __init__(
         self,
@@ -229,6 +235,45 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             )
         overrides["chunked_prefill_size"] = 0
 
+        if overrides.get("cuda_graph_backend_prefill") == CudaGraphBackend.DISABLED:
+            # A disabled backend must not leave stale shape knobs behind. This
+            # matters when a deployment disables graphs while retaining a
+            # model's generation defaults.
+            overrides.pop("cuda_graph_bs_prefill", None)
+            overrides.pop("cuda_graph_max_bs_prefill", None)
+            return
+
+        # Operator-provided buckets are an explicit shape policy. Preserve
+        # them byte-for-byte and only derive the missing max from the list.
+        if "cuda_graph_bs_prefill" in overrides:
+            if overrides.get("cuda_graph_max_bs_prefill") is None:
+                overrides["cuda_graph_max_bs_prefill"] = max(
+                    int(bucket) for bucket in overrides["cuda_graph_bs_prefill"]
+                )
+            return
+
+        explicit_max = overrides.get("cuda_graph_max_bs_prefill")
+        if explicit_max is not None:
+            # An explicit max is an operator choice, including values above
+            # the default 256-token ladder. SGLang's policy validator will
+            # reject contradictory max_prefill_tokens settings instead of
+            # silently changing the requested graph shapes.
+            ladder_cap = int(explicit_max)
+        else:
+            ladder_cap = _WHISPER_PREFILL_GRAPH_MAX_TOKENS
+            for cap_name in (
+                "max_prefill_tokens",
+                "max_total_tokens",
+                "context_length",
+            ):
+                cap = overrides.get(cap_name)
+                if cap is not None and int(cap) > 0:
+                    ladder_cap = min(ladder_cap, int(cap))
+
+        ladder = build_default_prefill_cuda_graph_bs(ladder_cap)
+        overrides["cuda_graph_bs_prefill"] = ladder
+        overrides["cuda_graph_max_bs_prefill"] = max(ladder)
+
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
         return {
             "max_running_requests": self.max_running_requests,
@@ -240,6 +285,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             "chunked_prefill_size": 0,
             "sampling_backend": "pytorch",
             "dtype": dtype,
+            "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
         }
 
     def make_adapters(self, model: Any) -> tuple[Any, Any]:
