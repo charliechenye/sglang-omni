@@ -169,26 +169,10 @@ class S2ProDecoderLayer(nn.Module):
         return hidden_states, residual
 
 
-class _S2ProTransformerView:
-    """Unregistered transformer-body view used by SGLang BCG discovery.
-
-    Fish keeps the transformer stack and its eager sampling tail in one model
-    class. The shared breakable-prefill runner captures the discovered layer
-    model and runs the outer model tail eagerly, so expose a lightweight view
-    without registering a second module path or duplicating parameters.
-    """
-
-    # note(chenye): ``PrefillCudaGraphRunner`` temporarily replaces ``forward``
-    # during replay, so the view needs an instance dictionary in addition to
-    # its single owner reference.
-    __slots__ = ("_owner", "__dict__")
-
+class _S2ProTransformerBody:
     def __init__(self, owner: "S2ProSGLangTextModel") -> None:
         self._owner = owner
-
-    @property
-    def layers(self):
-        return self._owner.layers
+        self.layers = owner.layers
 
     def forward(
         self,
@@ -275,22 +259,9 @@ class S2ProSGLangTextModel(nn.Module):
 
             self.lm_head = ParallelLMHead(vocab_size, hidden_size)
 
-        self._transformer_view = _S2ProTransformerView(self)
-
-    @property
-    def model(self) -> _S2ProTransformerView:
-        """Expose the transformer body for shared prefill graph discovery."""
-        return self._transformer_view
-
-    @model.setter
-    def model(self, value: _S2ProTransformerView) -> None:
-        # note(chneye): SGLang prefill graph discovery writes the resolved
-        # language model back to ``.model``; Fish permits only this identity
-        # preserving write.
-        if value is not self._transformer_view:
-            raise ValueError(
-                "Fish S2-Pro transformer view may only be reassigned to itself"
-            )
+        # Note (chenye): BCG swaps the body forward during replay, so it must
+        # stay separate from the outer logits and codebook tail.
+        self.model = _S2ProTransformerBody(self)
 
     def setup_vq_decode(
         self,
@@ -388,7 +359,7 @@ class S2ProSGLangTextModel(nn.Module):
         positions: Tensor,
         forward_batch: ForwardBatch,
         input_embeds: Optional[Tensor] = None,
-        omni_prefill_rids: list[str] | tuple[str, ...] | None = None,
+        omni_prefill_rids: list[str] | None = None,
     ) -> LogitsProcessorOutput:
         del omni_prefill_rids
         hidden_states = self.model.forward(
