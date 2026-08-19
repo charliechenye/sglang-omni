@@ -276,7 +276,10 @@ def test_fish_s2pro_before_prefill_syncs_decode_state() -> None:
     prefill_inputs = get_omni_prefill_inputs(forward_batch)
     assert prefill_inputs is not None
     assert forward_batch.input_embeds is None
-    assert prefill_inputs.input_embeds.shape == (2, 2)
+    assert torch.equal(
+        prefill_inputs.input_embeds,
+        torch.tensor([[10.0, 10.0], [11.0, 11.0]]),
+    )
     assert torch.equal(runner.model._prev_tokens[0], torch.zeros(4, dtype=torch.long))
     assert int(runner.model._prev_token_count[0].item()) == 0
     assert torch.equal(
