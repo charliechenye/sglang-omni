@@ -13,7 +13,7 @@ env:
   # Exact current upstream main used as the candidate base.
   UPSTREAM_BASE_SHA: 65eb44ba5a54a1ff142c2306d384e36d59a2b84a
   # Exact rebased FishAudio S2-Pro cleanup candidate under validation.
-  TARGET_SHA: d3597531b2dfe91e760b1c08d605d2c45b71f00f
+  TARGET_SHA: c2019f68e0790e29019dc3a58383b939becc7c2e
   EXPECTED_SGLANG_VERSION: 0.5.16
   TEST_VENV: /tmp/sglang-omni-cpu-venv
 
