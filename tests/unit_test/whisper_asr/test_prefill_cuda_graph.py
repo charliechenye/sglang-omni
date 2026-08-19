@@ -105,6 +105,19 @@ def test_whisper_prefill_admission_accepts_a_real_forward_batch() -> None:
     assert WhisperPrefillCudaGraphRunner._encoder_metadata_is_usable(batch)
 
 
+def test_whisper_prefill_admission_reads_encoder_lengths_from_host_mirror() -> None:
+    batch = SimpleNamespace(
+        batch_size=1,
+        encoder_lens=torch.empty(1, dtype=torch.int64, device="meta"),
+        encoder_lens_cpu=[4],
+        encoder_cached=[True],
+        encoder_out_cache_loc=None,
+        mm_inputs=None,
+    )
+
+    assert WhisperPrefillCudaGraphRunner._encoder_metadata_is_usable(batch)
+
+
 def test_whisper_model_exposes_decoder_body_without_duplicate_registration() -> None:
     model = WhisperModel(_tiny_whisper_config())
 

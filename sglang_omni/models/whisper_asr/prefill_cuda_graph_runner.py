@@ -74,8 +74,9 @@ class WhisperPrefillCudaGraphRunner(PrefillCudaGraphRunner):
             return False
         if encoder_cached is None or len(encoder_cached) != forward_batch.batch_size:
             return False
-        if bool(torch.any(encoder_lens <= 0).item()):
-            return False
+        # Use SGLang's host mirror for eligibility values. Reading encoder_lens
+        # here would introduce a device-to-host synchronization on every BCG
+        # admission check.
         if any(int(length) <= 0 for length in encoder_lens_cpu):
             return False
 
