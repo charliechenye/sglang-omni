@@ -178,9 +178,9 @@ class _S2ProTransformerView:
     without registering a second module path or duplicating parameters.
     """
 
-    # ``PrefillCudaGraphRunner`` temporarily replaces ``forward`` during
-    # replay, so the view needs an instance dictionary in addition to its
-    # single owner reference.
+    # note(chenye): ``PrefillCudaGraphRunner`` temporarily replaces ``forward``
+    # during replay, so the view needs an instance dictionary in addition to
+    # its single owner reference.
     __slots__ = ("_owner", "__dict__")
 
     def __init__(self, owner: "S2ProSGLangTextModel") -> None:
@@ -284,8 +284,9 @@ class S2ProSGLangTextModel(nn.Module):
 
     @model.setter
     def model(self, value: _S2ProTransformerView) -> None:
-        # SGLang prefill graph discovery writes the resolved language model
-        # back to ``.model``; Fish permits only this identity-preserving write.
+        # note(chneye): SGLang prefill graph discovery writes the resolved
+        # language model back to ``.model``; Fish permits only this identity
+        # preserving write.
         if value is not self._transformer_view:
             raise ValueError(
                 "Fish S2-Pro transformer view may only be reassigned to itself"
