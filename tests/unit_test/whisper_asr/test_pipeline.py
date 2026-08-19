@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import sys
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -180,6 +181,103 @@ def test_whisper_prefill_breakable_is_opt_in() -> None:
     assert "cuda_graph_backend_prefill" not in overrides
     assert "cuda_graph_bs_prefill" not in overrides
     assert "cuda_graph_max_bs_prefill" not in overrides
+
+
+def _resolve_whisper_server_args(
+    server_args_overrides: dict[str, object] | None = None,
+) -> tuple[Any, Any]:
+    from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
+    from sglang_omni.scheduling.generation_batch_policy import (
+        build_generation_batch_overrides,
+    )
+    from sglang_omni.scheduling.sglang_backend.server_args_builder import (
+        build_sglang_server_args,
+    )
+
+    builder = WhisperASREngineBuilder(
+        max_running_requests=16,
+        max_new_tokens=32,
+        mem_fraction_static=0.2,
+    )
+    overrides = build_generation_batch_overrides(
+        server_args_overrides=server_args_overrides,
+        **builder.generation_defaults(dtype="bfloat16"),
+    )
+    builder.adjust_overrides(overrides)
+
+    # SGLang intentionally skips __post_init__ for the no-model sentinel. Run
+    # the real CUDA-graph config handler so this test still exercises the
+    # production ServerArgs resolution without loading a model or touching a GPU.
+    server_args = build_sglang_server_args(
+        "dummy",
+        context_length=4096,
+        **overrides,
+    )
+    server_args._handle_cuda_graph_config()
+    return builder, server_args
+
+
+def test_whisper_server_args_default_prefill_graph_is_disabled() -> None:
+    from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
+
+    builder, server_args = _resolve_whisper_server_args()
+
+    prefill = server_args.cuda_graph_config.prefill
+    assert prefill.backend == CudaGraphBackend.DISABLED
+    assert prefill.bs is None
+    assert prefill.max_bs is None
+    assert server_args.max_prefill_tokens == 6144
+    assert server_args.chunked_prefill_size == 0
+    assert builder.supports_breakable_prefill_cuda_graph is True
+
+
+def test_whisper_server_args_explicit_breakable_prefill_uses_default_ladder() -> None:
+    from sglang_omni.scheduling.generation_batch_policy import (
+        CudaGraphBackend,
+        build_default_prefill_cuda_graph_bs,
+    )
+
+    _, server_args = _resolve_whisper_server_args(
+        {"cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE}
+    )
+
+    prefill = server_args.cuda_graph_config.prefill
+    assert prefill.backend == CudaGraphBackend.BREAKABLE
+    assert prefill.bs == build_default_prefill_cuda_graph_bs(256)
+    assert prefill.max_bs == 256
+
+
+def test_whisper_server_args_explicit_disabled_prefill_has_no_stale_shapes() -> None:
+    from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
+
+    _, server_args = _resolve_whisper_server_args(
+        {
+            "cuda_graph_backend_prefill": CudaGraphBackend.DISABLED,
+            "cuda_graph_bs_prefill": [4, 8],
+            "cuda_graph_max_bs_prefill": 8,
+        }
+    )
+
+    prefill = server_args.cuda_graph_config.prefill
+    assert prefill.backend == CudaGraphBackend.DISABLED
+    assert prefill.bs is None
+    assert prefill.max_bs is None
+
+
+def test_whisper_server_args_nested_prefill_backend_is_supported() -> None:
+    from sglang_omni.scheduling.generation_batch_policy import (
+        CudaGraphBackend,
+        build_default_prefill_cuda_graph_bs,
+    )
+
+    _, server_args = _resolve_whisper_server_args(
+        {"cuda_graph_config": {"prefill": {"backend": CudaGraphBackend.BREAKABLE}}}
+    )
+
+    prefill = server_args.cuda_graph_config.prefill
+    assert prefill.backend == CudaGraphBackend.BREAKABLE
+    assert prefill.bs == build_default_prefill_cuda_graph_bs(256)
+    assert prefill.max_bs == 256
 
 
 def test_whisper_enables_breakable_prefill_with_default_256_token_ladder() -> None:
