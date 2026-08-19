@@ -5,7 +5,6 @@ import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from threading import Lock
 from typing import Any
 
 from sglang.srt.configs.model_config import ModelConfig
@@ -27,7 +26,6 @@ from sglang_omni.vendor.sglang.parallel_state import create_parallel_state
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 logger = logging.getLogger(__name__)
-_PREFILL_RUNNER_OVERRIDE_LOCK = Lock()
 
 
 def filter_weights_by_prefix(
@@ -385,49 +383,33 @@ class SGLModelRunner(ModelRunner):
             self.post_capture_resize_kv_pool()
         return result
 
-    def _prefill_cuda_graph_runner_cls(self):
-        """Return the model-specific BCG runner for Whisper only."""
+    @contextmanager
+    def _prefill_cuda_graph_runner_override(self):
+        """Temporarily replace SGLang's module-level prefill runner for Whisper BCG."""
         from sglang.srt.model_executor.cuda_graph_config import (
             Backend as CudaGraphBackend,
         )
 
         if (
-            self._model_arch_override == "WhisperForConditionalGeneration"
-            and self.server_args.cuda_graph_config.prefill.backend
-            == CudaGraphBackend.BREAKABLE
+            self._model_arch_override != "WhisperForConditionalGeneration"
+            or self.server_args.cuda_graph_config.prefill.backend
+            != CudaGraphBackend.BREAKABLE
         ):
-            from sglang_omni.models.whisper_asr.prefill_cuda_graph_runner import (
-                WhisperPrefillCudaGraphRunner,
-            )
-
-            return WhisperPrefillCudaGraphRunner
-        return None
-
-    @contextmanager
-    def _prefill_cuda_graph_runner_override(self):
-        """Temporarily replace SGLang's hard-coded prefill runner factory.
-
-        SGLang 0.5.16 resolves ``PrefillCudaGraphRunner`` from a module-level
-        symbol during setup, without a per-model factory hook. Capture setup
-        is process-global, so serialize this small override and always restore
-        the symbol, including failed graph construction.
-        TODO: remove this compatibility shim when SGLang exposes a per-model
-        prefill-runner factory hook.
-        """
-        runner_cls = self._prefill_cuda_graph_runner_cls()
-        if runner_cls is None:
             yield
             return
 
         from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 
-        with _PREFILL_RUNNER_OVERRIDE_LOCK:
-            original = cuda_graph_setup.PrefillCudaGraphRunner
-            cuda_graph_setup.PrefillCudaGraphRunner = runner_cls
-            try:
-                yield
-            finally:
-                cuda_graph_setup.PrefillCudaGraphRunner = original
+        from sglang_omni.models.whisper_asr.prefill_cuda_graph_runner import (
+            WhisperPrefillCudaGraphRunner,
+        )
+
+        original = cuda_graph_setup.PrefillCudaGraphRunner
+        cuda_graph_setup.PrefillCudaGraphRunner = WhisperPrefillCudaGraphRunner
+        try:
+            yield
+        finally:
+            cuda_graph_setup.PrefillCudaGraphRunner = original
 
     def _weight_update_blocked_reason(self) -> str | None:
         ws = self._weight_share_config

@@ -222,34 +222,6 @@ class WhisperSGLangCrossAttention(nn.Module):
         cache_loc: torch.Tensor,
     ) -> None:
         """Project and eagerly write encoder K/V before decoder graph replay."""
-        if not isinstance(cache_loc, torch.Tensor):
-            raise TypeError(
-                "Whisper encoder KV writes require a tensor of cache locations"
-            )
-        if cache_loc.ndim != 1:
-            raise ValueError(
-                "Whisper encoder KV cache locations must be a flat tensor, "
-                f"got shape={tuple(cache_loc.shape)}"
-            )
-        if cache_loc.numel() == 0:
-            raise RuntimeError(
-                "Whisper encoder KV writes require non-empty encoder states and "
-                "encoder_out_cache_loc"
-            )
-        if cross_attention_states.ndim != 2:
-            raise ValueError(
-                "Whisper cross-attention states must be a flat [tokens, hidden] "
-                f"tensor, got shape={tuple(cross_attention_states.shape)}"
-            )
-        if cache_loc.numel() != cross_attention_states.shape[0]:
-            raise RuntimeError(
-                "Whisper encoder KV write length does not match the allocated "
-                f"cache locations: states={cross_attention_states.shape[0]} "
-                f"locations={cache_loc.numel()}"
-            )
-        if cross_attention_states.shape[0] == 0:
-            raise RuntimeError("Whisper encoder KV writes cannot be empty")
-
         key, value = self.kv_proj(cross_attention_states).chunk(2, dim=-1)
         key = key.view(-1, self.num_heads, self.head_dim)
         value = value.view(-1, self.num_heads, self.head_dim)
@@ -391,14 +363,6 @@ class WhisperModel(nn.Module):
     def layers(self) -> nn.ModuleList:
         """Expose the decoder body without registering a second module alias."""
         return self.decoder.layers
-
-    def cache_encoder_states(
-        self,
-        encoder_states: torch.Tensor,
-        cache_loc: torch.Tensor,
-    ) -> None:
-        for layer in self.decoder.layers:
-            layer.encoder_attn.cache_encoder_states(encoder_states, cache_loc)
 
     def forward(
         self,
@@ -559,9 +523,9 @@ class WhisperForConditionalGeneration(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
+        input_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ) -> Any:
-        input_embeds = kwargs.pop("input_embeds", None)
         del kwargs
         from sglang.srt.model_executor.runner_utils.capture_mode import (
             get_is_capture_mode,
@@ -577,18 +541,19 @@ class WhisperForConditionalGeneration(nn.Module):
                     encoder_lens,
                 )
 
+        if not all(forward_batch.encoder_cached):
+            assert cross_attention_states is not None
         if cross_attention_states is not None:
-            self.model.cache_encoder_states(
-                cross_attention_states,
-                forward_batch.encoder_out_cache_loc,
-            )
+            assert forward_batch.encoder_out_cache_loc is not None
+            for layer in self.model.decoder.layers:
+                layer.encoder_attn.cache_encoder_states(
+                    cross_attention_states,
+                    forward_batch.encoder_out_cache_loc,
+                )
 
-        if get_is_capture_mode():
-            skip_cross_attention = False
-        else:
-            skip_cross_attention = forward_batch.encoder_lens is None or bool(
-                torch.all(forward_batch.encoder_lens == 0).item()
-            )
+        skip_cross_attention = not get_is_capture_mode() and not any(
+            forward_batch.encoder_lens_cpu or []
+        )
 
         # note(chenye): BCG replay needs a stable embedding input address, so the outer
         # forward materializes positioned decoder embeddings before the captured body.

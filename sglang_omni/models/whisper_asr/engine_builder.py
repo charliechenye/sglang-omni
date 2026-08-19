@@ -12,7 +12,6 @@ from sglang_omni.models.whisper_asr.encoder_service import (
 )
 from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
 from sglang_omni.scheduling.generation_batch_policy import (
-    CudaGraphBackend,
     build_default_prefill_cuda_graph_bs,
 )
 
@@ -235,55 +234,6 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             )
         overrides["chunked_prefill_size"] = 0
 
-        prefill_backend = overrides.get("cuda_graph_backend_prefill")
-        if prefill_backend != CudaGraphBackend.BREAKABLE:
-            # note(chenye): Whisper BCG remains opt-in until large-v3 runtime validation,
-            # so non-Breakable configs must not inherit the model's default capture ladder.
-            if prefill_backend in (None, CudaGraphBackend.DISABLED):
-                overrides.pop("cuda_graph_bs_prefill", None)
-                overrides.pop("cuda_graph_max_bs_prefill", None)
-            return
-
-        if "cuda_graph_bs_prefill" in overrides:
-            buckets = overrides["cuda_graph_bs_prefill"]
-            if not buckets:
-                raise ValueError("cuda_graph_bs_prefill must not be empty")
-            if overrides.get("cuda_graph_max_bs_prefill") is None:
-                overrides["cuda_graph_max_bs_prefill"] = max(
-                    int(bucket) for bucket in buckets
-                )
-            return
-
-        explicit_max = overrides.get("cuda_graph_max_bs_prefill")
-        if explicit_max is not None:
-            explicit_max = int(explicit_max)
-            if explicit_max < 1:
-                raise ValueError(
-                    "cuda_graph_max_bs_prefill must be >= 1, " f"got {explicit_max}"
-                )
-            # note(chenye): an explicit operator max overrides the conservative 256-token
-            # default; shared policy validation rejects incompatible token caps.
-            ladder_cap = explicit_max
-        else:
-            ladder_cap = _WHISPER_PREFILL_GRAPH_MAX_TOKENS
-            for cap_name in (
-                "max_prefill_tokens",
-                "max_total_tokens",
-                "context_length",
-            ):
-                cap = overrides.get(cap_name)
-                if cap is not None and int(cap) > 0:
-                    ladder_cap = min(ladder_cap, int(cap))
-
-        ladder = build_default_prefill_cuda_graph_bs(ladder_cap)
-        if not ladder:
-            raise ValueError(
-                "Whisper Breakable prefill graph ladder is empty; "
-                f"effective token cap={ladder_cap}"
-            )
-        overrides["cuda_graph_bs_prefill"] = ladder
-        overrides["cuda_graph_max_bs_prefill"] = max(ladder)
-
     def generation_defaults(self, *, dtype: str) -> dict[str, Any]:
         return {
             "max_running_requests": self.max_running_requests,
@@ -292,6 +242,9 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             "enable_torch_compile": True,
             "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 6144,
+            "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(
+                _WHISPER_PREFILL_GRAPH_MAX_TOKENS
+            ),
             "chunked_prefill_size": 0,
             "sampling_backend": "pytorch",
             "dtype": dtype,
