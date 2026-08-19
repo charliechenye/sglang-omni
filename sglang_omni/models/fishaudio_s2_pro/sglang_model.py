@@ -398,18 +398,15 @@ class S2ProSGLangTextModel(nn.Module):
             input_embeds,
         )
 
-        # Extend: prune to last-token positions
         if forward_batch.forward_mode.is_extend():
             last_index = torch.cumsum(forward_batch.extend_seq_lens, dim=0) - 1
             hidden_states = hidden_states[last_index]
 
-        # Logits
         if self.tie_word_embeddings:
             logits = torch.nn.functional.linear(hidden_states, self.embed_tokens.weight)
         else:
             logits = self.lm_head(hidden_states)
 
-        # Codebook decode: constrained sampling + batched codebook loop
         if self._vq_ready:
             self._decode_codebooks(logits, hidden_states)
 
