@@ -163,6 +163,25 @@ def test_whisper_disables_chunked_prefill_for_atomic_encoder_prefix() -> None:
         builder.adjust_overrides({"chunked_prefill_size": 4096})
 
 
+def test_whisper_prefill_breakable_is_opt_in() -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
+
+    builder = WhisperASREngineBuilder(
+        max_running_requests=16,
+        max_new_tokens=32,
+        mem_fraction_static=0.2,
+    )
+    defaults = builder.generation_defaults(dtype="bfloat16")
+
+    assert "cuda_graph_backend_prefill" not in defaults
+    overrides = {**defaults}
+    builder.adjust_overrides(overrides)
+
+    assert "cuda_graph_backend_prefill" not in overrides
+    assert "cuda_graph_bs_prefill" not in overrides
+    assert "cuda_graph_max_bs_prefill" not in overrides
+
+
 def test_whisper_enables_breakable_prefill_with_default_256_token_ladder() -> None:
     from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
     from sglang_omni.scheduling.generation_batch_policy import (
@@ -178,6 +197,7 @@ def test_whisper_enables_breakable_prefill_with_default_256_token_ladder() -> No
     overrides = {
         **builder.generation_defaults(dtype="bfloat16"),
         "max_prefill_tokens": 6144,
+        "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
     }
 
     builder.adjust_overrides(overrides)
@@ -188,6 +208,27 @@ def test_whisper_enables_breakable_prefill_with_default_256_token_ladder() -> No
         256
     )
     assert overrides["cuda_graph_max_bs_prefill"] == 256
+
+
+@pytest.mark.parametrize("backend", [None, "disabled", "full"])
+def test_whisper_does_not_generate_breakable_shapes_for_other_backends(backend) -> None:
+    from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
+
+    builder = WhisperASREngineBuilder(
+        max_running_requests=16,
+        max_new_tokens=32,
+        mem_fraction_static=0.2,
+    )
+    overrides = {
+        "chunked_prefill_size": 0,
+        "max_prefill_tokens": 6144,
+        "cuda_graph_backend_prefill": backend,
+    }
+
+    builder.adjust_overrides(overrides)
+
+    assert "cuda_graph_bs_prefill" not in overrides
+    assert "cuda_graph_max_bs_prefill" not in overrides
 
 
 @pytest.mark.parametrize("explicit_max", [128, 512])
@@ -459,7 +500,8 @@ def test_whisper_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
     assert build_kwargs["context_length"] == 1500 + 224 + 256 + 8
     assert build_kwargs["chunked_prefill_size"] == 0
     assert build_kwargs["max_prefill_tokens"] == 6144
-    assert build_kwargs["cuda_graph_max_bs_prefill"] == 256
-    assert build_kwargs["cuda_graph_bs_prefill"][-1] == 256
+    assert build_kwargs.get("cuda_graph_backend_prefill") is None
+    assert build_kwargs.get("cuda_graph_max_bs_prefill") is None
+    assert build_kwargs.get("cuda_graph_bs_prefill") is None
     assert scheduler_kwargs["enable_async_decode"] is False
     assert scheduler_kwargs["async_decode_min_batch_size"] == 4

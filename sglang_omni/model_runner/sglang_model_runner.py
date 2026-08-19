@@ -411,6 +411,8 @@ class SGLModelRunner(ModelRunner):
         symbol during setup, without a per-model factory hook. Capture setup
         is process-global, so serialize this small override and always restore
         the symbol, including failed graph construction.
+        TODO: remove this compatibility shim when SGLang exposes a per-model
+        prefill-runner factory hook.
         """
         runner_cls = self._prefill_cuda_graph_runner_cls()
         if runner_cls is None:

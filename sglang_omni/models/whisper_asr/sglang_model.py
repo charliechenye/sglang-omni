@@ -219,17 +219,21 @@ class WhisperSGLangCrossAttention(nn.Module):
     def cache_encoder_states(
         self,
         cross_attention_states: torch.Tensor,
-        forward_batch_or_cache_loc: ForwardBatch | torch.Tensor,
+        cache_loc: torch.Tensor,
     ) -> None:
         """Project and eagerly write encoder K/V before decoder graph replay."""
-        cache_loc = getattr(
-            forward_batch_or_cache_loc,
-            "encoder_out_cache_loc",
-            forward_batch_or_cache_loc,
-        )
-        if cache_loc is None:
+        if not isinstance(cache_loc, torch.Tensor):
+            raise TypeError(
+                "Whisper encoder KV writes require a tensor of cache locations"
+            )
+        if cache_loc.ndim != 1:
+            raise ValueError(
+                "Whisper encoder KV cache locations must be a flat tensor, "
+                f"got shape={tuple(cache_loc.shape)}"
+            )
+        if cache_loc.numel() == 0:
             raise RuntimeError(
-                "Whisper cross-attention received encoder states without "
+                "Whisper encoder KV writes require non-empty encoder states and "
                 "encoder_out_cache_loc"
             )
         if cross_attention_states.ndim != 2:
@@ -243,10 +247,15 @@ class WhisperSGLangCrossAttention(nn.Module):
                 f"cache locations: states={cross_attention_states.shape[0]} "
                 f"locations={cache_loc.numel()}"
             )
+        if cross_attention_states.shape[0] == 0:
+            raise RuntimeError("Whisper encoder KV writes cannot be empty")
 
         key, value = self.kv_proj(cross_attention_states).chunk(2, dim=-1)
         key = key.view(-1, self.num_heads, self.head_dim)
         value = value.view(-1, self.num_heads, self.head_dim)
+        # These locations are slices of the request-owned extend allocation;
+        # the scheduler releases that allocation through the normal request
+        # KV lifecycle, so this cross-attention write needs no second owner.
         get_attn_backend().token_to_kv_pool.set_kv_buffer(
             self.attn,
             KVWriteLoc(cache_loc),
@@ -258,23 +267,12 @@ class WhisperSGLangCrossAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
-        cross_attention_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Accept the pre-BCG positional order ``(hidden, states, batch)`` for
-        # small downstream callers while exposing the graph-friendly
-        # ``(hidden, batch, states=None)`` contract used by the decoder body.
-        if cross_attention_states is not None and not isinstance(
-            cross_attention_states, torch.Tensor
-        ):
-            forward_batch, cross_attention_states = (
-                cross_attention_states,
-                forward_batch,
-            )
+        # Encoder K/V is always populated by WhisperModel.cache_encoder_states
+        # before this decoder body runs. Keeping this signature canonical is
+        # important for BCG capture: the decoder body must never project or
+        # write encoder K/V during graph capture/replay.
         query = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
-        if cross_attention_states is not None:
-            # Keep direct callers correct while the normal model path writes
-            # every decoder layer's K/V before entering the captured body.
-            self.cache_encoder_states(cross_attention_states, forward_batch)
         attn_output = self.attn(query, None, None, forward_batch)
         attn_output = attn_output.reshape(hidden_states.shape[:-1] + (self.embed_dim,))
         return self.out_proj(attn_output)
@@ -400,13 +398,10 @@ class WhisperModel(nn.Module):
     def cache_encoder_states(
         self,
         encoder_states: torch.Tensor,
-        forward_batch_or_cache_loc: ForwardBatch | torch.Tensor,
+        cache_loc: torch.Tensor,
     ) -> None:
         for layer in self.decoder.layers:
-            layer.encoder_attn.cache_encoder_states(
-                encoder_states,
-                forward_batch_or_cache_loc,
-            )
+            layer.encoder_attn.cache_encoder_states(encoder_states, cache_loc)
 
     def forward(
         self,

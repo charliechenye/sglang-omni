@@ -31,8 +31,15 @@ class WhisperPrefillCudaGraphRunner(PrefillCudaGraphRunner):
                 "Whisper prefill CUDA graph requires one cross-attention layer "
                 "for every self-attention layer"
             )
+        original_attention_layers = model_runner.attention_layers
         model_runner.attention_layers = self_attention_layers + cross_attention_layers
-        super().__init__(model_runner)
+        try:
+            super().__init__(model_runner)
+        finally:
+            # The shared runner is also used to construct later decode/eager
+            # paths. Keep the custom runner's private snapshot, but do not
+            # leave the model runner globally configured with 2N layers.
+            model_runner.attention_layers = original_attention_layers
 
     @staticmethod
     def _has_encoder_inputs(forward_batch: ForwardBatch) -> bool:
@@ -79,7 +86,11 @@ class WhisperPrefillCudaGraphRunner(PrefillCudaGraphRunner):
         )
         if uncached_length:
             cache_loc = forward_batch.encoder_out_cache_loc
-            if cache_loc is None or cache_loc.numel() != uncached_length:
+            if (
+                cache_loc is None
+                or cache_loc.ndim != 1
+                or cache_loc.numel() != uncached_length
+            ):
                 return False
             if not cls._has_encoder_inputs(forward_batch):
                 return False

@@ -69,6 +69,42 @@ def _encoder_batch(
     )
 
 
+def test_whisper_prefill_admission_accepts_a_real_forward_batch() -> None:
+    from sglang.srt.managers.schedule_batch import (
+        Modality,
+        MultimodalDataItem,
+        MultimodalInputs,
+    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+    batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=2,
+        input_ids=torch.tensor([1, 2]),
+        req_pool_indices=torch.tensor([0, 1]),
+        seq_lens=torch.tensor([1, 1]),
+        out_cache_loc=torch.tensor([5, 6]),
+        seq_lens_sum=2,
+        encoder_lens=torch.tensor([2, 2]),
+        encoder_out_cache_loc=torch.tensor([41, 42]),
+        encoder_lens_cpu=[2, 2],
+        encoder_cached=[True, False],
+        mm_inputs=[
+            None,
+            MultimodalInputs(
+                mm_items=[
+                    MultimodalDataItem(
+                        modality=Modality.AUDIO,
+                        precomputed_embeddings=torch.ones(2, 8),
+                    )
+                ]
+            ),
+        ],
+    )
+
+    assert WhisperPrefillCudaGraphRunner._encoder_metadata_is_usable(batch)
+
+
 def test_whisper_model_exposes_decoder_body_without_duplicate_registration() -> None:
     model = WhisperModel(_tiny_whisper_config())
 
@@ -76,6 +112,57 @@ def test_whisper_model_exposes_decoder_body_without_duplicate_registration() -> 
     assert "input_embeds" in inspect.signature(model.forward).parameters
     assert not any(name.startswith("layers.") for name in model.state_dict())
     assert any(name.startswith("decoder.layers.") for name in model.state_dict())
+
+
+def test_whisper_load_weights_maps_tied_projection_and_preserves_state_dict_names() -> (
+    None
+):
+    model = WhisperForConditionalGeneration(_tiny_whisper_config())
+    replacement = torch.randn_like(model.model.decoder.embed_tokens.weight)
+    position_replacement = torch.randn_like(model.model.decoder.embed_positions.weight)
+
+    model.load_weights(
+        [
+            ("proj_out.weight", replacement),
+            ("model.decoder.embed_positions.weight", position_replacement),
+        ]
+    )
+
+    torch.testing.assert_close(model.model.decoder.embed_tokens.weight, replacement)
+    torch.testing.assert_close(
+        model.model.decoder.embed_positions.weight, position_replacement
+    )
+    assert "proj_out.weight" not in model.state_dict()
+
+
+def test_whisper_decoder_uses_prefill_input_embeds_without_reembedding() -> None:
+    model = WhisperModel(_tiny_whisper_config())
+    provided = torch.randn(3, model.decoder.embed_tokens.embedding_dim)
+
+    class _IdentityLayer(torch.nn.Module):
+        def forward(self, hidden_states, forward_batch, skip_cross_attention=False):
+            del forward_batch, skip_cross_attention
+            return hidden_states
+
+    model.decoder.layers = torch.nn.ModuleList([_IdentityLayer()])
+    model.decoder.layer_norm = torch.nn.Identity()
+
+    def fail_embedding(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("decoder re-embedded input_ids despite input_embeds")
+
+    model.decoder.embed_tokens.forward = fail_embedding
+    model.decoder.embed_positions.forward = fail_embedding
+
+    output = model(
+        torch.tensor([1, 2, 3]),
+        torch.tensor([0, 1, 2]),
+        SimpleNamespace(),
+        input_embeds=provided,
+        skip_cross_attention=True,
+    )
+
+    torch.testing.assert_close(output, provided)
 
 
 @pytest.mark.parametrize("encoder_tokens", [1, 3])
@@ -86,6 +173,18 @@ def test_whisper_cross_attention_caches_encoder_kv_eagerly(
     attention = WhisperSGLangCrossAttention(_tiny_whisper_config(), layer_id=1)
     states = torch.randn(encoder_tokens, attention.embed_dim)
     cache_loc = torch.arange(encoder_tokens, dtype=torch.int64)
+    with torch.no_grad():
+        attention.k_proj.weight.copy_(
+            torch.arange(
+                attention.embed_dim * attention.embed_dim,
+                dtype=states.dtype,
+            ).reshape_as(attention.k_proj.weight)
+            / 100.0
+        )
+        attention.v_proj.weight.copy_(torch.flip(attention.k_proj.weight, dims=[0]))
+        attention.v_proj.bias.copy_(
+            torch.arange(attention.embed_dim, dtype=states.dtype)
+        )
     writes: list[tuple[object, object, torch.Tensor, torch.Tensor]] = []
     token_to_kv_pool = SimpleNamespace(
         set_kv_buffer=lambda layer, loc, key, value: writes.append(
@@ -106,6 +205,38 @@ def test_whisper_cross_attention_caches_encoder_kv_eagerly(
     assert write_loc.loc is cache_loc
     assert key.shape == (encoder_tokens, attention.num_heads, attention.head_dim)
     assert value.shape == key.shape
+    expected_key = attention.k_proj(states).view(
+        -1, attention.num_heads, attention.head_dim
+    )
+    expected_value = attention.v_proj(states).view(
+        -1, attention.num_heads, attention.head_dim
+    )
+    torch.testing.assert_close(key, expected_key)
+    torch.testing.assert_close(value, expected_value)
+    assert key.dtype == states.dtype
+    assert value.dtype == states.dtype
+    assert key.device == states.device
+    assert value.device == states.device
+
+
+@pytest.mark.parametrize(
+    ("states", "cache_loc", "error"),
+    [
+        (torch.empty(0, 8), torch.empty(0, dtype=torch.int64), "non-empty"),
+        (torch.ones(2, 8), torch.ones(2, 1, dtype=torch.int64), "flat"),
+        (torch.ones(2, 8), torch.ones(1, dtype=torch.int64), "length"),
+        (torch.ones(1, 2, 8), torch.ones(2, dtype=torch.int64), "flat"),
+    ],
+)
+def test_whisper_cross_attention_rejects_invalid_kv_writes(
+    states: torch.Tensor,
+    cache_loc: torch.Tensor,
+    error: str,
+) -> None:
+    attention = WhisperSGLangCrossAttention(_tiny_whisper_config(), layer_id=1)
+
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        attention.cache_encoder_states(states, cache_loc)
 
 
 @pytest.mark.parametrize(
@@ -146,6 +277,35 @@ def test_whisper_cross_attention_queries_cached_kv_without_reprojecting() -> Non
 
     assert output.shape == (2, attention.embed_dim)
     assert calls == [(None, None)]
+
+
+def test_whisper_cross_attention_signature_and_body_never_project_encoder_kv(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert list(inspect.signature(WhisperSGLangCrossAttention.forward).parameters) == [
+        "self",
+        "hidden_states",
+        "forward_batch",
+    ]
+    attention = WhisperSGLangCrossAttention(_tiny_whisper_config(), layer_id=1)
+
+    def fail_projection(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("decoder cross-attention body projected encoder K/V")
+
+    monkeypatch.setattr(attention.k_proj, "forward", fail_projection)
+    monkeypatch.setattr(attention.v_proj, "forward", fail_projection)
+
+    class _CachedAttention(torch.nn.Module):
+        def forward(self, query, key, value, forward_batch):
+            del key, value, forward_batch
+            return torch.zeros_like(query)
+
+    attention.attn = _CachedAttention()
+    attention.out_proj = torch.nn.Identity()
+    output = attention(torch.randn(2, attention.embed_dim), SimpleNamespace())
+
+    assert output.shape == (2, attention.embed_dim)
 
 
 def test_whisper_precomputed_encoder_states_are_cached_before_decoder_body(
@@ -245,6 +405,88 @@ def test_whisper_encoder_in_prefill_fallback_uses_the_same_kv_cache_path(
     assert calls == ["encoder", "cache", "decoder", "logits"]
 
 
+def test_whisper_mixed_encoder_batch_projects_only_uncached_requests_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = WhisperForConditionalGeneration(_tiny_whisper_config())
+    attention = model.model.decoder.layers[0].encoder_attn
+    batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        encoder_cached=[True, False, True, False],
+        encoder_lens=torch.tensor([2, 2, 2, 2]),
+        encoder_out_cache_loc=torch.tensor([41, 42, 73, 74], dtype=torch.int64),
+        mm_inputs=[
+            SimpleNamespace(
+                mm_items=[
+                    SimpleNamespace(
+                        feature=None,
+                        precomputed_embeddings=torch.full((2, 8), -99.0),
+                    )
+                ]
+            ),
+            SimpleNamespace(
+                mm_items=[
+                    SimpleNamespace(
+                        feature=None,
+                        precomputed_embeddings=torch.tensor([[11.0] * 8, [12.0] * 8]),
+                    )
+                ]
+            ),
+            SimpleNamespace(
+                mm_items=[
+                    SimpleNamespace(
+                        feature=None,
+                        precomputed_embeddings=torch.full((2, 8), -77.0),
+                    )
+                ]
+            ),
+            SimpleNamespace(
+                mm_items=[
+                    SimpleNamespace(
+                        feature=None,
+                        precomputed_embeddings=torch.tensor([[31.0] * 8, [32.0] * 8]),
+                    )
+                ]
+            ),
+        ],
+    )
+
+    states = model._batch_precomputed_encoder_states(batch)
+    assert states is not None
+    torch.testing.assert_close(
+        states,
+        torch.tensor([[11.0] * 8, [12.0] * 8, [31.0] * 8, [32.0] * 8]),
+    )
+
+    writes: list[tuple[object, object, torch.Tensor, torch.Tensor]] = []
+    monkeypatch.setattr(
+        sglang_model,
+        "get_attn_backend",
+        lambda: SimpleNamespace(
+            token_to_kv_pool=SimpleNamespace(
+                set_kv_buffer=lambda layer, loc, key, value: writes.append(
+                    (layer, loc, key, value)
+                )
+            )
+        ),
+    )
+    attention.cache_encoder_states(states, batch.encoder_out_cache_loc)
+
+    assert len(writes) == 1
+    layer, write_loc, key, value = writes[0]
+    assert layer is attention.attn
+    assert write_loc.loc is batch.encoder_out_cache_loc
+    assert torch.equal(write_loc.loc, torch.tensor([41, 42, 73, 74]))
+    torch.testing.assert_close(
+        key,
+        attention.k_proj(states).view(-1, attention.num_heads, attention.head_dim),
+    )
+    torch.testing.assert_close(
+        value,
+        attention.v_proj(states).view(-1, attention.num_heads, attention.head_dim),
+    )
+
+
 def test_whisper_no_encoder_batch_keeps_skip_cross_attention_semantics(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -314,38 +556,113 @@ def test_whisper_prefill_runner_registers_self_and_cross_attention_layers(
             self_attention_layers, cross_attention_layers
         )
     ]
+    original_attention_layers = [object()]
     model_runner = SimpleNamespace(
         model=SimpleNamespace(
             model=SimpleNamespace(
                 decoder=SimpleNamespace(layers=decoder_layers),
             )
         ),
-        attention_layers=[],
+        attention_layers=original_attention_layers,
     )
-    initialized: list[object] = []
+
+    original_mha_layers = [None, None]
+    original_moe_layers = [None, None]
+    original_moe_fusions = [None, None]
+    original_dsa_indexers = [None, None]
+    model_runner.mha_companion_layers = original_mha_layers
+    model_runner.moe_layers = original_moe_layers
+    model_runner.moe_fusions = original_moe_fusions
+    model_runner.dsa_indexers = original_dsa_indexers
+    initialized: list[
+        tuple[
+            object, list[object], list[object], list[object], list[object], list[object]
+        ]
+    ] = []
+
+    def fake_init(self, runner):
+        self.attention_layers = runner.attention_layers
+        self.mha_companion_layers = runner.mha_companion_layers
+        self.moe_layers = runner.moe_layers
+        self.moe_fusions = runner.moe_fusions
+        self.dsa_indexers = runner.dsa_indexers
+        initialized.append(
+            (
+                runner,
+                self.attention_layers,
+                self.mha_companion_layers,
+                self.moe_layers,
+                self.moe_fusions,
+                self.dsa_indexers,
+            )
+        )
+
     monkeypatch.setattr(
         WhisperPrefillCudaGraphRunner.__mro__[1],
         "__init__",
-        lambda self, runner: initialized.append(runner),
+        fake_init,
     )
 
-    WhisperPrefillCudaGraphRunner(model_runner)
+    prefill_runner = WhisperPrefillCudaGraphRunner(model_runner)
 
-    assert model_runner.attention_layers == (
+    assert model_runner.attention_layers is original_attention_layers
+    assert prefill_runner.attention_layers == (
         self_attention_layers + cross_attention_layers
     )
-    assert len({id(layer) for layer in model_runner.attention_layers}) == 4
-    assert initialized == [model_runner]
+    assert len({id(layer) for layer in prefill_runner.attention_layers}) == 4
+    assert initialized == [
+        (
+            model_runner,
+            prefill_runner.attention_layers,
+            original_mha_layers,
+            original_moe_layers,
+            original_moe_fusions,
+            original_dsa_indexers,
+        )
+    ]
+
+
+def test_whisper_prefill_runner_restores_attention_layers_on_init_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original_attention_layers = [object()]
+    decoder_layers = [
+        SimpleNamespace(
+            self_attn=SimpleNamespace(attn=object()),
+            encoder_attn=SimpleNamespace(attn=object()),
+        )
+    ]
+    model_runner = SimpleNamespace(
+        model=SimpleNamespace(
+            model=SimpleNamespace(decoder=SimpleNamespace(layers=decoder_layers))
+        ),
+        attention_layers=original_attention_layers,
+    )
+
+    def fail_init(self, runner):
+        del self, runner
+        raise RuntimeError("prefill runner init failed")
+
+    monkeypatch.setattr(WhisperPrefillCudaGraphRunner.__mro__[1], "__init__", fail_init)
+
+    with pytest.raises(RuntimeError, match="prefill runner init failed"):
+        WhisperPrefillCudaGraphRunner(model_runner)
+
+    assert model_runner.attention_layers is original_attention_layers
 
 
 @pytest.mark.parametrize(
     ("encoder_lens", "encoder_cached", "cache_loc", "has_inputs", "expected"),
     [
         ([4], [True], None, False, True),
+        ([0], [True], None, False, False),
         ([0], [False], None, False, False),
         ([4], [False], None, True, False),
         ([4], [False], torch.arange(4), True, True),
         ([4], [False], torch.arange(4), False, False),
+        ([4, 4], [True, False], torch.arange(4), True, True),
+        ([4, 4], [True, False], torch.arange(3), True, False),
+        ([4, 4], [True, False], torch.arange(4).reshape(2, 2), True, False),
     ],
 )
 def test_whisper_prefill_admission_requires_encoder_context(
@@ -363,6 +680,82 @@ def test_whisper_prefill_admission_requires_encoder_context(
     )
 
     assert WhisperPrefillCudaGraphRunner._encoder_metadata_is_usable(batch) is expected
+
+
+@pytest.mark.parametrize(
+    ("batch", "base_result"),
+    [
+        (
+            _encoder_batch(
+                encoder_lens=[4],
+                encoder_cached=[True],
+                encoder_out_cache_loc=None,
+                has_inputs=False,
+            ),
+            True,
+        ),
+        (
+            _encoder_batch(
+                encoder_lens=[4],
+                encoder_cached=[False],
+                encoder_out_cache_loc=torch.arange(4),
+                has_inputs=True,
+            ),
+            True,
+        ),
+        (
+            _encoder_batch(
+                encoder_lens=[4],
+                encoder_cached=[False],
+                encoder_out_cache_loc=None,
+                has_inputs=True,
+            ),
+            False,
+        ),
+        (
+            _encoder_batch(
+                encoder_lens=[0],
+                encoder_cached=[True],
+                encoder_out_cache_loc=None,
+                has_inputs=False,
+            ),
+            False,
+        ),
+    ],
+)
+def test_whisper_prefill_can_run_graph_delegates_to_base_after_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    batch: SimpleNamespace,
+    base_result: bool,
+) -> None:
+    runner = object.__new__(WhisperPrefillCudaGraphRunner)
+    monkeypatch.setattr(
+        WhisperPrefillCudaGraphRunner.__mro__[1],
+        "can_run_graph",
+        lambda self, forward_batch: base_result,
+    )
+
+    assert runner.can_run_graph(batch) is base_result
+
+
+def test_whisper_prefill_admission_keeps_base_runner_fallback_for_large_shapes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = object.__new__(WhisperPrefillCudaGraphRunner)
+    batch = _encoder_batch(
+        encoder_lens=[4],
+        encoder_cached=[True],
+        encoder_out_cache_loc=None,
+        has_inputs=False,
+    )
+    batch.input_ids = torch.zeros(257, dtype=torch.int64)
+    monkeypatch.setattr(
+        WhisperPrefillCudaGraphRunner.__mro__[1],
+        "can_run_graph",
+        lambda self, forward_batch: len(forward_batch.input_ids) <= 256,
+    )
+
+    assert runner.can_run_graph(batch) is False
 
 
 def test_whisper_prefill_replay_preserves_encoder_metadata(
