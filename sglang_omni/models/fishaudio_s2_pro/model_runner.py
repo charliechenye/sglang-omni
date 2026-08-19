@@ -84,12 +84,12 @@ class FishS2ProModelRunner(ModelRunner):
     def before_prefill(self, forward_batch, schedule_batch, requests):
         del schedule_batch
         self._sync_decode_state(requests)
-        input_embeds = self._build_prefill_input_embeds(forward_batch, requests)
-        if input_embeds is not None:
-            attach_omni_prefill_inputs(
-                forward_batch,
-                OmniPrefillInputs(input_embeds=input_embeds),
-            )
+        attach_omni_prefill_inputs(
+            forward_batch,
+            OmniPrefillInputs(
+                input_embeds=self._build_prefill_input_embeds(forward_batch, requests)
+            ),
+        )
 
     def before_decode(
         self,
