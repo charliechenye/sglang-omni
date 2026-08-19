@@ -29,6 +29,7 @@ def test_fish_prefill_graph_replay_keeps_outer_tail_eager() -> None:
         8, HIDDEN_SIZE
     )
     body = model.model
+    assert body.layers is model.layers
     original_forward = body.forward
 
     seen: dict[str, torch.Tensor] = {}
@@ -51,6 +52,7 @@ def test_fish_prefill_graph_replay_keeps_outer_tail_eager() -> None:
             torch.arange(8),
             batch,
             input_embeds=torch.zeros(5, HIDDEN_SIZE),
+            omni_prefill_rids=["request-a", "request-b"],
         )
     finally:
         body.forward = original_forward
