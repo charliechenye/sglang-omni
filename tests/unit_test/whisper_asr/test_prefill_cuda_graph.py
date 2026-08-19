@@ -507,7 +507,7 @@ def test_model_runner_restores_prefill_adapter_after_capture_failure() -> None:
     original = cuda_graph_setup.PrefillCudaGraphRunner
 
     with pytest.raises(RuntimeError, match="capture failed"):
-        with runner._prefill_cuda_graph_runner_override():
+        with runner._whisper_prefill_cuda_graph_runner_override():
             assert (
                 cuda_graph_setup.PrefillCudaGraphRunner is WhisperPrefillCudaGraphRunner
             )

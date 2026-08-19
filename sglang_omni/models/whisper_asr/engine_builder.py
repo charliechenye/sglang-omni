@@ -18,7 +18,9 @@ from sglang_omni.scheduling.generation_batch_policy import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ENCODER_GRAPH_BATCH_BUCKETS = (1, 2, 4, 8, 12, 16)
-_WHISPER_PREFILL_GRAPH_MAX_TOKENS = 256
+# note(chenye): decoder prefill excludes encoder tokens; 256 covers the
+# 224-token previous-context cap plus Whisper's fixed prefix while bounding capture cost.
+_WHISPER_DECODER_PREFILL_GRAPH_MAX_TOKENS = 256
 
 
 def _normalize_encoder_graph_buckets(buckets: list[int] | None) -> tuple[int, ...]:
@@ -243,7 +245,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 6144,
             "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(
-                _WHISPER_PREFILL_GRAPH_MAX_TOKENS
+                _WHISPER_DECODER_PREFILL_GRAPH_MAX_TOKENS
             ),
             "chunked_prefill_size": 0,
             "sampling_backend": "pytorch",

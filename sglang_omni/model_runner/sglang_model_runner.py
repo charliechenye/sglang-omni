@@ -376,7 +376,7 @@ class SGLModelRunner(ModelRunner):
         get_flags().capture.enable_torch_compile = bool(
             self.server_args.enable_torch_compile
         )
-        with self._prefill_cuda_graph_runner_override():
+        with self._whisper_prefill_cuda_graph_runner_override():
             result = super().init_cuda_graphs(capture_decode_cuda_graph)
         token_to_kv_pool = getattr(self, "token_to_kv_pool", None)
         if bool(getattr(token_to_kv_pool, "post_capture_active", False)):
@@ -384,8 +384,8 @@ class SGLModelRunner(ModelRunner):
         return result
 
     @contextmanager
-    def _prefill_cuda_graph_runner_override(self):
-        """Temporarily replace SGLang's module-level prefill runner for Whisper BCG."""
+    def _whisper_prefill_cuda_graph_runner_override(self):
+        """Use Whisper's prefill runner while pinned SGLang constructs its BCG."""
         from sglang.srt.model_executor.cuda_graph_config import (
             Backend as CudaGraphBackend,
         )
