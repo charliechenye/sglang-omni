@@ -36,9 +36,8 @@ class WhisperPrefillCudaGraphRunner(PrefillCudaGraphRunner):
         try:
             super().__init__(model_runner)
         finally:
-            # The shared runner is also used to construct later decode/eager
-            # paths. Keep the custom runner's private snapshot, but do not
-            # leave the model runner globally configured with 2N layers.
+            # note(chenye): decode and eager paths expect the original attention registry,
+            # so the temporary self+cross-attention view must not escape BCG setup.
             model_runner.attention_layers = original_attention_layers
 
     @staticmethod
@@ -74,9 +73,8 @@ class WhisperPrefillCudaGraphRunner(PrefillCudaGraphRunner):
             return False
         if encoder_cached is None or len(encoder_cached) != forward_batch.batch_size:
             return False
-        # Use SGLang's host mirror for eligibility values. Reading encoder_lens
-        # here would introduce a device-to-host synchronization on every BCG
-        # admission check.
+        # note(chenye): BCG admission must not synchronize on GPU metadata, so inspect
+        # encoder lengths through SGLang's host mirror.
         if any(int(length) <= 0 for length in encoder_lens_cpu):
             return False
 
@@ -100,10 +98,8 @@ class WhisperPrefillCudaGraphRunner(PrefillCudaGraphRunner):
     def capture_prepare(self, num_tokens: int) -> tuple[ForwardBatch, Any]:
         forward_batch, attn_backend = super().capture_prepare(num_tokens)
 
-        # The captured body must execute cross-attention, but the encoder and
-        # its K/V projection are deliberately outside that body. A cached
-        # one-token dummy context gives the backend valid encoder metadata
-        # without introducing a graph-time encoder write.
+        # note(chenye): capture must exercise cross-attention without capturing
+        # request-specific encoder K/V writes, so use a cached one-token context.
         encoder_lens_cpu = [1] * forward_batch.batch_size
         forward_batch.encoder_lens = torch.tensor(
             encoder_lens_cpu,
@@ -116,9 +112,8 @@ class WhisperPrefillCudaGraphRunner(PrefillCudaGraphRunner):
         return forward_batch, attn_backend
 
     def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        # A no-encoder request must retain Whisper's eager skip-cross-attention
-        # path. If the scheduler has not supplied all encoder metadata, do not
-        # risk replaying against stale cross-attention KV slots.
+        # note(chenye): incomplete encoder context must stay eager because graph replay
+        # could otherwise read stale cross-attention KV.
         if not self._encoder_metadata_is_usable(forward_batch):
             return False
         return super().can_run_graph(forward_batch)
@@ -129,9 +124,8 @@ class WhisperPrefillCudaGraphRunner(PrefillCudaGraphRunner):
         **kwargs: Any,
     ) -> ForwardBatch:
         static_forward_batch = super().load_batch(forward_batch, **kwargs)
-        # The generic runner copies encoder_lens but drops the rest of the
-        # encoder-decoder contract. Keep these references live: the outer
-        # eager tail writes new encoder K/V before the captured body replays.
+        # note(chenye): cross-attention planning must follow the live request, so
+        # restore encoder metadata that SGLang 0.5.16 omits from its static batch.
         static_forward_batch.encoder_lens = forward_batch.encoder_lens
         static_forward_batch.encoder_lens_cpu = forward_batch.encoder_lens_cpu
         static_forward_batch.encoder_cached = forward_batch.encoder_cached

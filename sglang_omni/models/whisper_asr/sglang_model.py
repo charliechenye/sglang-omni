@@ -253,9 +253,8 @@ class WhisperSGLangCrossAttention(nn.Module):
         key, value = self.kv_proj(cross_attention_states).chunk(2, dim=-1)
         key = key.view(-1, self.num_heads, self.head_dim)
         value = value.view(-1, self.num_heads, self.head_dim)
-        # These locations are slices of the request-owned extend allocation;
-        # the scheduler releases that allocation through the normal request
-        # KV lifecycle, so this cross-attention write needs no second owner.
+        # note(chenye): encoder K/V uses request-owned extend slots, so normal SGLang
+        # request cleanup remains the sole owner of release.
         get_attn_backend().token_to_kv_pool.set_kv_buffer(
             self.attn,
             KVWriteLoc(cache_loc),
@@ -268,10 +267,8 @@ class WhisperSGLangCrossAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        # Encoder K/V is always populated by WhisperModel.cache_encoder_states
-        # before this decoder body runs. Keeping this signature canonical is
-        # important for BCG capture: the decoder body must never project or
-        # write encoder K/V during graph capture/replay.
+        # note(chenye): decoder BCG must exclude request-specific encoder K/V
+        # projection, so cross-attention reads only the eagerly populated cache.
         query = self.q_proj(hidden_states).view(-1, self.num_heads, self.head_dim)
         attn_output = self.attn(query, None, None, forward_batch)
         attn_output = attn_output.reshape(hidden_states.shape[:-1] + (self.embed_dim,))
@@ -593,10 +590,8 @@ class WhisperForConditionalGeneration(nn.Module):
                 torch.all(forward_batch.encoder_lens == 0).item()
             )
 
-        # The BCG runner captures ``WhisperModel.forward`` as the body. Feed
-        # it a stable, already-positioned embedding tensor so the shared
-        # replay closure can copy it into SGLang's optional input-embed slot;
-        # when that slot is absent, the captured graph still uses input_ids.
+        # note(chenye): BCG replay needs a stable embedding input address, so the outer
+        # forward materializes positioned decoder embeddings before the captured body.
         if input_embeds is None:
             input_embeds = self.model.decoder.embed_input_ids(input_ids, positions)
 

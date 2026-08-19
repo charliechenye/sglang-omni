@@ -237,21 +237,13 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
 
         prefill_backend = overrides.get("cuda_graph_backend_prefill")
         if prefill_backend != CudaGraphBackend.BREAKABLE:
-            # Whisper's encoder-decoder prefill graph is deliberately opt-in.
-            # The shared SGLang default is disabled, and a non-Breakable
-            # backend must not acquire a Breakable-only shape ladder as a side
-            # effect of this model builder.
-            #
-            # With no backend (or an explicitly disabled backend), also remove
-            # stale shape knobs left by a reused override dictionary. Explicit
-            # shapes for another SGLang backend remain the operator's choice.
+            # note(chenye): Whisper BCG remains opt-in until large-v3 runtime validation,
+            # so non-Breakable configs must not inherit the model's default capture ladder.
             if prefill_backend in (None, CudaGraphBackend.DISABLED):
                 overrides.pop("cuda_graph_bs_prefill", None)
                 overrides.pop("cuda_graph_max_bs_prefill", None)
             return
 
-        # Operator-provided buckets are an explicit shape policy. Preserve
-        # them byte-for-byte and only derive the missing max from the list.
         if "cuda_graph_bs_prefill" in overrides:
             buckets = overrides["cuda_graph_bs_prefill"]
             if not buckets:
@@ -269,10 +261,8 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
                 raise ValueError(
                     "cuda_graph_max_bs_prefill must be >= 1, " f"got {explicit_max}"
                 )
-            # An explicit max is an operator choice, including values above
-            # the default 256-token ladder. SGLang's policy validator will
-            # reject contradictory max_prefill_tokens settings instead of
-            # silently changing the requested graph shapes.
+            # note(chenye): an explicit operator max overrides the conservative 256-token
+            # default; shared policy validation rejects incompatible token caps.
             ladder_cap = explicit_max
         else:
             ladder_cap = _WHISPER_PREFILL_GRAPH_MAX_TOKENS

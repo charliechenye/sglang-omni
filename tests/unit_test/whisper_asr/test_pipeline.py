@@ -205,9 +205,8 @@ def _resolve_whisper_server_args(
     )
     builder.adjust_overrides(overrides)
 
-    # SGLang intentionally skips __post_init__ for the no-model sentinel. Run
-    # the real CUDA-graph config handler so this test still exercises the
-    # production ServerArgs resolution without loading a model or touching a GPU.
+    # note(chenye): the dummy sentinel avoids model and GPU setup but skips
+    # post-init, so invoke the production CUDA-graph handler explicitly.
     server_args = build_sglang_server_args(
         "dummy",
         context_length=4096,
