@@ -37,8 +37,6 @@ def attach_omni_prefill_inputs(
     forward_batch: Any, prefill_inputs: OmniPrefillInputs
 ) -> None:
     """Attach ``prefill_inputs`` without modifying upstream-owned fields."""
-    if get_omni_prefill_inputs(forward_batch) is not None:
-        raise RuntimeError("OmniPrefillInputs already attached to this ForwardBatch")
     if forward_batch.replace_embeds is not None:
         raise RuntimeError(
             "OmniPrefillInputs conflicts with forward_batch.replace_embeds"
