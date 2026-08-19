@@ -396,7 +396,7 @@ class SGLModelRunner(ModelRunner):
             and self.server_args.cuda_graph_config.prefill.backend
             == CudaGraphBackend.BREAKABLE
         ):
-            from sglang_omni.model_runner.whisper_prefill_cuda_graph_runner import (
+            from sglang_omni.models.whisper_asr.prefill_cuda_graph_runner import (
                 WhisperPrefillCudaGraphRunner,
             )
 

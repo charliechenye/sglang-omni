@@ -11,10 +11,10 @@ from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from transformers import WhisperConfig
 
 from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
-from sglang_omni.model_runner.whisper_prefill_cuda_graph_runner import (
+from sglang_omni.models.whisper_asr import sglang_model
+from sglang_omni.models.whisper_asr.prefill_cuda_graph_runner import (
     WhisperPrefillCudaGraphRunner,
 )
-from sglang_omni.models.whisper_asr import sglang_model
 from sglang_omni.models.whisper_asr.sglang_model import (
     WhisperForConditionalGeneration,
     WhisperModel,
