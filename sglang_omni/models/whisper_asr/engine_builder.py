@@ -81,10 +81,11 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         prefill_coalesce_requires_pending_builds: bool = True,
         prefill_coalesce_after_builds_during_decode: bool = False,
         enable_pre_lm_encoder: bool = True,
-        pre_lm_cache_max_entries: int = 4096,
-        pre_lm_cache_size_bytes: int = 2 * 1024**3,
+        pre_lm_cache_max_entries: int = 1024,
+        pre_lm_cache_size_bytes: int | None = None,
         pre_lm_max_batch_size: int = 8,
         pre_lm_max_batch_wait_ms: int = 0,
+        pre_lm_cache_pin_host_memory: bool = True,
     ) -> None:
         if pre_lm_max_batch_size < 1:
             raise ValueError(
@@ -117,9 +118,13 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
         )
         self.enable_pre_lm_encoder = bool(enable_pre_lm_encoder)
         self.pre_lm_cache_max_entries = int(pre_lm_cache_max_entries)
-        self.pre_lm_cache_size_bytes = int(pre_lm_cache_size_bytes)
+        # None: derive the byte budget from the entry count (see encoder_service).
+        self.pre_lm_cache_size_bytes = (
+            None if pre_lm_cache_size_bytes is None else int(pre_lm_cache_size_bytes)
+        )
         self.pre_lm_max_batch_size = int(pre_lm_max_batch_size)
         self.pre_lm_max_batch_wait_ms = int(pre_lm_max_batch_wait_ms)
+        self.pre_lm_cache_pin_host_memory = bool(pre_lm_cache_pin_host_memory)
         self.processor: Any = None
         self.tokenizer: Any = None
         self.generation_config: Any = None
@@ -200,17 +205,25 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
                 model_path=self.checkpoint_dir,
                 feature_extractor=self.processor.feature_extractor,
             ),
+            encoder_token_count=self.encoder_token_count,
             cache_max_entries=self.pre_lm_cache_max_entries,
             cache_max_bytes=self.pre_lm_cache_size_bytes,
             max_batch_size=self.pre_lm_max_batch_size,
             max_batch_wait_ms=self.pre_lm_max_batch_wait_ms,
+            pin_host_memory=self.pre_lm_cache_pin_host_memory,
         )
+        service = self.audio_encoder_service
         logger.info(
-            "Whisper pre-LM encoder enabled "
-            "(max_batch=%d, cache_entries=%d, cache_bytes=%d)",
+            "Whisper pre-LM encoder enabled (max_batch=%d, cache capacity=%d "
+            "entries x %.2f MB = %.2f GB, configured entries=%d, byte cap=%s, "
+            "pinned host memory=%s)",
             self.pre_lm_max_batch_size,
+            service.cache_capacity_entries,
+            service.entry_bytes / 1e6,
+            service.cache_max_bytes / 1e9,
             self.pre_lm_cache_max_entries,
             self.pre_lm_cache_size_bytes,
+            service.pin_host_memory,
         )
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
