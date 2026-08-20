@@ -54,24 +54,6 @@ def _mm_input(embeddings: torch.Tensor) -> SimpleNamespace:
     )
 
 
-def _patch_eager_tail(
-    monkeypatch: pytest.MonkeyPatch,
-    model: WhisperForConditionalGeneration,
-    events: list[str],
-) -> None:
-    monkeypatch.setattr(
-        model.model,
-        "forward",
-        lambda *_args, **_kwargs: events.append("decoder")
-        or torch.randn(2, model.config.d_model),
-    )
-    monkeypatch.setattr(
-        model.logits_processor,
-        "forward",
-        lambda *_args, **_kwargs: events.append("logits") or object(),
-    )
-
-
 def test_whisper_mixed_prefill_keeps_uncached_encoder_order(
     monkeypatch: pytest.MonkeyPatch,
     sglang_runtime_context,
@@ -104,7 +86,17 @@ def test_whisper_mixed_prefill_keeps_uncached_encoder_order(
             "cache_encoder_states",
             record_cache,
         )
-    _patch_eager_tail(monkeypatch, model, events)
+    monkeypatch.setattr(
+        model.model,
+        "forward",
+        lambda *_args, **_kwargs: events.append("decoder")
+        or torch.randn(2, model.config.d_model),
+    )
+    monkeypatch.setattr(
+        model.logits_processor,
+        "forward",
+        lambda *_args, **_kwargs: events.append("logits") or object(),
+    )
 
     model(torch.tensor([1, 2]), torch.tensor([0, 1]), forward_batch)
 
@@ -220,7 +212,6 @@ def test_whisper_prefill_runner_keeps_encoder_metadata_live(
 
     assert captured.encoder_lens.tolist() == [1, 1]
     assert captured.encoder_lens_cpu == [1, 1]
-    assert captured.encoder_cached == [True, True]
 
     static_batch = SimpleNamespace()
     live_batch = SimpleNamespace(

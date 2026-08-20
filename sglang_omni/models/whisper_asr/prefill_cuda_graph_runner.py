@@ -34,7 +34,6 @@ class WhisperPrefillCudaGraphRunner(PrefillCudaGraphRunner):
             device=self.device,
         )
         forward_batch.encoder_lens_cpu = [1] * forward_batch.batch_size
-        forward_batch.encoder_cached = [True] * forward_batch.batch_size
         return forward_batch, attn_backend
 
     def load_batch(
