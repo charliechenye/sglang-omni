@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import sys
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
@@ -164,64 +163,20 @@ def test_whisper_disables_chunked_prefill_for_atomic_encoder_prefix() -> None:
         builder.adjust_overrides({"chunked_prefill_size": 4096})
 
 
-def _resolve_whisper_server_args(
-    server_args_overrides: dict[str, object] | None = None,
-) -> Any:
+def test_whisper_breakable_prefill_is_opt_in() -> None:
     from sglang_omni.models.whisper_asr.engine_builder import WhisperASREngineBuilder
-    from sglang_omni.scheduling.generation_batch_policy import (
-        build_generation_batch_overrides,
-    )
-    from sglang_omni.scheduling.sglang_backend.server_args_builder import (
-        build_sglang_server_args,
-    )
 
     builder = WhisperASREngineBuilder(
         max_running_requests=16,
         max_new_tokens=32,
         mem_fraction_static=0.2,
     )
-    overrides = build_generation_batch_overrides(
-        server_args_overrides=server_args_overrides,
-        **builder.generation_defaults(dtype="bfloat16"),
-    )
-    builder.adjust_overrides(overrides)
+    defaults = builder.generation_defaults(dtype="bfloat16")
 
-    # note(chenye): the dummy sentinel avoids model and GPU setup but skips
-    # post-init, so invoke the production CUDA-graph handler explicitly.
-    server_args = build_sglang_server_args(
-        "dummy",
-        context_length=4096,
-        **overrides,
-    )
-    server_args._handle_cuda_graph_config()
-    return server_args
-
-
-def test_whisper_server_args_default_prefill_graph_is_disabled() -> None:
-    from sglang_omni.scheduling.generation_batch_policy import CudaGraphBackend
-
-    server_args = _resolve_whisper_server_args()
-
-    prefill = server_args.cuda_graph_config.prefill
-    assert prefill.backend == CudaGraphBackend.DISABLED
-    assert server_args.max_prefill_tokens == 6144
-    assert server_args.chunked_prefill_size == 0
-
-
-def test_whisper_server_args_explicit_breakable_prefill_uses_default_ladder() -> None:
-    from sglang_omni.scheduling.generation_batch_policy import (
-        CudaGraphBackend,
-        build_default_prefill_cuda_graph_bs,
-    )
-
-    server_args = _resolve_whisper_server_args(
-        {"cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE}
-    )
-
-    prefill = server_args.cuda_graph_config.prefill
-    assert prefill.backend == CudaGraphBackend.BREAKABLE
-    assert prefill.bs == build_default_prefill_cuda_graph_bs(256)
-    assert prefill.max_bs == 256
+    assert builder.supports_breakable_prefill_cuda_graph is True
+    assert "cuda_graph_backend_prefill" not in defaults
+    assert "cuda_graph_bs_prefill" not in defaults
+    assert "cuda_graph_max_bs_prefill" not in defaults
 
 
 def test_whisper_prefill_coalescing_defaults_are_forwarded() -> None:
@@ -380,13 +335,8 @@ def test_whisper_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
                 max_bs=overrides["cuda_graph_max_bs"],
                 bs=overrides["cuda_graph_bs"],
             ),
-            prefill=SimpleNamespace(
-                backend=overrides.get("cuda_graph_backend_prefill", "disabled"),
-                bs=overrides.get("cuda_graph_bs_prefill"),
-                max_bs=overrides.get("cuda_graph_max_bs_prefill"),
-            ),
+            prefill=SimpleNamespace(backend="disabled", bs=None, max_bs=None),
         )
-        server_args._cuda_graph_config_locked = set()
         return server_args
 
     def _fake_create_infrastructure(server_args, gpu_id, **kwargs):

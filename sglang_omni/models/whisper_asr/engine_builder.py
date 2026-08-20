@@ -11,16 +11,10 @@ from sglang_omni.models.whisper_asr.encoder_service import (
     build_cache_namespace,
 )
 from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
-from sglang_omni.scheduling.generation_batch_policy import (
-    build_default_prefill_cuda_graph_bs,
-)
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ENCODER_GRAPH_BATCH_BUCKETS = (1, 2, 4, 8, 12, 16)
-# Decoder prefill excludes encoder tokens: 224 previous-context tokens plus
-# Whisper's four-token language/task prefix fit below this capture cap.
-_WHISPER_DECODER_PREFILL_GRAPH_MAX_TOKENS = 256
 
 
 def _normalize_encoder_graph_buckets(buckets: list[int] | None) -> tuple[int, ...]:
@@ -244,9 +238,6 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             "enable_torch_compile": True,
             "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 6144,
-            "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(
-                _WHISPER_DECODER_PREFILL_GRAPH_MAX_TOKENS
-            ),
             "chunked_prefill_size": 0,
             "sampling_backend": "pytorch",
             "dtype": dtype,
