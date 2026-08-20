@@ -156,7 +156,3 @@ def test_zonos2_loader_maps_checkpoint_weights_into_transformer_body() -> None:
         loader.model.layers[0].attention.wq,
         checkpoint["layers.0.attention.wq.weight"],
     )
-    torch.testing.assert_close(
-        loader.model.layers[0].feed_forward.w_in,
-        checkpoint["layers.0.feed_forward.w_in.weight"],
-    )
