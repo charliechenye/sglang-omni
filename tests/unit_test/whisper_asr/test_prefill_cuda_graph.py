@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from transformers import WhisperConfig
 
 from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
@@ -41,8 +41,11 @@ def _tiny_whisper_config() -> WhisperConfig:
 
 
 @pytest.fixture
-def sglang_server_args():
-    with get_context().override_server_args():
+def sglang_runtime_context():
+    with (
+        get_context().override_server_args(),
+        get_parallel().override(tp_size=1),
+    ):
         yield
 
 
@@ -177,7 +180,7 @@ def test_whisper_cross_attention_queries_cached_kv_without_reprojecting() -> Non
 
 def test_whisper_mixed_encoder_batch_projects_only_uncached_requests_in_order(
     monkeypatch: pytest.MonkeyPatch,
-    sglang_server_args,
+    sglang_runtime_context,
 ) -> None:
     model = WhisperForConditionalGeneration(_tiny_whisper_config())
     attention = model.model.decoder.layers[0].encoder_attn
@@ -261,7 +264,7 @@ def test_whisper_mixed_encoder_batch_projects_only_uncached_requests_in_order(
 
 def test_whisper_precomputed_encoder_states_are_cached_before_decoder_body(
     monkeypatch: pytest.MonkeyPatch,
-    sglang_server_args,
+    sglang_runtime_context,
 ) -> None:
     model = WhisperForConditionalGeneration(_tiny_whisper_config())
     input_ids = torch.tensor([1, 2])
@@ -314,7 +317,7 @@ def test_whisper_precomputed_encoder_states_are_cached_before_decoder_body(
 
 def test_whisper_encoder_in_prefill_fallback_uses_the_same_kv_cache_path(
     monkeypatch: pytest.MonkeyPatch,
-    sglang_server_args,
+    sglang_runtime_context,
 ) -> None:
     model = WhisperForConditionalGeneration(_tiny_whisper_config())
     input_ids = torch.tensor([1, 2])
