@@ -171,6 +171,8 @@ def create_generation_executor(
     device: str = "cuda:0",
     gpu_id: int | None = None,
     max_new_tokens: int = 4096,
+    prefill_coalesce_requests: int = 0,
+    prefill_coalesce_wait_ms: float = 60.0,
     server_args_overrides: dict[str, Any] | None = None,
 ) -> Any:
     """Factory for the SGLang-backed AR generation stage."""
@@ -179,7 +181,10 @@ def create_generation_executor(
         VoxtralTtsEngineBuilder,
     )
 
-    return VoxtralTtsEngineBuilder().build(
+    return VoxtralTtsEngineBuilder(
+        prefill_coalesce_requests=prefill_coalesce_requests,
+        prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
+    ).build(
         model_path,
         device=device,
         gpu_id=gpu_id,

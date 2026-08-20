@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import inspect
 from types import SimpleNamespace
 
 import numpy as np
@@ -554,6 +555,13 @@ def test_voxtral_breakable_prefill_is_opt_in() -> None:
     assert "cuda_graph_bs_prefill" not in defaults
 
 
+def test_voxtral_prefill_coalescing_is_opt_in() -> None:
+    signature = inspect.signature(stages.create_generation_executor)
+
+    assert signature.parameters["prefill_coalesce_requests"].default == 0
+    assert signature.parameters["prefill_coalesce_wait_ms"].default == 60.0
+
+
 def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -668,7 +676,12 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
         lambda **kwargs: SimpleNamespace(**kwargs),
     )
 
-    scheduler = stages.create_generation_executor("model", device="cuda:0")
+    scheduler = stages.create_generation_executor(
+        "model",
+        device="cuda:0",
+        prefill_coalesce_requests=4,
+        prefill_coalesce_wait_ms=12.0,
+    )
 
     assert build_kwargs["disable_cuda_graph"] is False
     assert build_kwargs["cuda_graph_bs"] == [1, 2, 4, 8, 12, 16]
@@ -683,6 +696,8 @@ def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
     assert scheduler.server_args.disable_cuda_graph is False
     assert scheduler.server_args.enable_torch_compile is True
     assert scheduler.server_args.torch_compile_max_bs == 16
+    assert scheduler.prefill_coalesce_requests == 4
+    assert scheduler.prefill_coalesce_wait_ms == 12.0
 
 
 def test_enable_inductor_gemm_autotune_sets_per_shape_autotuning() -> None:

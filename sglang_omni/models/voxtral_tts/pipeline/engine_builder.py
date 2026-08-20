@@ -18,7 +18,14 @@ class VoxtralTtsEngineBuilder(TtsEngineBuilder):
         CAPABILITIES.supports_breakable_prefill_cuda_graph
     )
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        prefill_coalesce_requests: int = 0,
+        prefill_coalesce_wait_ms: float = 60.0,
+    ) -> None:
+        self.prefill_coalesce_requests = prefill_coalesce_requests
+        self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
         self.decrypted_config_file: str | None = None
         self.voice_embeddings: dict[str, Any] = {}
 
@@ -76,3 +83,9 @@ class VoxtralTtsEngineBuilder(TtsEngineBuilder):
             model=model,
             voice_embeddings=self.voice_embeddings,
         )
+
+    def extra_scheduler_kwargs(self) -> dict[str, Any]:
+        return {
+            "prefill_coalesce_requests": self.prefill_coalesce_requests,
+            "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+        }
