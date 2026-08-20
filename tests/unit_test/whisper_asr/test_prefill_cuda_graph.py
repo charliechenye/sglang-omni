@@ -377,7 +377,7 @@ def test_whisper_decode_capture_reuses_cached_encoder_kv(
         forward_mode=ForwardMode.DECODE,
         encoder_cached=None,
         encoder_lens=torch.tensor([3]),
-        encoder_lens_cpu=[3],
+        encoder_lens_cpu=None,
         encoder_out_cache_loc=None,
         mm_inputs=None,
     )
