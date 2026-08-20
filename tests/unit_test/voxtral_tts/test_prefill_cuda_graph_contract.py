@@ -96,3 +96,29 @@ def test_voxtral_breakable_prefill_is_opt_in() -> None:
     assert builder.supports_breakable_prefill_cuda_graph is True
     assert "cuda_graph_backend_prefill" not in defaults
     assert "cuda_graph_bs_prefill" not in defaults
+
+
+def test_forward_selects_logical_endpoints_from_padded_extend() -> None:
+    from sglang_omni.models.voxtral_tts.sglang_model import VoxtralSGLangTTSModel
+
+    model = VoxtralSGLangTTSModel.__new__(VoxtralSGLangTTSModel)
+    captured_hidden = torch.arange(8 * HIDDEN, dtype=torch.float32).reshape(8, HIDDEN)
+    model.language_model = lambda **kwargs: captured_hidden
+    forward_batch = SimpleNamespace(
+        input_ids=torch.arange(8, dtype=torch.long),
+        extend_seq_lens=torch.tensor([2, 3], dtype=torch.long),
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False,
+            is_extend=lambda: True,
+        ),
+    )
+
+    output = model.forward(
+        forward_batch.input_ids,
+        torch.arange(8, dtype=torch.long),
+        forward_batch,
+        input_embeds=torch.zeros((5, HIDDEN)),
+    )
+
+    torch.testing.assert_close(output.hidden_states, captured_hidden[[1, 4]])
+    assert output.next_token_logits.shape == (2, 1)
