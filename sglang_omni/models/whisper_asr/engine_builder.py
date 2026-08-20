@@ -18,8 +18,8 @@ from sglang_omni.scheduling.generation_batch_policy import (
 logger = logging.getLogger(__name__)
 
 _DEFAULT_ENCODER_GRAPH_BATCH_BUCKETS = (1, 2, 4, 8, 12, 16)
-# note(chenye): decoder prefill excludes encoder tokens; 256 covers the
-# 224-token previous-context cap plus Whisper's fixed prefix while bounding capture cost.
+# Decoder prefill excludes encoder tokens: 224 previous-context tokens plus
+# Whisper's four-token language/task prefix fit below this capture cap.
 _WHISPER_DECODER_PREFILL_GRAPH_MAX_TOKENS = 256
 
 
