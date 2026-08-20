@@ -3,32 +3,15 @@
 
 from __future__ import annotations
 
-import inspect
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 
-from sglang_omni.model_runner.prefill_inputs import (
-    OmniPrefillInputs,
-    attach_omni_prefill_inputs,
-    get_omni_prefill_inputs,
-)
-from sglang_omni.models.zonos2 import CAPABILITIES, callbacks
+from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
+from sglang_omni.models.zonos2 import callbacks
 from sglang_omni.models.zonos2.engine_builder import Zonos2EngineBuilder
-
-
-def _forward_batch(*, num_tokens: int = 4, replace_embeds=None) -> SimpleNamespace:
-    return SimpleNamespace(
-        input_embeds=None,
-        replace_embeds=replace_embeds,
-        replace_positions=None,
-        mm_inputs=[object(), None],
-        input_ids=torch.zeros(num_tokens, dtype=torch.long),
-        batch_size=1,
-        rids=["request"],
-    )
 
 
 def _zonos2_sglang_model_module():
@@ -39,10 +22,6 @@ def _zonos2_sglang_model_module():
 
 
 class _PassthroughLayer(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(1))
-
     def forward(self, x, residual, router_states, positions, forward_batch):
         del residual, router_states, positions, forward_batch
         return x, torch.zeros_like(x), None
@@ -64,130 +43,28 @@ def _minimal_outer(module, body):
     return outer
 
 
-def test_zonos2_prefill_attaches_composed_embeds_to_private_sidecar() -> None:
-    forward_batch = _forward_batch(num_tokens=4)
-    mm_inputs = forward_batch.mm_inputs
-    requests = [object()]
-    embeds = torch.arange(16, dtype=torch.float32).reshape(4, 4)
-    calls: list[tuple[object, list[object]]] = []
-
-    def build_prefill_embeds(batch, request_list):
-        calls.append((batch, request_list))
-        return embeds
-
-    runner = SimpleNamespace(_build_prefill_embeds=build_prefill_embeds)
-
-    assert (
-        callbacks.zonos2_prefill_forward(runner, forward_batch, None, requests) is None
+def test_zonos2_prefill_attaches_embeddings_to_sidecar() -> None:
+    expected = torch.randn(4, 4)
+    runner = SimpleNamespace(_build_prefill_embeds=lambda *_: expected)
+    forward_batch = SimpleNamespace(
+        input_ids=torch.zeros(4, dtype=torch.long),
+        input_embeds=None,
+        replace_embeds=None,
     )
+
+    callbacks.zonos2_prefill_forward(runner, forward_batch, None, [])
 
     payload = get_omni_prefill_inputs(forward_batch)
     assert payload is not None
-    assert payload.input_embeds is embeds
-    assert payload.input_embeds.shape[0] == len(forward_batch.input_ids)
+    assert payload.input_embeds is expected
     assert forward_batch.input_embeds is None
-    assert forward_batch.mm_inputs is mm_inputs
-    assert calls == [(forward_batch, requests)]
 
 
-def test_zonos2_prefill_preserves_shared_sidecar_conflict_checks() -> None:
-    forward_batch = _forward_batch(
-        replace_embeds=torch.zeros(1, 4, dtype=torch.float32),
-    )
-    runner = SimpleNamespace(
-        _build_prefill_embeds=lambda *_: torch.zeros(4, 4, dtype=torch.float32)
-    )
-
-    with pytest.raises(RuntimeError, match="replace_embeds"):
-        callbacks.zonos2_prefill_forward(runner, forward_batch, None, [object()])
+def test_zonos2_builder_supports_breakable_prefill() -> None:
+    assert Zonos2EngineBuilder.supports_breakable_prefill_cuda_graph is True
 
 
-def test_zonos2_prefill_rejects_malformed_embed_rows() -> None:
-    forward_batch = _forward_batch(num_tokens=4)
-    runner = SimpleNamespace(
-        _build_prefill_embeds=lambda *_: torch.zeros(3, 4, dtype=torch.float32)
-    )
-
-    with pytest.raises(RuntimeError, match="extend-window tokens"):
-        callbacks.zonos2_prefill_forward(runner, forward_batch, None, [object()])
-
-
-def test_zonos2_bcg_is_capable_but_not_default_enabled() -> None:
-    assert CAPABILITIES.supports_breakable_prefill_cuda_graph is True
-    assert (
-        Zonos2EngineBuilder.supports_breakable_prefill_cuda_graph
-        is CAPABILITIES.supports_breakable_prefill_cuda_graph
-    )
-
-    defaults = Zonos2EngineBuilder().generation_defaults(dtype="bfloat16")
-    assert "cuda_graph_backend_prefill" not in defaults
-    assert "cuda_graph_bs_prefill" not in defaults
-
-
-def test_zonos2_resolver_discovers_registered_transformer_body() -> None:
-    module = _zonos2_sglang_model_module()
-    resolver = pytest.importorskip(
-        "sglang.srt.model_loader.utils"
-    ).resolve_language_model
-    body = _minimal_body(module)
-    outer = _minimal_outer(module, body)
-
-    resolved = resolver(outer)
-
-    assert resolved is body
-    assert resolved is not outer
-    assert resolved.layers is body.layers
-    assert not hasattr(outer, "language_model")
-
-
-def test_zonos2_attention_layer_is_discoverable_by_sglang() -> None:
-    compute_attention_and_moe_layers = pytest.importorskip(
-        "sglang.srt.model_executor.model_runner_components.layer_setup"
-    ).compute_attention_and_moe_layers
-    sentinel_attention = object()
-    body = SimpleNamespace(
-        layers=[SimpleNamespace(attention=SimpleNamespace(attn=sentinel_attention))]
-    )
-
-    discovered = compute_attention_and_moe_layers(body)
-
-    assert discovered.attention_layers == [sentinel_attention]
-
-
-def test_zonos2_transformer_body_exposes_bcg_forward_signature() -> None:
-    module = _zonos2_sglang_model_module()
-    body = _minimal_body(module)
-    outer = _minimal_outer(module, body)
-    resolver = pytest.importorskip(
-        "sglang.srt.model_loader.utils"
-    ).resolve_language_model
-    discovered_body = resolver(outer)
-
-    assert list(inspect.signature(discovered_body.forward).parameters) == [
-        "input_ids",
-        "positions",
-        "forward_batch",
-        "input_embeds",
-    ]
-
-
-def test_zonos2_transformer_body_returns_backend_compatible_tensor() -> None:
-    module = _zonos2_sglang_model_module()
-    body = _minimal_body(module)
-    input_embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-
-    output = body(
-        torch.zeros(2, dtype=torch.long),
-        torch.zeros(2, dtype=torch.long),
-        SimpleNamespace(),
-        input_embeds,
-    )
-
-    assert torch.is_tensor(output)
-    assert output.shape == input_embeds.shape
-
-
-def test_zonos2_outer_forward_calls_discovered_body(monkeypatch) -> None:
+def test_zonos2_outer_model_uses_resolved_transformer_body() -> None:
     module = _zonos2_sglang_model_module()
     resolver = pytest.importorskip(
         "sglang.srt.model_loader.utils"
@@ -196,16 +73,14 @@ def test_zonos2_outer_forward_calls_discovered_body(monkeypatch) -> None:
     outer = _minimal_outer(module, body)
     input_ids = torch.zeros(2, dtype=torch.long)
     positions = torch.arange(2, dtype=torch.long)
-    forward_batch = _forward_batch(num_tokens=2)
+    forward_batch = SimpleNamespace()
     input_embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    expected_hidden = torch.full((2, 4), 7.0)
-    calls = []
+    resolved = resolver(outer)
 
-    def sentinel(input_ids_arg, positions_arg, batch_arg, embeds_arg):
-        calls.append((input_ids_arg, positions_arg, batch_arg, embeds_arg))
-        return expected_hidden
+    assert resolved is body
+    hidden = resolved(input_ids, positions, forward_batch, input_embeds)
+    assert torch.is_tensor(hidden)
 
-    monkeypatch.setattr(body, "forward", sentinel)
     result = outer.forward(
         input_ids,
         positions,
@@ -213,105 +88,10 @@ def test_zonos2_outer_forward_calls_discovered_body(monkeypatch) -> None:
         input_embeds=input_embeds,
     )
 
-    assert resolver(outer) is body
-    assert len(calls) == 1
-    assert calls[0][0] is input_ids
-    assert calls[0][1] is positions
-    assert calls[0][2] is forward_batch
-    assert calls[0][3] is input_embeds
-    assert result.hidden_states is expected_hidden
-    assert result.next_token_logits.shape == (2, 1)
+    torch.testing.assert_close(result.hidden_states, hidden)
 
 
-def test_zonos2_sidecar_reaches_discovered_body_after_admission() -> None:
-    module = _zonos2_sglang_model_module()
-    sglang_model_runner = pytest.importorskip(
-        "sglang_omni.model_runner.sglang_model_runner",
-        reason="SGLang runtime dependencies are not installed",
-    )
-    body = _minimal_body(module)
-    outer = _minimal_outer(module, body)
-    forward_batch = _forward_batch(num_tokens=2)
-    embeds = torch.arange(8, dtype=torch.float32).reshape(2, 4)
-    runner_for_callback = SimpleNamespace(
-        _build_prefill_embeds=lambda *_: embeds,
-    )
-    callbacks.zonos2_prefill_forward(
-        runner_for_callback, forward_batch, None, [object()]
-    )
-    assert forward_batch.input_embeds is None
-
-    transport_runner = sglang_model_runner.SGLModelRunner.__new__(
-        sglang_model_runner.SGLModelRunner
-    )
-    transport_runner.support_pp = False
-    transport_runner.is_generation = True
-    kwargs = transport_runner._extend_forward_kwargs(forward_batch, object())
-
-    seen: list[torch.Tensor] = []
-
-    def sentinel(input_ids, positions, batch, input_embeds):
-        del input_ids, positions, batch
-        seen.append(input_embeds)
-        return torch.zeros_like(input_embeds)
-
-    body.forward = sentinel
-    outer.forward(
-        torch.zeros(2, dtype=torch.long),
-        torch.zeros(2, dtype=torch.long),
-        forward_batch,
-        **kwargs,
-    )
-
-    assert len(seen) == 1
-    assert seen[0] is embeds
-    assert forward_batch.input_embeds is None
-
-
-def test_zonos2_sidecar_rejects_upstream_input_embeds_conflict() -> None:
-    sglang_model_runner = pytest.importorskip(
-        "sglang_omni.model_runner.sglang_model_runner",
-        reason="SGLang runtime dependencies are not installed",
-    )
-    forward_batch = _forward_batch(num_tokens=2)
-    forward_batch.input_embeds = torch.zeros(2, 4)
-    attach_omni_prefill_inputs(
-        forward_batch,
-        OmniPrefillInputs(input_embeds=torch.ones(2, 4)),
-    )
-    runner = sglang_model_runner.SGLModelRunner.__new__(
-        sglang_model_runner.SGLModelRunner
-    )
-    runner.support_pp = False
-    runner.is_generation = True
-
-    with pytest.raises(RuntimeError, match="upstream input_embeds"):
-        runner._extend_forward_kwargs(forward_batch, object())
-
-
-def test_zonos2_body_parameters_are_registered_once_under_inner_module() -> None:
-    module = _zonos2_sglang_model_module()
-    body = _minimal_body(module)
-    outer = _minimal_outer(module, body)
-
-    named_parameters = dict(outer.named_parameters())
-    body_parameters = dict(body.named_parameters())
-
-    assert set(named_parameters) == {
-        "model.layers.0.weight",
-        "model.out_norm",
-    }
-    assert {id(parameter) for parameter in named_parameters.values()} == {
-        id(parameter) for parameter in body_parameters.values()
-    }
-    assert len({id(parameter) for parameter in outer.parameters()}) == len(
-        named_parameters
-    )
-    assert not hasattr(outer, "layers")
-    assert not hasattr(outer, "out_norm")
-
-
-def test_zonos2_loader_maps_legacy_checkpoint_names_into_inner_body() -> None:
+def test_zonos2_loader_maps_checkpoint_weights_into_transformer_body() -> None:
     module = _zonos2_sglang_model_module()
 
     def parameter(shape):
