@@ -286,6 +286,62 @@ def test_voxtral_collect_audio_step_reuses_output_tokens_for_eos_filter() -> Non
     assert len(requests[0].data.output_codes) == 1
 
 
+def test_before_prefill_attaches_composed_embeddings_to_sidecar() -> None:
+    from sglang_omni.model_runner.prefill_inputs import get_omni_prefill_inputs
+    from sglang_omni.models.voxtral_tts.model_runner import VoxtralTTSModelRunner
+
+    hidden_size = 4
+    audio_token_id = 24
+    runner = VoxtralTTSModelRunner.__new__(VoxtralTTSModelRunner)
+    embedding = torch.nn.Embedding(128, hidden_size)
+    runner.model = SimpleNamespace(get_input_embeddings=lambda: embedding)
+    voice_one = torch.arange(8, dtype=torch.float32).reshape(2, hidden_size) + 100
+    voice_two = torch.arange(16, dtype=torch.float32).reshape(4, hidden_size) + 200
+    requests = [
+        SimpleNamespace(
+            data=SimpleNamespace(
+                req=SimpleNamespace(
+                    prefix_indices=[],
+                    extend_range=SimpleNamespace(length=4),
+                ),
+                input_ids=torch.tensor([7, audio_token_id, audio_token_id, 9]),
+                voice_embedding=voice_one,
+                audio_token_id=audio_token_id,
+            )
+        ),
+        SimpleNamespace(
+            data=SimpleNamespace(
+                req=SimpleNamespace(
+                    prefix_indices=[0, 1],
+                    extend_range=SimpleNamespace(length=3),
+                ),
+                input_ids=torch.tensor(
+                    [8, audio_token_id, 10, audio_token_id, audio_token_id]
+                ),
+                voice_embedding=voice_two,
+                audio_token_id=audio_token_id,
+            )
+        ),
+    ]
+    forward_batch = SimpleNamespace(
+        input_ids=torch.tensor(
+            [7, audio_token_id, audio_token_id, 9, 10, audio_token_id, audio_token_id]
+        ),
+        input_embeds=None,
+        replace_embeds=None,
+    )
+    expected = runner._build_prefill_input_embeds(forward_batch, requests).clone()
+
+    runner.before_prefill(forward_batch, None, requests)
+
+    sidecar = get_omni_prefill_inputs(forward_batch)
+    assert sidecar is not None
+    torch.testing.assert_close(sidecar.input_embeds, expected)
+    assert forward_batch.input_embeds is None
+    torch.testing.assert_close(sidecar.input_embeds[1:3], voice_one)
+    torch.testing.assert_close(sidecar.input_embeds[5:7], voice_two[1:3])
+
+
 def test_voxtral_decode_writes_feedback_buffer_for_standard_forward() -> None:
     from sglang_omni.models.voxtral_tts.model_runner import VoxtralTTSModelRunner
 
@@ -452,6 +508,50 @@ def test_voxtral_forward_returns_graph_compatible_logits() -> None:
     assert output.next_token_logits.shape == (2, 1)
     assert output.next_token_logits.dtype == output.hidden_states.dtype
     assert output.next_token_logits.device == output.hidden_states.device
+
+
+def test_forward_selects_logical_endpoints_from_padded_extend() -> None:
+    from sglang_omni.models.voxtral_tts.sglang_model import VoxtralSGLangTTSModel
+
+    hidden_size = 4
+    model = VoxtralSGLangTTSModel.__new__(VoxtralSGLangTTSModel)
+    captured_hidden = torch.arange(8 * hidden_size, dtype=torch.float32).reshape(
+        8, hidden_size
+    )
+    model.language_model = lambda **kwargs: captured_hidden
+    forward_batch = SimpleNamespace(
+        input_ids=torch.arange(8, dtype=torch.long),
+        extend_seq_lens=torch.tensor([2, 3], dtype=torch.long),
+        forward_mode=SimpleNamespace(
+            is_decode=lambda: False,
+            is_extend=lambda: True,
+        ),
+    )
+
+    output = model.forward(
+        forward_batch.input_ids,
+        torch.arange(8, dtype=torch.long),
+        forward_batch,
+        input_embeds=torch.zeros((5, hidden_size)),
+    )
+
+    torch.testing.assert_close(output.hidden_states, captured_hidden[[1, 4]])
+    assert output.next_token_logits.shape == (2, 1)
+
+
+def test_voxtral_breakable_prefill_is_opt_in() -> None:
+    from sglang_omni.models.voxtral_tts import CAPABILITIES
+    from sglang_omni.models.voxtral_tts.pipeline.engine_builder import (
+        VoxtralTtsEngineBuilder,
+    )
+
+    builder = VoxtralTtsEngineBuilder()
+    defaults = builder.generation_defaults(dtype="bfloat16")
+
+    assert CAPABILITIES.supports_breakable_prefill_cuda_graph is True
+    assert builder.supports_breakable_prefill_cuda_graph is True
+    assert "cuda_graph_backend_prefill" not in defaults
+    assert "cuda_graph_bs_prefill" not in defaults
 
 
 def test_voxtral_generation_reenables_cuda_graph_after_bootstrap(
