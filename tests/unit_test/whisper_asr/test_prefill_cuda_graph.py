@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.runner_utils.capture_mode import model_capture_mode
 from sglang.srt.runtime_context import get_context, get_parallel
 from transformers import WhisperConfig
 
@@ -363,6 +364,50 @@ def test_whisper_encoder_in_prefill_fallback_uses_the_same_kv_cache_path(
     model(input_ids, positions, forward_batch)
 
     assert calls == ["encoder", "cache", "cache", "decoder", "logits"]
+
+
+def test_whisper_decode_capture_reuses_cached_encoder_kv(
+    monkeypatch: pytest.MonkeyPatch,
+    sglang_runtime_context,
+) -> None:
+    model = WhisperForConditionalGeneration(_tiny_whisper_config())
+    input_ids = torch.tensor([1])
+    positions = torch.tensor([0])
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.DECODE,
+        encoder_cached=None,
+        encoder_lens=torch.tensor([3]),
+        encoder_lens_cpu=[3],
+        encoder_out_cache_loc=None,
+        mm_inputs=None,
+    )
+    cache_calls: list[object] = []
+    for layer in model.model.decoder.layers:
+        monkeypatch.setattr(
+            layer.encoder_attn,
+            "cache_encoder_states",
+            lambda *args, **kwargs: cache_calls.append((args, kwargs)),
+        )
+    decoder_skip_cross_attention: list[bool] = []
+    monkeypatch.setattr(
+        model.model,
+        "forward",
+        lambda *args, **kwargs: decoder_skip_cross_attention.append(
+            kwargs["skip_cross_attention"]
+        )
+        or torch.randn(input_ids.shape[0], model.config.d_model),
+    )
+    monkeypatch.setattr(
+        model.logits_processor,
+        "forward",
+        lambda *args, **kwargs: object(),
+    )
+
+    with model_capture_mode():
+        model(input_ids, positions, forward_batch)
+
+    assert cache_calls == []
+    assert decoder_skip_cross_attention == [False]
 
 
 def test_whisper_prefill_capture_populates_encoder_metadata(

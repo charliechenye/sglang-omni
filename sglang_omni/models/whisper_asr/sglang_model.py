@@ -541,15 +541,16 @@ class WhisperForConditionalGeneration(nn.Module):
                     encoder_lens,
                 )
 
-        if not all(forward_batch.encoder_cached):
-            assert cross_attention_states is not None
-        if cross_attention_states is not None:
-            assert forward_batch.encoder_out_cache_loc is not None
-            for layer in self.model.decoder.layers:
-                layer.encoder_attn.cache_encoder_states(
-                    cross_attention_states,
-                    forward_batch.encoder_out_cache_loc,
-                )
+        if not forward_batch.forward_mode.is_decode():
+            if not all(forward_batch.encoder_cached):
+                assert cross_attention_states is not None
+            if cross_attention_states is not None:
+                assert forward_batch.encoder_out_cache_loc is not None
+                for layer in self.model.decoder.layers:
+                    layer.encoder_attn.cache_encoder_states(
+                        cross_attention_states,
+                        forward_batch.encoder_out_cache_loc,
+                    )
 
         skip_cross_attention = not get_is_capture_mode() and not any(
             forward_batch.encoder_lens_cpu or []
