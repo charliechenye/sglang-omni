@@ -22,8 +22,11 @@ from sglang_omni.scheduling.stage_cache import StageOutputCache
 
 logger = logging.getLogger(__name__)
 
-_CACHE_MAX_ENTRIES = 4096
-_CACHE_MAX_BYTES = 2 * 1024**3
+# Note(Jeffro): Whisper encoder states are fixed-size ([encoder_token_count, d_model] in the
+# encoder dtype), so the cache is sized in entries and the byte budget is
+# derived from that: 1024 entries is ~3.9 GB of host memory for large-v3
+# (3.84 MB per entry) and ~1.5 GB for base.
+_CACHE_MAX_ENTRIES = 1024
 _SHUTDOWN = object()
 
 
@@ -74,11 +77,21 @@ class WhisperPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Te
         model: Any,
         *,
         cache_namespace: str,
+        encoder_token_count: int,
         cache_max_entries: int = _CACHE_MAX_ENTRIES,
-        cache_max_bytes: int = _CACHE_MAX_BYTES,
+        cache_max_bytes: int | None = None,
         max_batch_size: int = 8,
         max_batch_wait_ms: int = 0,
+        pin_host_memory: bool = True,
     ) -> None:
+        if encoder_token_count < 1:
+            raise ValueError(
+                f"encoder_token_count must be >= 1, got {encoder_token_count}"
+            )
+        if cache_max_entries < 0:
+            raise ValueError(f"cache_max_entries must be >= 0, got {cache_max_entries}")
+        if cache_max_bytes is not None and cache_max_bytes < 0:
+            raise ValueError(f"cache_max_bytes must be >= 0, got {cache_max_bytes}")
         self._model = model
         reference = next(model.model.encoder.parameters())
         self._device = reference.device
@@ -89,11 +102,31 @@ class WhisperPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Te
             if self._device.type == "cuda"
             else None
         )
+
+        self._encoder_token_count = int(encoder_token_count)
+        self._entry_bytes = (
+            self._encoder_token_count * self._hidden_size * self._dtype.itemsize
+        )
+        derived_bytes = int(cache_max_entries) * self._entry_bytes
+        self._cache_max_bytes = (
+            derived_bytes
+            if cache_max_bytes is None
+            else min(derived_bytes, int(cache_max_bytes))
+        )
+        self._cache_capacity_entries = min(
+            int(cache_max_entries), self._cache_max_bytes // self._entry_bytes
+        )
+        self._pin_host_memory = pin_host_memory and self._device.type == "cuda"
         self._cache = StageOutputCache(
             max_size=cache_max_entries,
-            max_bytes=cache_max_bytes,
+            max_bytes=self._cache_max_bytes,
             cache_device="cpu",
+            pin_memory=self._pin_host_memory,
         )
+        self._pin_failures = 0
+        self._prewarm_s = 0.0
+        if self._pin_host_memory:
+            self._prewarm_pinned_pool(self._cache_capacity_entries)
         self._namespace = cache_namespace
         self._max_batch_size = max(int(max_batch_size), 1)
         self._max_batch_wait_s = max(float(max_batch_wait_ms), 0.0) / 1000.0
@@ -112,6 +145,81 @@ class WhisperPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Te
         self._queue_wait_max_s = 0.0
         self._encoder_time_s = 0.0
         super().__init__(worker_name="whisper-asr-audio-encode")
+
+    @property
+    def entry_bytes(self) -> int:
+        """Bytes of one cached encoder state."""
+        return self._entry_bytes
+
+    @property
+    def cache_max_bytes(self) -> int:
+        """Effective byte budget after applying the optional cap."""
+        return self._cache_max_bytes
+
+    @property
+    def cache_capacity_entries(self) -> int:
+        """How many encoder states the cache can hold at once."""
+        return self._cache_capacity_entries
+
+    @property
+    def pin_host_memory(self) -> bool:
+        """Whether cached states are held in page-locked host memory."""
+        return self._pin_host_memory
+
+    def _new_pinned_host(self, tokens: int) -> torch.Tensor:
+        return torch.empty(
+            (tokens, self._hidden_size),
+            dtype=self._dtype,
+            device="cpu",
+            pin_memory=True,
+        )
+
+    def _prewarm_pinned_pool(self, entries: int) -> None:
+        """Pay the one-off cudaHostAlloc cost for the whole cache at start-up.
+
+        Freed pinned blocks stay in PyTorch's caching host allocator, so
+        allocating the full capacity once and dropping it means the first
+        cache fill reuses warm blocks instead of paying ~1 ms per entry on
+        the encoder worker.
+        """
+        if entries <= 0:
+            return
+        started = time.perf_counter()
+        blocks: list[torch.Tensor] = []
+        try:
+            for _ in range(int(entries)):
+                blocks.append(self._new_pinned_host(self._encoder_token_count))
+        except RuntimeError as exc:
+            logger.warning(
+                "Whisper pre-LM cache: pinned host pool prewarm stopped after "
+                "%d/%d entries (%s); remaining entries will pin lazily or fall "
+                "back to pageable memory",
+                len(blocks),
+                entries,
+                exc,
+            )
+        finally:
+            warmed = len(blocks)
+            blocks.clear()
+            self._prewarm_s = time.perf_counter() - started
+        logger.info(
+            "Whisper pre-LM cache: prewarmed %d pinned host entries "
+            "(%.1f MB) in %.2fs",
+            warmed,
+            warmed * self._entry_bytes / 1e6,
+            self._prewarm_s,
+        )
+
+    def _disable_pinning(self, exc: Exception) -> None:
+        if not self._pin_host_memory:
+            return
+        self._pin_host_memory = False
+        self._cache.pin_memory = False
+        logger.warning(
+            "Whisper pre-LM cache: pinned host allocation failed (%s); "
+            "switching this cache to pageable host memory",
+            exc,
+        )
 
     def close(self) -> None:
         with self._lifecycle_lock:
@@ -245,8 +353,12 @@ class WhisperPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Te
                 "queue_wait_max_s": self._queue_wait_max_s,
                 "encoder_time_s": self._encoder_time_s,
                 "cache_entries": len(self._cache),
+                "cache_capacity_entries": self._cache_capacity_entries,
                 "cache_bytes": self._cache.current_bytes,
                 "cache_evictions": self._cache.eviction_count,
+                "pin_host_memory": self._pin_host_memory,
+                "pin_failures": self._pin_failures,
+                "pin_prewarm_s": self._prewarm_s,
             }
 
     def _cache_key(self, item: Any) -> str | None:
@@ -345,14 +457,44 @@ class WhisperPreLMEncoderService(PreLMEncoderService[Any, torch.Tensor, torch.Te
             parts.append(encoded[index, :expected].clone())
         return parts
 
+    def stage_host_copy(
+        self, item: Any, embedding: torch.Tensor
+    ) -> torch.Tensor | None:
+        """Copy embedding GPU->CPU into a pinned buffer without waiting.
+
+        We are still on the encoder stream here, so the copy runs on the GPU
+        right after the encoder kernels and the CPU thread returns at once.
+        synchronize_batch (called next by the base class) waits for it, so by
+        the time cache_embedding gets this tensor the data is complete.
+        Returns None when pinning is off or the item has no cache key.
+        """
+        if not self._pin_host_memory or self._cache_key(item) is None:
+            return None
+        try:
+            host = self._new_pinned_host(int(embedding.shape[0]))
+        except RuntimeError as exc:
+            self._pin_failures += 1
+            self._disable_pinning(exc)
+            return None
+        host.copy_(embedding, non_blocking=True)
+        return host
+
     def synchronize_batch(self) -> None:
         if self._stream is not None:
             self._stream.synchronize()
 
-    def cache_embedding(self, item: Any, embedding: torch.Tensor) -> None:
+    def cache_embedding(
+        self,
+        item: Any,
+        embedding: torch.Tensor,
+        host_copy: torch.Tensor | None = None,
+    ) -> None:
         key = self._cache_key(item)
-        if key is not None:
-            self._cache.put(key, embedding)
+        if key is None:
+            return
+        # note (Jeffro): host_copy is complete here (synchronize_batch ran in
+        # between) and already pinned, so the cache stores it without another copy.
+        self._cache.put(key, host_copy if host_copy is not None else embedding)
 
     def _retry_batch(self, batch: list[QueueEntry[Any]], _exc: Exception) -> bool:
         if len(batch) == 1:
