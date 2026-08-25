@@ -60,10 +60,6 @@ from sglang_omni.proto.admin import (
     ADMIN_WEIGHTS_CHECKER,
 )
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
-from sglang_omni.scheduling.prefill_coalesce import (
-    validate_prefill_coalesce_requests,
-    validate_prefill_coalesce_wait_ms,
-)
 from sglang_omni.scheduling.types import DeferredAdmission
 from sglang_omni.vendor.sglang.parallel_state import create_parallel_state
 from sglang_omni.vendor.sglang.server_args import override_server_args
@@ -294,10 +290,10 @@ class OmniScheduler:
                 "requests"
             )
 
-        # Note: (maydomine) Validate here as well as in the CLI because per-stage
-        # YAML reaches the scheduler through factory_args.
-        requests = validate_prefill_coalesce_requests(prefill_coalesce_requests)
-        wait_ms = validate_prefill_coalesce_wait_ms(prefill_coalesce_wait_ms)
+        # Range and type are enforced at configuration validation
+        # (FactoryArgs); only the TP interaction is this scheduler's call.
+        requests = int(prefill_coalesce_requests)
+        wait_ms = float(prefill_coalesce_wait_ms)
         if requests > 1 and int(server_args.tp_size) > 1:
             logger.warning(
                 "Prefill admission coalescing is disabled for "
@@ -934,6 +930,20 @@ class OmniScheduler:
             self._admit_or_defer_built_request(payload, pending_stream_done, req_data)
         self._drain_request_build_results()
         self._drain_request_admission_results()
+
+    def request_build_queue_fits_workers(self) -> bool:
+        """True when pending+backlog still fits in the request-build pool.
+
+        Without a build executor the scheduler loop must stay free, so this
+        is False and admission stays deferred.
+        """
+        if self._request_build_executor is None:
+            return False
+        with self._request_admission_lock:
+            queued = len(self._pending_request_builds) + len(
+                self._backlogged_request_build_payloads
+            )
+        return queued <= self.request_build_max_workers
 
     def _run_request_builder(self, payload: Any, active_stage: str | None) -> Any:
         req_id = payload.request_id
