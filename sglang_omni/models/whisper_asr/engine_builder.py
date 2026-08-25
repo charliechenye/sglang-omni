@@ -244,7 +244,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             "disable_overlap_schedule": True,
             "enable_torch_compile": True,
             "mem_fraction_static": self.mem_fraction_static,
-            "max_prefill_tokens": 6144,
+            "max_prefill_tokens": 10528,
             "chunked_prefill_size": 0,
             "sampling_backend": "pytorch",
             "dtype": dtype,
@@ -281,6 +281,7 @@ class WhisperASREngineBuilder(AsrEngineBuilder):
             "prefill_coalesce_after_builds_during_decode": (
                 self.prefill_coalesce_after_builds_during_decode
             ),
+            "prefill_low_pressure_max_tokens": 6144,
         }
 
     def extra_scheduler_callbacks(self) -> dict[str, Any]:

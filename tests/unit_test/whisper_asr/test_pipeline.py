@@ -152,7 +152,7 @@ def test_whisper_disables_chunked_prefill_for_atomic_encoder_prefix() -> None:
     )
     defaults = builder.generation_defaults(dtype="float16")
 
-    assert defaults["max_prefill_tokens"] == 6144
+    assert defaults["max_prefill_tokens"] == 10528
     assert defaults["chunked_prefill_size"] == 0
 
     overrides = {"chunked_prefill_size": 0}
@@ -183,6 +183,7 @@ def test_whisper_prefill_coalescing_defaults_are_forwarded() -> None:
         "prefill_coalesce_when_idle": True,
         "prefill_coalesce_requires_pending_builds": True,
         "prefill_coalesce_after_builds_during_decode": False,
+        "prefill_low_pressure_max_tokens": 6144,
     }
 
 
@@ -360,6 +361,6 @@ def test_whisper_asr_threads_explicit_cuda_graph_bs(monkeypatch) -> None:
     assert build_kwargs["context_length"] == 1500 + 224 + 256 + 8
     assert build_kwargs["chunked_prefill_size"] == 0
     assert build_kwargs["enable_custom_logit_processor"] is True
-    assert build_kwargs["max_prefill_tokens"] == 6144
+    assert build_kwargs["max_prefill_tokens"] == 10528
     assert scheduler_kwargs["enable_async_decode"] is False
     assert scheduler_kwargs["async_decode_min_batch_size"] == 4

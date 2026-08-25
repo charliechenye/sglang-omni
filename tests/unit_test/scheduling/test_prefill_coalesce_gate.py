@@ -34,6 +34,17 @@ def _req(enqueue_t: float | None):
     return SimpleNamespace(_coalesce_enqueue_t=enqueue_t)
 
 
+def _observe_prefill_limit(upstream):
+    observed_limits: list[int] = []
+
+    def observe_limit(scheduler, running_batch):
+        observed_limits.append(scheduler.max_prefill_tokens)
+        return NextBatchPlan(batch_to_run=_UPSTREAM_BATCH, running_batch=running_batch)
+
+    upstream.side_effect = observe_limit
+    return observed_limits
+
+
 class _StubScheduler:
     """The attribute surface get_new_batch_prefill touches."""
 
@@ -45,6 +56,9 @@ class _StubScheduler:
         coalesce_when_idle: bool = False,
         requires_pending_builds: bool = False,
         coalesce_after_builds_during_decode: bool = False,
+        max_prefill_tokens: int = 10528,
+        low_pressure_max_tokens: int | None = None,
+        request_build_max_workers: int = 8,
     ) -> None:
         self.prefill_coalesce_requests = coalesce_requests
         self.prefill_coalesce_wait_s = wait_ms / 1e3
@@ -53,6 +67,9 @@ class _StubScheduler:
         self.prefill_coalesce_after_builds_during_decode = (
             coalesce_after_builds_during_decode
         )
+        self.prefill_low_pressure_max_tokens = low_pressure_max_tokens
+        self.request_build_max_workers = request_build_max_workers
+        self.max_prefill_tokens = max_prefill_tokens
         self.chunked_req = None
         self.waiting_queue: list = []
         self.running_batch = SimpleNamespace(is_empty=lambda: False)
@@ -349,3 +366,61 @@ def test_unstamped_request_is_stamped_and_eventually_released(upstream, clock):
 
     clock.return_value = 200.07  # past the deadline
     assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+
+
+def test_prefill_limit_is_unchanged_without_low_pressure_cap(upstream):
+    sched = _StubScheduler(coalesce_requests=0, max_prefill_tokens=8192)
+    observed_limits = _observe_prefill_limit(upstream)
+
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+    assert observed_limits == [8192]
+    assert sched.max_prefill_tokens == 8192
+
+
+def test_low_pressure_counts_unentered_request_work_only(upstream):
+    sched = _StubScheduler(
+        coalesce_requests=0,
+        low_pressure_max_tokens=6144,
+    )
+    sched.waiting_queue = [object()]
+    sched._pending_request_builds = {"build-1": object(), "build-2": object()}
+    sched._pending_request_admissions = {
+        "admission-1": object(),
+        "admission-2": object(),
+    }
+    sched._backlogged_request_build_payloads = [object(), object(), object()]
+    sched.running_batch = SimpleNamespace(
+        is_empty=lambda: False,
+        reqs=[object()] * 100,
+    )
+    observed_limits = _observe_prefill_limit(upstream)
+
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+    assert observed_limits == [6144]
+    assert sched.max_prefill_tokens == 10528
+
+
+@pytest.mark.parametrize(
+    ("max_prefill_tokens", "queue_pressure", "expected_limit"),
+    [
+        (10528, 9, 10528),
+        (4096, 0, 4096),
+    ],
+)
+def test_prefill_limit_respects_pressure_and_configured_cap(
+    upstream,
+    max_prefill_tokens,
+    queue_pressure,
+    expected_limit,
+):
+    sched = _StubScheduler(
+        coalesce_requests=0,
+        max_prefill_tokens=max_prefill_tokens,
+        low_pressure_max_tokens=6144,
+    )
+    sched._backlogged_request_build_payloads = [object()] * queue_pressure
+    observed_limits = _observe_prefill_limit(upstream)
+
+    assert sched.get_new_batch_prefill() is _UPSTREAM_BATCH
+    assert observed_limits == [expected_limit]
+    assert sched.max_prefill_tokens == max_prefill_tokens

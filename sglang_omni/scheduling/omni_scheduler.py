@@ -203,6 +203,7 @@ class OmniScheduler:
         prefill_coalesce_after_builds_during_decode: bool = False,
         request_build_max_workers: int = 1,
         request_build_max_pending: int | None = None,
+        prefill_low_pressure_max_tokens: int | None = None,
         shutdown_callback: Callable[[], None] | None = None,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
@@ -314,6 +315,11 @@ class OmniScheduler:
         )
         self.prefill_coalesce_after_builds_during_decode = bool(
             prefill_coalesce_after_builds_during_decode
+        )
+        self.prefill_low_pressure_max_tokens = (
+            None
+            if prefill_low_pressure_max_tokens is None
+            else int(prefill_low_pressure_max_tokens)
         )
 
         # Token / memory info (upstream reads from tp_worker.get_worker_info)
@@ -1346,16 +1352,43 @@ class OmniScheduler:
         return plan.batch_to_run
 
     def get_new_batch_prefill(self, running_batch):
+        def get_upstream_prefill():
+            if self.prefill_low_pressure_max_tokens is None:
+                return _Upstream.get_new_batch_prefill(self, running_batch)
+
+            # Running requests are already executing and do not add admission pressure.
+            with self._request_admission_lock:
+                queue_pressure = (
+                    len(self.waiting_queue)
+                    + len(self._pending_request_builds)
+                    + len(self._pending_request_admissions)
+                    + len(self._backlogged_request_build_payloads)
+                )
+            if queue_pressure > self.request_build_max_workers:
+                return _Upstream.get_new_batch_prefill(self, running_batch)
+
+            # Keep Whisper's atomic prefill conservative while request-build work
+            # fits within worker capacity.
+            original_max_prefill_tokens = self.max_prefill_tokens
+            self.max_prefill_tokens = min(
+                original_max_prefill_tokens,
+                self.prefill_low_pressure_max_tokens,
+            )
+            try:
+                return _Upstream.get_new_batch_prefill(self, running_batch)
+            finally:
+                self.max_prefill_tokens = original_max_prefill_tokens
+
         # Note: (maydomine) batch prefill admissions to amortize the fixed step
         # cost; the oldest-request deadline survives partial admission and aborts.
         #
         # 0.5.16 passes ``running_batch`` in and expects a ``NextBatchPlan`` back,
         # so the coalesce hold-off returns an empty plan rather than None.
         if self.prefill_coalesce_requests <= 1 or self.chunked_req is not None:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            return get_upstream_prefill()
         decode_is_idle = running_batch is None or running_batch.is_empty()
         if not self.prefill_coalesce_when_idle and decode_is_idle:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            return get_upstream_prefill()
         if self.prefill_coalesce_requires_pending_builds:
             with self._request_admission_lock:
                 build_work_pending = bool(
@@ -1366,10 +1399,10 @@ class OmniScheduler:
             if not build_work_pending and not (
                 self.prefill_coalesce_after_builds_during_decode and not decode_is_idle
             ):
-                return _Upstream.get_new_batch_prefill(self, running_batch)
+                return get_upstream_prefill()
         waiting = self.waiting_queue
         if not waiting or len(waiting) >= self.prefill_coalesce_requests:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            return get_upstream_prefill()
         now = time.perf_counter()
         oldest = now
         for req in waiting:
@@ -1378,7 +1411,7 @@ class OmniScheduler:
                 t = req._coalesce_enqueue_t = now
             oldest = min(oldest, t)
         if now - oldest >= self.prefill_coalesce_wait_s:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            return get_upstream_prefill()
         return NextBatchPlan(batch_to_run=None, running_batch=running_batch)
 
     def run_batch(self, batch, pp_proxy_tensors=None):
