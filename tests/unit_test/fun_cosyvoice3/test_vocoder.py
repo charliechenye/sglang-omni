@@ -35,12 +35,95 @@ class _FakeHiFT(torch.nn.Module):
         return torch.arange(speech_feat.shape[-1]).reshape(1, -1).float(), None
 
 
+class _FakeGraph:
+    def __init__(self, static: dict[str, torch.Tensor], output: torch.Tensor) -> None:
+        self.static = static
+        self.output = output
+        self.replays = 0
+
+    def replay(self) -> None:
+        self.replays += 1
+        self.output.copy_(self.static["mu"])
+
+
 def _payload(state: FunCosyVoice3State) -> StagePayload:
     return StagePayload(
         request_id="req-vocoder",
         request=OmniRequest(inputs="hello"),
         data=state.to_dict(),
     )
+
+
+@pytest.mark.parametrize(
+    ("decoder_t", "bucket_t"),
+    [
+        (254, None),
+        (256, 256),
+        (530, 544),
+        (544, 544),
+        (545, None),
+        (546, 576),
+        (574, 576),
+        (770, 800),
+        (994, 1024),
+        (1024, 1024),
+        (1026, None),
+    ],
+)
+def test_cosyvoice3_flow_cuda_graph_bucket_policy(
+    decoder_t: int, bucket_t: int | None
+) -> None:
+    assert stages._flow_cuda_graph_bucket(decoder_t) == bucket_t
+
+
+@pytest.mark.parametrize(
+    ("decoder_ts", "bucket_t"),
+    [
+        ((530, 542, 544), 544),
+        ((546, 558, 574), 576),
+    ],
+)
+def test_cosyvoice3_flow_cuda_graph_reuses_bucket_with_padding_and_crop(
+    decoder_ts: tuple[int, ...], bucket_t: int
+) -> None:
+    runner = object.__new__(stages._CosyVoice3FlowCudaGraphRunner)
+    runner._device = torch.device("cpu")
+    static = runner._new_inputs(bucket_t)
+    output = torch.empty(1, 80, bucket_t)
+    graph = _FakeGraph(static, output)
+
+    def eager_forward(*args, **kwargs):
+        raise AssertionError("the bucket should be replayed")
+
+    runner._eager_forward = eager_forward
+    runner._graphs = {bucket_t: (graph, static, output)}
+
+    for replay_count, decoder_t in enumerate(decoder_ts, start=1):
+        mu = torch.full((1, 80, decoder_t), float(decoder_t))
+        mask = torch.ones(1, 1, decoder_t)
+        spks = torch.full((1, 80), 7.0)
+        cond = torch.full((1, 80, decoder_t), 3.0)
+
+        result, cache = runner.forward(
+            mu=mu,
+            mask=mask,
+            n_timesteps=10,
+            spks=spks,
+            cond=cond,
+            streaming=False,
+        )
+
+        assert cache is None
+        assert graph.replays == replay_count
+        assert result.shape == (1, 80, decoder_t)
+        assert torch.equal(result, mu)
+        assert torch.equal(static["mu"][..., :decoder_t], mu)
+        assert torch.count_nonzero(static["mu"][..., decoder_t:]) == 0
+        assert torch.equal(static["mask"][..., :decoder_t], mask)
+        assert torch.count_nonzero(static["mask"][..., decoder_t:]) == 0
+        assert torch.equal(static["cond"][..., :decoder_t], cond)
+        assert torch.count_nonzero(static["cond"][..., decoder_t:]) == 0
+        assert torch.equal(static["spks"], spks)
 
 
 def test_cosyvoice3_vocoder_does_not_pad_or_rescale_short_sequences() -> None:

@@ -26,6 +26,267 @@ from sglang_omni.utils.device import resolve_device_spec
 
 logger = logging.getLogger(__name__)
 
+# note(chenye): Buffered decoder T is even, so the reachable graph domains are
+# q16 at T=256..544 and q32 at T=546..1024.
+# Unexpected shapes, including odd T, fall back to eager.
+_FLOW_CUDA_GRAPH_BUCKETS = tuple(range(256, 545, 16)) + tuple(range(576, 1025, 32))
+
+
+def _flow_cuda_graph_bucket(decoder_t: int) -> int | None:
+    if 256 <= decoder_t <= 544:
+        return ((decoder_t + 15) // 16) * 16
+    if 546 <= decoder_t <= 1024:
+        return ((decoder_t + 31) // 32) * 32
+    return None
+
+
+def _graph_safe_nonstreaming_mask(
+    xs: torch.Tensor,
+    masks: torch.Tensor,
+    use_dynamic_chunk: bool,
+    use_dynamic_left_chunk: bool,
+    decoding_chunk_size: int,
+    static_chunk_size: int,
+    num_decoding_left_chunks: int,
+    enable_full_context: bool = True,
+) -> torch.Tensor:
+    del (
+        xs,
+        use_dynamic_left_chunk,
+        decoding_chunk_size,
+        num_decoding_left_chunks,
+        enable_full_context,
+    )
+    if use_dynamic_chunk or static_chunk_size != 0:
+        raise RuntimeError(
+            "Fun-CosyVoice3 CUDA graph mask is only valid for buffered Flow"
+        )
+    chunk_masks = masks
+    empty_rows = chunk_masks.sum(dim=-1, keepdim=True) == 0
+    return chunk_masks.masked_fill(empty_rows, True)
+
+
+class _CosyVoice3FlowCudaGraphRunner:
+    """Startup captured CUDA graphs for the buffered 10 step Flow decoder."""
+
+    def __init__(
+        self,
+        decoder: Any,
+        *,
+        device: torch.device,
+        warmup_iters: int = 1,
+    ) -> None:
+        self._decoder = decoder
+        self._eager_forward = decoder.forward
+        self._device = device
+        self._warmup_iters = int(warmup_iters)
+        self._graphs: dict[int, tuple[Any, dict[str, torch.Tensor], torch.Tensor]] = {}
+        self._graph_rand_noise: torch.Tensor | None = None
+
+    @classmethod
+    def build(
+        cls,
+        decoder: Any,
+        *,
+        device: torch.device,
+    ) -> _CosyVoice3FlowCudaGraphRunner | None:
+        device = torch.device(device)
+        if device.type != "cuda":
+            return None
+
+        runner = cls(decoder, device=device)
+        try:
+            runner._capture_all()
+            decoder.forward = runner.forward
+        except Exception as exc:
+            for graph, _, _ in runner._graphs.values():
+                reset = getattr(graph, "reset", None)
+                if reset is not None:
+                    reset()
+            runner._graphs.clear()
+            runner._graph_rand_noise = None
+            logger.warning(
+                "Fun-CosyVoice3 Flow CUDA graph initialization failed; "
+                "using eager decoder (%s: %s)",
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        logger.info(
+            "Fun-CosyVoice3 Flow CUDA graphs initialized: %d buckets",
+            len(runner._graphs),
+        )
+        return runner
+
+    @staticmethod
+    def _call_decoder(
+        decoder_forward: Any,
+        inputs: dict[str, torch.Tensor],
+    ) -> tuple[torch.Tensor, Any]:
+        return decoder_forward(
+            mu=inputs["mu"],
+            mask=inputs["mask"],
+            n_timesteps=10,
+            spks=inputs["spks"],
+            cond=inputs["cond"],
+            streaming=False,
+        )
+
+    def _new_inputs(self, bucket_t: int) -> dict[str, torch.Tensor]:
+        return {
+            "mu": torch.zeros((1, 80, bucket_t), device=self._device),
+            "mask": torch.ones((1, 1, bucket_t), device=self._device),
+            "spks": torch.zeros((1, 80), device=self._device),
+            "cond": torch.zeros((1, 80, bucket_t), device=self._device),
+        }
+
+    def _capture_one(
+        self,
+        *,
+        bucket_t: int,
+        capture_stream: Any,
+        dit_module: Any,
+    ) -> tuple[Any, dict[str, torch.Tensor], torch.Tensor]:
+        inputs = self._new_inputs(bucket_t)
+        current_stream = torch.cuda.current_stream(self._device)
+        original_mask = dit_module.add_optional_chunk_mask
+        graph = None
+        try:
+            capture_stream.wait_stream(current_stream)
+            with torch.cuda.stream(capture_stream), torch.inference_mode():
+                for _ in range(self._warmup_iters):
+                    self._call_decoder(self._eager_forward, inputs)
+            current_stream.wait_stream(capture_stream)
+            torch.cuda.synchronize(self._device)
+
+            capture_stream.wait_stream(current_stream)
+            graph = torch.cuda.CUDAGraph()
+            dit_module.add_optional_chunk_mask = _graph_safe_nonstreaming_mask
+            try:
+                with (
+                    torch.inference_mode(),
+                    torch.cuda.graph(
+                        graph,
+                        stream=capture_stream,
+                        capture_error_mode="thread_local",
+                    ),
+                ):
+                    output, _ = self._call_decoder(self._eager_forward, inputs)
+            finally:
+                dit_module.add_optional_chunk_mask = original_mask
+            current_stream.wait_stream(capture_stream)
+            torch.cuda.synchronize(self._device)
+
+            if not isinstance(output, torch.Tensor):
+                raise RuntimeError("Flow decoder graph returned a non-tensor output")
+            if output.shape != (1, 80, bucket_t):
+                raise RuntimeError(
+                    "unexpected Flow decoder graph output shape: "
+                    f"{tuple(output.shape)} for T={bucket_t}"
+                )
+            return graph, inputs, output
+        except Exception:
+            if graph is not None:
+                reset = getattr(graph, "reset", None)
+                if reset is not None:
+                    reset()
+            raise
+
+    def _capture_all(self) -> None:
+        rand_noise = getattr(self._decoder, "rand_noise", None)
+        if not isinstance(rand_noise, torch.Tensor):
+            raise RuntimeError("expected CausalConditionalCFM.rand_noise tensor")
+        if rand_noise.device.type != "cpu":
+            raise RuntimeError("expected the official CFM rand_noise tensor on CPU")
+        if rand_noise.dtype != torch.float32:
+            raise RuntimeError("expected the official CFM rand_noise tensor in FP32")
+        if rand_noise.ndim != 3 or tuple(rand_noise.shape[:2]) != (1, 80):
+            raise RuntimeError(
+                f"unexpected CFM rand_noise shape: {tuple(rand_noise.shape)}"
+            )
+        max_bucket_t = _FLOW_CUDA_GRAPH_BUCKETS[-1]
+        if rand_noise.shape[2] < max_bucket_t:
+            raise RuntimeError(
+                "CFM rand_noise is shorter than the largest Flow graph bucket: "
+                f"noise={rand_noise.shape[2]} bucket={max_bucket_t}"
+            )
+
+        import cosyvoice.flow.DiT.dit as dit_module
+
+        noise_cpu = rand_noise[:, :, :max_bucket_t].detach()
+        self._graph_rand_noise = noise_cpu.to(device=self._device).contiguous()
+        if not torch.equal(self._graph_rand_noise.cpu(), noise_cpu):
+            raise RuntimeError("pre-staged CFM rand_noise changed deterministic values")
+
+        with torch.cuda.device(self._device):
+            capture_stream = torch.cuda.Stream(device=self._device)
+            try:
+                self._decoder.rand_noise = self._graph_rand_noise
+                for bucket_t in _FLOW_CUDA_GRAPH_BUCKETS:
+                    self._graphs[bucket_t] = self._capture_one(
+                        bucket_t=bucket_t,
+                        capture_stream=capture_stream,
+                        dit_module=dit_module,
+                    )
+            finally:
+                self._decoder.rand_noise = rand_noise
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        if (
+            args
+            or set(kwargs).difference(
+                {
+                    "mu",
+                    "mask",
+                    "n_timesteps",
+                    "spks",
+                    "cond",
+                    "streaming",
+                    "temperature",
+                }
+            )
+            or kwargs.get("n_timesteps") != 10
+            or kwargs.get("streaming", False)
+        ):
+            return self._eager_forward(*args, **kwargs)
+        if kwargs.get("temperature", 1.0) != 1.0:
+            return self._eager_forward(*args, **kwargs)
+
+        mu = kwargs.get("mu")
+        mask = kwargs.get("mask")
+        spks = kwargs.get("spks")
+        cond = kwargs.get("cond")
+        if not all(isinstance(value, torch.Tensor) for value in (mu, mask, spks, cond)):
+            return self._eager_forward(*args, **kwargs)
+
+        actual_t = int(mu.shape[-1]) if mu.ndim else 0
+        bucket_t = _flow_cuda_graph_bucket(actual_t)
+        entry = self._graphs.get(bucket_t) if bucket_t is not None else None
+        if entry is None:
+            return self._eager_forward(*args, **kwargs)
+
+        graph, static, output = entry
+        if (
+            any(value.device != self._device for value in (mu, mask, spks, cond))
+            or mu.shape != (1, 80, actual_t)
+            or mask.shape != (1, 1, actual_t)
+            or spks.shape != (1, 80)
+            or cond.shape != (1, 80, actual_t)
+            or any(value.dtype != torch.float32 for value in (mu, mask, spks, cond))
+        ):
+            return self._eager_forward(*args, **kwargs)
+
+        static["mu"].zero_()
+        static["mu"][..., :actual_t].copy_(mu)
+        static["mask"].zero_()
+        static["mask"][..., :actual_t].copy_(mask)
+        static["spks"].copy_(spks)
+        static["cond"].zero_()
+        static["cond"][..., :actual_t].copy_(cond)
+        graph.replay()
+        return output[..., :actual_t], None
+
+
 _COSYVOICE_INSTALL_HINT = (
     "Fun-CosyVoice3 support requires the `cosyvoice` package. "
     "Clone the official repository and set PYTHONPATH, or install it "
@@ -105,6 +366,13 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         self._flow = flow
         self._hift = hift
         self._fp16 = fp16
+        decoder = getattr(flow, "decoder", None)
+        flow_parameter = next(flow.parameters(), None)
+        if not fp16 and decoder is not None and flow_parameter is not None:
+            _CosyVoice3FlowCudaGraphRunner.build(
+                decoder,
+                device=flow_parameter.device,
+            )
 
     def prepare_item(
         self, payload: StagePayload
