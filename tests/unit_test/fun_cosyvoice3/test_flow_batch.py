@@ -124,6 +124,37 @@ def _infer_flow(flow: _FakeFlow, inputs: list[FlowBatchInput]) -> list[torch.Ten
     return FunCosyVoice3Flow(flow).inference(inputs)
 
 
+def test_flow_graph_runner_decline_falls_back_to_eager() -> None:
+    class _DecliningRunner:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.inputs: tuple[torch.Tensor, ...] | None = None
+
+        def run(self, *args: torch.Tensor) -> None:
+            self.calls += 1
+            self.inputs = args
+            return None
+
+    flow = _FakeFlow()
+    runner = _DecliningRunner()
+    outputs = FunCosyVoice3Flow(flow, cuda_graph_runner=runner).inference(
+        [_input([1]), _input([2])]
+    )
+
+    assert [output.shape for output in outputs] == [(1, 4, 2), (1, 4, 2)]
+    assert runner.calls == 1
+    assert runner.inputs is not None
+    assert [tuple(value.shape) for value in runner.inputs] == [
+        (2, 4, 2),
+        (11,),
+        (2, 4, 2),
+        (2, 1, 2),
+        (2, 4),
+        (2, 4, 2),
+    ]
+    assert len(flow.decoder.estimator.calls) == 10
+
+
 def test_pack_flow_inputs_keeps_prompt_and_target_contiguous() -> None:
     flow = _FakeFlow()
     items = [
