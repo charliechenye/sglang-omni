@@ -293,11 +293,8 @@ class _CosyVoice3FlowCudaGraphRunner:
         )
         self._capture_shapes = tuple(
             sorted(
-                {
-                    (int(batch_size), int(frames))
-                    for batch_size, frames in capture_shapes
-                },
-                key=lambda shape: (shape[0] * shape[1], shape[0], shape[1]),
+                {self._normalize_capture_shape(shape) for shape in capture_shapes},
+                key=lambda shape: (shape[1], shape[0]),
                 reverse=True,
             )
         )
@@ -316,24 +313,43 @@ class _CosyVoice3FlowCudaGraphRunner:
     ) -> "_CosyVoice3FlowCudaGraphRunner | None":
         """Build and startup-capture a runner, or return None for eager mode."""
         device = torch.device(device)
-        if (
-            device.type != "cuda"
-            or not torch.cuda.is_available()
-            or compute_dtype not in cls._SUPPORTED_DTYPES
-        ):
-            return None
         runner = cls(
             decoder,
             device=device,
             compute_dtype=compute_dtype,
             capture_shapes=capture_shapes,
         )
+        if (
+            device.type != "cuda"
+            or not torch.cuda.is_available()
+            or compute_dtype not in cls._SUPPORTED_DTYPES
+        ):
+            return None
         runner.capture()
         return runner
 
     @property
     def captured_shapes(self) -> tuple[tuple[int, int], ...]:
         return tuple(sorted(self._graphs))
+
+    @property
+    def failed_shapes(self) -> tuple[tuple[int, int], ...]:
+        return tuple(sorted(self._failed))
+
+    @staticmethod
+    def _normalize_capture_shape(shape: tuple[int, int]) -> tuple[int, int]:
+        try:
+            batch_size, frames = shape
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Flow CUDA graph capture shapes must be (batch_size, frames)"
+            ) from exc
+        batch_size, frames = int(batch_size), int(frames)
+        if batch_size < 1 or frames < 1:
+            raise ValueError(
+                "Flow CUDA graph capture shapes require batch_size >= 1 and frames >= 1"
+            )
+        return batch_size, frames
 
     def _autocast(self):
         if self._device.type != "cuda" or self._compute_dtype in (None, torch.float32):
@@ -396,16 +412,14 @@ class _CosyVoice3FlowCudaGraphRunner:
 
         try:
             from cosyvoice.flow.DiT import dit as dit_module
-        except ImportError as exc:
-            logger.warning(
-                "Fun-CosyVoice3 Flow CUDA graphs unavailable: %s; using eager",
-                exc,
-            )
-            self._failed.update(self._capture_shapes)
-            return
+        except ImportError:
+            dit_module = None
 
-        original_mask = dit_module.add_optional_chunk_mask
-        dit_module.add_optional_chunk_mask = _graph_safe_nonstreaming_chunk_mask
+        original_mask = (
+            dit_module.add_optional_chunk_mask if dit_module is not None else None
+        )
+        if dit_module is not None:
+            dit_module.add_optional_chunk_mask = _graph_safe_nonstreaming_chunk_mask
         try:
             with torch.cuda.device(self._device):
                 for key in self._capture_shapes:
@@ -421,7 +435,8 @@ class _CosyVoice3FlowCudaGraphRunner:
                             exc,
                         )
         finally:
-            dit_module.add_optional_chunk_mask = original_mask
+            if dit_module is not None:
+                dit_module.add_optional_chunk_mask = original_mask
 
     @staticmethod
     def _matches(
