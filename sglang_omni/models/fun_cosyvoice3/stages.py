@@ -260,7 +260,7 @@ def _graph_safe_nonstreaming_chunk_mask(
     return masks
 
 
-def _install_flow_cuda_graph_safe_dit_mask() -> None:
+def _install_flow_cuda_graph_safe_dit_mask() -> tuple[Any, Any]:
     """Install the buffered-only DiT mask helper before compiling the estimator."""
     try:
         from cosyvoice.flow.DiT import dit as dit_module
@@ -268,7 +268,9 @@ def _install_flow_cuda_graph_safe_dit_mask() -> None:
         raise RuntimeError(
             "Flow CUDA graph compatibility requires the CosyVoice DiT module"
         ) from exc
+    original_mask = dit_module.add_optional_chunk_mask
     dit_module.add_optional_chunk_mask = _graph_safe_nonstreaming_chunk_mask
+    return dit_module, original_mask
 
 
 @dataclass
@@ -722,11 +724,13 @@ def _compile_dit_backbone(
     if warmup_mel_frames < 2:
         raise ValueError(f"warmup_mel_frames must be >= 2, got {warmup_mel_frames}")
 
-    if enable_flow_cuda_graph_compat:
-        _install_flow_cuda_graph_safe_dit_mask()
-
     original_forward = estimator.forward
     _configure_dit_torch_compile()
+    dit_module = None
+    original_mask = None
+    if enable_flow_cuda_graph_compat:
+        dit_module, original_mask = _install_flow_cuda_graph_safe_dit_mask()
+
     try:
         estimator.forward = torch.compile(original_forward, dynamic=True)
         with torch.inference_mode():
@@ -738,6 +742,8 @@ def _compile_dit_backbone(
                 )
     except Exception as exc:
         estimator.forward = original_forward
+        if dit_module is not None:
+            dit_module.add_optional_chunk_mask = original_mask
         logger.warning(
             "torch.compile for the Fun-CosyVoice3 DiT backbone failed "
             "(%s: %s); the flow decoder will run eager",

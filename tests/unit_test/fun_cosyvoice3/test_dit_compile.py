@@ -66,9 +66,14 @@ def test_compile_dit_backbone_compatibility_installs_before_compile(
     estimator = _FakeDiTEstimator()
     flow = _FakeFlow(estimator)
     events = []
+    original_mask = object()
+    dit_module = type("_FakeDiTModule", (), {})()
+    dit_module.add_optional_chunk_mask = original_mask
 
     def _install_compatibility():
+        dit_module.add_optional_chunk_mask = stages._graph_safe_nonstreaming_chunk_mask
         events.append("install")
+        return dit_module, original_mask
 
     def _fake_compile(fn, dynamic=None):
         events.append(("compile", dynamic))
@@ -96,6 +101,10 @@ def test_compile_dit_backbone_compatibility_installs_before_compile(
         is True
     )
     assert events == ["install", ("compile", True), "warmup", "warmup"]
+    assert (
+        dit_module.add_optional_chunk_mask
+        is stages._graph_safe_nonstreaming_chunk_mask
+    )
 
 
 def test_compile_dit_backbone_default_does_not_install_graph_compatibility(
@@ -119,6 +128,49 @@ def test_compile_dit_backbone_default_does_not_install_graph_compatibility(
 
     assert stages._compile_dit_backbone(flow, warmup_steps=1) is True
     assert install_calls == []
+
+
+def test_compile_dit_backbone_compatibility_failure_restores_mask(monkeypatch) -> None:
+    estimator = _FakeDiTEstimator()
+    flow = _FakeFlow(estimator)
+    original_forward = estimator.forward
+
+    def original_mask(*args, **kwargs):
+        del args, kwargs
+
+    dit_module = type("_FakeDiTModule", (), {})()
+    dit_module.add_optional_chunk_mask = original_mask
+
+    def _install_compatibility():
+        dit_module.add_optional_chunk_mask = stages._graph_safe_nonstreaming_chunk_mask
+        return dit_module, original_mask
+
+    def _fail_compile(fn, dynamic=None):
+        del fn, dynamic
+
+        def _wrapped(*args, **kwargs):
+            del args, kwargs
+            raise RuntimeError("synthetic compile failure")
+
+        return _wrapped
+
+    monkeypatch.setattr(
+        stages,
+        "_install_flow_cuda_graph_safe_dit_mask",
+        _install_compatibility,
+    )
+    monkeypatch.setattr(torch, "compile", _fail_compile)
+
+    assert (
+        stages._compile_dit_backbone(
+            flow,
+            warmup_mel_frames=16,
+            enable_flow_cuda_graph_compat=True,
+        )
+        is False
+    )
+    assert estimator.forward == original_forward
+    assert dit_module.add_optional_chunk_mask is original_mask
 
 
 def test_compile_dit_backbone_warmup_matches_serving_grad_mode(monkeypatch) -> None:
