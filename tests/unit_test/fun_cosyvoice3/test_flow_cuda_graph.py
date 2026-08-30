@@ -9,6 +9,15 @@ import torch
 
 from sglang_omni.models.fun_cosyvoice3 import stages
 
+_MIXED_SOLVER_INPUT_DTYPES = (
+    torch.float32,
+    torch.float32,
+    torch.float32,
+    torch.float32,
+    torch.bfloat16,
+    torch.float32,
+)
+
 
 class _FakeGraph:
     def __init__(
@@ -38,6 +47,9 @@ class _TinyCudaDecoder:
     t_scheduler = "linear"
     inference_cfg_rate = 0.5
 
+    def __init__(self) -> None:
+        self.estimator_batch_sizes: list[int] = []
+
     def forward_estimator(
         self,
         x: torch.Tensor,
@@ -51,6 +63,7 @@ class _TinyCudaDecoder:
     ) -> torch.Tensor:
         if streaming:
             raise AssertionError("the CUDA graph fixture is buffered-only")
+        self.estimator_batch_sizes.append(int(x.shape[0]))
         return (
             0.125 * x
             + 0.25 * mu
@@ -79,21 +92,34 @@ def _runner_with_shapes(
         device=torch.device("cpu"),
         compute_dtype=torch.bfloat16,
         capture_shapes=shapes,
+        solver_input_dtypes=_MIXED_SOLVER_INPUT_DTYPES,
     )
 
 
 def _inputs(
     batch_size: int, frames: int, *, dtype: torch.dtype = torch.float32
 ) -> tuple[torch.Tensor, ...]:
-    x = torch.arange(batch_size * 80 * frames, dtype=dtype).reshape(
+    return _inputs_with_dtypes(batch_size, frames, (dtype,) * 6)
+
+
+def _inputs_with_dtypes(
+    batch_size: int,
+    frames: int,
+    dtypes: tuple[torch.dtype, ...],
+) -> tuple[torch.Tensor, ...]:
+    x = torch.arange(batch_size * 80 * frames, dtype=dtypes[0]).reshape(
         batch_size, 80, frames
     )
-    t_span = torch.linspace(0, 1, 11, dtype=dtype)
-    mu = torch.full_like(x, 2)
-    mask = torch.ones(batch_size, 1, frames, dtype=dtype)
-    spks = torch.arange(batch_size * 80, dtype=dtype).reshape(batch_size, 80)
-    cond = torch.full_like(x, 3)
+    t_span = torch.linspace(0, 1, 11, dtype=dtypes[1])
+    mu = torch.full((batch_size, 80, frames), 2, dtype=dtypes[2])
+    mask = torch.ones(batch_size, 1, frames, dtype=dtypes[3])
+    spks = torch.arange(batch_size * 80, dtype=dtypes[4]).reshape(batch_size, 80)
+    cond = torch.full((batch_size, 80, frames), 3, dtype=dtypes[5])
     return x, t_span, mu, mask, spks, cond
+
+
+def _mixed_inputs(batch_size: int, frames: int) -> tuple[torch.Tensor, ...]:
+    return _inputs_with_dtypes(batch_size, frames, _MIXED_SOLVER_INPUT_DTYPES)
 
 
 def _install_graph(
@@ -101,9 +127,14 @@ def _install_graph(
     key: tuple[int, int],
     *,
     dtype: torch.dtype = torch.float32,
+    input_dtypes: tuple[torch.dtype, ...] | None = None,
     fail: bool = False,
 ) -> _FakeGraph:
-    static_inputs = _inputs(key[0], key[1], dtype=dtype)
+    static_inputs = (
+        _inputs_with_dtypes(key[0], key[1], input_dtypes)
+        if input_dtypes is not None
+        else _inputs(key[0], key[1], dtype=dtype)
+    )
     static_output = torch.zeros_like(static_inputs[0], dtype=torch.float32)
     graph = _FakeGraph(static_inputs, static_output, fail=fail)
     runner._graphs[key] = stages._CapturedFlowCudaGraph(
@@ -171,7 +202,7 @@ def test_runner_build_rejects_unsupported_dtype_without_capture() -> None:
             SimpleNamespace(),
             device=torch.device("cuda"),
             compute_dtype=torch.float16,
-            capture_shapes=((1, 3),),
+            capture_shapes=(),
         )
         is None
     )
@@ -183,6 +214,7 @@ def test_runner_orders_requested_shapes_largest_first() -> None:
         device=torch.device("cpu"),
         compute_dtype=torch.bfloat16,
         capture_shapes=((1, 20), (4, 4), (2, 12), (1, 20)),
+        solver_input_dtypes=_MIXED_SOLVER_INPUT_DTYPES,
     )
 
     assert runner._capture_shapes == ((1, 20), (2, 12), (4, 4))
@@ -192,6 +224,68 @@ def test_runner_orders_requested_shapes_largest_first() -> None:
 def test_runner_rejects_invalid_capture_shapes(shape) -> None:
     with pytest.raises(ValueError, match="batch_size >= 1 and frames >= 1"):
         _runner_with_shapes((shape,))
+
+
+def test_runner_normalizes_solver_input_dtype_contract() -> None:
+    runner = _runner_with_shapes(((2, 16),))
+
+    assert runner.solver_input_dtypes == _MIXED_SOLVER_INPUT_DTYPES
+
+
+@pytest.mark.parametrize(
+    "solver_input_dtypes",
+    [None, (torch.float32,) * 5, (torch.float32,) * 7],
+)
+def test_runner_rejects_incomplete_solver_input_dtype_contract(
+    solver_input_dtypes,
+) -> None:
+    with pytest.raises(ValueError, match="six"):
+        stages._CosyVoice3FlowCudaGraphRunner(
+            SimpleNamespace(t_scheduler="linear"),
+            device=torch.device("cpu"),
+            compute_dtype=torch.bfloat16,
+            capture_shapes=((2, 16),),
+            solver_input_dtypes=solver_input_dtypes,
+        )
+
+
+def test_capture_inputs_use_the_solver_input_dtype_contract() -> None:
+    runner = _runner_with_shapes(((2, 16),))
+
+    inputs = runner._capture_inputs(2, 16)
+
+    assert tuple(value.dtype for value in inputs) == _MIXED_SOLVER_INPUT_DTYPES
+    assert [tuple(value.shape) for value in inputs] == [
+        (2, 80, 16),
+        (11,),
+        (2, 80, 16),
+        (2, 1, 16),
+        (2, 80),
+        (2, 80, 16),
+    ]
+
+
+def test_runner_keeps_runtime_dtype_mismatch_eager_only() -> None:
+    runner = _CosyVoice3FlowCudaGraphRunner(
+        SimpleNamespace(t_scheduler="linear"),
+        device=torch.device("cpu"),
+        compute_dtype=torch.bfloat16,
+        capture_shapes=(),
+        solver_input_dtypes=_MIXED_SOLVER_INPUT_DTYPES,
+    )
+    graph = _install_graph(
+        runner,
+        (2, 4),
+        input_dtypes=_MIXED_SOLVER_INPUT_DTYPES,
+    )
+
+    inputs = _mixed_inputs(2, 4)
+    assert runner.run(*inputs) is not None
+    mismatched_inputs = list(inputs)
+    mismatched_inputs[0] = mismatched_inputs[0].to(torch.bfloat16)
+
+    assert runner.run(*mismatched_inputs) is None
+    assert graph.replay_calls == 1
 
 
 def test_graph_safe_mask_matches_all_false_row_fallback() -> None:
@@ -250,14 +344,21 @@ def test_real_bf16_cuda_graph_replay_matches_eager_and_updates_inputs() -> None:
         device=device,
         compute_dtype=torch.bfloat16,
         capture_shapes=((2, 16),),
+        solver_input_dtypes=_MIXED_SOLVER_INPUT_DTYPES,
     )
     runner.capture()
 
     assert runner.captured_shapes == ((2, 16),)
     assert runner.failed_shapes == ()
+    assert runner.solver_input_dtypes == _MIXED_SOLVER_INPUT_DTYPES
     assert isinstance(runner._graphs[(2, 16)].graph, torch.cuda.CUDAGraph)
+    assert (
+        tuple(value.dtype for value in runner._graphs[(2, 16)].static_inputs)
+        == _MIXED_SOLVER_INPUT_DTYPES
+    )
     inputs_a = _real_inputs(runner, 2, 16)
-    assert all(value.dtype == torch.bfloat16 for value in inputs_a)
+    assert tuple(value.dtype for value in inputs_a) == _MIXED_SOLVER_INPUT_DTYPES
+    assert set(decoder.estimator_batch_sizes) == {4}
 
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         eager_a = stages._solve_flow_euler(decoder, *inputs_a).detach().clone()
@@ -288,14 +389,23 @@ def test_real_cuda_graphs_isolate_interleaved_exact_shapes() -> None:
         device=device,
         compute_dtype=torch.bfloat16,
         capture_shapes=((1, 16), (2, 16)),
+        solver_input_dtypes=_MIXED_SOLVER_INPUT_DTYPES,
     )
     assert runner._capture_shapes == ((2, 16), (1, 16))
     runner.capture()
 
     assert runner.captured_shapes == ((1, 16), (2, 16))
     assert runner.failed_shapes == ()
+    assert runner.solver_input_dtypes == _MIXED_SOLVER_INPUT_DTYPES
+    assert all(
+        tuple(value.dtype for value in captured.static_inputs)
+        == _MIXED_SOLVER_INPUT_DTYPES
+        for captured in runner._graphs.values()
+    )
     inputs_a = _real_inputs(runner, 1, 16)
     inputs_b = _real_inputs(runner, 2, 16)
+    assert tuple(value.dtype for value in inputs_a) == _MIXED_SOLVER_INPUT_DTYPES
+    assert tuple(value.dtype for value in inputs_b) == _MIXED_SOLVER_INPUT_DTYPES
     inputs_a[0].add_(0.25)
     inputs_b[0].add_(0.75)
 

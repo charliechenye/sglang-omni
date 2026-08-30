@@ -28,8 +28,6 @@ from sglang_omni.utils.audio_payload import audio_waveform_payload
 from sglang_omni.utils.checkpoint import resolve_checkpoint
 from sglang_omni.utils.device import resolve_device_spec
 
-logger = logging.getLogger(__name__)
-
 # Note (xinran): This is an admission budget, not a maximum supported request
 # length. The scheduler admits a request that exceeds it as a singleton Flow
 # batch and defers following requests to the next batch.
@@ -283,20 +281,22 @@ class _CosyVoice3FlowCudaGraphRunner:
         device: torch.device,
         compute_dtype: torch.dtype | None,
         capture_shapes: Sequence[tuple[int, int]],
+        solver_input_dtypes: Sequence[torch.dtype] | None = None,
     ) -> None:
         self._decoder = decoder
         self._device = torch.device(device)
         self._compute_dtype = compute_dtype
         self._enabled = compute_dtype in self._SUPPORTED_DTYPES
-        self._graph_dtype = (
-            torch.float32 if compute_dtype in (None, torch.float32) else compute_dtype
-        )
         self._capture_shapes = tuple(
             sorted(
                 {self._normalize_capture_shape(shape) for shape in capture_shapes},
                 key=lambda shape: (shape[1], shape[0]),
                 reverse=True,
             )
+        )
+        self._solver_input_dtypes = self._normalize_solver_input_dtypes(
+            solver_input_dtypes,
+            required=bool(self._capture_shapes),
         )
         self._graphs: dict[tuple[int, int], _CapturedFlowCudaGraph] = {}
         self._failed: set[tuple[int, int]] = set()
@@ -310,6 +310,7 @@ class _CosyVoice3FlowCudaGraphRunner:
         device: torch.device,
         compute_dtype: torch.dtype | None,
         capture_shapes: Sequence[tuple[int, int]],
+        solver_input_dtypes: Sequence[torch.dtype] | None = None,
     ) -> "_CosyVoice3FlowCudaGraphRunner | None":
         """Build and startup-capture a runner, or return None for eager mode."""
         device = torch.device(device)
@@ -318,6 +319,7 @@ class _CosyVoice3FlowCudaGraphRunner:
             device=device,
             compute_dtype=compute_dtype,
             capture_shapes=capture_shapes,
+            solver_input_dtypes=solver_input_dtypes,
         )
         if (
             device.type != "cuda"
@@ -335,6 +337,38 @@ class _CosyVoice3FlowCudaGraphRunner:
     @property
     def failed_shapes(self) -> tuple[tuple[int, int], ...]:
         return tuple(sorted(self._failed))
+
+    @property
+    def solver_input_dtypes(self) -> tuple[torch.dtype, ...] | None:
+        return self._solver_input_dtypes
+
+    @staticmethod
+    def _normalize_solver_input_dtypes(
+        solver_input_dtypes: Sequence[torch.dtype] | None,
+        *,
+        required: bool,
+    ) -> tuple[torch.dtype, ...] | None:
+        if solver_input_dtypes is None:
+            if required:
+                raise ValueError(
+                    "Flow CUDA graph capture requires a six-entry "
+                    "solver_input_dtypes contract"
+                )
+            return None
+        try:
+            normalized = tuple(solver_input_dtypes)
+        except TypeError as exc:
+            raise ValueError(
+                "solver_input_dtypes must contain six torch dtypes"
+            ) from exc
+        if len(normalized) != 6:
+            raise ValueError(
+                "solver_input_dtypes must contain exactly six entries "
+                "for x, t_span, mu, mask, spks, and cond"
+            )
+        if any(not isinstance(dtype, torch.dtype) for dtype in normalized):
+            raise ValueError("solver_input_dtypes entries must be torch.dtype values")
+        return normalized
 
     @staticmethod
     def _normalize_capture_shape(shape: tuple[int, int]) -> tuple[int, int]:
@@ -362,18 +396,19 @@ class _CosyVoice3FlowCudaGraphRunner:
         return torch.cuda.device(self._device)
 
     def _capture_inputs(self, batch_size: int, frames: int) -> tuple[torch.Tensor, ...]:
+        if self._solver_input_dtypes is None:
+            raise RuntimeError("Flow CUDA graph capture requires solver_input_dtypes")
+        x_dtype, t_span_dtype, mu_dtype, mask_dtype, spks_dtype, cond_dtype = (
+            self._solver_input_dtypes
+        )
         shape = (batch_size, 80, frames)
-        x = torch.zeros(shape, device=self._device, dtype=self._graph_dtype)
-        t_span = _flow_t_span(
-            self._decoder, device=self._device, dtype=self._graph_dtype
-        )
-        mu = torch.zeros_like(x)
+        x = torch.zeros(shape, device=self._device, dtype=x_dtype)
+        t_span = _flow_t_span(self._decoder, device=self._device, dtype=t_span_dtype)
+        mu = torch.zeros(shape, device=self._device, dtype=mu_dtype)
         # A valid mask keeps the capture path away from all-masked attention rows.
-        mask = torch.ones(
-            batch_size, 1, frames, device=self._device, dtype=self._graph_dtype
-        )
-        spks = torch.zeros(batch_size, 80, device=self._device, dtype=self._graph_dtype)
-        cond = torch.zeros_like(x)
+        mask = torch.ones(batch_size, 1, frames, device=self._device, dtype=mask_dtype)
+        spks = torch.zeros(batch_size, 80, device=self._device, dtype=spks_dtype)
+        cond = torch.zeros(shape, device=self._device, dtype=cond_dtype)
         return x, t_span, mu, mask, spks, cond
 
     def _capture_one(self, batch_size: int, frames: int) -> _CapturedFlowCudaGraph:
