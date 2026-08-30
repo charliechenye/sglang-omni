@@ -255,7 +255,20 @@ def _graph_safe_nonstreaming_chunk_mask(
             "CUDA graph mask workaround only supports buffered non-streaming Flow"
         )
     empty_rows = masks.sum(dim=-1, keepdim=True) == 0
-    return masks.masked_fill(empty_rows, True)
+    torch._dynamo.graph_break()
+    masks.masked_fill_(empty_rows, True)
+    return masks
+
+
+def _install_flow_cuda_graph_safe_dit_mask() -> None:
+    """Install the buffered-only DiT mask helper before compiling the estimator."""
+    try:
+        from cosyvoice.flow.DiT import dit as dit_module
+    except ImportError as exc:
+        raise RuntimeError(
+            "Flow CUDA graph compatibility requires the CosyVoice DiT module"
+        ) from exc
+    dit_module.add_optional_chunk_mask = _graph_safe_nonstreaming_chunk_mask
 
 
 @dataclass
@@ -453,7 +466,11 @@ class _CosyVoice3FlowCudaGraphRunner:
         original_mask = (
             dit_module.add_optional_chunk_mask if dit_module is not None else None
         )
-        if dit_module is not None:
+        mask_already_graph_safe = (
+            dit_module is not None
+            and original_mask is _graph_safe_nonstreaming_chunk_mask
+        )
+        if dit_module is not None and not mask_already_graph_safe:
             dit_module.add_optional_chunk_mask = _graph_safe_nonstreaming_chunk_mask
         try:
             with torch.cuda.device(self._device):
@@ -470,7 +487,7 @@ class _CosyVoice3FlowCudaGraphRunner:
                             exc,
                         )
         finally:
-            if dit_module is not None:
+            if dit_module is not None and not mask_already_graph_safe:
                 dit_module.add_optional_chunk_mask = original_mask
 
     @staticmethod
@@ -691,6 +708,7 @@ def _compile_dit_backbone(
     warmup_mel_frames: int = 128,
     warmup_steps: int = 3,
     compute_dtype: torch.dtype | None = None,
+    enable_flow_cuda_graph_compat: bool = False,
 ) -> bool:
 
     estimator = getattr(getattr(flow, "decoder", None), "estimator", None)
@@ -703,6 +721,9 @@ def _compile_dit_backbone(
         return False
     if warmup_mel_frames < 2:
         raise ValueError(f"warmup_mel_frames must be >= 2, got {warmup_mel_frames}")
+
+    if enable_flow_cuda_graph_compat:
+        _install_flow_cuda_graph_safe_dit_mask()
 
     original_forward = estimator.forward
     _configure_dit_torch_compile()

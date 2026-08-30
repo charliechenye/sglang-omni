@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
+import contextlib
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -73,6 +75,71 @@ class _TinyCudaDecoder:
         ) * mask
 
 
+_COMPILED_DIT_MODULE: ModuleType | None = None
+
+
+def _compiled_tiny_dit_mask(
+    xs: torch.Tensor, masks: torch.Tensor
+) -> torch.Tensor:
+    return _COMPILED_DIT_MODULE.add_optional_chunk_mask(
+        xs,
+        masks,
+        False,
+        False,
+        0,
+        0,
+        -1,
+    )
+
+
+class _CompiledTinyDiTEstimator(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.ones(1, dtype=torch.bfloat16))
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mu: torch.Tensor,
+        t: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        streaming: bool,
+    ) -> torch.Tensor:
+        del streaming
+        mask = _compiled_tiny_dit_mask(x.transpose(1, 2), mask)
+        return (
+            self.scale * x
+            + 0.25 * mu
+            + 0.5 * cond
+            + 0.01 * spks.unsqueeze(-1)
+            + 0.02 * t[:, None, None]
+        ) * mask
+
+
+class _CompiledTinyCudaDecoder:
+    t_scheduler = "linear"
+    inference_cfg_rate = 0.5
+
+    def __init__(self, estimator: torch.nn.Module) -> None:
+        self.estimator = estimator
+
+    def forward_estimator(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        mu: torch.Tensor,
+        t: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+        *,
+        streaming: bool,
+    ) -> torch.Tensor:
+        return self.estimator(x, mask, mu, t, spks, cond, streaming=streaming)
+
+
 def _runner(
     *, compute_dtype: torch.dtype | None = torch.float32
 ) -> stages._CosyVoice3FlowCudaGraphRunner:
@@ -120,6 +187,28 @@ def _inputs_with_dtypes(
 
 def _mixed_inputs(batch_size: int, frames: int) -> tuple[torch.Tensor, ...]:
     return _inputs_with_dtypes(batch_size, frames, _MIXED_SOLVER_INPUT_DTYPES)
+
+
+def _install_fake_cosyvoice_dit_module(monkeypatch, helper) -> ModuleType:
+    cosyvoice_module = ModuleType("cosyvoice")
+    flow_module = ModuleType("cosyvoice.flow")
+    dit_package = ModuleType("cosyvoice.flow.DiT")
+    dit_module = ModuleType("cosyvoice.flow.DiT.dit")
+    cosyvoice_module.__path__ = []
+    flow_module.__path__ = []
+    dit_package.__path__ = []
+    dit_module.add_optional_chunk_mask = helper
+    cosyvoice_module.flow = flow_module
+    flow_module.DiT = dit_package
+    dit_package.dit = dit_module
+    for name, module in (
+        ("cosyvoice", cosyvoice_module),
+        ("cosyvoice.flow", flow_module),
+        ("cosyvoice.flow.DiT", dit_package),
+        ("cosyvoice.flow.DiT.dit", dit_module),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    return dit_module
 
 
 def _install_graph(
@@ -266,7 +355,7 @@ def test_capture_inputs_use_the_solver_input_dtype_contract() -> None:
 
 
 def test_runner_keeps_runtime_dtype_mismatch_eager_only() -> None:
-    runner = _CosyVoice3FlowCudaGraphRunner(
+    runner = stages._CosyVoice3FlowCudaGraphRunner(
         SimpleNamespace(t_scheduler="linear"),
         device=torch.device("cpu"),
         compute_dtype=torch.bfloat16,
@@ -288,8 +377,9 @@ def test_runner_keeps_runtime_dtype_mismatch_eager_only() -> None:
     assert graph.replay_calls == 1
 
 
-def test_graph_safe_mask_matches_all_false_row_fallback() -> None:
+def test_graph_safe_mask_repairs_empty_rows_in_place() -> None:
     masks = torch.tensor([[[True, False, False]], [[False, False, False]]])
+    original_nonempty_row = masks[0].clone()
 
     result = stages._graph_safe_nonstreaming_chunk_mask(
         torch.zeros(2, 3, 1),
@@ -301,10 +391,75 @@ def test_graph_safe_mask_matches_all_false_row_fallback() -> None:
         -1,
     )
 
+    assert result is masks
+    torch.testing.assert_close(masks[0], original_nonempty_row)
     assert result.tolist() == [
         [[True, False, False]],
         [[True, True, True]],
     ]
+
+
+@pytest.mark.parametrize(
+    ("use_dynamic_chunk", "static_chunk_size"),
+    [(True, 0), (False, 1)],
+)
+def test_graph_safe_mask_rejects_unsupported_chunk_modes(
+    use_dynamic_chunk: bool,
+    static_chunk_size: int,
+) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="only supports buffered non-streaming Flow",
+    ):
+        stages._graph_safe_nonstreaming_chunk_mask(
+            torch.zeros(1, 3, 1),
+            torch.ones(1, 1, 3),
+            use_dynamic_chunk,
+            False,
+            0,
+            static_chunk_size,
+            -1,
+        )
+
+
+def test_capture_preserves_preinstalled_graph_safe_mask(monkeypatch) -> None:
+    dit_module = _install_fake_cosyvoice_dit_module(
+        monkeypatch, stages._graph_safe_nonstreaming_chunk_mask
+    )
+    runner = stages._CosyVoice3FlowCudaGraphRunner(
+        SimpleNamespace(t_scheduler="linear"),
+        device=torch.device("cuda"),
+        compute_dtype=torch.bfloat16,
+        capture_shapes=((1, 3),),
+        solver_input_dtypes=_MIXED_SOLVER_INPUT_DTYPES,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(runner, "_capture_one", lambda *shape: object())
+    binding_before = dit_module.add_optional_chunk_mask
+
+    runner.capture()
+
+    assert dit_module.add_optional_chunk_mask is binding_before
+
+
+def test_capture_restores_temporarily_installed_mask(monkeypatch) -> None:
+    def original_mask(*args, **kwargs):
+        del args, kwargs
+
+    dit_module = _install_fake_cosyvoice_dit_module(monkeypatch, original_mask)
+    runner = stages._CosyVoice3FlowCudaGraphRunner(
+        SimpleNamespace(t_scheduler="linear"),
+        device=torch.device("cuda"),
+        compute_dtype=torch.bfloat16,
+        capture_shapes=((1, 3),),
+        solver_input_dtypes=_MIXED_SOLVER_INPUT_DTYPES,
+    )
+    monkeypatch.setattr(torch.cuda, "device", lambda _: contextlib.nullcontext())
+    monkeypatch.setattr(runner, "_capture_one", lambda *shape: object())
+
+    runner.capture()
+
+    assert dit_module.add_optional_chunk_mask is original_mask
 
 
 @pytest.mark.parametrize("compute_dtype", [torch.float16, torch.float64])
@@ -322,6 +477,72 @@ def _real_inputs(
     frames: int,
 ) -> tuple[torch.Tensor, ...]:
     return tuple(value.clone() for value in runner._capture_inputs(batch_size, frames))
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_compiled_estimator_whole_solver_cuda_graph_is_exact(monkeypatch) -> None:
+    global _COMPILED_DIT_MODULE
+
+    dit_module = _install_fake_cosyvoice_dit_module(
+        monkeypatch, stages._graph_safe_nonstreaming_chunk_mask
+    )
+    _COMPILED_DIT_MODULE = dit_module
+    try:
+        estimator = _CompiledTinyDiTEstimator().cuda().eval()
+        decoder = _CompiledTinyCudaDecoder(estimator)
+        flow = SimpleNamespace(decoder=decoder)
+
+        assert stages._compile_dit_backbone(
+            flow,
+            warmup_mel_frames=16,
+            warmup_steps=1,
+            compute_dtype=torch.bfloat16,
+            enable_flow_cuda_graph_compat=True,
+        )
+        helper_before_capture = dit_module.add_optional_chunk_mask
+        runner = stages._CosyVoice3FlowCudaGraphRunner(
+            decoder,
+            device=torch.device("cuda"),
+            compute_dtype=torch.bfloat16,
+            capture_shapes=((2, 16),),
+            solver_input_dtypes=_MIXED_SOLVER_INPUT_DTYPES,
+        )
+        inputs_a = _real_inputs(runner, 2, 16)
+        with torch.inference_mode(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16
+        ):
+            # Warm the compiled CFG-batch signature before entering CUDA graph
+            # capture; the real capture path remains inference-mode only.
+            stages._solve_flow_euler(decoder, *inputs_a)
+        runner.capture()
+
+        assert runner.captured_shapes == ((2, 16),)
+        assert runner.failed_shapes == ()
+        assert isinstance(runner._graphs[(2, 16)].graph, torch.cuda.CUDAGraph)
+        assert dit_module.add_optional_chunk_mask is helper_before_capture
+
+        with torch.inference_mode(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16
+        ):
+            eager_a = stages._solve_flow_euler(decoder, *inputs_a).detach().clone()
+            graph_a = runner.run(*inputs_a)
+        assert graph_a is not None
+        assert torch.equal(graph_a, eager_a)
+
+        inputs_b = tuple(value.clone() for value in inputs_a)
+        inputs_b[0].add_(1)
+        inputs_b[2].add_(0.5)
+        with torch.inference_mode(), torch.autocast(
+            device_type="cuda", dtype=torch.bfloat16
+        ):
+            eager_b = stages._solve_flow_euler(decoder, *inputs_b).detach().clone()
+            graph_b = runner.run(*inputs_b)
+        assert graph_b is not None
+        assert torch.equal(graph_b, eager_b)
+        assert not torch.equal(graph_a, graph_b)
+    finally:
+        _COMPILED_DIT_MODULE = None
 
 
 def _assert_cuda_close(eager: torch.Tensor, graph: torch.Tensor | None) -> None:

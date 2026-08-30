@@ -60,6 +60,67 @@ def test_compile_dit_backbone_compiles_estimator_forward_dynamic(monkeypatch) ->
     assert forward_shapes == [((2, 80, 16), (2, 1, 16), (2, 80, 16), False)] * 3
 
 
+def test_compile_dit_backbone_compatibility_installs_before_compile(
+    monkeypatch,
+) -> None:
+    estimator = _FakeDiTEstimator()
+    flow = _FakeFlow(estimator)
+    events = []
+
+    def _install_compatibility():
+        events.append("install")
+
+    def _fake_compile(fn, dynamic=None):
+        events.append(("compile", dynamic))
+
+        def _wrapped(x, mask, mu, t, spks, cond, streaming):
+            events.append("warmup")
+            return fn(x, mask, mu, t, spks, cond, streaming)
+
+        return _wrapped
+
+    monkeypatch.setattr(
+        stages,
+        "_install_flow_cuda_graph_safe_dit_mask",
+        _install_compatibility,
+    )
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    assert (
+        stages._compile_dit_backbone(
+            flow,
+            warmup_mel_frames=16,
+            warmup_steps=2,
+            enable_flow_cuda_graph_compat=True,
+        )
+        is True
+    )
+    assert events == ["install", ("compile", True), "warmup", "warmup"]
+
+
+def test_compile_dit_backbone_default_does_not_install_graph_compatibility(
+    monkeypatch,
+) -> None:
+    estimator = _FakeDiTEstimator()
+    flow = _FakeFlow(estimator)
+    install_calls = []
+
+    monkeypatch.setattr(
+        stages,
+        "_install_flow_cuda_graph_safe_dit_mask",
+        lambda: install_calls.append(True),
+    )
+
+    def _fake_compile(fn, dynamic=None):
+        del dynamic
+        return fn
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    assert stages._compile_dit_backbone(flow, warmup_steps=1) is True
+    assert install_calls == []
+
+
 def test_compile_dit_backbone_warmup_matches_serving_grad_mode(monkeypatch) -> None:
     # flow.inference is @torch.inference_mode(); warmup must match (Dynamo
     # guards on grad mode) so the first request reuses the warmed graph.
