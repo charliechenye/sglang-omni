@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.3" />
-    <meta name="docbuild:last-update" content="Aug 30, 2026"/>
+    <meta name="docbuild:last-update" content="Aug 31, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -827,22 +827,27 @@ as the static superset because runtime prep derives stream receivers from it.</p
 <td><p><code class="docutils literal notranslate"><span class="pre">{}</span></code></p></td>
 <td><p>Environment defaults applied before stage factory imports. Existing process values take precedence.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">endpoints</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mps</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">off</span></code>, <code class="docutils literal notranslate"><span class="pre">on</span></code>, or <code class="docutils literal notranslate"><span class="pre">auto</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">off</span></code></p></td>
+<td><p>Native CUDA MPS policy for eligible same-GPU worker processes.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">endpoints</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">EndpointsConfig</span></code></p></td>
 <td><p>IPC defaults</p></td>
 <td><p>Endpoint allocation settings.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">placement</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">placement</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">PlacementConfig</span></code></p></td>
 <td><p>defaults</p></td>
 <td><p>Placement planning limits, e.g. <code class="docutils literal notranslate"><span class="pre">max_total_gpu_memory_fraction_per_gpu</span></code>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">terminal_stages_fn</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">terminal_stages_fn</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">str</span></code> or <code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
 <td><p>Dotted function path for request-aware terminal-stage resolution.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">config_cls</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">config_cls</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
 <td><p>class name</p></td>
 <td><p>Stored automatically and used when loading a saved config file.</p></td>
@@ -1035,7 +1040,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Aug 30, 2026.
+  Last updated on Aug 31, 2026.
   <br/>
 </p>
   </div>
