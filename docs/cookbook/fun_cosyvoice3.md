@@ -241,6 +241,20 @@ sgl-omni serve \
 
 Do not enable it together with TensorRT.
 
+### CUDA Graphs for buffered Flow
+
+`enable_flow_cuda_graph` is opt-in and targets the validated CUDA + BF16 configuration.
+Graphs are captured at startup for buffered Flow requests; nonresident shapes use the
+normal solver and are never captured at request time. Resident graphs consume additional
+GPU memory. The option can be combined with `enable_dit_torch_compile`.
+
+```bash
+sgl-omni serve \
+  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --vocoder.factory.enable_flow_cuda_graph true \
+  --port 8000
+```
+
 ### TensorRT for the DiT backbone
 
 TensorRT accelerates the DiT by building a cached `.plan` engine from the bundled ONNX. The CFG batch is frozen at 2 with dynamic mel dimensions; larger request batches are handled by chunking cond/uncond pairs. TensorRT and torch.compile are mutually exclusive.
