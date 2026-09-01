@@ -155,17 +155,31 @@ are not supported as forced `language` hints; use `Chinese`/`zh` for them.
 The current Qwen3-ASR model accepts at most 1,200 seconds of audio in one
 request, so we transcribe longer uploads in chunks: we split the audio, run
 each chunk as its own engine request, and join the transcripts back in
-order. The behavior follows these values, which Qwen3-ASR declares in code
-(`Qwen3ASRPipelineConfig.audio_chunking`). They are fixed model defaults in
-this release:
+order. The behavior follows two kinds of values.
+
+The scheduling policy is yours to tune, with dotted flags or the matching
+YAML keys:
+
+| Name | Default | Meaning |
+|---|---|---|
+| `--audio_chunking.max_audio_clip_s` | `30` | Longest clip we send to the engine in one request, and therefore the chunk length. It sits well below the model's native 1,200s on purpose: shorter chunks batch better, and the output-token budget scales with clip length on its own. Capped at the native clip limit. |
+| `--audio_chunking.max_concurrent_chunks` | `8` | How many chunks of one request run in the engine at once. A per-request cap so one long upload can't crowd out everyone else's requests. |
+| `--audio_chunking.max_total_audio_s` | `3600` | Upper limit on the whole upload; you get HTTP 400 above it. This is a memory guard: we keep the decoded waveform in memory while its chunks run. |
+
+The model properties are ClassVars on `Qwen3ASRPipelineConfig`; no
+configuration path reaches them:
 
 | Name | Value | Meaning |
 |---|---|---|
-| `max_audio_clip_s` | `60` | Longest clip we send to the engine in one request, and therefore the chunk length. It sits well below the model's native 1,200s on purpose: shorter chunks batch better, and the output-token budget scales with clip length on its own. |
+| `allow_audio_chunking` | `true` | Qwen3-ASR transcribes an isolated chunk correctly, so chunking is on. |
 | `max_native_clip_s` | `1200` | Longest clip the model takes as one request (its native limit). Streaming cannot chunk, so this is the streaming cutoff. |
-| `max_total_audio_s` | `3600` | Upper limit on the whole upload; you get HTTP 400 above it. This is a memory guard: we keep the decoded waveform in memory while its chunks run. |
-| `max_concurrent_chunks` | `8` | How many chunks of one request run in the engine at once. A per-request cap so one long upload can't crowd out everyone else's requests. |
 | `min_tail_s` | `0.5` | Shortest final chunk worth transcribing; if the tail would be shorter, we move the previous cut earlier to absorb it. This matches the model's own minimum input length. |
+
+Note: Raising `audio_chunking.max_audio_clip_s` also resizes the encoder CUDA-graph bucket
+ladder, which is derived from the chunk length: a longer chunk means more and
+larger captured graphs, and their static buffers stay resident for the life of
+the server (roughly 6.6 KB per token of ladder ceiling; at 1,200s the ceiling
+is 124,800 tokens). Budget for that when you raise the flag on small GPUs.
 
 Behavior notes:
 
