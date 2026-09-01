@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import gc
 import importlib
+import logging
 from typing import Any
 
 from sglang_omni.models.qwen3_tts import request_builders
@@ -11,6 +13,8 @@ from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.vendor.sglang.server_args import override_server_args
+
+logger = logging.getLogger(__name__)
 
 
 def _talker_requires_speech_tokenizer(model: Any) -> bool:
@@ -37,6 +41,12 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
         self.attn_implementation = attn_implementation
         self.wrapper: Any | None = None
         self._stream_output_builder: Any | None = None
+        # Issue #20 diagnostic only: for non-Base checkpoints, keep a transient
+        # full speech tokenizer alive through torch.compile / decode CUDA-graph
+        # capture without attaching it to the Talker request path. Releasing it
+        # immediately after capture lets us distinguish a capture-time CUDA /
+        # allocator side effect from a true serving-time tokenizer dependency.
+        self._capture_probe_speech_tokenizer: Any | None = None
 
     def resolve_checkpoint(self, model_path: str) -> str:
         qwen3_stages.apply_qwen_tts_transformers_compatibility_patches()
@@ -93,6 +103,20 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
                 attn_implementation=self.attn_implementation,
             )
             model.load_speech_tokenizer(speech_tokenizer)
+        else:
+            logger.info(
+                "Issue20 capture probe: loading transient Talker speech tokenizer "
+                "through compile/CUDA-graph capture"
+            )
+            self._capture_probe_speech_tokenizer = (
+                qwen3_stages._load_qwen3_tts_tokenizer(
+                    checkpoint_dir,
+                    device=device,
+                    dtype=self.dtype,
+                    attn_implementation=self.attn_implementation,
+                )
+            )
+
         processor = AutoProcessor.from_pretrained(
             checkpoint_dir,
             fix_mistral_regex=True,
@@ -131,6 +155,26 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
                 "sglang_omni.qwen3_tts.compile_complete",
                 enable_torch_compile=False,
             )
+
+    def post_cuda_graph_setup(self, model: Any, server_args: Any) -> None:
+        del model, server_args
+        if self._capture_probe_speech_tokenizer is None:
+            return
+
+        logger.info(
+            "Issue20 capture probe: releasing transient Talker speech tokenizer "
+            "after decode CUDA-graph capture"
+        )
+        self._capture_probe_speech_tokenizer = None
+        gc.collect()
+
+        # The probe tokenizer is unrelated to captured graph inputs/outputs. Drop
+        # allocator cache after releasing it so ready-state residency reflects
+        # whether the memory can actually be returned before serving begins.
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         model_runner_mod = importlib.import_module(
