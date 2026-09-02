@@ -9,6 +9,10 @@ from typing import Any
 from sglang_omni.models.qwen3_tts import CAPABILITIES, request_builders
 from sglang_omni.models.qwen3_tts import stages as qwen3_stages
 from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
+from sglang_omni.scheduling.generation_batch_policy import (
+    CudaGraphBackend,
+    build_default_prefill_cuda_graph_bs,
+)
 
 
 def _is_truthy(value: Any) -> bool:
@@ -60,6 +64,11 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
             "dtype": dtype,
             "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
+            # note (luojiaxuan): under load, prefills coalesce several requests
+            # into one extend batch, so the ladder must reach well past a single
+            # prompt's token count for graph replays to keep covering them.
+            "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
+            "cuda_graph_bs_prefill": build_default_prefill_cuda_graph_bs(512),
             "enable_torch_compile": False,
             "mem_fraction_static": 0.85,
             "max_prefill_tokens": 8192,

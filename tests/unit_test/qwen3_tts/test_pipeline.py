@@ -298,10 +298,13 @@ def test_qwen3_tts_deterministic_inference_configures_pipeline() -> None:
     assert vocoder["followup_cuda_graph"] is False
 
 
-def test_qwen3_tts_breakable_prefill_is_compatible_but_not_default_enabled() -> None:
-    """Compatibility permits explicit opt-in without changing shipped defaults."""
+def test_qwen3_tts_breakable_prefill_enabled_by_default() -> None:
     from sglang_omni.models.qwen3_tts import CAPABILITIES
     from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
+    from sglang_omni.scheduling.generation_batch_policy import (
+        CudaGraphBackend,
+        build_default_prefill_cuda_graph_bs,
+    )
 
     builder = Qwen3TtsEngineBuilder()
     defaults = builder.generation_defaults(dtype="bfloat16")
@@ -311,8 +314,8 @@ def test_qwen3_tts_breakable_prefill_is_compatible_but_not_default_enabled() -> 
         type(builder).supports_breakable_prefill_cuda_graph
         is CAPABILITIES.supports_breakable_prefill_cuda_graph
     )
-    assert "cuda_graph_backend_prefill" not in defaults
-    assert "cuda_graph_bs_prefill" not in defaults
+    assert defaults["cuda_graph_backend_prefill"] is CudaGraphBackend.BREAKABLE
+    assert defaults["cuda_graph_bs_prefill"] == build_default_prefill_cuda_graph_bs(512)
     assert defaults["disable_cuda_graph"] is False
 
 
