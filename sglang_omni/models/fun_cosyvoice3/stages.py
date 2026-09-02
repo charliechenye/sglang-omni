@@ -513,8 +513,14 @@ def _group_flow_requests(
         # Let the existing Flow input validation report malformed zero-length
         # requests instead of failing in the coalescing arithmetic first.
         return [list(requests) for _, requests in atomic_groups]
-    best_objective: tuple[int, int, int, tuple[tuple[int, int], ...]] | None = None
-    best_groups: list[list[_PreparedFlowRequest]] | None = None
+    baseline_groups = [list(requests) for _, requests in atomic_groups]
+    best_objective: tuple[int, int, int, tuple[tuple[int, int], ...]] = (
+        len(baseline_groups),
+        baseline_work,
+        0,
+        tuple((bucket_key, bucket_key) for bucket_key, _ in atomic_groups),
+    )
+    best_groups = baseline_groups
 
     def visit(
         start: int,
@@ -550,7 +556,7 @@ def _group_flow_requests(
                 max_merged_span,
                 tuple(signature),
             )
-            if best_objective is None or objective < best_objective:
+            if objective < best_objective:
                 best_objective = objective
                 best_groups = result_groups
             return
@@ -573,8 +579,6 @@ def _group_flow_requests(
             candidate_groups.pop()
 
     visit(0, [])
-    if best_groups is None:
-        raise RuntimeError("Fun-CosyVoice3 Flow coalescing found no feasible grouping")
     return best_groups
 
 
