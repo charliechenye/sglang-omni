@@ -83,6 +83,8 @@ Adaptive Flow coalescing is disabled by default with
 `flow_batch_coalesce_max_added_padding_pct: 0`. When enabled, it can merge contiguous
 existing Flow buckets while keeping the configured raw-length span and whole-outer-batch
 padding cap. The H200-validated preset is `64` frames and `5%`; it is not a universal optimum.
+Adaptive coalescing currently supports `max_batch_size <= 8`, which bounds the exact
+contiguous-partition search used by the validated policy.
 Tune both values for the target hardware and workload:
 
 ```bash

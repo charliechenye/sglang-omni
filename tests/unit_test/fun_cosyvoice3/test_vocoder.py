@@ -706,6 +706,40 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
     }
 
 
+def test_create_vocoder_executor_rejects_large_batch_for_coalescing() -> None:
+    with pytest.raises(ValueError, match=r"max_batch_size.*8"):
+        stages.create_vocoder_executor(
+            "model-that-must-not-load",
+            max_batch_size=9,
+            flow_batch_coalesce_span_frames=64,
+            flow_batch_coalesce_max_added_padding_pct=5,
+        )
+
+
+def test_create_vocoder_executor_allows_large_batch_when_coalescing_disabled(
+    monkeypatch,
+) -> None:
+    fake_flow = _BatchCapableFakeFlow()
+    fake_hift = _FakeHiFT()
+    monkeypatch.setattr(stages, "resolve_device_spec", lambda device, gpu_id: "cpu")
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(
+        stages,
+        "_load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, device, fp16: (fake_flow, fake_hift),
+    )
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cpu",
+        max_batch_size=16,
+        flow_batch_coalesce_span_frames=0,
+        flow_batch_coalesce_max_added_padding_pct=0,
+    )
+
+    assert scheduler._max_batch_size == 16
+
+
 def test_create_vocoder_executor_rejects_non_positive_admission_budget(
     monkeypatch,
 ) -> None:

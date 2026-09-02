@@ -32,6 +32,7 @@ from sglang_omni.utils.device import resolve_device_spec
 # length. The scheduler admits a request that exceeds it as a singleton Flow
 # batch and defers following requests to the next batch.
 _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES = 2000
+_MAX_FLOW_COALESCE_BATCH_SIZE = 8
 
 _AUTOCAST_DTYPES: dict[str, torch.dtype | None] = {
     "float32": None,
@@ -770,6 +771,14 @@ def create_vocoder_executor(
         flow_batch_coalesce_span_frames,
         flow_batch_coalesce_max_added_padding_pct,
     )
+    if (
+        flow_batch_coalesce_span_frames > 0
+        and max_batch_size > _MAX_FLOW_COALESCE_BATCH_SIZE
+    ):
+        raise ValueError(
+            "Fun-CosyVoice3 adaptive Flow coalescing currently requires "
+            f"max_batch_size <= {_MAX_FLOW_COALESCE_BATCH_SIZE}"
+        )
     device = resolve_device_spec(device, gpu_id)
     checkpoint_dir = resolve_checkpoint(model_path)
     if dtype not in _AUTOCAST_DTYPES:
