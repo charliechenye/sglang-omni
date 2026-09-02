@@ -78,6 +78,31 @@ prompt-plus-output mel length exceeds that budget runs as a B=1 Flow batch throu
 adapter, and later requests wait for the next scheduler batch. This preserves valid long
 generations while preventing them from being combined with more work.
 
+Adaptive Flow coalescing is disabled by default with
+`flow_batch_coalesce_span_frames: 0` and
+`flow_batch_coalesce_max_added_padding_pct: 0`. When enabled, it can merge contiguous
+existing Flow buckets while keeping the configured raw-length span and whole-outer-batch
+padding cap. The H200-validated preset is `64` frames and `5%`; it is not a universal optimum.
+Tune both values for the target hardware and workload:
+
+```bash
+sgl-omni serve \
+  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --config examples/configs/fun_cosyvoice3_0_5b.yaml \
+  --vocoder.factory.flow_batch_coalesce_span_frames 64 \
+  --vocoder.factory.flow_batch_coalesce_max_added_padding_pct 5
+```
+
+The YAML equivalent is:
+
+```yaml
+stages:
+  vocoder:
+    factory:
+      flow_batch_coalesce_span_frames: 64
+      flow_batch_coalesce_max_added_padding_pct: 5
+```
+
 HiFT is batched the same way: the mels from one Flow bucket are right-zero-padded into a single
 tensor, decoded in one HiFT call, and sliced back to each request's true length, under the
 padding budget `hift_max_padding_waste` (1.5 by default; `1.0` only groups requests that need no
@@ -86,9 +111,9 @@ parametrizations. Right-zero-padding matches the zero padding HiFT applies in si
 inference, so batched output is identical except in the final mel frame of padded requests.
 
 The built-in Flow implementation supports the pinned CosyVoice PyTorch estimator and buffered
-`streaming=False, finalize=True` inference only. TensorRT Flow is not supported by this
-integration and fails during vocoder initialization rather than falling back to another
-inference path.
+`streaming=False, finalize=True` inference only.
+TensorRT Flow is not supported by this integration and fails during vocoder initialization
+rather than falling back to another inference path.
 
 Change the mel-frame bucket size, for example to 100 frames:
 

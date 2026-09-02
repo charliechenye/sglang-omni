@@ -63,6 +63,10 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 flow_batch_admission_frames=8000,
                 max_batch_size=16,
                 max_batch_wait_ms=30,
+                # Validated on H200 at 64 frames / 5%; tune for other
+                # hardware or workloads instead of treating it as universal.
+                flow_batch_coalesce_span_frames=0,
+                flow_batch_coalesce_max_added_padding_pct=0.0,
                 # Opt-in; off by default (one-time startup compile cost).
                 enable_dit_torch_compile=False,
             ),
