@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.4" />
-    <meta name="docbuild:last-update" content="Sep 01, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 02, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -580,6 +580,9 @@ download the model (public, no token required):</p>
 </pre></div>
 </div>
 <p>A matching config file is available at <code class="docutils literal notranslate"><span class="pre">examples/configs/moss_tts_local.yaml</span></code>.</p>
+<p>Speech input admission follows the text backbone’s context metadata rather than
+the generic 4,096-character precheck. Requests that exceed the effective model
+context are rejected with an OpenAI-compatible HTTP 400 error.</p>
 </section>
 <section id="synthesizing-speech">
 <h2>Synthesizing Speech<a class="headerlink" href="#synthesizing-speech" title="Link to this heading">#</a></h2>
@@ -1035,7 +1038,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 01, 2026.
+  Last updated on Sep 02, 2026.
   <br/>
 </p>
   </div>
