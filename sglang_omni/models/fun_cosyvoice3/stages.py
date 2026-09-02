@@ -495,8 +495,8 @@ def _group_flow_requests(
     solve count, padded work, maximum newly merged span, then bucket ranges.
     """
     if coalesce_span_frames == 0:
-        # Preserve current-main's insertion order and grouping exactly when the
-        # policy is disabled.
+        # note(chenye): preserve insertion order and grouping exactly
+        # when the policy is disabled.
         return list(buckets.values())
     if not buckets:
         return []
@@ -510,8 +510,8 @@ def _group_flow_requests(
         for _, requests in atomic_groups
     )
     if baseline_work == 0:
-        # Let the existing Flow input validation report malformed zero-length
-        # requests instead of failing in the coalescing arithmetic first.
+        # note(chenye): Let the existing Flow input validation report malformed
+        # zero length requests instead of failing in the coalescing arithmetic first.
         return [list(requests) for _, requests in atomic_groups]
     baseline_groups = [list(requests) for _, requests in atomic_groups]
     best_objective: tuple[int, int, int, tuple[tuple[int, int], ...]] = (
