@@ -105,6 +105,8 @@ stages:
       flow_batch_coalesce_max_added_padding_pct: 5
 ```
 
+These settings use the existing dotted stage-factory configuration override surface.
+
 HiFT is batched the same way: the mels from one Flow bucket are right-zero-padded into a single
 tensor, decoded in one HiFT call, and sliced back to each request's true length, under the
 padding budget `hift_max_padding_waste` (1.5 by default; `1.0` only groups requests that need no
