@@ -4340,11 +4340,14 @@ def test_qwen3_tts_prefill_attaches_runner_composed_embeddings_to_sidecar(
         lambda forward_batch, requests: calls.append("embeds") or input_embeds
     )
     mm_inputs = [object()]
+    positions = torch.arange(3)
     forward_batch = SimpleNamespace(
         input_ids=torch.zeros(3, dtype=torch.long),
         input_embeds=None,
         replace_embeds=None,
         mm_inputs=mm_inputs,
+        positions=positions,
+        mrope_positions=None,
     )
 
     runner.before_prefill(forward_batch, object(), [object()])
@@ -4355,6 +4358,9 @@ def test_qwen3_tts_prefill_attaches_runner_composed_embeddings_to_sidecar(
     assert forward_batch.input_embeds is None
     assert forward_batch.mm_inputs is mm_inputs
     assert calls == ["prepare", "embeds"]
+    assert forward_batch.mrope_positions.shape == (3, 3)
+    for row in forward_batch.mrope_positions:
+        assert torch.equal(row, positions)
 
 
 def test_qwen3_tts_prefill_uses_shared_late_bound_forward_transport(
