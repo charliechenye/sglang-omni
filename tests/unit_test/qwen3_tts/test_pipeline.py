@@ -319,68 +319,28 @@ def test_qwen3_tts_breakable_prefill_enabled_by_default() -> None:
     assert defaults["disable_cuda_graph"] is False
 
 
-def test_qwen3_tts_breakable_prefill_breaks_around_qk_norm_rope(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    install_fake_sglang(monkeypatch)
-    from sglang_omni.models.qwen3_tts import sglang_model
+def test_qwen3_tts_before_prefill_mirrors_positions_into_mrope() -> None:
+    from sglang_omni.models.qwen3_tts.model_runner import _ensure_mrope_positions
 
-    events: list[tuple[str, object]] = []
-
-    def fake_eager_on_graph(enabled: bool):
-        events.append(("enabled", enabled))
-
-        def decorate(function):
-            def wrapped(*args, **kwargs):
-                events.append(("wrapped", (args, kwargs)))
-                return function(*args, **kwargs)
-
-            return wrapped
-
-        return decorate
-
-    class FakeAttention(torch.nn.Module):
-        def __init__(self, **kwargs) -> None:
-            super().__init__()
-
-        def apply_qk_norm_rope(self, qkv, positions, forward_batch):
-            events.append(("inner", (qkv, positions, forward_batch)))
-            return qkv, positions, forward_batch
-
-    class FakeModule(torch.nn.Module):
-        def __init__(self, *args, **kwargs) -> None:
-            super().__init__()
-
-    monkeypatch.setattr(sglang_model, "eager_on_graph", fake_eager_on_graph)
-    monkeypatch.setattr(
-        sglang_model,
-        "Qwen3OmniMoeThinkerTextAttention",
-        FakeAttention,
+    batch = SimpleNamespace(
+        positions=torch.arange(7, dtype=torch.int64),
+        mrope_positions=None,
     )
-    monkeypatch.setattr(sglang_model, "Qwen3OmniMoeTalkerDenseMLP", FakeModule)
-    monkeypatch.setattr(sglang_model, "RMSNorm", FakeModule)
+    _ensure_mrope_positions(batch)
 
-    config = SimpleNamespace(
-        hidden_size=1024,
-        num_attention_heads=16,
-        num_key_value_heads=8,
-        rope_theta=1_000_000,
-        rope_scaling=None,
-        max_position_embeddings=32_768,
-        head_dim=128,
-        rms_norm_eps=1e-6,
-        attention_bias=False,
-        intermediate_size=3072,
+    assert batch.mrope_positions.shape == (3, 7)
+    assert torch.equal(batch.mrope_positions[0], batch.positions)
+    assert torch.equal(batch.mrope_positions[1], batch.positions)
+    assert torch.equal(batch.mrope_positions[2], batch.positions)
+
+    existing = torch.zeros((3, 7), dtype=torch.int64)
+    batch = SimpleNamespace(
+        positions=torch.arange(7, dtype=torch.int64),
+        mrope_positions=existing,
     )
-    layer = sglang_model.Qwen3TTSTalkerDecoderLayer(config, layer_id=0)
+    _ensure_mrope_positions(batch)
 
-    expected = (object(), object(), object())
-    assert layer.self_attn.apply_qk_norm_rope(*expected) == expected
-    assert events == [
-        ("enabled", True),
-        ("wrapped", (expected, {})),
-        ("inner", expected),
-    ]
+    assert batch.mrope_positions is existing
 
 
 @pytest.mark.parametrize(

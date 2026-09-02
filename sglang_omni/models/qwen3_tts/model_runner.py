@@ -17,6 +17,22 @@ from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRun
 from sglang_omni.scheduling.types import RequestOutput
 
 
+def _ensure_mrope_positions(forward_batch: Any) -> None:
+    """Give the batch MRoPE positions mirroring its plain positions.
+
+    The Talker declares ``is_mrope_enabled``, so a captured prefill graph
+    binds the runner's ``mrope_positions`` slot — but that slot is only
+    refreshed at replay when the live batch carries mrope positions, and a
+    TTS request has no multimodal inputs to provide them. All three MRoPE
+    rows are equal for the Talker, so the plain positions expanded to
+    ``[3, T]`` are the exact values the layer collapses back to.
+    """
+    if forward_batch.mrope_positions is None:
+        forward_batch.mrope_positions = (
+            forward_batch.positions.unsqueeze(0).expand(3, -1).contiguous()
+        )
+
+
 class Qwen3TTSModelRunner(ModelRunner):
     """Runs Qwen3-TTS AR steps and stores generated codec frames per request."""
 
@@ -45,6 +61,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         requests: list,
     ) -> None:
         del schedule_batch
+        _ensure_mrope_positions(forward_batch)
         self.model.prepare_decode_buffers(requests)
         attach_omni_prefill_inputs(
             forward_batch,
