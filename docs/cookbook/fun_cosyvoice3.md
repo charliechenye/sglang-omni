@@ -105,6 +105,8 @@ stages:
       flow_batch_coalesce_max_added_padding_pct: 5
 ```
 
+These settings use the existing dotted stage-factory configuration override surface.
+
 HiFT still runs once per request. The built-in Flow implementation supports the pinned
 CosyVoice PyTorch estimator and buffered `streaming=False, finalize=True` inference only.
 TensorRT Flow is not supported by this integration and fails during vocoder initialization

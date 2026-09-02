@@ -285,34 +285,13 @@ def test_flow_coalescing_disabled_preserves_current_bucket_groups(monkeypatch) -
     ]
 
 
-def test_s64_flow_coalescing_merges_adjacent_baseline_buckets(monkeypatch) -> None:
-    items = [
-        (_state(prompt_tokens=0), _codes(25)),
-        (_state(prompt_tokens=0), _codes(27)),
-    ]
-
-    _, batch_calls, hift = _run_decode_with_coalescing(
-        monkeypatch,
-        items,
-        span_frames=64,
-        max_added_padding_pct=5,
-    )
-
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [25, 27]
-    ]
-    assert len(hift.calls) == 2
-
-
-def test_flow_coalescing_preserves_result_order_across_merged_bucket(
-    monkeypatch,
-) -> None:
+def test_flow_coalescing_merges_and_restores_result_order(monkeypatch) -> None:
     items = [
         (_state(sample_rate=16001, prompt_tokens=0), _codes(27)),
         (_state(sample_rate=16002, prompt_tokens=0), _codes(25)),
     ]
 
-    results, batch_calls, _ = _run_decode_with_coalescing(
+    results, batch_calls, hift = _run_decode_with_coalescing(
         monkeypatch,
         items,
         span_frames=64,
@@ -323,196 +302,124 @@ def test_flow_coalescing_preserves_result_order_across_merged_bucket(
     assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
         [25, 27]
     ]
+    assert len(hift.calls) == 2
 
 
-def test_flow_coalescing_keeps_baseline_buckets_atomic(monkeypatch) -> None:
-    items = [
-        (_state(prompt_tokens=0), _codes(24)),  # 48 frames, bucket 1
-        (_state(prompt_tokens=0), _codes(25)),  # 50 frames, bucket 1
-        (_state(prompt_tokens=0), _codes(27)),  # 54 frames, bucket 2
-    ]
+def _make_flow_buckets(
+    total_mel_frames: list[int], *, bucket_frames: int = 50
+) -> dict[int, list[stages._PreparedFlowRequest]]:
+    buckets: dict[int, list[stages._PreparedFlowRequest]] = {}
+    for index, total in enumerate(total_mel_frames):
+        bucket_key = (total + bucket_frames - 1) // bucket_frames
+        buckets.setdefault(bucket_key, []).append(
+            stages._PreparedFlowRequest(
+                index=index,
+                sample_rate=24000,
+                flow_input=stages.FlowBatchInput(
+                    token=torch.empty((1, 0), dtype=torch.int32),
+                    prompt_token=torch.empty((1, 0), dtype=torch.int32),
+                    prompt_feat=torch.empty((1, 0, 80)),
+                    embedding=torch.empty((1, 192)),
+                ),
+                total_mel_frames=total,
+            )
+        )
+    return buckets
 
-    _, batch_calls, _ = _run_decode_with_coalescing(
-        monkeypatch,
-        items,
-        span_frames=1,
-        max_added_padding_pct=5,
-    )
 
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [24, 25],
-        [27],
-    ]
-
-
-def test_flow_coalescing_merges_only_adjacent_sorted_baseline_buckets(
-    monkeypatch,
+@pytest.mark.parametrize(
+    ("total_mel_frames", "bucket_frames", "span_frames", "padding_pct", "expected"),
+    [
+        pytest.param(
+            [48, 50, 54],
+            50,
+            1,
+            5,
+            [[48, 50], [54]],
+            id="atomic-baseline-buckets",
+        ),
+        pytest.param(
+            [104, 50, 54],
+            50,
+            64,
+            30,
+            [[50, 54], [104]],
+            id="sort-before-coarsening",
+        ),
+        pytest.param(
+            [50, 94],
+            50,
+            40,
+            100,
+            [[50], [94]],
+            id="span-limit",
+        ),
+        pytest.param(
+            [50, 54],
+            50,
+            64,
+            0,
+            [[50], [54]],
+            id="positive-span-zero-padding",
+        ),
+        pytest.param(
+            [10, 13, 30, 33],
+            10,
+            4,
+            5,
+            [[10], [13], [30, 33]],
+            id="whole-outer-padding-cap",
+        ),
+        pytest.param(
+            [50, 54, 104],
+            50,
+            64,
+            100,
+            [[50, 54, 104]],
+            id="fewest-solves",
+        ),
+        pytest.param(
+            [50, 54, 104],
+            50,
+            64,
+            30,
+            [[50, 54], [104]],
+            id="least-padded-work",
+        ),
+        pytest.param(
+            [10, 10, 20, 40],
+            10,
+            40,
+            30,
+            [[10, 10, 20], [40]],
+            id="smallest-maximum-merge-span",
+        ),
+        pytest.param(
+            [10, 20, 30],
+            10,
+            20,
+            40,
+            [[10], [20, 30]],
+            id="bucket-range-signature",
+        ),
+    ],
+)
+def test_flow_coalescing_policy_directly(
+    total_mel_frames: list[int],
+    bucket_frames: int,
+    span_frames: int,
+    padding_pct: float,
+    expected: list[list[int]],
 ) -> None:
-    # The outer input is intentionally out of bucket order. The adaptive
-    # policy sorts atomic buckets, then can merge only neighboring buckets.
-    items = [
-        (_state(prompt_tokens=0), _codes(52)),  # 104 frames, bucket 3
-        (_state(prompt_tokens=0), _codes(25)),  # 50 frames, bucket 1
-        (_state(prompt_tokens=0), _codes(27)),  # 54 frames, bucket 2
-    ]
-
-    _, batch_calls, _ = _run_decode_with_coalescing(
-        monkeypatch,
-        items,
-        span_frames=64,
-        max_added_padding_pct=30,
+    groups = stages._group_flow_requests(
+        _make_flow_buckets(total_mel_frames, bucket_frames=bucket_frames),
+        coalesce_span_frames=span_frames,
+        coalesce_max_added_padding_pct=padding_pct,
     )
 
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [25, 27],
-        [52],
-    ]
-
-
-def test_flow_coalescing_rejects_merge_over_span_limit(monkeypatch) -> None:
-    items = [
-        (_state(prompt_tokens=0), _codes(25)),  # 50 frames
-        (_state(prompt_tokens=0), _codes(47)),  # 94 frames
-    ]
-
-    _, batch_calls, _ = _run_decode_with_coalescing(
-        monkeypatch,
-        items,
-        span_frames=40,
-        max_added_padding_pct=100,
-    )
-
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [25],
-        [47],
-    ]
-
-
-def test_flow_coalescing_applies_padding_cap_to_whole_outer_batch(monkeypatch) -> None:
-    # The full 50/54/104-frame merge fits the span limit, but its 50% added
-    # work exceeds the 5% cap. Only the first adjacent merge is selected.
-    items = [
-        (_state(prompt_tokens=0), _codes(25)),
-        (_state(prompt_tokens=0), _codes(27)),
-        (_state(prompt_tokens=0), _codes(52)),
-    ]
-
-    _, batch_calls, _ = _run_decode_with_coalescing(
-        monkeypatch,
-        items,
-        span_frames=64,
-        max_added_padding_pct=5,
-    )
-
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [25, 27],
-        [52],
-    ]
-    baseline_work = 50 + 54 + 104
-    selected_work = 2 * 54 + 104
-    assert (selected_work / baseline_work - 1) * 100 <= 5
-
-
-def test_flow_coalescing_prefers_fewer_solves_then_less_padded_work(
-    monkeypatch,
-) -> None:
-    # One solve is over the global padding cap. Both two-solve partitions are
-    # feasible, and merging 50/54 has less padded work than merging 54/104.
-    items = [
-        (_state(prompt_tokens=0), _codes(25)),
-        (_state(prompt_tokens=0), _codes(27)),
-        (_state(prompt_tokens=0), _codes(52)),
-    ]
-
-    _, batch_calls, _ = _run_decode_with_coalescing(
-        monkeypatch,
-        items,
-        span_frames=64,
-        max_added_padding_pct=30,
-    )
-
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [25, 27],
-        [52],
-    ]
-
-
-def test_flow_coalescing_uses_minimum_maximum_new_merge_span(monkeypatch) -> None:
-    # With bucket width 10, the two feasible two-solve partitions have equal
-    # padded work. The first merge has span 10, versus 20 for the second.
-    items = [
-        (_state(prompt_tokens=0), _codes(5)),
-        (_state(prompt_tokens=0), _codes(5)),
-        (_state(prompt_tokens=0), _codes(10)),
-        (_state(prompt_tokens=0), _codes(20)),
-    ]
-
-    _, batch_calls, _ = _run_decode_with_coalescing(
-        monkeypatch,
-        items,
-        bucket_frames=10,
-        span_frames=40,
-        max_added_padding_pct=30,
-    )
-
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [5, 5, 10],
-        [20],
-    ]
-
-
-def test_flow_coalescing_uses_deterministic_bucket_range_signature(monkeypatch) -> None:
-    # The two two-solve candidates tie on work and merge span. The signature
-    # ((1, 1), (2, 3)) wins lexicographically over ((1, 2), (3, 3)).
-    items = [
-        (_state(prompt_tokens=0), _codes(5)),
-        (_state(prompt_tokens=0), _codes(10)),
-        (_state(prompt_tokens=0), _codes(15)),
-    ]
-
-    _, batch_calls, _ = _run_decode_with_coalescing(
-        monkeypatch,
-        items,
-        bucket_frames=10,
-        span_frames=20,
-        max_added_padding_pct=40,
-    )
-
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [5],
-        [10, 15],
-    ]
-
-
-def test_flow_coalescing_uses_supplied_non_s64_configuration(monkeypatch) -> None:
-    items = [
-        (_state(prompt_tokens=0), _codes(25)),
-        (_state(prompt_tokens=0), _codes(27)),
-    ]
-
-    _, batch_calls, _ = _run_decode_with_coalescing(
-        monkeypatch,
-        items,
-        span_frames=40,
-        max_added_padding_pct=3,
-    )
-
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [25],
-        [27],
-    ]
-
-
-def test_flow_coalescing_allows_positive_span_with_zero_padding() -> None:
-    vocoder = stages._CosyVoice3Vocoder(
-        _BatchCapableFakeFlow(),
-        _FakeHiFT(),
-        flow_batch_coalesce_span_frames=64,
-        flow_batch_coalesce_max_added_padding_pct=0,
-    )
-
-    assert vocoder._flow_batch_coalesce_span_frames == 64
-    assert vocoder._flow_batch_coalesce_max_added_padding_pct == 0
+    assert [
+        [request.total_mel_frames for request in group] for group in groups
+    ] == expected
 
 
 def test_decode_batch_preserves_input_order_across_buckets(monkeypatch) -> None:
