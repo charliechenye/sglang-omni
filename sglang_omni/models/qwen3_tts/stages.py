@@ -9,6 +9,7 @@ from typing import Any
 
 import torch
 
+from sglang_omni.models.qwen3_tts import request_builders as _request_builders
 from sglang_omni.models.qwen3_tts.compat import (
     apply_qwen_tts_transformers_compatibility_patches,
 )
@@ -22,6 +23,7 @@ from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     DEFAULT_QWEN3_TTS_STREAM_STRIDE,
     Qwen3TTSStreamingVocoderScheduler,
 )
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 from sglang_omni.scheduling.threaded_simple_scheduler import ThreadedSimpleScheduler
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
@@ -102,6 +104,67 @@ def _load_qwen3_tts_generate_defaults(checkpoint_dir: str) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _tensor_axis_len(value: Any, axis: int) -> int | None:
+    shape = getattr(value, "shape", None)
+    if shape is None:
+        return None
+    try:
+        return int(shape[axis])
+    except (IndexError, TypeError, ValueError):
+        return None
+
+
+def _profiled_preprocess_qwen3_tts_payload(payload):
+    """Issue-23 research probe around the otherwise-unprofiled threaded preprocessor."""
+
+    request_id = str(payload.request_id)
+    _emit_event(
+        request_id=request_id,
+        stage="preprocessing",
+        event_name="qwen3_tts_preprocess_start",
+    )
+    try:
+        result = preprocess_qwen3_tts_payload(payload)
+        with _request_builders._PREPARED_REQUESTS_LOCK:
+            prepared = _request_builders._PREPARED_REQUESTS.get(request_id)
+
+        metadata: dict[str, Any] = {"status": "ok"}
+        if prepared is None:
+            metadata["prepared_request_found"] = False
+        else:
+            metadata.update(
+                {
+                    "prepared_request_found": True,
+                    "text_chars": len(prepared.state.text),
+                    "task_type": prepared.state.task_type,
+                    "non_streaming_mode": bool(prepared.state.non_streaming_mode),
+                    "prompt_embed_tokens": _tensor_axis_len(
+                        prepared.prompt_input_embeds, 0
+                    ),
+                    "prompt_cache_key_tokens": len(prepared.input_ids_list),
+                    "attention_tokens": _tensor_axis_len(prepared.attention_mask, -1),
+                    "trailing_text_tokens": _tensor_axis_len(
+                        prepared.trailing_text_hidden, 0
+                    ),
+                }
+            )
+        _emit_event(
+            request_id=request_id,
+            stage="preprocessing",
+            event_name="qwen3_tts_preprocess_end",
+            metadata=metadata,
+        )
+        return result
+    except BaseException as exc:
+        _emit_event(
+            request_id=request_id,
+            stage="preprocessing",
+            event_name="qwen3_tts_preprocess_end",
+            metadata={"status": "error", "error_type": type(exc).__name__},
+        )
+        raise
+
+
 def create_preprocessing_executor(
     model_path: str,
     *,
@@ -113,7 +176,7 @@ def create_preprocessing_executor(
     # the speech-tokenizer batcher would only ever see batches of one; the
     # default matches the batcher's max_batch_size.
     return ThreadedSimpleScheduler(
-        preprocess_qwen3_tts_payload,
+        _profiled_preprocess_qwen3_tts_payload,
         max_concurrency=max_concurrency,
         abort_callback=cleanup_prepared_qwen3_tts_request,
     )
