@@ -17,6 +17,7 @@ import torch
 
 from sglang_omni.models.qwen3_omni.pending_text_queue import PendingTextTensorQueue
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.models.qwen3_tts.prompt_cache_identity import PromptRowDescriptor
 from sglang_omni.preprocessing.cache_key import hash_bytes as _hash_bytes
 from sglang_omni.preprocessing.cache_key import (
     reference_path_cache_key as _reference_path_cache_key,
@@ -135,6 +136,7 @@ class Qwen3TTSPreparedRequest:
     prompt_input_embeds: torch.Tensor
     tts_pad_embed: torch.Tensor
     gen_kwargs: dict[str, Any]
+    semantic_prompt_rows: tuple[PromptRowDescriptor, ...] | None = None
 
 
 @dataclass
@@ -550,6 +552,38 @@ def _build_qwen3_tts_pad_embed(model: Any) -> torch.Tensor:
         )
 
 
+def _tokenize_qwen3_tts_text_on_cpu(wrapper: Any, text: str) -> torch.Tensor:
+    """Retain the wrapper's processor token IDs before model-device transfer.
+
+    Qwen3TTSModel._tokenize_texts() currently moves its result to the model
+    device.  Calling the same processor directly keeps that exact tokenization
+    contract while retaining the CPU tensor needed by semantic provenance.
+    Test doubles without a processor use the wrapper helper and must already
+    return CPU IDs; production wrappers always expose ``processor``.
+    """
+
+    processor = getattr(wrapper, "processor", None)
+    if processor is None:
+        tokenized = wrapper._tokenize_texts([text])[0]
+    else:
+        encoded = processor(text=[text], return_tensors="pt", padding=True)
+        tokenized = encoded["input_ids"]
+    if not isinstance(tokenized, torch.Tensor):
+        tokenized = torch.as_tensor(tokenized, dtype=torch.long)
+    if tokenized.ndim == 1:
+        tokenized = tokenized.unsqueeze(0)
+    if tokenized.ndim != 2 or tokenized.shape[0] != 1:
+        raise ValueError(
+            "Qwen3-TTS text tokenization must return one [1, T] input_ids tensor"
+        )
+    if tokenized.device.type != "cpu":
+        raise RuntimeError(
+            "Qwen3-TTS semantic provenance requires token IDs retained on CPU "
+            "before prompt construction moves them to the model device"
+        )
+    return tokenized.detach().to(dtype=torch.long)
+
+
 def _build_instruct_id(wrapper: Any, instructions: str | None) -> torch.Tensor | None:
     if not instructions:
         return None
@@ -557,7 +591,7 @@ def _build_instruct_id(wrapper: Any, instructions: str | None) -> torch.Tensor |
         instruct_text = wrapper._build_instruct_text(instructions)
     else:
         instruct_text = f"<|im_start|>user\n{instructions}<|im_end|>\n"
-    return wrapper._tokenize_texts([instruct_text])[0]
+    return _tokenize_qwen3_tts_text_on_cpu(wrapper, instruct_text)
 
 
 def _qwen3_tts_uploaded_voice_cache_key(state: Qwen3TTSState) -> SpeakerCacheKey | None:
@@ -924,6 +958,44 @@ def _qwen3_tts_encoder_config_hash(model: Any, wrapper: Any) -> str:
     return _hash_bytes("|".join(parts).encode("utf-8"))
 
 
+def _qwen3_tts_semantic_reference_identity(
+    state: Qwen3TTSState,
+    *,
+    model: Any,
+    wrapper: Any,
+) -> tuple[str, ...] | None:
+    """Return source/lifecycle identity for Base speaker conditioning.
+
+    The identity deliberately excludes the reference hook's ``options_key``.
+    ``ref_text`` and ``x_vector_only_mode`` select prompt layout, but they do
+    not change the source speaker artifact identity and must not split the
+    speaker row before the prompt's actual text/layout rows do.
+    """
+
+    uploaded_key = _qwen3_tts_uploaded_voice_cache_key(state)
+    if uploaded_key is not None:
+        return (
+            "uploaded_voice",
+            uploaded_key.model_type,
+            uploaded_key.voice_name,
+            str(int(uploaded_key.voice_version)),
+            uploaded_key.artifact_kind,
+        )
+
+    input_key = _qwen3_tts_ref_audio_input_key(state.ref_audio)
+    if input_key is None:
+        return None
+    return (
+        "adhoc_reference",
+        _Qwen3TTSAdhocReferenceHook.model_id,
+        _Qwen3TTSAdhocReferenceHook.encoder_id,
+        _Qwen3TTSAdhocReferenceHook.artifact_kind,
+        input_key,
+        _qwen3_tts_model_revision(model, wrapper),
+        _qwen3_tts_encoder_config_hash(model, wrapper),
+    )
+
+
 def _get_qwen3_tts_adhoc_reference_service_locked(
     model: Any,
     wrapper: Any,
@@ -989,12 +1061,56 @@ def _validate_qwen3_tts_model_task(model: Any, state: Qwen3TTSState) -> None:
         )
 
 
+def _unpack_qwen3_tts_prompt_build_result(
+    result: tuple[Any, ...],
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    tuple[PromptRowDescriptor, ...] | None,
+]:
+    """Accept legacy test doubles while collecting the Phase 2A shadow rows."""
+
+    if len(result) == 4:
+        input_embeds, attention_mask, trailing_text_hidden, ref_code = result
+        semantic_prompt_rows = None
+    elif len(result) == 5:
+        (
+            input_embeds,
+            attention_mask,
+            trailing_text_hidden,
+            ref_code,
+            semantic_prompt_rows,
+        ) = result
+    else:
+        raise ValueError(
+            "Qwen3-TTS prompt builder must return four values, or five values "
+            "including semantic_prompt_rows"
+        )
+    if semantic_prompt_rows is not None:
+        semantic_prompt_rows = tuple(semantic_prompt_rows)
+    return (
+        input_embeds,
+        attention_mask,
+        trailing_text_hidden,
+        ref_code,
+        semantic_prompt_rows,
+    )
+
+
 def _prepare_qwen3_tts_base_request(
     *,
     state: Qwen3TTSState,
     model: Any,
     wrapper: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    tuple[PromptRowDescriptor, ...] | None,
+]:
     speaker_cache = get_speaker_artifact_cache()
     cache_key = _qwen3_tts_uploaded_voice_cache_key(state)
     cached_artifact = speaker_cache.get(cache_key) if cache_key is not None else None
@@ -1030,21 +1146,32 @@ def _prepare_qwen3_tts_base_request(
             ),
         )
 
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
+    input_id = _tokenize_qwen3_tts_text_on_cpu(
+        wrapper, wrapper._build_assistant_text(state.text)
+    )
     ref_id = (
-        wrapper._tokenize_texts([wrapper._build_ref_text(ref_text)])[0]
+        _tokenize_qwen3_tts_text_on_cpu(wrapper, wrapper._build_ref_text(ref_text))
         if ref_text
         else None
     )
     instruct_id = _build_instruct_id(wrapper, state.instructions)
+    semantic_reference_identity = _qwen3_tts_semantic_reference_identity(
+        state,
+        model=model,
+        wrapper=wrapper,
+    )
     with torch.no_grad():
-        return model.build_voice_clone_inputs(
-            input_id=input_id,
-            ref_id=ref_id,
-            voice_clone_prompt=voice_clone_prompt,
-            language=state.language,
-            non_streaming_mode=state.non_streaming_mode,
-            instruct_id=instruct_id,
+        return _unpack_qwen3_tts_prompt_build_result(
+            model.build_voice_clone_inputs(
+                input_id=input_id,
+                ref_id=ref_id,
+                voice_clone_prompt=voice_clone_prompt,
+                language=state.language,
+                non_streaming_mode=state.non_streaming_mode,
+                instruct_id=instruct_id,
+                semantic_reference_identity=semantic_reference_identity,
+                return_semantic_prompt_rows=True,
+            )
         )
 
 
@@ -1053,16 +1180,27 @@ def _prepare_qwen3_tts_custom_voice_request(
     state: Qwen3TTSState,
     model: Any,
     wrapper: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    tuple[PromptRowDescriptor, ...] | None,
+]:
+    input_id = _tokenize_qwen3_tts_text_on_cpu(
+        wrapper, wrapper._build_assistant_text(state.text)
+    )
     instruct_id = _build_instruct_id(wrapper, state.instructions)
     with torch.no_grad():
-        return model.build_custom_voice_inputs(
-            input_id=input_id,
-            voice=state.voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE,
-            language=state.language,
-            non_streaming_mode=state.non_streaming_mode,
-            instruct_id=instruct_id,
+        return _unpack_qwen3_tts_prompt_build_result(
+            model.build_custom_voice_inputs(
+                input_id=input_id,
+                voice=state.voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE,
+                language=state.language,
+                non_streaming_mode=state.non_streaming_mode,
+                instruct_id=instruct_id,
+                return_semantic_prompt_rows=True,
+            )
         )
 
 
@@ -1071,15 +1209,26 @@ def _prepare_qwen3_tts_voice_design_request(
     state: Qwen3TTSState,
     model: Any,
     wrapper: Any,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor | None,
+    tuple[PromptRowDescriptor, ...] | None,
+]:
+    input_id = _tokenize_qwen3_tts_text_on_cpu(
+        wrapper, wrapper._build_assistant_text(state.text)
+    )
     instruct_id = _build_instruct_id(wrapper, state.instructions)
     with torch.no_grad():
-        return model.build_voice_design_inputs(
-            input_id=input_id,
-            language=state.language,
-            non_streaming_mode=state.non_streaming_mode,
-            instruct_id=instruct_id,
+        return _unpack_qwen3_tts_prompt_build_result(
+            model.build_voice_design_inputs(
+                input_id=input_id,
+                language=state.language,
+                non_streaming_mode=state.non_streaming_mode,
+                instruct_id=instruct_id,
+                return_semantic_prompt_rows=True,
+            )
         )
 
 
@@ -1102,6 +1251,7 @@ def _prepare_qwen3_tts_request(
             attention_mask,
             trailing_text_hidden,
             ref_code,
+            semantic_prompt_rows,
         ) = _prepare_qwen3_tts_base_request(
             state=state,
             model=model,
@@ -1113,6 +1263,7 @@ def _prepare_qwen3_tts_request(
             attention_mask,
             trailing_text_hidden,
             ref_code,
+            semantic_prompt_rows,
         ) = _prepare_qwen3_tts_custom_voice_request(
             state=state,
             model=model,
@@ -1124,6 +1275,7 @@ def _prepare_qwen3_tts_request(
             attention_mask,
             trailing_text_hidden,
             ref_code,
+            semantic_prompt_rows,
         ) = _prepare_qwen3_tts_voice_design_request(
             state=state,
             model=model,
@@ -1141,6 +1293,13 @@ def _prepare_qwen3_tts_request(
             dtype=feedback_buffer.dtype,
         )
     )
+    if semantic_prompt_rows is not None and len(semantic_prompt_rows) != int(
+        input_embeds.shape[1]
+    ):
+        raise RuntimeError(
+            "Qwen3-TTS semantic prompt rows must match the real prompt row count: "
+            f"rows={len(semantic_prompt_rows)}, embeddings={input_embeds.shape[1]}"
+        )
     input_ids_list = build_embedding_cache_key_ids(prompt_input_embeds)
     input_ids = torch.tensor(input_ids_list, dtype=torch.long)
     trailing_text_hidden = (
@@ -1164,6 +1323,7 @@ def _prepare_qwen3_tts_request(
         prompt_input_embeds=prompt_input_embeds,
         tts_pad_embed=_build_qwen3_tts_pad_embed(model),
         gen_kwargs=gen_kwargs,
+        semantic_prompt_rows=semantic_prompt_rows,
     )
 
 

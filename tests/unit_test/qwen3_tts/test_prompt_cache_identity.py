@@ -9,8 +9,11 @@ import pytest
 import torch
 from torch import nn
 
+from sglang_omni.models.qwen3_tts import request_builders
+from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
 from sglang_omni.models.qwen3_tts.prompt_cache_identity import (
     PromptCacheNamespace,
+    PromptRowDescriptor,
     Qwen3TTSPromptConfig,
     Qwen3TTSPromptRequest,
     build_qwen3_tts_prompt_cache_identity,
@@ -18,6 +21,11 @@ from sglang_omni.models.qwen3_tts.prompt_cache_identity import (
 )
 from sglang_omni.models.qwen3_tts.request_builders import build_embedding_cache_key_ids
 from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling.speaker_cache import (
+    SpeakerCacheKey,
+    get_speaker_artifact_cache,
+)
 
 CONFIG = Qwen3TTSPromptConfig(
     tts_bos_token_id=1,
@@ -106,6 +114,7 @@ class _TinyPromptModel(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
+        self._feedback_buffer = torch.empty((1, HIDDEN_SIZE))
         self.codec_embedding = nn.Embedding(1000, HIDDEN_SIZE)
         self.text_embedding = nn.Embedding(1000, HIDDEN_SIZE)
         _fill_embedding(
@@ -148,10 +157,11 @@ class _TinyCodePredictor(nn.Module):
 class _TinyQwen3TTSTalker(Qwen3TTSTalker):
     """Use Qwen3TTSTalker's prompt construction with tiny CPU-only modules."""
 
-    def __init__(self) -> None:
+    def __init__(self, model_type: str = "base") -> None:
         # Bypass the production constructor: it allocates the full transformer,
         # speaker encoder, predictor buffers, and CUDA-specific runtime state.
         nn.Module.__init__(self)
+        self.tts_model_type = model_type
         self.root_config = SimpleNamespace(
             tts_bos_token_id=1,
             tts_eos_token_id=2,
@@ -185,6 +195,49 @@ _SPEAKER_EMBEDS = {
     REFERENCE_AUDIO_KEY: _speaker_embedding(50_000),
     "bytes:other-reference": _speaker_embedding(60_000),
 }
+
+
+class _Phase2Processor:
+    """Small processor double matching Qwen3TTSModel's processor call shape."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, *, text, return_tensors, padding):
+        assert return_tensors == "pt"
+        assert padding is True
+        assert len(text) == 1
+        source = text[0]
+        self.calls.append(tuple(text))
+        if source.startswith("assistant:"):
+            ids = [*ROLE_IDS, *TARGET_IDS, 900, 901, 902, 903, 904]
+        elif source.startswith("ref:"):
+            ids = [*ROLE_IDS, *REFERENCE_TEXT_IDS, 703, 704]
+        elif source.startswith("instruct:"):
+            ids = [500, 501]
+        else:
+            raise AssertionError(f"unexpected processor input: {source!r}")
+        return {"input_ids": torch.tensor([ids], dtype=torch.long)}
+
+
+class _Phase2Wrapper:
+    def __init__(self) -> None:
+        self.processor = _Phase2Processor()
+
+    def _tokenize_texts(self, texts):
+        raise AssertionError("production should use processor before device transfer")
+
+    def _build_assistant_text(self, text):
+        return f"assistant:{text}"
+
+    def _build_ref_text(self, text):
+        return f"ref:{text}"
+
+    def _build_instruct_text(self, text):
+        return f"instruct:{text}"
+
+    def _merge_generate_kwargs(self, **kwargs):
+        return kwargs
 
 
 def _tokenized_text(
@@ -241,6 +294,79 @@ def _build_real_prompt_embeddings(request: Qwen3TTSPromptRequest) -> torch.Tenso
                 instruct_id=instruct_id,
             )
     return prompt_embeddings.squeeze(0).detach()
+
+
+def _build_real_prompt_with_semantic_rows(
+    request: Qwen3TTSPromptRequest,
+) -> tuple[torch.Tensor, tuple[PromptRowDescriptor, ...]]:
+    talker = _TinyQwen3TTSTalker(
+        model_type={
+            "Base": "base",
+            "CustomVoice": "custom_voice",
+            "VoiceDesign": "voice_design",
+        }[request.task_type]
+    )
+    input_id = _tokenized_text(request.target_text_ids, (900, 901, 902, 903, 904))
+    instruct_id = (
+        torch.tensor([list(request.instruction_text_ids)], dtype=torch.long)
+        if request.instruction_text_ids
+        else None
+    )
+    reference_identity = (
+        "adhoc_reference",
+        "qwen3_tts",
+        "qwen3_tts_voice_clone_prompt",
+        "qwen3_tts_voice_clone_prompt_adhoc",
+        request.reference_audio_key or "",
+        "fixture-model",
+        "fixture-encoder",
+    )
+
+    with torch.inference_mode():
+        if request.task_type == "Base":
+            assert request.reference_audio_key is not None
+            ref_id = _tokenized_text(request.reference_text_ids, (703, 704))
+            voice_clone_prompt = {
+                "ref_spk_embedding": [
+                    _SPEAKER_EMBEDS[request.reference_audio_key].clone()
+                ],
+                "icl_mode": [not request.x_vector_only_mode],
+            }
+            if not request.x_vector_only_mode:
+                voice_clone_prompt["ref_code"] = [
+                    torch.tensor(request.reference_code_frames, dtype=torch.long)
+                ]
+            result = talker.build_voice_clone_inputs(
+                input_id=input_id,
+                ref_id=ref_id,
+                voice_clone_prompt=voice_clone_prompt,
+                language=request.language,
+                non_streaming_mode=request.non_streaming_mode,
+                instruct_id=instruct_id,
+                semantic_reference_identity=reference_identity,
+                return_semantic_prompt_rows=True,
+            )
+        elif request.task_type == "CustomVoice":
+            assert request.voice is not None
+            result = talker.build_custom_voice_inputs(
+                input_id=input_id,
+                voice=request.voice,
+                language=request.language,
+                non_streaming_mode=request.non_streaming_mode,
+                instruct_id=instruct_id,
+                return_semantic_prompt_rows=True,
+            )
+        else:
+            result = talker.build_voice_design_inputs(
+                input_id=input_id,
+                language=request.language,
+                non_streaming_mode=request.non_streaming_mode,
+                instruct_id=instruct_id,
+                return_semantic_prompt_rows=True,
+            )
+    prompt_embeddings, _, _, _, semantic_rows = result
+    assert semantic_rows is not None
+    return prompt_embeddings.squeeze(0).detach(), semantic_rows
 
 
 def _old_embedding_lcp(
@@ -616,3 +742,337 @@ def test_semantic_identity_does_not_include_generation_or_weight_state() -> None
 
     assert "weight" not in identity.namespace.to_key()
     assert identity == _identity(_xvector_request())
+
+
+def _phase2_payload(
+    *,
+    inputs,
+    request_id: str = "phase2-request",
+    params: dict | None = None,
+    tts_params: dict | None = None,
+) -> StagePayload:
+    return StagePayload(
+        request_id=request_id,
+        request=OmniRequest(
+            inputs=inputs,
+            params=params or {},
+            metadata={"tts_params": tts_params or {}},
+        ),
+        data={},
+    )
+
+
+def _put_phase2_uploaded_prompt(*, x_vector_only_mode: bool) -> None:
+    cache = get_speaker_artifact_cache()
+    cache.put(
+        SpeakerCacheKey(
+            model_type=("qwen3_tts_xvec" if x_vector_only_mode else "qwen3_tts_icl"),
+            voice_name="guide",
+            voice_version=7,
+            artifact_kind="voice_clone_prompt",
+        ),
+        {
+            "artifact_type": "qwen3_tts_voice_clone_prompt",
+            "ref_spk_embedding": [_SPEAKER_EMBEDS[REFERENCE_AUDIO_KEY].clone()],
+            "icl_mode": [not x_vector_only_mode],
+            **(
+                {
+                    "ref_code": [torch.tensor(REFERENCE_CODE_FRAMES, dtype=torch.long)],
+                    "ref_text": "reference",
+                }
+                if not x_vector_only_mode
+                else {}
+            ),
+        },
+    )
+
+
+def _phase2_base_inputs(*, x_vector_only_mode: bool) -> dict:
+    reference = {"audio_path": "voice.wav"}
+    if not x_vector_only_mode:
+        reference["text"] = "reference"
+    return {"text": "target", "references": [reference]}
+
+
+def test_phase2_real_preparation_emits_rows_for_all_task_paths() -> None:
+    cache = get_speaker_artifact_cache()
+    cache.clear()
+    _put_phase2_uploaded_prompt(x_vector_only_mode=False)
+    _put_phase2_uploaded_prompt(x_vector_only_mode=True)
+    try:
+        cases = (
+            (
+                _phase2_base_inputs(x_vector_only_mode=False),
+                {
+                    "task_type": "Base",
+                    "uploaded_voice_name": "guide",
+                    "uploaded_voice_created_at": 7,
+                },
+                "base",
+            ),
+            (
+                _phase2_base_inputs(x_vector_only_mode=True),
+                {
+                    "task_type": "Base",
+                    "x_vector_only_mode": True,
+                    "uploaded_voice_name": "guide",
+                    "uploaded_voice_created_at": 7,
+                },
+                "base",
+            ),
+            (
+                "target",
+                {
+                    "task_type": "CustomVoice",
+                    "voice": "Ryan",
+                    "instructions": "calm",
+                },
+                "custom_voice",
+            ),
+            (
+                "target",
+                {
+                    "task_type": "VoiceDesign",
+                    "instructions": "A warm adult voice.",
+                },
+                "voice_design",
+            ),
+        )
+        for inputs, tts_params, model_type in cases:
+            prepared = request_builders._prepare_qwen3_tts_request(
+                _phase2_payload(inputs=inputs, tts_params=tts_params),
+                model=_TinyQwen3TTSTalker(model_type=model_type),
+                wrapper=_Phase2Wrapper(),
+            )
+            assert prepared.semantic_prompt_rows
+            assert (
+                len(prepared.semantic_prompt_rows)
+                == prepared.prompt_input_embeds.shape[0]
+            )
+    finally:
+        cache.clear()
+
+
+def test_phase2_provenance_cross_checks_phase1_at_prompt_boundaries() -> None:
+    cases = (
+        (_base_request(), _base_request(target_text_ids=(999, 201, 202))),
+        (_base_request(), _base_request(target_text_ids=(200, 999, 202))),
+        (
+            _base_request(reference_code_frames=((400, 401, 402),)),
+            _base_request(),
+        ),
+        (_xvector_request(), _xvector_request(target_text_ids=(999, 201, 202))),
+        (_custom_request(language="en"), _custom_request(language="en", voice="Alice")),
+        (
+            _design_request(instruction_text_ids=(500, 501)),
+            _design_request(instruction_text_ids=(500, 999)),
+        ),
+    )
+    for left, right in cases:
+        _, left_rows = _build_real_prompt_with_semantic_rows(left)
+        _, right_rows = _build_real_prompt_with_semantic_rows(right)
+        production_lcp = 0
+        for production_left, production_right in zip(left_rows, right_rows):
+            if production_left != production_right:
+                break
+            production_lcp += 1
+        assert production_lcp == _identity(left).lcp_length(_identity(right))
+
+
+def test_phase2_generation_and_output_fields_are_prompt_neutral() -> None:
+    baseline_params = {
+        "task_type": "CustomVoice",
+        "voice": "Ryan",
+        "instructions": "calm",
+    }
+    baseline = request_builders._prepare_qwen3_tts_request(
+        _phase2_payload(inputs="target", tts_params=baseline_params),
+        model=_TinyQwen3TTSTalker(model_type="custom_voice"),
+        wrapper=_Phase2Wrapper(),
+    ).semantic_prompt_rows
+    assert baseline
+
+    variants = (
+        {"request_id": "different-request"},
+        {"tts_params": {"seed": 123}},
+        {"params": {"do_sample": False}},
+        {"params": {"temperature": 0.37}},
+        {"params": {"top_p": 0.63}},
+        {"params": {"top_k": 17}},
+        {"params": {"repetition_penalty": 1.23}},
+        {"params": {"max_new_tokens": 77}},
+        {"params": {"subtalker_dosample": False}},
+        {"params": {"subtalker_temperature": 0.41}},
+        {"params": {"subtalker_top_p": 0.67}},
+        {"params": {"subtalker_top_k": 13}},
+        {"params": {"stream_codec_output": False}},
+    )
+    for variant in variants:
+        tts_params = dict(baseline_params)
+        tts_params.update(variant.get("tts_params", {}))
+        prepared = request_builders._prepare_qwen3_tts_request(
+            _phase2_payload(
+                inputs="target",
+                request_id=variant.get("request_id", "phase2-request"),
+                params=variant.get("params"),
+                tts_params=tts_params,
+            ),
+            model=_TinyQwen3TTSTalker(model_type="custom_voice"),
+            wrapper=_Phase2Wrapper(),
+        )
+        assert prepared.semantic_prompt_rows == baseline
+
+
+def test_phase2_stream_codec_output_does_not_split_base_icl_provenance() -> None:
+    cache = get_speaker_artifact_cache()
+    cache.clear()
+    _put_phase2_uploaded_prompt(x_vector_only_mode=False)
+    try:
+        rows = []
+        for stream_codec_output in (True, False):
+            prepared = request_builders._prepare_qwen3_tts_request(
+                _phase2_payload(
+                    inputs=_phase2_base_inputs(x_vector_only_mode=False),
+                    tts_params={
+                        "task_type": "Base",
+                        "uploaded_voice_name": "guide",
+                        "uploaded_voice_created_at": 7,
+                        "stream_codec_output": stream_codec_output,
+                    },
+                ),
+                model=_TinyQwen3TTSTalker(model_type="base"),
+                wrapper=_Phase2Wrapper(),
+            )
+            assert prepared.semantic_prompt_rows
+            rows.append(prepared.semantic_prompt_rows)
+        assert rows[0] == rows[1]
+    finally:
+        cache.clear()
+
+
+def test_phase2_non_streaming_mode_changes_base_prompt_rows() -> None:
+    cache = get_speaker_artifact_cache()
+    cache.clear()
+    _put_phase2_uploaded_prompt(x_vector_only_mode=True)
+    try:
+        rows = []
+        for non_streaming_mode in (False, True):
+            prepared = request_builders._prepare_qwen3_tts_request(
+                _phase2_payload(
+                    inputs=_phase2_base_inputs(x_vector_only_mode=True),
+                    tts_params={
+                        "task_type": "Base",
+                        "x_vector_only_mode": True,
+                        "uploaded_voice_name": "guide",
+                        "uploaded_voice_created_at": 7,
+                        "non_streaming_mode": non_streaming_mode,
+                    },
+                ),
+                model=_TinyQwen3TTSTalker(model_type="base"),
+                wrapper=_Phase2Wrapper(),
+            )
+            assert prepared.semantic_prompt_rows
+            rows.append(prepared.semantic_prompt_rows)
+        assert rows[0] != rows[1]
+    finally:
+        cache.clear()
+
+
+def test_phase2_reference_identity_fails_closed_for_unsafe_sources(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeReferenceService:
+        def get_or_encode(self, state, *, desc):
+            del desc
+            return (
+                {
+                    "ref_code": [None],
+                    "ref_spk_embedding": [_SPEAKER_EMBEDS[REFERENCE_AUDIO_KEY].clone()],
+                    "icl_mode": [False],
+                },
+                state.ref_text,
+            )
+
+    monkeypatch.setattr(
+        request_builders,
+        "_get_qwen3_tts_adhoc_reference_service",
+        lambda model, wrapper: FakeReferenceService(),
+    )
+
+    def prepare(ref_audio: str) -> request_builders.Qwen3TTSPreparedRequest:
+        return request_builders._prepare_qwen3_tts_request(
+            _phase2_payload(
+                inputs={
+                    "text": "target",
+                    "references": [{"audio_path": ref_audio, "text": "reference"}],
+                },
+                tts_params={
+                    "task_type": "Base",
+                    "x_vector_only_mode": True,
+                },
+            ),
+            model=_TinyQwen3TTSTalker(model_type="base"),
+            wrapper=_Phase2Wrapper(),
+        )
+
+    unsafe = prepare("https://example.invalid/reference.wav")
+    assert unsafe.semantic_prompt_rows is None
+    assert unsafe.input_ids_list == build_embedding_cache_key_ids(
+        unsafe.prompt_input_embeds
+    )
+
+    safe_path = tmp_path / "reference.wav"
+    safe_path.write_bytes(b"content-addressed reference")
+    safe = prepare(str(safe_path))
+    assert safe.semantic_prompt_rows
+    assert safe.input_ids_list == build_embedding_cache_key_ids(
+        safe.prompt_input_embeds
+    )
+
+
+def test_phase2_reference_identity_excludes_prompt_options() -> None:
+    first = request_builders._qwen3_tts_semantic_reference_identity(
+        Qwen3TTSState(
+            ref_audio=b"reference",
+            ref_text="first transcript",
+            x_vector_only_mode=False,
+        ),
+        model=SimpleNamespace(),
+        wrapper=SimpleNamespace(),
+    )
+    second = request_builders._qwen3_tts_semantic_reference_identity(
+        Qwen3TTSState(
+            ref_audio=b"reference",
+            ref_text="different transcript",
+            x_vector_only_mode=True,
+        ),
+        model=SimpleNamespace(),
+        wrapper=SimpleNamespace(),
+    )
+
+    assert first == second
+    assert first is not None
+    assert "first transcript" not in first
+    assert "different transcript" not in first
+
+
+def test_phase2_reference_code_semantics_use_shape_only() -> None:
+    from sglang_omni.models.qwen3_tts.sglang_model import (
+        _semantic_reference_frame_count,
+    )
+
+    class ShapeOnlyReferenceCode:
+        ndim = 2
+        shape = (3, 3)
+
+        def cpu(self):
+            raise AssertionError("semantic identity must not call ref_code.cpu()")
+
+        def tolist(self):
+            raise AssertionError("semantic identity must not call ref_code.tolist()")
+
+        def numpy(self):
+            raise AssertionError("semantic identity must not call ref_code.numpy()")
+
+    assert _semantic_reference_frame_count(ShapeOnlyReferenceCode()) == 3
