@@ -44,6 +44,12 @@ TARGET_IDS = (200, 201, 202)
 REFERENCE_AUDIO_KEY = "bytes:fixture-reference"
 REFERENCE_TEXT_IDS = (300, 301)
 REFERENCE_CODE_FRAMES = ((400, 401, 402), (410, 411, 412))
+HIDDEN_SIZE = 24
+TEXT_EMBED_OFFSET = 0
+MAIN_CODEC_EMBED_OFFSET = 4
+PREDICTOR_GROUP_1_EMBED_OFFSET = 8
+PREDICTOR_GROUP_2_EMBED_OFFSET = 12
+SPEAKER_EMBED_OFFSET = 16
 
 
 def _base_request(**changes: object) -> Qwen3TTSPromptRequest:
@@ -87,11 +93,12 @@ def _identity(request: Qwen3TTSPromptRequest):
     return build_qwen3_tts_prompt_cache_identity(request, CONFIG, namespace=NAMESPACE)
 
 
-def _fill_embedding(embedding: nn.Embedding, base: float) -> None:
+def _fill_embedding(embedding: nn.Embedding, *, base: float, offset: int) -> None:
     with torch.no_grad():
         ids = torch.arange(embedding.num_embeddings, dtype=torch.float32).unsqueeze(1)
-        offsets = torch.arange(embedding.embedding_dim, dtype=torch.float32)
-        embedding.weight.copy_(base + ids * 10 + offsets)
+        embedding.weight.zero_()
+        embedding.weight[:, offset] = (base + ids).squeeze(1)
+        embedding.weight[:, offset + 1] = ids.squeeze(1)
 
 
 class _TinyPromptModel(nn.Module):
@@ -99,10 +106,18 @@ class _TinyPromptModel(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.codec_embedding = nn.Embedding(1000, 8)
-        self.text_embedding = nn.Embedding(1000, 8)
-        _fill_embedding(self.codec_embedding, 1_000)
-        _fill_embedding(self.text_embedding, 100)
+        self.codec_embedding = nn.Embedding(1000, HIDDEN_SIZE)
+        self.text_embedding = nn.Embedding(1000, HIDDEN_SIZE)
+        _fill_embedding(
+            self.codec_embedding,
+            base=1_000,
+            offset=MAIN_CODEC_EMBED_OFFSET,
+        )
+        _fill_embedding(
+            self.text_embedding,
+            base=100,
+            offset=TEXT_EMBED_OFFSET,
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.codec_embedding
@@ -116,10 +131,18 @@ class _TinyCodePredictor(nn.Module):
         super().__init__()
         self.model = nn.Module()
         self.model.codec_embedding = nn.ModuleList(
-            [nn.Embedding(1000, 8), nn.Embedding(1000, 8)]
+            [nn.Embedding(1000, HIDDEN_SIZE), nn.Embedding(1000, HIDDEN_SIZE)]
         )
-        _fill_embedding(self.model.codec_embedding[0], 10_000)
-        _fill_embedding(self.model.codec_embedding[1], 20_000)
+        _fill_embedding(
+            self.model.codec_embedding[0],
+            base=10_000,
+            offset=PREDICTOR_GROUP_1_EMBED_OFFSET,
+        )
+        _fill_embedding(
+            self.model.codec_embedding[1],
+            base=20_000,
+            offset=PREDICTOR_GROUP_2_EMBED_OFFSET,
+        )
 
 
 class _TinyQwen3TTSTalker(Qwen3TTSTalker):
@@ -151,39 +174,16 @@ class _TinyQwen3TTSTalker(Qwen3TTSTalker):
         self.code_predictor = _TinyCodePredictor()
 
 
+def _speaker_embedding(value: float) -> torch.Tensor:
+    embedding = torch.zeros((1, 1, HIDDEN_SIZE), dtype=torch.float32)
+    embedding[..., SPEAKER_EMBED_OFFSET] = value
+    embedding[..., SPEAKER_EMBED_OFFSET + 1] = value + 1
+    return embedding
+
+
 _SPEAKER_EMBEDS = {
-    REFERENCE_AUDIO_KEY: torch.tensor(
-        [
-            [
-                [
-                    50_000.0,
-                    50_001.0,
-                    50_002.0,
-                    50_003.0,
-                    50_004.0,
-                    50_005.0,
-                    50_006.0,
-                    50_007.0,
-                ]
-            ]
-        ]
-    ),
-    "bytes:other-reference": torch.tensor(
-        [
-            [
-                [
-                    60_000.0,
-                    60_001.0,
-                    60_002.0,
-                    60_003.0,
-                    60_004.0,
-                    60_005.0,
-                    60_006.0,
-                    60_007.0,
-                ]
-            ]
-        ]
-    ),
+    REFERENCE_AUDIO_KEY: _speaker_embedding(50_000),
+    "bytes:other-reference": _speaker_embedding(60_000),
 }
 
 
@@ -259,13 +259,41 @@ def _old_embedding_lcp(
 
 
 def assert_prompt_lcp_equivalent(
-    left_request: Qwen3TTSPromptRequest, right_request: Qwen3TTSPromptRequest
-) -> None:
-    """Compare semantic rows with hashes of actual prompt-builder outputs."""
+    left_request: Qwen3TTSPromptRequest,
+    right_request: Qwen3TTSPromptRequest,
+    *,
+    expected_lcp: int | None = None,
+) -> tuple[int, int]:
+    """Compare old real-builder and new semantic LCPs against the contract."""
 
-    expected = _identity(left_request).lcp_length(_identity(right_request))
-    actual = _old_embedding_lcp(left_request, right_request)
-    assert actual == expected, f"real-builder LCP={actual}, semantic LCP={expected}"
+    old_lcp = _old_embedding_lcp(left_request, right_request)
+    new_lcp = _identity(left_request).lcp_length(_identity(right_request))
+    assert old_lcp == new_lcp, f"old LCP={old_lcp}, new LCP={new_lcp}"
+    if expected_lcp is not None:
+        assert (
+            old_lcp == expected_lcp
+        ), f"old LCP={old_lcp}, expected LCP={expected_lcp}"
+        assert (
+            new_lcp == expected_lcp
+        ), f"new LCP={new_lcp}, expected LCP={expected_lcp}"
+    return old_lcp, new_lcp
+
+
+def test_fixture_separates_additive_component_subspaces() -> None:
+    talker = _TinyQwen3TTSTalker()
+    text_embedding = talker.get_text_embeddings()
+    codec_embedding = talker.get_input_embeddings()
+
+    # The removed linear fixture made these two sums equal:
+    # (100 + 200 * 10) + (1000 + 5 * 10) ==
+    # (100 + 201 * 10) + (1000 + 4 * 10).
+    old_linear_left = (100 + 200 * 10) + (1_000 + 5 * 10)
+    old_linear_right = (100 + 201 * 10) + (1_000 + 4 * 10)
+    assert old_linear_left == old_linear_right
+
+    left = text_embedding(torch.tensor([[200]])) + codec_embedding(torch.tensor([[5]]))
+    right = text_embedding(torch.tensor([[201]])) + codec_embedding(torch.tensor([[4]]))
+    assert not torch.equal(left, right)
 
 
 def test_real_builder_has_stable_rows_for_all_task_variants() -> None:
@@ -288,16 +316,18 @@ def test_real_builder_has_stable_rows_for_all_task_variants() -> None:
 
 
 @pytest.mark.parametrize(
-    ("left", "right"),
+    ("left", "right", "expected_lcp"),
     [
         pytest.param(
             _base_request(),
             _base_request(reference_text_ids=(999, 301)),
+            8,
             id="base-icl-streaming-reference-text",
         ),
         pytest.param(
             _base_request(),
             _base_request(reference_code_frames=((999, 401, 402), (410, 411, 412))),
+            9,
             id="base-icl-streaming-reference-code",
         ),
         pytest.param(
@@ -306,6 +336,7 @@ def test_real_builder_has_stable_rows_for_all_task_variants() -> None:
                 non_streaming_mode=True,
                 reference_text_ids=(999, 301),
             ),
+            8,
             id="base-icl-non-streaming-reference-text",
         ),
         pytest.param(
@@ -314,16 +345,61 @@ def test_real_builder_has_stable_rows_for_all_task_variants() -> None:
                 non_streaming_mode=True,
                 reference_code_frames=((999, 401, 402), (410, 411, 412)),
             ),
+            15,
             id="base-icl-non-streaming-reference-code",
+        ),
+        pytest.param(
+            _base_request(),
+            _base_request(target_text_ids=(999, 201, 202)),
+            10,
+            id="base-icl-streaming-target-before-codec-boundary",
+        ),
+        pytest.param(
+            _base_request(),
+            _base_request(target_text_ids=(200, 999, 202)),
+            11,
+            id="base-icl-streaming-target-after-codec-boundary",
+        ),
+        pytest.param(
+            _base_request(non_streaming_mode=True),
+            _base_request(
+                non_streaming_mode=True,
+                target_text_ids=(200, 999, 202),
+            ),
+            11,
+            id="base-icl-non-streaming-target",
+        ),
+        pytest.param(
+            _base_request(non_streaming_mode=True),
+            _base_request(
+                non_streaming_mode=True,
+                target_text_ids=(200, 201),
+            ),
+            12,
+            id="base-icl-non-streaming-target-length",
+        ),
+        pytest.param(
+            _base_request(language="en"),
+            _base_request(language="zh"),
+            5,
+            id="base-icl-language",
+        ),
+        pytest.param(
+            _base_request(instruction_text_ids=(500, 501)),
+            _base_request(instruction_text_ids=(500, 999)),
+            1,
+            id="base-icl-instruction",
         ),
         pytest.param(
             _xvector_request(),
             _xvector_request(target_text_ids=(200, 201, 999)),
+            9,
             id="base-x-vector-streaming-trailing-target",
         ),
         pytest.param(
             _xvector_request(),
             _xvector_request(target_text_ids=(999, 201, 202)),
+            8,
             id="base-x-vector-streaming-first-target",
         ),
         pytest.param(
@@ -332,52 +408,94 @@ def test_real_builder_has_stable_rows_for_all_task_variants() -> None:
                 non_streaming_mode=True,
                 target_text_ids=(200, 999, 202),
             ),
+            9,
             id="base-x-vector-non-streaming-target",
+        ),
+        pytest.param(
+            _xvector_request(language="en"),
+            _xvector_request(language="zh"),
+            5,
+            id="base-x-vector-language",
+        ),
+        pytest.param(
+            _xvector_request(instruction_text_ids=(500, 501)),
+            _xvector_request(instruction_text_ids=(500, 999)),
+            1,
+            id="base-x-vector-instruction",
+        ),
+        pytest.param(
+            _xvector_request(non_streaming_mode=True),
+            _xvector_request(
+                non_streaming_mode=True,
+                target_text_ids=(200, 201),
+            ),
+            10,
+            id="base-x-vector-non-streaming-target-length",
         ),
         pytest.param(
             _custom_request(language="en"),
             _custom_request(language="zh"),
+            5,
             id="custom-voice-language",
         ),
         pytest.param(
             _custom_request(language="en"),
             _custom_request(language="en", voice="Alice"),
+            7,
             id="custom-voice-speaker",
         ),
         pytest.param(
             _custom_request(language="en", instruction_text_ids=(500, 501)),
             _custom_request(language="en", instruction_text_ids=(500, 999)),
+            1,
             id="custom-voice-instruction",
+        ),
+        pytest.param(
+            _custom_request(language="en"),
+            _custom_request(language="en", target_text_ids=(200, 999, 202)),
+            10,
+            id="custom-voice-target",
         ),
         pytest.param(
             _design_request(),
             _design_request(instruction_text_ids=(500, 999)),
+            1,
             id="voice-design-instruction",
         ),
         pytest.param(
             _design_request(),
             _design_request(target_text_ids=(200, 999, 202)),
+            11,
             id="voice-design-target",
+        ),
+        pytest.param(
+            _design_request(language="en"),
+            _design_request(language="zh"),
+            7,
+            id="voice-design-language",
         ),
         pytest.param(
             _custom_request(language="auto"),
             _custom_request(language="dialect"),
+            14,
             id="custom-voice-auto-dialect",
         ),
         pytest.param(
             _custom_request(language="auto"),
             _custom_request(language="en"),
+            5,
             id="custom-voice-auto-explicit-language",
         ),
         pytest.param(
             _xvector_request(),
             _xvector_request(reference_audio_key="bytes:other-reference"),
+            6,
             id="base-x-vector-reference-source",
         ),
     ],
 )
-def test_semantic_lcp_matches_real_builder_hashes(left, right) -> None:
-    assert_prompt_lcp_equivalent(left, right)
+def test_semantic_lcp_matches_real_builder_hashes(left, right, expected_lcp) -> None:
+    assert_prompt_lcp_equivalent(left, right, expected_lcp=expected_lcp)
 
 
 def test_icl_reference_code_length_preserves_streaming_prefix_boundary() -> None:
@@ -385,7 +503,7 @@ def test_icl_reference_code_length_preserves_streaming_prefix_boundary() -> None
     two_frames = _base_request()
 
     assert _identity(one_frame).is_prefix_of(_identity(two_frames))
-    assert_prompt_lcp_equivalent(one_frame, two_frames)
+    assert_prompt_lcp_equivalent(one_frame, two_frames, expected_lcp=10)
 
 
 def test_streaming_and_non_streaming_share_only_conditioned_prefix() -> None:
@@ -395,7 +513,7 @@ def test_streaming_and_non_streaming_share_only_conditioned_prefix() -> None:
     assert _identity(streaming).lcp_length(_identity(non_streaming)) == (
         len(_identity(streaming).rows) - 1
     )
-    assert_prompt_lcp_equivalent(streaming, non_streaming)
+    assert_prompt_lcp_equivalent(streaming, non_streaming, expected_lcp=8)
 
 
 def test_instructions_are_prepended_and_cannot_false_share() -> None:
@@ -404,7 +522,9 @@ def test_instructions_are_prepended_and_cannot_false_share() -> None:
 
     assert without_instruction.lcp_length(with_instruction) == 0
     assert_prompt_lcp_equivalent(
-        _custom_request(), _custom_request(instruction_text_ids=(500,))
+        _custom_request(),
+        _custom_request(instruction_text_ids=(500,)),
+        expected_lcp=0,
     )
 
 
