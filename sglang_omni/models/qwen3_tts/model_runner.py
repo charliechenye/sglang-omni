@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import torch
@@ -14,6 +15,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     attach_omni_prefill_inputs,
 )
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
+from sglang_omni.profiler.event_recorder import emit as _emit_request_event
 from sglang_omni.scheduling.types import RequestOutput
 
 
@@ -40,6 +42,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         super().__init__(tp_worker, output_processor)
         self._has_pending_code_step = False
         self._row_ids_cache: torch.Tensor | None = None
+        self._pending_mixed_codec_probe: dict[str, Any] | None = None
 
     def _execution_context(
         self,
@@ -93,7 +96,44 @@ class Qwen3TTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
+        self._pending_mixed_codec_probe = None
         self._collect_codes(result, forward_batch, schedule_batch, requests)
+        if not self._has_pending_code_step:
+            return
+
+        forward_mode = getattr(schedule_batch, "forward_mode", None)
+        if (
+            forward_mode is None
+            or not hasattr(forward_mode, "is_mixed")
+            or not bool(forward_mode.is_mixed())
+        ):
+            return
+
+        extend_lens = getattr(schedule_batch, "extend_lens", None)
+        if extend_lens is None or len(extend_lens) != len(requests):
+            return
+
+        one_token_request_ids = tuple(
+            requests[row].request_id
+            for row, extend_len in enumerate(extend_lens)
+            if int(extend_len) == 1
+        )
+        newcomer_request_ids = tuple(
+            requests[row].request_id
+            for row, extend_len in enumerate(extend_lens)
+            if int(extend_len) != 1
+        )
+        if not one_token_request_ids or not newcomer_request_ids:
+            return
+
+        self._pending_mixed_codec_probe = {
+            "request_id": newcomer_request_ids[0],
+            "batch_size": len(requests),
+            "newcomer_count": len(newcomer_request_ids),
+            "one_token_request_ids": one_token_request_ids,
+            "one_token_row_count": len(one_token_request_ids),
+            "extend_num_tokens": sum(int(value) for value in extend_lens),
+        }
 
     def post_decode(
         self,
@@ -102,6 +142,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
+        self._pending_mixed_codec_probe = None
         self._collect_codes(result, forward_batch, schedule_batch, requests)
 
     def sample_before_post_prefill(
@@ -269,6 +310,7 @@ class Qwen3TTSModelRunner(ModelRunner):
         batch_size = len(scheduler_output.requests)
         codes_snap = self.model._output_codes[:batch_size].detach().clone()
         embeds_snap = self.model._output_embeds[:batch_size].detach().clone()
+        committed_request_ids: set[str] = set()
         for row_idx, sched_req in enumerate(scheduler_output.requests):
             req_output = outputs[sched_req.request_id]
             if req_output.data is None or int(req_output.data) == eos_id:
@@ -277,6 +319,40 @@ class Qwen3TTSModelRunner(ModelRunner):
             sched_req.data.output_codes.append(code_chunk)
             sched_req.data.latest_stream_code_chunk = code_chunk
             sched_req.data.pending_feedback_queue.append(embeds_snap[row_idx])
+            committed_request_ids.add(sched_req.request_id)
+
+        probe = getattr(self, "_pending_mixed_codec_probe", None)
+        self._pending_mixed_codec_probe = None
+        if probe is None:
+            return
+
+        committed_one_token_rows = sum(
+            rid in committed_request_ids for rid in probe["one_token_request_ids"]
+        )
+        if committed_one_token_rows == 0:
+            return
+
+        # Research-only logical service timestamp: all per-row code chunks above
+        # have been committed into request state.  Do not synchronize the GPU;
+        # downstream consumers inherit normal stream ordering.  Capture the
+        # timestamp before JSONL serialization so recorder I/O is outside the
+        # measured service point.
+        commit_ns = time.time_ns()
+        _emit_request_event(
+            request_id=str(probe["request_id"]),
+            stage=None,
+            event_name="mixed_codec_frame_ready",
+            timestamp_ns=commit_ns,
+            metadata={
+                "forward_mode": "MIXED",
+                "batch_size": int(probe["batch_size"]),
+                "newcomer_count": int(probe["newcomer_count"]),
+                "one_token_row_count": int(probe["one_token_row_count"]),
+                "committed_one_token_row_count": int(committed_one_token_rows),
+                "extend_num_tokens": int(probe["extend_num_tokens"]),
+                "semantics": "all committed one-token codec rows visible in request state",
+            },
+        )
 
     def _sample_positions(
         self, forward_batch: Any, device: torch.device
