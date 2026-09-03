@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from sglang_omni.models.qwen3_tts.prompt_cache_identity import (
     PromptCacheNamespace,
@@ -17,6 +17,7 @@ from sglang_omni.models.qwen3_tts.prompt_cache_identity import (
     qwen3_tts_reference_source_key,
 )
 from sglang_omni.models.qwen3_tts.request_builders import build_embedding_cache_key_ids
+from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
 
 CONFIG = Qwen3TTSPromptConfig(
     tts_bos_token_id=1,
@@ -86,206 +87,315 @@ def _identity(request: Qwen3TTSPromptRequest):
     return build_qwen3_tts_prompt_cache_identity(request, CONFIG, namespace=NAMESPACE)
 
 
-def _fixture_row_embeddings(identity) -> torch.Tensor:
-    """Make deterministic additive CPU rows for the existing hash oracle.
+def _fill_embedding(embedding: nn.Embedding, base: float) -> None:
+    with torch.no_grad():
+        ids = torch.arange(embedding.num_embeddings, dtype=torch.float32).unsqueeze(1)
+        offsets = torch.arange(embedding.embedding_dim, dtype=torch.float32)
+        embedding.weight.copy_(base + ids * 10 + offsets)
 
-    Each semantic component occupies a stable slot.  This is intentionally a
-    test fixture, not a second production embedding implementation.
-    """
 
-    rows: list[torch.Tensor] = []
-    for row in identity.rows:
-        vector = torch.zeros(36, dtype=torch.float32)
-        for component in row.components:
-            encoded = json.dumps(
-                component.to_dict(), sort_keys=True, separators=(",", ":")
-            ).encode()
-            digest = hashlib.blake2b(encoded, digest_size=16).digest()
-            values = [
-                float(int.from_bytes(digest[offset : offset + 4], "little") % 100_000)
-                for offset in range(0, 16, 4)
+class _TinyPromptModel(nn.Module):
+    """Deterministic CPU embedding modules used by the real talker methods."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.codec_embedding = nn.Embedding(1000, 8)
+        self.text_embedding = nn.Embedding(1000, 8)
+        _fill_embedding(self.codec_embedding, 1_000)
+        _fill_embedding(self.text_embedding, 100)
+
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.codec_embedding
+
+    def get_text_embeddings(self) -> nn.Embedding:
+        return self.text_embedding
+
+
+class _TinyCodePredictor(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.model = nn.Module()
+        self.model.codec_embedding = nn.ModuleList(
+            [nn.Embedding(1000, 8), nn.Embedding(1000, 8)]
+        )
+        _fill_embedding(self.model.codec_embedding[0], 10_000)
+        _fill_embedding(self.model.codec_embedding[1], 20_000)
+
+
+class _TinyQwen3TTSTalker(Qwen3TTSTalker):
+    """Use Qwen3TTSTalker's prompt construction with tiny CPU-only modules."""
+
+    def __init__(self) -> None:
+        # Bypass the production constructor: it allocates the full transformer,
+        # speaker encoder, predictor buffers, and CUDA-specific runtime state.
+        nn.Module.__init__(self)
+        self.root_config = SimpleNamespace(
+            tts_bos_token_id=1,
+            tts_eos_token_id=2,
+            tts_pad_token_id=3,
+        )
+        self.config = SimpleNamespace(
+            codec_bos_id=4,
+            codec_pad_id=5,
+            codec_think_id=6,
+            codec_nothink_id=7,
+            codec_think_bos_id=8,
+            codec_think_eos_id=9,
+            codec_language_id={"en": 10, "zh": 11, "dialect": 12},
+            spk_id={"ryan": 20, "alice": 21},
+            spk_is_dialect={"ryan": "dialect"},
+            num_code_groups=3,
+        )
+        self.model = _TinyPromptModel()
+        self.text_projection = nn.Identity()
+        self.code_predictor = _TinyCodePredictor()
+
+
+_SPEAKER_EMBEDS = {
+    REFERENCE_AUDIO_KEY: torch.tensor(
+        [
+            [
+                [
+                    50_000.0,
+                    50_001.0,
+                    50_002.0,
+                    50_003.0,
+                    50_004.0,
+                    50_005.0,
+                    50_006.0,
+                    50_007.0,
+                ]
             ]
-            if component.kind == "text_embedding":
-                slot = 0
-            elif component.kind == "codec_embedding":
-                slot = 4 + int(component.identity[0]) * 4
-            elif component.kind == "speaker_embedding":
-                slot = 28
-            else:  # pragma: no cover - protects the fixture from silent drift.
-                raise AssertionError(f"unknown component kind: {component.kind}")
-            vector[slot : slot + 4] += torch.tensor(values, dtype=torch.float32)
-        rows.append(vector)
-    return torch.stack(rows)
+        ]
+    ),
+    "bytes:other-reference": torch.tensor(
+        [
+            [
+                [
+                    60_000.0,
+                    60_001.0,
+                    60_002.0,
+                    60_003.0,
+                    60_004.0,
+                    60_005.0,
+                    60_006.0,
+                    60_007.0,
+                ]
+            ]
+        ]
+    ),
+}
 
 
-def _oracle_lcp(left, right) -> int:
-    left_ids = build_embedding_cache_key_ids(_fixture_row_embeddings(left))
-    right_ids = build_embedding_cache_key_ids(_fixture_row_embeddings(right))
-    length = 0
-    for left_id, right_id in zip(left_ids, right_ids):
+def _tokenized_text(
+    token_ids: tuple[int, ...], suffix: tuple[int, ...]
+) -> torch.Tensor:
+    return torch.tensor([[*ROLE_IDS, *token_ids, *suffix]], dtype=torch.long)
+
+
+def _build_real_prompt_embeddings(request: Qwen3TTSPromptRequest) -> torch.Tensor:
+    talker = _TinyQwen3TTSTalker()
+    input_id = _tokenized_text(request.target_text_ids, (900, 901, 902, 903, 904))
+    instruct_id = (
+        torch.tensor([list(request.instruction_text_ids)], dtype=torch.long)
+        if request.instruction_text_ids
+        else None
+    )
+
+    with torch.inference_mode():
+        if request.task_type == "Base":
+            assert request.reference_audio_key is not None
+            ref_id = _tokenized_text(request.reference_text_ids, (703, 704))
+            voice_clone_prompt = {
+                "ref_spk_embedding": [
+                    _SPEAKER_EMBEDS[request.reference_audio_key].clone()
+                ],
+                "icl_mode": [not request.x_vector_only_mode],
+            }
+            if not request.x_vector_only_mode:
+                voice_clone_prompt["ref_code"] = [
+                    torch.tensor(request.reference_code_frames, dtype=torch.long)
+                ]
+            prompt_embeddings, _, _, _ = talker.build_voice_clone_inputs(
+                input_id=input_id,
+                ref_id=ref_id,
+                voice_clone_prompt=voice_clone_prompt,
+                language=request.language,
+                non_streaming_mode=request.non_streaming_mode,
+                instruct_id=instruct_id,
+            )
+        elif request.task_type == "CustomVoice":
+            assert request.voice is not None
+            prompt_embeddings, _, _, _ = talker.build_custom_voice_inputs(
+                input_id=input_id,
+                voice=request.voice,
+                language=request.language,
+                non_streaming_mode=request.non_streaming_mode,
+                instruct_id=instruct_id,
+            )
+        else:
+            prompt_embeddings, _, _, _ = talker.build_voice_design_inputs(
+                input_id=input_id,
+                language=request.language,
+                non_streaming_mode=request.non_streaming_mode,
+                instruct_id=instruct_id,
+            )
+    return prompt_embeddings.squeeze(0).detach()
+
+
+def _old_embedding_lcp(
+    left_request: Qwen3TTSPromptRequest, right_request: Qwen3TTSPromptRequest
+) -> int:
+    left_ids = build_embedding_cache_key_ids(
+        _build_real_prompt_embeddings(left_request)
+    )
+    right_ids = build_embedding_cache_key_ids(
+        _build_real_prompt_embeddings(right_request)
+    )
+    for index, (left_id, right_id) in enumerate(zip(left_ids, right_ids)):
         if left_id != right_id:
-            break
-        length += 1
-    return length
+            return index
+    return min(len(left_ids), len(right_ids))
 
 
-def _assert_lcp_matches_oracle(left_request, right_request) -> None:
-    left = _identity(left_request)
-    right = _identity(right_request)
-    assert left.lcp_length(right) == _oracle_lcp(left, right)
+def assert_prompt_lcp_equivalent(
+    left_request: Qwen3TTSPromptRequest, right_request: Qwen3TTSPromptRequest
+) -> None:
+    """Compare semantic rows with hashes of actual prompt-builder outputs."""
+
+    expected = _identity(left_request).lcp_length(_identity(right_request))
+    actual = _old_embedding_lcp(left_request, right_request)
+    assert actual == expected, f"real-builder LCP={actual}, semantic LCP={expected}"
 
 
-def test_all_task_variants_have_stable_semantic_rows() -> None:
+def test_real_builder_has_stable_rows_for_all_task_variants() -> None:
     requests = [
         _base_request(),
+        _base_request(non_streaming_mode=True),
         _xvector_request(),
-        _custom_request(),
+        _xvector_request(non_streaming_mode=True),
+        _custom_request(language="en"),
         _design_request(),
     ]
 
     for request in requests:
-        first = _identity(request)
-        second = _identity(request)
-        assert first == second
-        assert first.lcp_length(second) == len(first.rows)
-        assert first.to_key() == second.to_key()
-        assert first.rows
+        identity = _identity(request)
+        prompt_embeddings = _build_real_prompt_embeddings(request)
+        assert prompt_embeddings.shape[0] == len(identity.rows)
+        assert build_embedding_cache_key_ids(prompt_embeddings) == (
+            build_embedding_cache_key_ids(_build_real_prompt_embeddings(request))
+        )
 
 
 @pytest.mark.parametrize(
     ("left", "right"),
     [
         pytest.param(
-            _xvector_request(),
-            _xvector_request(target_text_ids=(200, 201, 999)),
-            id="streaming-generated-tail-is-not-prompt-identity",
-        ),
-        pytest.param(
-            _xvector_request(),
-            _xvector_request(target_text_ids=(999, 201, 202)),
-            id="streaming-first-target-token-is-prompt-identity",
-        ),
-        pytest.param(
             _base_request(),
             _base_request(reference_text_ids=(999, 301)),
-            id="icl-reference-text",
+            id="base-icl-streaming-reference-text",
         ),
         pytest.param(
             _base_request(),
             _base_request(reference_code_frames=((999, 401, 402), (410, 411, 412))),
-            id="icl-reference-code",
+            id="base-icl-streaming-reference-code",
         ),
         pytest.param(
-            _base_request(),
-            _base_request(target_text_ids=(200, 999, 202), non_streaming_mode=True),
-            id="nonstreaming-target-text",
+            _base_request(non_streaming_mode=True),
+            _base_request(
+                non_streaming_mode=True,
+                reference_text_ids=(999, 301),
+            ),
+            id="base-icl-non-streaming-reference-text",
         ),
         pytest.param(
-            _custom_request(instruction_text_ids=(500, 999)),
-            _custom_request(instruction_text_ids=(500, 501)),
-            id="instruction-token-prefix",
+            _base_request(non_streaming_mode=True),
+            _base_request(
+                non_streaming_mode=True,
+                reference_code_frames=((999, 401, 402), (410, 411, 412)),
+            ),
+            id="base-icl-non-streaming-reference-code",
+        ),
+        pytest.param(
+            _xvector_request(),
+            _xvector_request(target_text_ids=(200, 201, 999)),
+            id="base-x-vector-streaming-trailing-target",
+        ),
+        pytest.param(
+            _xvector_request(),
+            _xvector_request(target_text_ids=(999, 201, 202)),
+            id="base-x-vector-streaming-first-target",
+        ),
+        pytest.param(
+            _xvector_request(non_streaming_mode=True),
+            _xvector_request(
+                non_streaming_mode=True,
+                target_text_ids=(200, 999, 202),
+            ),
+            id="base-x-vector-non-streaming-target",
         ),
         pytest.param(
             _custom_request(language="en"),
             _custom_request(language="zh"),
-            id="explicit-language",
+            id="custom-voice-language",
         ),
         pytest.param(
             _custom_request(language="en"),
             _custom_request(language="en", voice="Alice"),
-            id="custom-speaker",
+            id="custom-voice-speaker",
         ),
         pytest.param(
-            _xvector_request(language="auto"),
-            _xvector_request(language="en"),
-            id="base-language",
+            _custom_request(language="en", instruction_text_ids=(500, 501)),
+            _custom_request(language="en", instruction_text_ids=(500, 999)),
+            id="custom-voice-instruction",
+        ),
+        pytest.param(
+            _design_request(),
+            _design_request(instruction_text_ids=(500, 999)),
+            id="voice-design-instruction",
+        ),
+        pytest.param(
+            _design_request(),
+            _design_request(target_text_ids=(200, 999, 202)),
+            id="voice-design-target",
+        ),
+        pytest.param(
+            _custom_request(language="auto"),
+            _custom_request(language="dialect"),
+            id="custom-voice-auto-dialect",
+        ),
+        pytest.param(
+            _custom_request(language="auto"),
+            _custom_request(language="en"),
+            id="custom-voice-auto-explicit-language",
         ),
         pytest.param(
             _xvector_request(),
             _xvector_request(reference_audio_key="bytes:other-reference"),
-            id="reference-audio-source",
+            id="base-x-vector-reference-source",
         ),
     ],
 )
-def test_semantic_lcp_matches_old_embedding_hash_oracle(left, right) -> None:
-    _assert_lcp_matches_oracle(left, right)
+def test_semantic_lcp_matches_real_builder_hashes(left, right) -> None:
+    assert_prompt_lcp_equivalent(left, right)
 
 
-def test_streaming_boundary_ignores_text_after_codec_prefix() -> None:
-    short_reference = _base_request(
-        reference_code_frames=((400, 401, 402),),
-        target_text_ids=(200, 201, 202),
+def test_icl_reference_code_length_preserves_streaming_prefix_boundary() -> None:
+    one_frame = _base_request(reference_code_frames=((400, 401, 402),))
+    two_frames = _base_request()
+
+    assert _identity(one_frame).is_prefix_of(_identity(two_frames))
+    assert_prompt_lcp_equivalent(one_frame, two_frames)
+
+
+def test_streaming_and_non_streaming_share_only_conditioned_prefix() -> None:
+    streaming = _xvector_request()
+    non_streaming = _xvector_request(non_streaming_mode=True)
+
+    assert _identity(streaming).lcp_length(_identity(non_streaming)) == (
+        len(_identity(streaming).rows) - 1
     )
-    changed_after_boundary = replace(short_reference, target_text_ids=(200, 201, 999))
-
-    left = _identity(short_reference)
-    right = _identity(changed_after_boundary)
-    assert left == right
-    assert _oracle_lcp(left, right) == len(left.rows)
-
-
-def test_streaming_first_target_change_stops_at_conditioned_prefix() -> None:
-    unchanged = _identity(_xvector_request())
-    changed_first_token = _identity(_xvector_request(target_text_ids=(999, 201, 202)))
-    conditioned_length = len(unchanged.rows) - 1
-
-    assert unchanged.lcp_length(changed_first_token) == conditioned_length
-    assert _oracle_lcp(unchanged, changed_first_token) == conditioned_length
-
-
-def test_icl_mode_and_reference_text_code_keep_partial_prefix_reuse() -> None:
-    icl = _identity(_base_request())
-    xvector = _identity(_xvector_request())
-    changed_reference_text = _identity(_base_request(reference_text_ids=(999, 301)))
-    changed_reference_code = _identity(
-        _base_request(reference_code_frames=((999, 401, 402), (410, 411, 412)))
-    )
-    conditioned_length = len(xvector.rows) - 1
-
-    assert icl.lcp_length(xvector) == conditioned_length
-    assert icl.lcp_length(changed_reference_text) == conditioned_length
-    assert icl.lcp_length(changed_reference_code) == conditioned_length + 1
-    assert _oracle_lcp(icl, xvector) == conditioned_length
-    assert _oracle_lcp(icl, changed_reference_text) == conditioned_length
-    assert _oracle_lcp(icl, changed_reference_code) == conditioned_length + 1
-
-
-def test_icl_reference_code_length_moves_streaming_text_boundary() -> None:
-    one_frame = _identity(_base_request(reference_code_frames=((400, 401, 402),)))
-    two_frames = _identity(_base_request())
-
-    # The one-frame prompt has two codec rows (BOS + frame), so the two
-    # reference-text rows are visible and target text starts only in the
-    # two-frame prompt.
-    assert one_frame.is_prefix_of(two_frames)
-    assert one_frame.lcp_length(two_frames) == len(one_frame.rows)
-    assert _oracle_lcp(one_frame, two_frames) == len(one_frame.rows)
-
-
-def test_streaming_and_nonstreaming_share_only_conditioned_prefix() -> None:
-    streaming = _identity(_xvector_request(non_streaming_mode=False))
-    non_streaming = _identity(_xvector_request(non_streaming_mode=True))
-
-    assert streaming.lcp_length(non_streaming) == len(streaming.rows) - 1
-    assert _oracle_lcp(streaming, non_streaming) == len(streaming.rows) - 1
-
-
-def test_custom_auto_language_uses_speaker_dialect() -> None:
-    auto = _identity(_custom_request(language="auto", voice="Ryan"))
-    explicit_dialect = _identity(_custom_request(language="dialect", voice="Ryan"))
-    explicit_other_language = _identity(_custom_request(language="en", voice="Ryan"))
-
-    assert auto == explicit_dialect
-    assert auto.lcp_length(explicit_other_language) == 5
-    assert _oracle_lcp(auto, explicit_other_language) == 5
-
-
-def test_auto_language_depends_on_custom_voice_dialect() -> None:
-    dialect_voice = _identity(_custom_request(language="auto", voice="Ryan"))
-    voice_without_dialect = _identity(_custom_request(language="auto", voice="Alice"))
-
-    assert dialect_voice.lcp_length(voice_without_dialect) == 3
-    assert _oracle_lcp(dialect_voice, voice_without_dialect) == 3
+    assert_prompt_lcp_equivalent(streaming, non_streaming)
 
 
 def test_instructions_are_prepended_and_cannot_false_share() -> None:
@@ -293,29 +403,9 @@ def test_instructions_are_prepended_and_cannot_false_share() -> None:
     with_instruction = _identity(_custom_request(instruction_text_ids=(500,)))
 
     assert without_instruction.lcp_length(with_instruction) == 0
-    assert _oracle_lcp(without_instruction, with_instruction) == 0
-
-
-def test_generation_request_id_generated_tail_and_weight_epoch_are_excluded() -> None:
-    request = _xvector_request()
-    identity = _identity(request)
-
-    generation_variants = [
-        {"temperature": 0.2, "top_p": 0.7},
-        {"do_sample": False, "max_new_tokens": 8},
-    ]
-    for generation_kwargs in generation_variants:
-        del generation_kwargs
-        assert _identity(request) == identity
-
-    for request_id, generated_tail, weight_epoch in [
-        ("request-a", (1, 2), 0),
-        ("request-b", (99, 100), 7),
-    ]:
-        del request_id, generated_tail, weight_epoch
-        assert _identity(request).lcp_length(identity) == len(identity.rows)
-
-    assert "weight" not in identity.namespace.to_key()
+    assert_prompt_lcp_equivalent(
+        _custom_request(), _custom_request(instruction_text_ids=(500,))
+    )
 
 
 def test_namespace_changes_disable_cross_model_prefix_reuse() -> None:
@@ -363,31 +453,46 @@ def test_reference_source_key_is_stable_and_content_based(tmp_path) -> None:
     assert qwen3_tts_reference_source_key({"data": "abc", "media_type": "audio/wav"})
 
 
-def test_uploaded_voice_version_is_not_a_row_component_by_itself() -> None:
-    """Artifact versioning belongs to speaker-artifact lifecycle, not rows."""
-
-    same_materialized_audio = _xvector_request(reference_audio_key="data:same-bytes")
-    version_one = _identity(same_materialized_audio)
-    version_two = _identity(same_materialized_audio)
-
-    assert version_one == version_two
-    assert version_one.lcp_length(version_two) == len(version_one.rows)
-
-
-def test_uploaded_voice_replacement_changes_materialized_reference_identity() -> None:
-    # The uploaded voice name/version selects the speaker artifact.  The
-    # semantic prompt receives the resulting stable materialized source key.
-    previous_upload_version = 1
-    replacement_upload_version = 2
-    assert previous_upload_version != replacement_upload_version
-    previous_upload = _identity(
-        _xvector_request(reference_audio_key="data:previous-upload")
-    )
-    replacement_upload = _identity(
-        _xvector_request(reference_audio_key="data:replacement-upload")
+def test_uploaded_voice_identity_uses_existing_lifecycle_key_and_artifact() -> None:
+    from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+    from sglang_omni.models.qwen3_tts.request_builders import (
+        _cacheable_qwen3_tts_voice_prompt,
+        _qwen3_tts_uploaded_voice_cache_key,
+        _qwen3_tts_voice_prompt_from_cache,
     )
 
-    assert previous_upload.lcp_length(replacement_upload) < len(previous_upload.rows)
-    assert _oracle_lcp(previous_upload, replacement_upload) == (
-        previous_upload.lcp_length(replacement_upload)
+    previous = Qwen3TTSState(
+        uploaded_voice_name="guide",
+        uploaded_voice_created_at=1,
+        x_vector_only_mode=True,
     )
+    replacement = replace(previous, uploaded_voice_created_at=2)
+    previous_key = _qwen3_tts_uploaded_voice_cache_key(previous)
+    replacement_key = _qwen3_tts_uploaded_voice_cache_key(replacement)
+
+    assert previous_key is not None
+    assert replacement_key is not None
+    assert previous_key != replacement_key
+    assert previous_key.model_type == "qwen3_tts_xvec"
+    assert previous_key.voice_name == "guide"
+    assert previous_key.artifact_kind == "voice_clone_prompt"
+
+    prompt = {
+        "ref_spk_embedding": [torch.arange(8, dtype=torch.float32)],
+        "icl_mode": [False],
+    }
+    artifact = _cacheable_qwen3_tts_voice_prompt(prompt, ref_text=None)
+    restored_prompt, restored_text = _qwen3_tts_voice_prompt_from_cache(artifact)
+
+    assert restored_text is None
+    assert torch.equal(
+        restored_prompt["ref_spk_embedding"][0], prompt["ref_spk_embedding"][0]
+    )
+    assert restored_prompt["icl_mode"] == [False]
+
+
+def test_semantic_identity_does_not_include_generation_or_weight_state() -> None:
+    identity = _identity(_xvector_request())
+
+    assert "weight" not in identity.namespace.to_key()
+    assert identity == _identity(_xvector_request())
