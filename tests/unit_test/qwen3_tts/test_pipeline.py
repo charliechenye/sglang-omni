@@ -4337,7 +4337,8 @@ def test_qwen3_tts_prefill_attaches_runner_composed_embeddings_to_sidecar(
         prepare_decode_buffers=lambda requests: calls.append("prepare")
     )
     runner._build_prefill_input_embeds = (
-        lambda forward_batch, requests: calls.append("embeds") or input_embeds
+        lambda forward_batch, schedule_batch, requests: calls.append("embeds")
+        or input_embeds
     )
     mm_inputs = [object()]
     positions = torch.arange(3)
@@ -4384,7 +4385,9 @@ def test_qwen3_tts_prefill_uses_shared_late_bound_forward_transport(
 
     runner = Qwen3TTSModelRunner.__new__(Qwen3TTSModelRunner)
     runner.model = FakeTalker()
-    runner._build_prefill_input_embeds = lambda _batch, _requests: input_embeds
+    runner._build_prefill_input_embeds = (
+        lambda _batch, _schedule_batch, _requests: input_embeds
+    )
 
     shared_runner = SGLModelRunner.__new__(SGLModelRunner)
     shared_runner.support_pp = False
@@ -4414,6 +4417,7 @@ def test_qwen3_tts_prefill_uses_shared_late_bound_forward_transport(
         batch_size=1,
         rids=["request-a"],
         positions=torch.arange(3),
+        mrope_positions=None,
     )
     schedule_batch = SimpleNamespace(is_prefill_only=True)
 

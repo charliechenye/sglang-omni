@@ -60,7 +60,6 @@ class Qwen3TTSModelRunner(ModelRunner):
         schedule_batch: Any,
         requests: list,
     ) -> None:
-        del schedule_batch
         _ensure_mrope_positions(forward_batch)
         self.model.prepare_decode_buffers(requests)
         attach_omni_prefill_inputs(
@@ -68,6 +67,7 @@ class Qwen3TTSModelRunner(ModelRunner):
             OmniPrefillInputs(
                 input_embeds=self._build_prefill_input_embeds(
                     forward_batch,
+                    schedule_batch,
                     requests,
                 ),
             ),
@@ -356,14 +356,28 @@ class Qwen3TTSModelRunner(ModelRunner):
     def _build_prefill_input_embeds(
         self,
         forward_batch: Any,
+        schedule_batch: Any,
         requests: list,
     ) -> torch.Tensor:
+        prefix_lens = schedule_batch.prefix_lens
+        extend_lens = schedule_batch.extend_lens
+        if prefix_lens is None or extend_lens is None:
+            raise RuntimeError(
+                "Qwen3-TTS prefill requires ScheduleBatch prefix_lens and "
+                "extend_lens"
+            )
+        if len(prefix_lens) != len(requests) or len(extend_lens) != len(requests):
+            raise RuntimeError(
+                "Qwen3-TTS ScheduleBatch prefill span lengths must match "
+                f"requests: prefix_lens={len(prefix_lens)}, "
+                f"extend_lens={len(extend_lens)}, requests={len(requests)}"
+            )
         pieces = []
-        for sched_req in requests:
+        for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
             req = data.req
-            req_len = int(req.extend_range.length)
-            prefix_len = len(req.prefix_indices)
+            prefix_len = prefix_lens[row_idx]
+            req_len = extend_lens[row_idx]
             if data.prefill_input_embeds is None:
                 data.prefill_input_embeds = data.prompt_input_embeds
             if data.prefill_input_embeds is None:
