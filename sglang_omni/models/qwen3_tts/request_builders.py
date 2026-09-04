@@ -701,12 +701,9 @@ def _cacheable_qwen3_tts_voice_prompt(
     artifact: dict[str, Any] = {
         "artifact_type": "qwen3_tts_voice_clone_prompt",
         "ref_spk_embedding": stored_speaker_embeddings,
-        "speaker_artifact_id": (
-            _qwen3_tts_artifact_fingerprint(
-                stored_speaker_embeddings[0], domain="speaker"
-            )
-            if stored_speaker_embeddings
-            else None
+        "speaker_artifact_id": _qwen3_tts_artifact_fingerprint(
+            stored_speaker_embeddings[0],
+            domain="speaker",
         ),
         "icl_mode": tuple(bool(value) for value in voice_clone_prompt["icl_mode"]),
         "ref_text": ref_text,
