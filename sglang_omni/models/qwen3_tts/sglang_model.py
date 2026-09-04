@@ -1080,17 +1080,6 @@ class Qwen3TTSTalker(nn.Module):
         instruct_id: torch.Tensor | None = None,
         return_semantic_prompt_rows: bool = False,
     ) -> tuple[Any, ...]:
-        semantic_target_ids: tuple[int, ...] | None = None
-        semantic_instruction_ids: tuple[int, ...] = ()
-        if return_semantic_prompt_rows:
-            input_token_ids = _semantic_token_ids(input_id, field_name="input_id")
-            semantic_role_ids = input_token_ids[:3]
-            semantic_target_ids = input_token_ids[3:-5]
-            if instruct_id is not None:
-                semantic_instruction_ids = _semantic_token_ids(
-                    instruct_id, field_name="instruct_id"
-                )
-        input_id = input_id.to(device=self.device)
         spk_id = getattr(self.config, "spk_id", None) or {}
         if not spk_id:
             raise ValueError(
@@ -1104,6 +1093,18 @@ class Qwen3TTSTalker(nn.Module):
                 f"Unsupported Qwen3-TTS CustomVoice speaker {voice!r}. "
                 f"Supported speakers: {supported}"
             )
+
+        semantic_target_ids: tuple[int, ...] | None = None
+        semantic_instruction_ids: tuple[int, ...] = ()
+        if return_semantic_prompt_rows:
+            input_token_ids = _semantic_token_ids(input_id, field_name="input_id")
+            semantic_role_ids = input_token_ids[:3]
+            semantic_target_ids = input_token_ids[3:-5]
+            if instruct_id is not None:
+                semantic_instruction_ids = _semantic_token_ids(
+                    instruct_id, field_name="instruct_id"
+                )
+        input_id = input_id.to(device=self.device)
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self._build_tts_special_embeds(
             dtype=input_id.dtype
