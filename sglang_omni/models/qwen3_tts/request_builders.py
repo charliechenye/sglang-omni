@@ -663,24 +663,66 @@ def _qwen3_tts_uploaded_voice_cache_key(state: Qwen3TTSState) -> SpeakerCacheKey
     )
 
 
+def _qwen3_tts_artifact_fingerprint(value: torch.Tensor, *, domain: str) -> str:
+    """Fingerprint one stored CPU Qwen3-TTS artifact and its representation."""
+
+    if not isinstance(value, torch.Tensor):
+        raise TypeError("Qwen3-TTS artifact must be a torch.Tensor")
+    if not domain:
+        raise ValueError("Qwen3-TTS artifact fingerprint domain must be non-empty")
+    if value.layout != torch.strided:
+        raise ValueError("Qwen3-TTS artifact must use strided tensor storage")
+    if value.device.type != "cpu":
+        raise ValueError("Qwen3-TTS artifact fingerprint requires a CPU tensor")
+
+    tensor = value.detach().contiguous()
+    metadata = (
+        f"qwen3-tts-artifact|{domain}|{tensor.dtype}|{tuple(tensor.shape)}|"
+    ).encode()
+    contents = tensor.view(torch.uint8).numpy().tobytes()
+    digest = hashlib.blake2b(metadata + contents, digest_size=16).hexdigest()
+    return f"{domain}:{digest}"
+
+
 def _cacheable_qwen3_tts_voice_prompt(
     voice_clone_prompt: dict[str, Any],
     *,
     ref_text: str | None,
 ) -> dict[str, Any]:
     ref_codes = voice_clone_prompt.get("ref_code")
+    stored_speaker_embeddings = tuple(
+        _cacheable_qwen3_tts_tensor(embedding)
+        for embedding in voice_clone_prompt["ref_spk_embedding"]
+    )
+    if len(stored_speaker_embeddings) != 1:
+        raise ValueError(
+            "Qwen3-TTS voice-clone artifact expects exactly one speaker embedding"
+        )
     artifact: dict[str, Any] = {
         "artifact_type": "qwen3_tts_voice_clone_prompt",
-        "ref_spk_embedding": tuple(
-            _cacheable_qwen3_tts_tensor(embedding)
-            for embedding in voice_clone_prompt["ref_spk_embedding"]
+        "ref_spk_embedding": stored_speaker_embeddings,
+        "speaker_artifact_id": (
+            _qwen3_tts_artifact_fingerprint(
+                stored_speaker_embeddings[0], domain="speaker"
+            )
+            if stored_speaker_embeddings
+            else None
         ),
         "icl_mode": tuple(bool(value) for value in voice_clone_prompt["icl_mode"]),
         "ref_text": ref_text,
+        "ref_code_artifact_id": None,
     }
-    if ref_codes is not None and all(code is not None for code in ref_codes):
-        artifact["ref_code"] = tuple(
+    if ref_codes and all(code is not None for code in ref_codes):
+        stored_ref_codes = tuple(
             _cacheable_qwen3_tts_tensor(code) for code in ref_codes
+        )
+        if len(stored_ref_codes) != 1:
+            raise ValueError(
+                "Qwen3-TTS voice-clone artifact expects exactly one reference code"
+            )
+        artifact["ref_code"] = stored_ref_codes
+        artifact["ref_code_artifact_id"] = _qwen3_tts_artifact_fingerprint(
+            stored_ref_codes[0], domain="ref_code"
         )
     return artifact
 
@@ -699,6 +741,8 @@ def _qwen3_tts_voice_prompt_from_cache(
             embedding.detach().clone() for embedding in artifact["ref_spk_embedding"]
         ],
         "icl_mode": list(artifact["icl_mode"]),
+        "speaker_artifact_id": artifact.get("speaker_artifact_id"),
+        "ref_code_artifact_id": artifact.get("ref_code_artifact_id"),
     }
     if "ref_code" in artifact:
         prompt["ref_code"] = [code.detach().clone() for code in artifact["ref_code"]]
@@ -1113,12 +1157,19 @@ def _prepare_qwen3_tts_base_request(
             raise ValueError("Qwen3-TTS expects exactly one voice-clone prompt")
         voice_clone_prompt = wrapper._prompt_items_to_voice_clone_prompt(prompt_items)
         ref_text = prompt_items[0].ref_text
-        speaker_cache.put(
-            cache_key,
-            _cacheable_qwen3_tts_voice_prompt(
-                voice_clone_prompt,
-                ref_text=ref_text,
-            ),
+        stored_artifact = _cacheable_qwen3_tts_voice_prompt(
+            voice_clone_prompt,
+            ref_text=ref_text,
+        )
+        speaker_cache.put(cache_key, stored_artifact)
+        # Preserve the original freshly-produced tensors for prompt construction;
+        # only the identity metadata comes from the CPU artifact that was stored.
+        voice_clone_prompt = dict(voice_clone_prompt)
+        voice_clone_prompt["speaker_artifact_id"] = stored_artifact.get(
+            "speaker_artifact_id"
+        )
+        voice_clone_prompt["ref_code_artifact_id"] = stored_artifact.get(
+            "ref_code_artifact_id"
         )
 
     input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
