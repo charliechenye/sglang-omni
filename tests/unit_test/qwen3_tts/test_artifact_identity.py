@@ -112,6 +112,7 @@ class _QwenVoiceCloneModel:
             torch.ones((1, 2), dtype=torch.long),
             torch.zeros((1, 1, 4)),
             torch.tensor([[10, 20]], dtype=torch.long),
+            None,
         )
 
 
@@ -289,7 +290,7 @@ def test_uploaded_voice_miss_and_hit_use_same_artifact_identity(
     )
 
     assert wrapper.create_calls == 1
-    assert len(first) == len(second) == 4
+    assert len(first) == len(second) == 5
     first_prompt, second_prompt = model.captured_prompts
     assert first_prompt["speaker_artifact_id"] == second_prompt["speaker_artifact_id"]
     assert first_prompt["ref_code_artifact_id"] == second_prompt["ref_code_artifact_id"]

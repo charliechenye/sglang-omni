@@ -44,4 +44,5 @@ class Qwen3TTSState(DeclarativeStateBase):
     prepared_ref_code: Any | None = wire(None, codec="tensor_cpu")
     prepared_pad_embed: Any | None = wire(None, codec="tensor_cpu")
     prepared_input_ids: list[int] | None = None
+    prepared_prompt_cache_key: str | None = None
     prepared_gen_kwargs: dict[str, Any] | None = None
