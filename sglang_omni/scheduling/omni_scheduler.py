@@ -21,6 +21,7 @@ import types
 from array import array
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import nullcontext
 from itertools import islice
 from typing import Any, Callable
 
@@ -185,6 +186,8 @@ class OmniScheduler:
         stream_done_handler: Callable | None = None,
         abort_callback: Callable[[str], None] | None = None,
         request_finished_callback: Callable[[str], None] | None = None,
+        weight_update_guard: Callable[[], Any] | None = None,
+        weight_update_requires_empty_requests: bool = False,
         enable_overlap: bool = False,
         enable_async_decode: bool = False,
         async_decode_min_batch_size: int = 2,
@@ -210,6 +213,10 @@ class OmniScheduler:
         self._stream_done_handler = stream_done_handler
         self._abort_callback = abort_callback
         self._request_finished_callback = request_finished_callback
+        self._weight_update_guard = weight_update_guard
+        self._weight_update_requires_empty_requests = bool(
+            weight_update_requires_empty_requests
+        )
         self._shutdown_callback = shutdown_callback
         self._shutdown_lock = threading.Lock()
         self._request_admission_lock = threading.RLock()
@@ -2001,58 +2008,87 @@ class OmniScheduler:
     ) -> dict[str, Any]:
         keep_pause = bool(payload.get("keep_pause", False))
         keep_engine_paused = keep_pause
+        success = False
+        message = ""
+        num_paused = 0
+        flush_success: bool | None = None
         with self._admin_lock:
             previous_pause_state = self._engine_paused
             self._engine_paused = True
             try:
                 self._resolve_pending_async()
-                num_paused = 0
                 abort_all_requests = bool(payload.get("abort_all_requests", False))
+                requires_empty_requests = bool(
+                    getattr(self, "_weight_update_requires_empty_requests", False)
+                )
                 if abort_all_requests:
                     num_paused = self._abort_all_requests()
+                    active_request_ids = (
+                        self._active_request_ids() if requires_empty_requests else []
+                    )
                 else:
                     active_request_ids = self._active_request_ids()
-                    if active_request_ids and not self._can_update_active_requests(
-                        previous_pause_state
-                    ):
-                        if not keep_pause:
-                            self._engine_paused = previous_pause_state
-                        return {
-                            "success": False,
-                            "message": (
-                                "active requests are present; set "
-                                "abort_all_requests=true or pause_generation with "
-                                "mode=retract before updating weights"
-                            ),
-                            "error": "active requests present during weight update",
-                            "data": {
-                                "active_request_count": len(active_request_ids),
-                                "active_request_ids": active_request_ids[:16],
-                                "abort_all_requests": abort_all_requests,
-                                "pause_mode": self._last_pause_mode,
-                                "engine_paused": self._engine_paused,
-                            },
-                        }
+                if active_request_ids and (
+                    requires_empty_requests
+                    or not self._can_update_active_requests(previous_pause_state)
+                ):
+                    if not keep_pause:
+                        self._engine_paused = previous_pause_state
+                    message = (
+                        "active requests are present; set "
+                        "abort_all_requests=true before updating weights"
+                        if requires_empty_requests
+                        else (
+                            "active requests are present; set "
+                            "abort_all_requests=true or pause_generation with "
+                            "mode=retract before updating weights"
+                        )
+                    )
+                    return {
+                        "success": False,
+                        "message": message,
+                        "error": "active requests present during weight update",
+                        "data": {
+                            "active_request_count": len(active_request_ids),
+                            "active_request_ids": active_request_ids[:16],
+                            "abort_all_requests": abort_all_requests,
+                            "pause_mode": self._last_pause_mode,
+                            "engine_paused": self._engine_paused,
+                        },
+                    }
 
+                guard_entered = False
                 try:
-                    success, message = update_fn(payload)
-                except Exception:
-                    if keep_pause_on_failure:
-                        keep_engine_paused = True
-                    raise
-                if success:
-                    self._advance_prompt_cache_epoch()
-                flush_success: bool | None = None
-                if success and bool(payload.get("flush_cache", True)):
-                    flush_success = self._flush_cache_after_update()
-                    success = success and bool(flush_success)
-                    if not flush_success:
-                        message = f"{message}; cache flush failed"
+                    guard_factory = getattr(self, "_weight_update_guard", None)
+                    guard_context = (
+                        guard_factory() if guard_factory is not None else nullcontext()
+                    )
+                    with guard_context:
+                        guard_entered = True
+                        try:
+                            success, message = update_fn(payload)
+                        except Exception:
+                            if keep_pause_on_failure:
+                                keep_engine_paused = True
+                            raise
+                        if success:
+                            self._advance_prompt_cache_epoch()
+                        if success and bool(payload.get("flush_cache", True)):
+                            flush_success = self._flush_cache_after_update()
+                            success = success and bool(flush_success)
+                            if not flush_success:
+                                message = f"{message}; cache flush failed"
 
-                if keep_pause_on_failure and not success:
-                    keep_engine_paused = True
-                if bool(payload.get("torch_empty_cache", False)):
-                    self._empty_torch_cache()
+                        if keep_pause_on_failure and not success:
+                            keep_engine_paused = True
+                        if bool(payload.get("torch_empty_cache", False)):
+                            self._empty_torch_cache()
+                except Exception as exc:
+                    if guard_entered:
+                        raise
+                    logger.exception("OmniScheduler: weight-update guard failed")
+                    success = False
+                    message = f"weight-update guard failed: {exc}"
             finally:
                 if keep_engine_paused:
                     self._engine_paused = True
@@ -2158,6 +2194,12 @@ class OmniScheduler:
                     payload.request_id
                     for payload in self._backlogged_request_build_payloads
                     if payload.request_id not in self._aborted_request_ids
+                )
+            if self._deferred_request_payloads:
+                request_ids.update(
+                    request_id
+                    for request_id in self._deferred_request_payloads
+                    if request_id not in self._aborted_request_ids
                 )
             for req in self.waiting_queue:
                 rid = req.rid

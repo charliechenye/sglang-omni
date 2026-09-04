@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import threading
 from collections import Counter
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +13,7 @@ import torch
 
 from sglang_omni.models.qwen3_tts import request_builders as qwen3_request_builders
 from sglang_omni.models.qwen3_tts.payload_types import Qwen3TTSState
+from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.scheduling.reference_encoder import (
     KeyedReferenceEncodeHook,
     ReferenceEncodeService,
@@ -115,6 +118,20 @@ class _QwenVoiceCloneModel:
         )
 
 
+def _prepared_request() -> qwen3_request_builders.Qwen3TTSPreparedRequest:
+    return qwen3_request_builders.Qwen3TTSPreparedRequest(
+        state=Qwen3TTSState(text="target"),
+        input_ids_list=[],
+        input_ids=torch.empty(0, dtype=torch.long),
+        attention_mask=torch.empty(0, dtype=torch.long),
+        trailing_text_hidden=torch.empty(0),
+        ref_code=None,
+        prompt_input_embeds=torch.empty(0),
+        tts_pad_embed=torch.empty(0),
+        gen_kwargs={},
+    )
+
+
 def test_artifact_fingerprint_covers_domain_dtype_shape_and_contents() -> None:
     value = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
 
@@ -216,6 +233,142 @@ def test_eviction_reencode_reuses_bit_identical_content_identity() -> None:
         )
     finally:
         service.close()
+
+
+def test_reference_service_reencodes_after_invalidation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+    hook = _QwenArtifactHook()
+    monkeypatch.setattr(
+        qwen3_request_builders,
+        "_Qwen3TTSAdhocReferenceHook",
+        lambda model, wrapper: hook,
+    )
+    model = object()
+    wrapper = object()
+    try:
+        first_service = qwen3_request_builders._get_qwen3_tts_adhoc_reference_service(
+            model, wrapper
+        )
+        first_prompt, _ = first_service.get_or_encode("same")
+
+        with qwen3_request_builders.qwen3_tts_weight_update_guard():
+            pass
+
+        second_service = qwen3_request_builders._get_qwen3_tts_adhoc_reference_service(
+            model, wrapper
+        )
+        second_prompt, _ = second_service.get_or_encode("same")
+
+        assert first_service is not second_service
+        assert hook.encode_calls == Counter({"same": 2})
+        assert (
+            first_prompt["speaker_artifact_id"] == second_prompt["speaker_artifact_id"]
+        )
+        assert (
+            first_prompt["ref_code_artifact_id"]
+            == second_prompt["ref_code_artifact_id"]
+        )
+    finally:
+        with qwen3_request_builders.qwen3_tts_weight_update_guard():
+            pass
+
+
+def test_weight_update_guard_quiesces_preprocessing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+    entered = threading.Event()
+    release = threading.Event()
+    new_entered = threading.Event()
+    mutation_started = threading.Event()
+    mutation_release = threading.Event()
+    prepared = _prepared_request()
+
+    def prepare(
+        payload: StagePayload, *args: Any, **kwargs: Any
+    ) -> qwen3_request_builders.Qwen3TTSPreparedRequest:
+        del args, kwargs
+        if payload.request_id == "old":
+            entered.set()
+            if not release.wait(timeout=1.0):
+                raise RuntimeError("old preprocessing was not released")
+            raise RuntimeError("old preprocessing stopped")
+        new_entered.set()
+        return prepared
+
+    monkeypatch.setattr(
+        qwen3_request_builders,
+        "_get_qwen3_tts_adhoc_reference_service_locked",
+        lambda model, wrapper: None,
+    )
+    monkeypatch.setattr(qwen3_request_builders, "_prepare_qwen3_tts_request", prepare)
+    qwen3_request_builders.set_qwen3_tts_preprocessing_context(
+        model=object(), wrapper=object()
+    )
+    try:
+        old_payload = StagePayload(
+            request_id="old", request=OmniRequest(inputs="old"), data={}
+        )
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            old_future = executor.submit(
+                qwen3_request_builders.preprocess_qwen3_tts_payload, old_payload
+            )
+            assert entered.wait(timeout=1.0)
+
+            def update() -> None:
+                with qwen3_request_builders.qwen3_tts_weight_update_guard():
+                    mutation_started.set()
+                    if not mutation_release.wait(timeout=1.0):
+                        raise RuntimeError("weight mutation was not released")
+
+            update_future = executor.submit(update)
+            assert not mutation_started.wait(timeout=0.05)
+
+            release.set()
+            with pytest.raises(RuntimeError, match="old preprocessing stopped"):
+                old_future.result(timeout=1.0)
+            assert mutation_started.wait(timeout=1.0)
+
+            new_payload = StagePayload(
+                request_id="new", request=OmniRequest(inputs="new"), data={}
+            )
+            new_future = executor.submit(
+                qwen3_request_builders.preprocess_qwen3_tts_payload, new_payload
+            )
+            assert not new_entered.wait(timeout=0.05)
+
+            mutation_release.set()
+            assert update_future.result(timeout=1.0) is None
+            assert new_entered.wait(timeout=1.0)
+            new_future.result(timeout=1.0)
+    finally:
+        release.set()
+        mutation_release.set()
+        qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+
+
+def test_invalidation_clears_qwen_speaker_artifacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cache = SpeakerArtifactCache(max_bytes=1024 * 1024)
+    monkeypatch.setattr(
+        qwen3_request_builders, "get_speaker_artifact_cache", lambda: cache
+    )
+    keys = (
+        SpeakerCacheKey("qwen3_tts_xvec", "guide", 1, "voice_clone_prompt"),
+        SpeakerCacheKey("qwen3_tts_icl", "guide", 1, "voice_clone_prompt"),
+    )
+    for key in keys:
+        cache.put(key, {"key": key.model_type})
+        assert cache.get(key) is not None
+
+    with qwen3_request_builders.qwen3_tts_weight_update_guard():
+        pass
+
+    for key in keys:
+        assert cache.get(key) is None
 
 
 def test_x_vector_and_icl_share_identical_speaker_identity() -> None:

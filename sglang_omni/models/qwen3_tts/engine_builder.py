@@ -139,6 +139,8 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder):
             "request_build_max_pending": 16,
             "prefill_coalesce_requests": self.prefill_coalesce_requests,
             "prefill_coalesce_wait_ms": self.prefill_coalesce_wait_ms,
+            "weight_update_guard": request_builders.qwen3_tts_weight_update_guard,
+            "weight_update_requires_empty_requests": True,
         }
 
     def make_abort_callback(self) -> Any | None:

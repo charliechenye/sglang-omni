@@ -149,6 +149,9 @@ _ADHOC_REFERENCE_SERVICE_ENTRY: (
     tuple[tuple[int, int], ReferenceEncodeService] | None
 ) = None
 _PREPARED_REQUESTS_LOCK = threading.Lock()
+_QWEN3_TTS_PREPROCESSING_CONDITION = threading.Condition(_PREPARED_REQUESTS_LOCK)
+_QWEN3_TTS_PREPROCESSING_BLOCKED = False
+_QWEN3_TTS_PREPROCESSING_ACTIVE = 0
 
 
 def set_qwen3_tts_preprocessing_context(*, model: Any, wrapper: Any) -> None:
@@ -175,6 +178,44 @@ def clear_qwen3_tts_preprocessing_context() -> None:
         _PREPROCESSING_CONTEXT = None
         _ADHOC_REFERENCE_SERVICE_ENTRY = None
         _PREPARED_REQUESTS.clear()
+        _QWEN3_TTS_PREPROCESSING_CONDITION.notify_all()
+
+
+def _invalidate_qwen3_tts_reference_artifacts_locked() -> None:
+    global _ADHOC_REFERENCE_SERVICE_ENTRY
+
+    if _ADHOC_REFERENCE_SERVICE_ENTRY is not None:
+        _ADHOC_REFERENCE_SERVICE_ENTRY[1].close()
+        _ADHOC_REFERENCE_SERVICE_ENTRY = None
+    get_speaker_artifact_cache().clear()
+
+
+@contextlib.contextmanager
+def qwen3_tts_weight_update_guard():
+    """Quiesce Qwen preprocessing and invalidate old reference artifacts."""
+
+    global _QWEN3_TTS_PREPROCESSING_BLOCKED
+    with _QWEN3_TTS_PREPROCESSING_CONDITION:
+        _QWEN3_TTS_PREPROCESSING_BLOCKED = True
+        try:
+            while _QWEN3_TTS_PREPROCESSING_ACTIVE:
+                _QWEN3_TTS_PREPROCESSING_CONDITION.wait()
+            if _PREPARED_REQUESTS:
+                raise RuntimeError(
+                    "Qwen3-TTS weight update requires no prepared request handoff"
+                )
+            _invalidate_qwen3_tts_reference_artifacts_locked()
+        except BaseException:
+            _QWEN3_TTS_PREPROCESSING_BLOCKED = False
+            _QWEN3_TTS_PREPROCESSING_CONDITION.notify_all()
+            raise
+
+    try:
+        yield
+    finally:
+        with _QWEN3_TTS_PREPROCESSING_CONDITION:
+            _QWEN3_TTS_PREPROCESSING_BLOCKED = False
+            _QWEN3_TTS_PREPROCESSING_CONDITION.notify_all()
 
 
 def _prepared_request_id(payload: StagePayload) -> str | None:
@@ -1223,30 +1264,41 @@ def preprocess_qwen3_tts_payload(
 ) -> StagePayload:
     """Run Qwen3-TTS prompt/audio preprocessing outside the AR scheduler."""
 
-    with _PREPARED_REQUESTS_LOCK:
+    global _QWEN3_TTS_PREPROCESSING_ACTIVE
+    with _QWEN3_TTS_PREPROCESSING_CONDITION:
+        while _QWEN3_TTS_PREPROCESSING_BLOCKED:
+            _QWEN3_TTS_PREPROCESSING_CONDITION.wait()
         context = _PREPROCESSING_CONTEXT
+        if context is not None:
+            _QWEN3_TTS_PREPROCESSING_ACTIVE += 1
     if context is None:
         raise RuntimeError(
             "Qwen3-TTS preprocessing context is not initialized; "
             "create_sglang_tts_engine_executor must register it before requests run"
         )
 
-    prepared = _prepare_qwen3_tts_request(
-        payload,
-        model=context.model,
-        wrapper=context.wrapper,
-        default_stream_codec_output=default_stream_codec_output,
-    )
-    with _PREPARED_REQUESTS_LOCK:
-        _PREPARED_REQUESTS[payload.request_id] = prepared
+    try:
+        prepared = _prepare_qwen3_tts_request(
+            payload,
+            model=context.model,
+            wrapper=context.wrapper,
+            default_stream_codec_output=default_stream_codec_output,
+        )
+        with _PREPARED_REQUESTS_LOCK:
+            _PREPARED_REQUESTS[payload.request_id] = prepared
 
-    data = prepared.state.to_dict()
-    data[_QWEN3_TTS_PREPARED_MARKER] = payload.request_id
-    return StagePayload(
-        request_id=payload.request_id,
-        request=payload.request,
-        data=data,
-    )
+        data = prepared.state.to_dict()
+        data[_QWEN3_TTS_PREPARED_MARKER] = payload.request_id
+        return StagePayload(
+            request_id=payload.request_id,
+            request=payload.request,
+            data=data,
+        )
+    finally:
+        with _QWEN3_TTS_PREPROCESSING_CONDITION:
+            _QWEN3_TTS_PREPROCESSING_ACTIVE -= 1
+            if _QWEN3_TTS_PREPROCESSING_ACTIVE == 0:
+                _QWEN3_TTS_PREPROCESSING_CONDITION.notify_all()
 
 
 def build_sglang_qwen3_tts_request(
