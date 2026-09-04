@@ -15,7 +15,7 @@ from sglang_omni.scheduling.reference_encoder import (
     KeyedReferenceEncodeHook,
     ReferenceEncodeService,
 )
-from sglang_omni.scheduling.speaker_cache import SpeakerArtifactCache, SpeakerCacheKey
+from sglang_omni.scheduling.speaker_cache import SpeakerArtifactCache
 
 
 def _voice_clone_prompt(
@@ -173,9 +173,11 @@ def test_cacheable_voice_prompt_rejects_multiple_artifacts(
     artifact_field: str, error_message: str
 ) -> None:
     prompt = _voice_clone_prompt(
-        ref_code=torch.tensor([[1, 2]], dtype=torch.long)
-        if artifact_field == "ref_code"
-        else None
+        ref_code=(
+            torch.tensor([[1, 2]], dtype=torch.long)
+            if artifact_field == "ref_code"
+            else None
+        )
     )
     prompt[artifact_field].append(prompt[artifact_field][0].clone())
 
