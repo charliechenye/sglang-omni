@@ -1746,7 +1746,7 @@ def test_qwen3_tts_custom_voice_requires_speaker_table(
         tts_eos_token_id=2,
         tts_pad_token_id=3,
     )
-    talker.config = SimpleNamespace(spk_id={})
+    talker.config = SimpleNamespace(spk_id={}, codec_bos_id=4, codec_pad_id=5)
 
     with pytest.raises(ValueError, match="configured spk_id"):
         Qwen3TTSTalker.build_semantic_prompt_plan(
@@ -1772,7 +1772,9 @@ def test_qwen3_tts_custom_voice_rejects_invalid_speaker(
         tts_eos_token_id=2,
         tts_pad_token_id=3,
     )
-    talker.config = SimpleNamespace(spk_id={"Vivian": 3065})
+    talker.config = SimpleNamespace(
+        spk_id={"Vivian": 3065}, codec_bos_id=4, codec_pad_id=5
+    )
 
     with pytest.raises(ValueError, match="Unsupported Qwen3-TTS CustomVoice speaker"):
         Qwen3TTSTalker.build_semantic_prompt_plan(

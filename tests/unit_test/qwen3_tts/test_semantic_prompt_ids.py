@@ -104,7 +104,7 @@ def _semantic_base_prompt(
     *, ref_code: torch.Tensor | None, speaker_value: float = 1.0
 ) -> dict[str, Any]:
     prompt = _voice_clone_prompt(ref_code=ref_code, speaker_value=speaker_value)
-    speaker_hex = "1" * 32 if speaker_value == 1.0 else "2" * 32
+    speaker_hex = "0" * 31 + ("1" if speaker_value == 1.0 else "2")
     prompt["speaker_artifact_id"] = "speaker:" + speaker_hex
     if ref_code is not None:
         prompt["ref_code_artifact_id"] = "ref_code:" + "3" * 32
@@ -114,6 +114,7 @@ def _semantic_base_prompt(
     )
     prompt["speaker_artifact_id"] = artifact["speaker_artifact_id"]
     prompt["ref_code_artifact_id"] = artifact.get("ref_code_artifact_id")
+    prompt["ref_code_frames"] = artifact.get("ref_code_frames")
     return prompt
 
 
