@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from types import SimpleNamespace
 from typing import Any
 
@@ -87,6 +88,16 @@ def _semantic_input_id(*target_ids: int) -> torch.Tensor:
 
 def _semantic_ref_id(*reference_ids: int) -> torch.Tensor:
     return torch.tensor([[40, 41, 42, *reference_ids, 50, 51]], dtype=torch.long)
+
+
+def _legacy_embedding_cache_key_ids(input_embeds: torch.Tensor) -> list[int]:
+    """Frozen pre-semantic production oracle used only for LCP equivalence tests."""
+    rows = input_embeds.detach().to(dtype=torch.float32, device="cpu")
+    key_ids: list[int] = []
+    for row in rows:
+        digest = hashlib.blake2b(row.numpy().tobytes(), digest_size=8).digest()
+        key_ids.append(int.from_bytes(digest, "little") & ((1 << 63) - 1))
+    return key_ids
 
 
 def _semantic_base_prompt(
@@ -180,7 +191,6 @@ def _build_semantic_prompt(
 
     assert len(result) == 5
     embeds, _, _, _, ids = result
-    assert ids is not None
     return embeds, tuple(ids)
 
 
@@ -325,12 +335,8 @@ def test_semantic_prompt_prefix_boundaries(
     )
     assert _lcp(left_semantic, right_semantic) == expected_lcp
     if compare_legacy:
-        left_legacy = qwen3_request_builders.build_embedding_cache_key_ids(
-            left_embeds.squeeze(0)
-        )
-        right_legacy = qwen3_request_builders.build_embedding_cache_key_ids(
-            right_embeds.squeeze(0)
-        )
+        left_legacy = _legacy_embedding_cache_key_ids(left_embeds.squeeze(0))
+        right_legacy = _legacy_embedding_cache_key_ids(right_embeds.squeeze(0))
         assert _lcp(left_semantic, right_semantic) == _lcp(left_legacy, right_legacy)
 
 
@@ -377,61 +383,33 @@ def test_semantic_row_encoders_are_direct_and_domain_separated() -> None:
     artifact_key = 0x123456789ABCDEF
     text_id = 17
     text_codec = sglang_model._semantic_text_codec_row_id(text_id, 3)
-    assert text_codec is not None and text_codec >= 1 << 61
+    assert text_codec >= 1 << 61
     prefix = _make_prompt_builder()._semantic_conditioned_prefix_ids(
         role_ids=[text_id], codec_prefill_ids=(3,)
     )
-    assert prefix is not None and prefix[0] == text_id
+    assert prefix[0] == text_id
     speaker = sglang_model._semantic_speaker_row_id(text_id, artifact_key)
     frame_zero = sglang_model._semantic_frame_row_id(text_id, artifact_key, 0)
     frame_one = sglang_model._semantic_frame_row_id(text_id, artifact_key, 1)
-    assert speaker is not None and frame_zero is not None and frame_one is not None
     assert speaker == -1 - (artifact_key ^ (text_id << 31))
     assert frame_zero == -1 - (artifact_key ^ ((text_id << 31) | 1))
     assert speaker < 0 and frame_zero < 0 and frame_one < 0
     assert len({speaker, frame_zero, frame_one}) == 3
 
 
-def test_semantic_ids_do_not_change_prompt_tensors(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from sglang_omni.models.qwen3_tts import sglang_model
-
-    builder = _make_prompt_builder(model_type="custom_voice")
-    kwargs = {
-        "input_id": _semantic_input_id(20, 21, 22),
-        "voice": "Vivian",
-        "language": "en",
-        "non_streaming_mode": True,
-        "instruct_id": torch.tensor([[60]], dtype=torch.long),
-    }
-    semantic = builder.build_custom_voice_inputs(**kwargs)
-    monkeypatch.setattr(sglang_model, "_semantic_prompt_text_parts", lambda *args: None)
-    fallback = builder.build_custom_voice_inputs(**kwargs)
-
-    assert len(semantic) == len(fallback) == 5
-    assert all(
-        torch.equal(left, right) for left, right in zip(semantic[:3], fallback[:3])
-    )
-    assert semantic[3] is fallback[3] is None
-    assert semantic[4] is not None
-    assert fallback[4] is None
-
-
-def test_base_missing_artifact_identity_selects_legacy_rows() -> None:
+def test_base_missing_speaker_artifact_identity_fails() -> None:
     builder = _make_prompt_builder()
-    result = builder.build_voice_clone_inputs(
-        input_id=_semantic_input_id(20, 21, 22),
-        ref_id=None,
-        voice_clone_prompt=_voice_clone_prompt(ref_code=None),
-        language="auto",
-        non_streaming_mode=False,
-    )
-    assert len(result) == 5
-    assert result[-1] is None
+    with pytest.raises(RuntimeError, match="speaker artifact identity"):
+        builder.build_voice_clone_inputs(
+            input_id=_semantic_input_id(20, 21, 22),
+            ref_id=None,
+            voice_clone_prompt=_voice_clone_prompt(ref_code=None),
+            language="auto",
+            non_streaming_mode=False,
+        )
 
 
-def test_icl_missing_ref_code_artifact_identity_disables_semantic_rows() -> None:
+def test_icl_missing_ref_code_artifact_identity_fails() -> None:
     builder = _make_prompt_builder()
     ref_code = torch.tensor(
         [[70, 71, 72], [73, 74, 75]],
@@ -441,15 +419,29 @@ def test_icl_missing_ref_code_artifact_identity_disables_semantic_rows() -> None
     assert prompt["speaker_artifact_id"] is not None
     prompt.pop("ref_code_artifact_id")
 
-    result = builder.build_voice_clone_inputs(
-        input_id=_semantic_input_id(20, 21, 22),
-        ref_id=_semantic_ref_id(50, 51),
-        voice_clone_prompt=prompt,
-        language="auto",
-        non_streaming_mode=False,
-    )
+    with pytest.raises(RuntimeError, match="ref-code artifact identity"):
+        builder.build_voice_clone_inputs(
+            input_id=_semantic_input_id(20, 21, 22),
+            ref_id=_semantic_ref_id(50, 51),
+            voice_clone_prompt=prompt,
+            language="auto",
+            non_streaming_mode=False,
+        )
 
-    assert result[-1] is None
+
+def test_icl_missing_ref_code_fails() -> None:
+    builder = _make_prompt_builder()
+    prompt = _semantic_base_prompt(ref_code=None)
+    prompt["icl_mode"] = [True]
+
+    with pytest.raises(RuntimeError, match="did not provide ref_code"):
+        builder.build_voice_clone_inputs(
+            input_id=_semantic_input_id(20, 21, 22),
+            ref_id=_semantic_ref_id(50, 51),
+            voice_clone_prompt=prompt,
+            language="auto",
+            non_streaming_mode=False,
+        )
 
 
 def test_negative_reference_ids_survive_array_and_radix_contract() -> None:

@@ -45,8 +45,7 @@ QWEN3_TTS_TASK_BASE = "Base"
 QWEN3_TTS_TASK_CUSTOM_VOICE = "CustomVoice"
 QWEN3_TTS_TASK_VOICE_DESIGN = "VoiceDesign"
 QWEN3_TTS_DEFAULT_CUSTOM_VOICE = "Vivian"
-QWEN3_TTS_LEGACY_PROMPT_CACHE_KEY = "qwen3_tts:prompt:v1"
-QWEN3_TTS_SEMANTIC_PROMPT_CACHE_KEY = "qwen3_tts:prompt:v2"
+QWEN3_TTS_PROMPT_CACHE_KEY = "qwen3_tts:prompt:v2"
 _QWEN3_TTS_PREPARED_MARKER = "_qwen3_tts_prepared_request"
 _QWEN3_TTS_REF_CODE_BATCH_STOP = object()
 
@@ -55,7 +54,7 @@ _SemanticPromptBuildResult = tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor | None,
-    tuple[int, ...] | None,
+    tuple[int, ...],
 ]
 
 _GENERATION_FIELDS = (
@@ -165,7 +164,6 @@ class Qwen3TTSPreparedRequest:
     prompt_input_embeds: torch.Tensor
     tts_pad_embed: torch.Tensor
     gen_kwargs: dict[str, Any]
-    prompt_cache_key: str = QWEN3_TTS_LEGACY_PROMPT_CACHE_KEY
 
 
 @dataclass
@@ -264,6 +262,8 @@ def build_qwen3_tts_state(
         tts_engine_params = stage_params["tts_engine"]
 
     text, references = normalize_qwen3_tts_inputs(inputs)
+    if not text.strip():
+        raise ValueError("Qwen3-TTS requires non-empty text")
     has_reference = has_voice_clone_reference(references, tts_params)
     task_type_raw = tts_params.get("task_type") or params.get("task_type")
     task_type_explicit = task_type_raw is not None and str(task_type_raw).strip() != ""
@@ -620,16 +620,6 @@ def build_generation_kwargs(
         if field in selected_fields:
             generation_kwargs[field] = selected_fields[field]
     return generation_kwargs
-
-
-def build_embedding_cache_key_ids(input_embeds: torch.Tensor) -> list[int]:
-    """Build stable radix-cache token ids for a precomputed embedding prefix."""
-    rows = input_embeds.detach().to(dtype=torch.float32, device="cpu")
-    key_ids: list[int] = []
-    for row in rows:
-        digest = hashlib.blake2b(row.numpy().tobytes(), digest_size=8).digest()
-        key_ids.append(int.from_bytes(digest, "little") & ((1 << 63) - 1))
-    return key_ids
 
 
 def _build_qwen3_tts_pad_embed(model: Any) -> torch.Tensor:
@@ -1278,12 +1268,7 @@ def _prepare_qwen3_tts_request(
             dtype=feedback_buffer.dtype,
         )
     )
-    if prompt_cache_ids is None:
-        input_ids_list = build_embedding_cache_key_ids(prompt_input_embeds)
-        prompt_cache_key = QWEN3_TTS_LEGACY_PROMPT_CACHE_KEY
-    else:
-        input_ids_list = list(prompt_cache_ids)
-        prompt_cache_key = QWEN3_TTS_SEMANTIC_PROMPT_CACHE_KEY
+    input_ids_list = list(prompt_cache_ids)
     input_ids = torch.tensor(input_ids_list, dtype=torch.long)
     trailing_text_hidden = (
         trailing_text_hidden.squeeze(0)
@@ -1306,7 +1291,6 @@ def _prepare_qwen3_tts_request(
         prompt_input_embeds=prompt_input_embeds,
         tts_pad_embed=_build_qwen3_tts_pad_embed(model),
         gen_kwargs=gen_kwargs,
-        prompt_cache_key=prompt_cache_key,
     )
 
 
@@ -1349,7 +1333,6 @@ _PREPARED_PAYLOAD_FIELDS = (
     "prepared_ref_code",
     "prepared_pad_embed",
     "prepared_input_ids",
-    "prepared_prompt_cache_key",
     "prepared_gen_kwargs",
 )
 
@@ -1365,7 +1348,6 @@ def _store_prepared_qwen3_tts_payload(
     state.prepared_ref_code = prepared.ref_code
     state.prepared_pad_embed = prepared.tts_pad_embed
     state.prepared_input_ids = list(prepared.input_ids_list)
-    state.prepared_prompt_cache_key = prepared.prompt_cache_key
     state.prepared_gen_kwargs = dict(prepared.gen_kwargs)
     # Note (Jiaxin Deng): the reference clip is consumed here and read by nothing
     # downstream, so it would otherwise ride every later hop as raw media.
@@ -1397,9 +1379,6 @@ def _load_prepared_qwen3_tts_request(
     )
     tts_pad_embed = state.prepared_pad_embed.to(device=device, dtype=dtype)
     input_ids_list = [int(token) for token in state.prepared_input_ids]
-    prompt_cache_key = (
-        state.prepared_prompt_cache_key or QWEN3_TTS_LEGACY_PROMPT_CACHE_KEY
-    )
     gen_kwargs = dict(state.prepared_gen_kwargs or {})
     for name in _PREPARED_PAYLOAD_FIELDS:
         setattr(state, name, None)
@@ -1416,7 +1395,6 @@ def _load_prepared_qwen3_tts_request(
         prompt_input_embeds=prompt_input_embeds,
         tts_pad_embed=tts_pad_embed,
         gen_kwargs=gen_kwargs,
-        prompt_cache_key=prompt_cache_key,
     )
 
 
@@ -1472,7 +1450,7 @@ def build_sglang_qwen3_tts_request(
         sampling_params=sampling_params,
         eos_token_ids={int(model.config.codec_eos_token_id)},
         vocab_size=int(model.config.vocab_size),
-        extra_key=prepared.prompt_cache_key,
+        extra_key=QWEN3_TTS_PROMPT_CACHE_KEY,
     )
     req.tokenizer = None
     req._input_embeds_are_projected = True

@@ -112,7 +112,7 @@ class _QwenVoiceCloneModel:
             torch.ones((1, 2), dtype=torch.long),
             torch.zeros((1, 1, 4)),
             torch.tensor([[10, 20]], dtype=torch.long),
-            None,
+            (101, 102),
         )
 
 
