@@ -209,12 +209,8 @@ def _lcp(left: tuple[int, ...] | list[int], right: tuple[int, ...] | list[int]) 
 def test_real_prompt_builder_emits_one_semantic_id_per_row(
     kind: str, non_streaming: bool
 ) -> None:
-    builder = _make_prompt_builder(
-        model_type="custom_voice" if kind == "custom" else "voice_design"
-    )
     embeds, ids = _build_semantic_prompt(
         kind,
-        builder=builder,
         non_streaming=non_streaming,
         instruction_ids=(60, 61) if kind == "design" else (),
     )
@@ -432,6 +428,27 @@ def test_base_missing_artifact_identity_selects_legacy_rows() -> None:
         non_streaming_mode=False,
     )
     assert len(result) == 5
+    assert result[-1] is None
+
+
+def test_icl_missing_ref_code_artifact_identity_disables_semantic_rows() -> None:
+    builder = _make_prompt_builder()
+    ref_code = torch.tensor(
+        [[70, 71, 72], [73, 74, 75]],
+        dtype=torch.long,
+    )
+    prompt = _semantic_base_prompt(ref_code=ref_code)
+    assert prompt["speaker_artifact_id"] is not None
+    prompt.pop("ref_code_artifact_id")
+
+    result = builder.build_voice_clone_inputs(
+        input_id=_semantic_input_id(20, 21, 22),
+        ref_id=_semantic_ref_id(50, 51),
+        voice_clone_prompt=prompt,
+        language="auto",
+        non_streaming_mode=False,
+    )
+
     assert result[-1] is None
 
 
