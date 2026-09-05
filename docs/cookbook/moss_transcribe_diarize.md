@@ -116,16 +116,23 @@ sgl-omni serve \
 
 Calibration mode enforces `disable_cuda_graph=true` and
 `enable_torch_compile=false` even if the normal MOSS-TD stage defaults are
-present. The explicit flags above make the launch contract visible. Do not set
-`asr.factory.encoder_torch_compile=true` for a calibration run unless the
-encoder experiment is intentional; it is unrelated to the decoder collector.
-The checkpoint interval must be positive.
+present. It also resolves both phase backends to `disabled` in the final
+SGLang `ServerArgs`, including when an operator supplied
+`cuda_graph_backend_prefill`, `cuda_graph_backend_decode`, or a nested
+`cuda_graph_config`. The explicit flags above make the launch contract
+visible. Do not set `asr.factory.encoder_torch_compile=true` for a calibration
+run unless the encoder experiment is intentional; it is unrelated to the
+decoder collector. The checkpoint interval must be positive.
 
-Send the representative BF16 audio corpus to this server, then stop the server
-gracefully so the stage shutdown callback can finalize the artifact. During the
-run, the file is atomically replaced with `status: "in_progress"` checkpoints.
-Only a graceful finalization can publish `status: "complete"`; an interrupted
-or killed process therefore leaves an artifact that validation rejects.
+Start a fresh, dedicated server for the selected calibration corpus. Send only
+the intended BF16 audio samples in the intended order; do not add unrelated
+synthetic warmup, precondition, or smoke-test audio unless it is deliberately
+part of the calibration corpus. Then stop the server gracefully. The stage
+waits for the scheduler thread to exit before its calibration finalizer runs.
+During the run, the file is atomically replaced with `status: "in_progress"`
+checkpoints. Only a graceful post-quiescence finalization can publish
+`status: "complete"`; an interrupted, killed, timed-out, or checkpoint-failed
+run remains unusable and validation rejects it.
 
 The hook is registered on each of the 28 per-layer `RadixAttention` modules.
 It observes the positional K/V inputs after QK norm and rotary processing and
@@ -136,7 +143,9 @@ completed artifact records `model_path`, `git_head`, `git_dirty`,
 and timestamps. `validate_raw_calibration` rejects anything that is not exactly
 28 observed layers, has a missing layer, has a non-positive maximum, or has a
 NaN/infinity. The `observed_layers` list and `observed_layer_count` are the
-direct evidence that all 28 hooks ran.
+direct evidence that all 28 hooks ran. Validate the artifact after the server
+has stopped and before converting it; an `in_progress` file is intentionally
+not valid.
 
 Validate and convert the completed raw artifact with an explicit margin:
 
@@ -160,9 +169,11 @@ fit. The output is the TP=1 vLLM-legacy JSON consumed by the existing
 Normal serving is unchanged when calibration is off: the output path defaults
 to `None`, no hooks or collector are constructed, the regular CUDA-graph and
 decoder-compile defaults remain in effect, and the canonical FP8 scale-loading
-implementation is not modified. The focused unit tests cover this default
-path as well as artifact validation, atomic checkpointing, hook placement, and
-explicit-margin conversion.
+implementation is not modified. To prove that condition for a change, run the
+focused MOSS-TD tests and inspect the non-calibration assertions: the default
+builder has no collector callback, keeps the normal `breakable` prefill policy,
+and does not add calibration graph overrides. The calibration-only assertions
+are gated solely by the explicit non-`None` output path.
 
 ## Model Usage
 

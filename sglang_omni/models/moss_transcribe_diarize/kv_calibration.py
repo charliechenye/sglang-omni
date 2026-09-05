@@ -19,11 +19,12 @@ import math
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from numbers import Real
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import torch
 
@@ -89,7 +90,12 @@ def _git_metadata() -> tuple[str, bool]:
         ) from exc
 
 
-def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
+def _atomic_write_json(
+    path: Path,
+    payload: Mapping[str, Any],
+    *,
+    validator: Callable[[Path], None] | None = None,
+) -> None:
     """Atomically replace *path* with a durable JSON document."""
 
     path = path.expanduser()
@@ -112,6 +118,11 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             output.write("\n")
             output.flush()
             os.fsync(output.fileno())
+        if validator is not None:
+            # Validate the fully written staging file before replacing a
+            # previously published artifact.  A failed validation therefore
+            # cannot make a bad output path look complete.
+            validator(Path(temporary_name))
         os.replace(temporary_name, path)
         directory_fd = os.open(
             path.parent,
@@ -131,6 +142,15 @@ def _atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
 
 def _reject_json_constant(value: str) -> None:
     raise ValueError(f"non-standard JSON constant {value!r} is not allowed")
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise CalibrationValidationError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
 
 
 def _require_json_integer(value: Any, *, field: str) -> int:
@@ -264,6 +284,7 @@ def read_raw_calibration(path: str | os.PathLike[str]) -> dict[str, Any]:
     try:
         payload = json.loads(
             artifact_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
             parse_constant=_reject_json_constant,
         )
     except (OSError, json.JSONDecodeError, ValueError) as exc:
@@ -341,13 +362,18 @@ class MossTDKVCalibrationCollector:
             raise ValueError("output_path must not be a directory")
         self._checkpoint_interval_s = checkpoint_interval_s
         self._device = torch.device(device)
+        self._state_lock = threading.RLock()
         self._running_amax = torch.zeros(
             (EXPECTED_NUM_LAYERS, 2), dtype=torch.float32, device=self._device
+        )
+        self._nonfinite_amax = torch.zeros(
+            (EXPECTED_NUM_LAYERS, 2), dtype=torch.bool, device=self._device
         )
         self._seen_layers: set[int] = set()
         self._hook_calls = 0
         self._handles: list[Any] = []
         self._closed = False
+        self._checkpoint_error: str | None = None
         self._timestamp = _utc_timestamp()
         self._next_checkpoint_at = time.monotonic() + checkpoint_interval_s
         if git_metadata is None:
@@ -402,52 +428,84 @@ class MossTDKVCalibrationCollector:
         return capture
 
     def _capture(self, layer_index: int, inputs: tuple[Any, ...]) -> None:
-        if self._closed:
-            return
-        self._hook_calls += 1
-        if len(inputs) < 3:
-            raise RuntimeError(
-                f"layer {layer_index} RadixAttention hook received fewer than "
-                "three positional inputs; cannot identify K/V"
-            )
-        key, value = inputs[1], inputs[2]
-        if not isinstance(key, torch.Tensor) or not isinstance(value, torch.Tensor):
-            raise RuntimeError(
-                f"layer {layer_index} RadixAttention hook did not receive tensor K/V"
-            )
-        if key.numel() == 0 or value.numel() == 0:
-            raise RuntimeError(f"layer {layer_index} received an empty K/V tensor")
-        if key.device != self._device or value.device != self._device:
-            raise RuntimeError(
-                f"layer {layer_index} K/V device mismatch: expected {self._device}, "
-                f"got {key.device} and {value.device}"
-            )
-
-        # These reductions and maxima remain on the model device. In
-        # particular, there is no host scalar read, CPU copy, or synchronization
-        # here.
-        with torch.no_grad():
-            key_amax = _device_amax(key)
-            value_amax = _device_amax(value)
-            for slot, candidate in (
-                (self._running_amax[layer_index, 0], key_amax),
-                (self._running_amax[layer_index, 1], value_amax),
-            ):
-                # Preserve every non-finite observation so final artifact
-                # validation cannot accidentally accept it, independent of
-                # backend reduction semantics.
-                finite_max = torch.maximum(slot, candidate)
-                slot.copy_(
-                    torch.where(torch.isfinite(candidate), finite_max, candidate)
+        # The stage normally has one scheduler thread, but the lock also
+        # makes explicit finalization safe if a test or teardown races a hook:
+        # a hook either finishes its device update before close or observes the
+        # closed state and does nothing.
+        with self._state_lock:
+            if self._closed:
+                return
+            self._hook_calls += 1
+            if len(inputs) < 3:
+                raise RuntimeError(
+                    f"layer {layer_index} RadixAttention hook received fewer than "
+                    "three positional inputs; cannot identify K/V"
                 )
-        self._seen_layers.add(layer_index)
-        self._maybe_checkpoint()
+            key, value = inputs[1], inputs[2]
+            if not isinstance(key, torch.Tensor) or not isinstance(
+                value, torch.Tensor
+            ):
+                raise RuntimeError(
+                    f"layer {layer_index} RadixAttention hook did not receive "
+                    "tensor K/V"
+                )
+            if key.numel() == 0 or value.numel() == 0:
+                raise RuntimeError(f"layer {layer_index} received an empty K/V tensor")
+            if key.device != self._device or value.device != self._device:
+                raise RuntimeError(
+                    f"layer {layer_index} K/V device mismatch: "
+                    f"expected {self._device}, "
+                    f"got {key.device} and {value.device}"
+                )
+
+            # These reductions and maxima remain on the model device. In
+            # particular, there is no host scalar read, CPU copy, or
+            # synchronization here.
+            with torch.no_grad():
+                key_amax = _device_amax(key)
+                value_amax = _device_amax(value)
+                for slot, candidate, nonfinite_slot in (
+                    (
+                        self._running_amax[layer_index, 0],
+                        key_amax,
+                        self._nonfinite_amax[layer_index, 0],
+                    ),
+                    (
+                        self._running_amax[layer_index, 1],
+                        value_amax,
+                        self._nonfinite_amax[layer_index, 1],
+                    ),
+                ):
+                    # Preserve every non-finite observation in both the
+                    # reduction and a sticky device-side flag, independent of
+                    # backend reduction semantics.
+                    candidate_nonfinite = ~torch.isfinite(candidate)
+                    nonfinite_slot.copy_(
+                        torch.logical_or(nonfinite_slot, candidate_nonfinite)
+                    )
+                    finite_max = torch.maximum(slot, candidate)
+                    slot.copy_(
+                        torch.where(
+                            torch.isfinite(candidate), finite_max, candidate
+                        )
+                    )
+            self._seen_layers.add(layer_index)
+            self._maybe_checkpoint()
 
     def _maybe_checkpoint(self) -> None:
+        if self._closed or self._checkpoint_error is not None:
+            return
         now = time.monotonic()
         if now < self._next_checkpoint_at:
             return
-        self._write_snapshot(status="in_progress")
+        try:
+            self._write_snapshot(status="in_progress")
+        except BaseException as exc:
+            # A failed checkpoint must be sticky.  Otherwise a later graceful
+            # stop could silently publish a complete artifact even though the
+            # requested durable checkpoint was never written.
+            self._checkpoint_error = str(exc) or type(exc).__name__
+            raise
         self._next_checkpoint_at = now + self._checkpoint_interval_s
 
     def _snapshot_values(self) -> list[list[float | str]]:
@@ -455,9 +513,21 @@ class MossTDKVCalibrationCollector:
         # it synchronizes once for the whole 28x2 tensor rather than once per
         # layer or decode step.
         values = self._running_amax.detach().cpu().tolist()
+        nonfinite = self._nonfinite_amax.detach().cpu().tolist()
         return [
-            [_json_safe_float(float(key)), _json_safe_float(float(value))]
-            for key, value in values
+            [
+                (
+                    "NaN"
+                    if nonfinite[index][0]
+                    else _json_safe_float(float(key))
+                ),
+                (
+                    "NaN"
+                    if nonfinite[index][1]
+                    else _json_safe_float(float(value))
+                ),
+            ]
+            for index, (key, value) in enumerate(values)
         ]
 
     def _payload(
@@ -466,54 +536,88 @@ class MossTDKVCalibrationCollector:
         status: str,
         validation_error: str | None = None,
     ) -> dict[str, Any]:
-        values = self._snapshot_values()
-        payload = {
-            **self._metadata,
-            "status": status,
-            "observed_layer_count": len(self._seen_layers),
-            "observed_layers": sorted(self._seen_layers),
-            "layers": [
-                {
-                    "layer": index,
-                    "k_amax": values[index][0],
-                    "v_amax": values[index][1],
-                }
-                for index in range(EXPECTED_NUM_LAYERS)
-            ],
-            "last_checkpoint_timestamp": _utc_timestamp(),
-            "hook_calls": self._hook_calls,
-        }
-        if validation_error is not None:
-            payload["validation_error"] = validation_error
-        return payload
+        with self._state_lock:
+            values = self._snapshot_values()
+            payload = {
+                **self._metadata,
+                "status": status,
+                "observed_layer_count": len(self._seen_layers),
+                "observed_layers": sorted(self._seen_layers),
+                "layers": [
+                    {
+                        "layer": index,
+                        "k_amax": values[index][0],
+                        "v_amax": values[index][1],
+                    }
+                    for index in range(EXPECTED_NUM_LAYERS)
+                ],
+                "last_checkpoint_timestamp": _utc_timestamp(),
+                "hook_calls": self._hook_calls,
+            }
+            if validation_error is not None:
+                payload["validation_error"] = validation_error
+            return payload
 
     def _write_snapshot(self, *, status: str) -> None:
-        _atomic_write_json(self._output_path, self._payload(status=status))
+        with self._state_lock:
+            if self._closed:
+                return
+            _atomic_write_json(self._output_path, self._payload(status=status))
 
     def _remove_hooks(self) -> None:
-        for handle in self._handles:
-            handle.remove()
-        self._handles.clear()
+        # Detach the handle list before calling user/framework code. This
+        # makes repeated teardown attempts idempotent even if one remove()
+        # raises, and still gives every registered handle one removal attempt.
+        handles, self._handles = self._handles, []
+        first_error: BaseException | None = None
+        for handle in handles:
+            try:
+                handle.remove()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+        if first_error is not None:
+            raise first_error
 
     def finalize(self) -> None:
         """Remove hooks and atomically publish a valid completed artifact."""
 
-        if self._closed:
-            return
-        self._remove_hooks()
-        try:
-            payload = self._payload(status="complete")
+        with self._state_lock:
+            if self._closed:
+                return
             try:
-                validate_raw_calibration(payload)
-            except CalibrationValidationError as exc:
+                self._remove_hooks()
+                if self._checkpoint_error is not None:
+                    error = (
+                        "calibration checkpoint failed; refusing to publish a "
+                        f"complete artifact: {self._checkpoint_error}"
+                    )
+                    payload = self._payload(
+                        status="invalid",
+                        validation_error=error,
+                    )
+                    try:
+                        _atomic_write_json(self._output_path, payload)
+                    except BaseException as exc:
+                        raise CalibrationValidationError(
+                            f"{error}; could not write invalid artifact: {exc}"
+                        ) from exc
+                    raise CalibrationValidationError(error)
+
+                payload = self._payload(status="complete")
                 try:
-                    self._write_payload_with_error(payload, str(exc))
-                finally:
-                    self._closed = True
-                raise
-            _atomic_write_json(self._output_path, payload)
-        finally:
-            self._closed = True
+                    validate_raw_calibration(payload)
+                except CalibrationValidationError as exc:
+                    try:
+                        self._write_payload_with_error(payload, str(exc))
+                    except BaseException as write_exc:
+                        raise CalibrationValidationError(
+                            f"{exc}; could not write invalid artifact: {write_exc}"
+                        ) from write_exc
+                    raise
+                _atomic_write_json(self._output_path, payload)
+            finally:
+                self._closed = True
 
     def _write_payload_with_error(
         self,
@@ -528,10 +632,13 @@ class MossTDKVCalibrationCollector:
     def abort(self) -> None:
         """Detach without finalizing, leaving an unusable in-progress artifact."""
 
-        if self._closed:
-            return
-        self._remove_hooks()
-        self._closed = True
+        with self._state_lock:
+            if self._closed:
+                return
+            try:
+                self._remove_hooks()
+            finally:
+                self._closed = True
 
 
 def find_moss_td_radix_attention_modules(model: Any) -> list[Any]:
@@ -631,8 +738,107 @@ def convert_raw_calibration_to_vllm_legacy(
             "scaling_factor": {"0": scaling_factor},
         },
     }
-    _atomic_write_json(Path(output_path).expanduser(), payload)
+    _atomic_write_json(
+        Path(output_path).expanduser(),
+        payload,
+        validator=lambda staged_path: validate_vllm_legacy_scale_artifact(
+            staged_path,
+            expected_scales=scaling_factor,
+        ),
+    )
     return payload
+
+
+def validate_vllm_legacy_scale_artifact(
+    path: str | os.PathLike[str],
+    *,
+    expected_scales: Mapping[int | str, Real] | None = None,
+) -> dict[int, float]:
+    """Validate a converted artifact with SGLang's actual KV-scale loader.
+
+    The loader's public contract is intentionally called with all of its
+    consumer arguments here.  This catches schema, model-type, dtype, TP-map,
+    layer-count, and layer-id errors that a local JSON shape check could miss.
+    If ``expected_scales`` is supplied, the values returned by that loader must
+    also match the converter's values exactly.
+    """
+
+    artifact_path = Path(path).expanduser()
+    try:
+        json.loads(
+            artifact_path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        if isinstance(exc, CalibrationValidationError):
+            raise
+        raise CalibrationValidationError(
+            f"could not read valid vLLM-legacy JSON from {artifact_path}: {exc}"
+        ) from exc
+
+    try:
+        from sglang.srt.model_loader.weight_utils import kv_cache_scales_loader
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError(
+            "validating vLLM-legacy KV scales requires an importable SGLang "
+            "installation"
+        ) from exc
+
+    entries = list(
+        kv_cache_scales_loader(
+            str(artifact_path),
+            tp_rank=0,
+            tp_size=1,
+            num_hidden_layers=EXPECTED_NUM_LAYERS,
+            model_type=QWEN3_MODEL_TYPE,
+        )
+    )
+    if len(entries) != EXPECTED_NUM_LAYERS:
+        raise CalibrationValidationError(
+            "vLLM-legacy loader expected exactly 28 layer entries; got "
+            f"{len(entries)}"
+        )
+
+    actual: dict[int, float] = {}
+    for layer_id, value in entries:
+        if isinstance(layer_id, bool) or not isinstance(layer_id, int):
+            raise CalibrationValidationError(
+                f"vLLM-legacy loader returned a non-integer layer id: {layer_id!r}"
+            )
+        if layer_id in actual:
+            raise CalibrationValidationError(
+                f"vLLM-legacy loader returned duplicate layer id {layer_id}"
+            )
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise CalibrationValidationError(
+                f"vLLM-legacy loader returned an invalid scale for layer {layer_id}"
+            )
+        value_float = float(value)
+        if not math.isfinite(value_float) or value_float <= 0.0:
+            raise CalibrationValidationError(
+                f"vLLM-legacy loader returned a non-positive/non-finite scale "
+                f"for layer {layer_id}"
+            )
+        actual[layer_id] = value_float
+
+    expected_ids = set(range(EXPECTED_NUM_LAYERS))
+    if set(actual) != expected_ids:
+        raise CalibrationValidationError(
+            "vLLM-legacy loader returned layer ids other than 0-27: "
+            f"{sorted(actual)}"
+        )
+    if expected_scales is not None:
+        expected = {
+            int(layer_id): float(value)
+            for layer_id, value in expected_scales.items()
+        }
+        if actual != expected:
+            raise CalibrationValidationError(
+                "vLLM-legacy loader values do not exactly match the converted "
+                f"values: expected {expected!r}, got {actual!r}"
+            )
+    return actual
 
 
 def _build_cli() -> argparse.ArgumentParser:
@@ -691,4 +897,5 @@ __all__ = [
     "main",
     "read_raw_calibration",
     "validate_raw_calibration",
+    "validate_vllm_legacy_scale_artifact",
 ]

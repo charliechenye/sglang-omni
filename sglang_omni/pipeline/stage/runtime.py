@@ -298,6 +298,18 @@ class Stage:
                         )
                     else:
                         self._scheduler_thread = None
+                        post_quiescence_callback = getattr(
+                            self.scheduler,
+                            "run_post_quiescence_callback",
+                            None,
+                        )
+                        if post_quiescence_callback is not None:
+                            try:
+                                post_quiescence_callback()
+                            except Exception as exc:
+                                _record_cleanup_error(
+                                    "post-quiescence scheduler", exc
+                                )
         try:
             self.control_plane.close()
         except Exception as exc:

@@ -196,6 +196,7 @@ class OmniScheduler:
         request_build_max_workers: int = 1,
         request_build_max_pending: int | None = None,
         shutdown_callback: Callable[[], None] | None = None,
+        post_quiescence_callback: Callable[[], None] | None = None,
     ):
         self.inbox: _queue_mod.Queue[IncomingMessage] = _queue_mod.Queue()
         self.outbox: _queue_mod.Queue[OutgoingMessage] = _queue_mod.Queue()
@@ -211,6 +212,7 @@ class OmniScheduler:
         self._abort_callback = abort_callback
         self._request_finished_callback = request_finished_callback
         self._shutdown_callback = shutdown_callback
+        self._post_quiescence_callback = post_quiescence_callback
         self._shutdown_lock = threading.Lock()
         self._request_admission_lock = threading.RLock()
         self._prompt_cache_epoch = 0
@@ -1760,6 +1762,20 @@ class OmniScheduler:
         with self._shutdown_lock:
             callback = self._shutdown_callback
             self._shutdown_callback = None
+        if callback is not None:
+            callback()
+
+    def run_post_quiescence_callback(self) -> None:
+        """Run the stage-owned callback after the scheduler thread has exited.
+
+        ``Stage.stop`` is the owner of the join that establishes this
+        quiescence point.  Keeping this separate from ``_shutdown_resources``
+        preserves the existing early-stop behavior for scheduler resources.
+        """
+
+        with self._shutdown_lock:
+            callback = getattr(self, "_post_quiescence_callback", None)
+            self._post_quiescence_callback = None
         if callback is not None:
             callback()
 

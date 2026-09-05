@@ -91,6 +91,14 @@ class SGLangGenerationEngineBuilder(ABC):
 
         self.pre_infra_setup(checkpoint_dir)
 
+        # Give a model-specific test mode one final chance to normalize the
+        # operator's raw overrides before generation-batch precedence and
+        # SGLang ServerArgs resolution run.  Normal builders return the same
+        # object unchanged.
+        server_args_overrides = self.prepare_server_args_overrides(
+            server_args_overrides
+        )
+
         if current_platform.is_cpu():
             # A stage default asking for a graph would otherwise fail inside
             # capture rather than at configuration time.
@@ -284,6 +292,14 @@ class SGLangGenerationEngineBuilder(ABC):
     ) -> int:
         del checkpoint_dir, server_args_overrides
         return self.context_length
+
+    def prepare_server_args_overrides(
+        self,
+        server_args_overrides: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        """Normalize raw operator overrides before shared merge logic."""
+
+        return server_args_overrides
 
     def validate_before_infrastructure(self, server_args: Any) -> None:
         del server_args

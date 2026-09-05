@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
@@ -14,8 +15,56 @@ from sglang_omni.models.moss_transcribe_diarize.encoder_service import (
 from sglang_omni.scheduling.engine_factory import AsrEngineBuilder
 from sglang_omni.scheduling.generation_batch_policy import (
     CudaGraphBackend,
+    CudaGraphConfig,
     build_default_prefill_cuda_graph_bs,
 )
+
+
+def _force_calibration_server_args_overrides(
+    server_args_overrides: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    """Make every decoder CUDA-graph/compile input eager for calibration.
+
+    SGLang gives nested ``cuda_graph_config`` precedence over convenience
+    flags, while explicit convenience flags can in turn override the legacy
+    ``disable_cuda_graph`` switch.  Calibration owns all of those knobs so an
+    operator's normal-serving settings cannot re-enable a graph around the
+    collector.
+    """
+
+    normalized = dict(server_args_overrides or {})
+    normalized["disable_cuda_graph"] = True
+    normalized["enable_torch_compile"] = False
+    normalized["cuda_graph_backend_decode"] = CudaGraphBackend.DISABLED
+    normalized["cuda_graph_backend_prefill"] = CudaGraphBackend.DISABLED
+
+    config = normalized.get("cuda_graph_config")
+    if isinstance(config, CudaGraphConfig):
+        config = config.to_dict()
+    elif config is None:
+        config = {}
+    elif not isinstance(config, Mapping):
+        raise ValueError(
+            "MOSS-TD KV calibration requires cuda_graph_config to be a mapping"
+        )
+    else:
+        config = dict(config)
+
+    for phase in ("decode", "prefill"):
+        phase_config = config.get(phase)
+        if phase_config is None:
+            phase_config = {}
+        elif not isinstance(phase_config, Mapping):
+            raise ValueError(
+                "MOSS-TD KV calibration requires each cuda_graph_config phase "
+                "to be a mapping"
+            )
+        else:
+            phase_config = dict(phase_config)
+        phase_config["backend"] = CudaGraphBackend.DISABLED
+        config[phase] = phase_config
+    normalized["cuda_graph_config"] = config
+    return normalized
 
 
 class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
@@ -118,7 +167,7 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
             2,
             *build_default_prefill_cuda_graph_bs(4096),
         ]
-        return {
+        defaults = {
             "max_running_requests": self.max_running_requests,
             "disable_cuda_graph": self.kv_calibration_output_path is not None,
             "disable_overlap_schedule": True,
@@ -132,10 +181,25 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
             "max_prefill_tokens": 4096,
             "chunked_prefill_size": 4096,
             "sampling_backend": "pytorch",
-            "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
+            "cuda_graph_backend_prefill": (
+                CudaGraphBackend.DISABLED
+                if self.kv_calibration_output_path is not None
+                else CudaGraphBackend.BREAKABLE
+            ),
             "cuda_graph_bs_prefill": prefill_cuda_graph_bs,
             "dtype": dtype,
         }
+        if self.kv_calibration_output_path is not None:
+            defaults.update(_force_calibration_server_args_overrides(None))
+        return defaults
+
+    def prepare_server_args_overrides(
+        self,
+        server_args_overrides: Mapping[str, Any] | None,
+    ) -> Mapping[str, Any] | None:
+        if self.kv_calibration_output_path is None:
+            return server_args_overrides
+        return _force_calibration_server_args_overrides(server_args_overrides)
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
         # note (Dayuxiaoshui): context_length is an explicit server-args
@@ -143,10 +207,9 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         # expands overrides.
         if self.kv_calibration_output_path is not None:
             # Keep this guard at the final builder merge point as well as in the
-            # stage factory: direct builder users must not accidentally capture
+            # pre-merge hook: direct builder users must not accidentally capture
             # a graph or compile away the hooks.
-            overrides["disable_cuda_graph"] = True
-            overrides["enable_torch_compile"] = False
+            overrides.update(_force_calibration_server_args_overrides(overrides))
         if "context_length" in overrides:
             self.context_length = int(overrides.pop("context_length"))
 
@@ -232,7 +295,12 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
     def extra_scheduler_callbacks(self) -> dict[str, Any]:
         if self.kv_calibration_collector is None:
             return {}
-        return {"shutdown_callback": self.kv_calibration_collector.finalize}
+        # Finalization belongs after Stage joins the scheduler thread.  The
+        # regular shutdown callback runs from OmniScheduler.stop(), before
+        # model execution has necessarily quiesced.
+        return {
+            "post_quiescence_callback": self.kv_calibration_collector.finalize
+        }
 
     def cleanup_build_failure(self) -> None:
         if self.kv_calibration_collector is not None:
