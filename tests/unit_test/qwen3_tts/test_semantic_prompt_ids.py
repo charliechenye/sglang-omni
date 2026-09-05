@@ -104,6 +104,10 @@ def _semantic_base_prompt(
     *, ref_code: torch.Tensor | None, speaker_value: float = 1.0
 ) -> dict[str, Any]:
     prompt = _voice_clone_prompt(ref_code=ref_code, speaker_value=speaker_value)
+    speaker_hex = "1" * 32 if speaker_value == 1.0 else "2" * 32
+    prompt["speaker_artifact_id"] = "speaker:" + speaker_hex
+    if ref_code is not None:
+        prompt["ref_code_artifact_id"] = "ref_code:" + "3" * 32
     artifact = qwen3_request_builders._cacheable_qwen3_tts_voice_prompt(
         prompt,
         ref_text="reference",
@@ -153,50 +157,69 @@ def _build_semantic_prompt(
         )
         if ref_code_artifact_id is not None:
             prompt["ref_code_artifact_id"] = ref_code_artifact_id
+        semantic_plan = builder.build_semantic_prompt_plan(
+            task="base",
+            semantic_input_ids=semantic_input_ids,
+            semantic_instruct_ids=semantic_instruct_ids,
+            semantic_ref_ids=tuple(int(token) for token in ref_id.reshape(-1).tolist()),
+            language=language,
+            non_streaming_mode=non_streaming,
+            voice_clone_prompt=prompt,
+        )
         result = builder.build_voice_clone_inputs(
             input_id=input_id,
             ref_id=ref_id,
             voice_clone_prompt=prompt,
-            language=language,
-            non_streaming_mode=non_streaming,
+            semantic_plan=semantic_plan,
             instruct_id=instruct_id,
-            semantic_input_ids=semantic_input_ids,
-            semantic_instruct_ids=semantic_instruct_ids,
-            semantic_ref_ids=tuple(int(token) for token in ref_id.reshape(-1).tolist()),
         )
     elif kind == "xvector":
+        prompt = _semantic_base_prompt(
+            ref_code=None,
+            speaker_value=speaker_value,
+        )
+        semantic_plan = builder.build_semantic_prompt_plan(
+            task="base",
+            semantic_input_ids=semantic_input_ids,
+            semantic_instruct_ids=semantic_instruct_ids,
+            language=language,
+            non_streaming_mode=non_streaming,
+            voice_clone_prompt=prompt,
+        )
         result = builder.build_voice_clone_inputs(
             input_id=input_id,
             ref_id=None,
-            voice_clone_prompt=_semantic_base_prompt(
-                ref_code=None, speaker_value=speaker_value
-            ),
-            language=language,
-            non_streaming_mode=non_streaming,
+            voice_clone_prompt=prompt,
+            semantic_plan=semantic_plan,
             instruct_id=instruct_id,
-            semantic_input_ids=semantic_input_ids,
-            semantic_instruct_ids=semantic_instruct_ids,
-            semantic_ref_ids=None,
         )
     elif kind == "custom":
-        result = builder.build_custom_voice_inputs(
-            input_id=input_id,
-            voice=voice,
-            language=language,
-            non_streaming_mode=non_streaming,
-            instruct_id=instruct_id,
+        semantic_plan = builder.build_semantic_prompt_plan(
+            task="custom_voice",
             semantic_input_ids=semantic_input_ids,
             semantic_instruct_ids=semantic_instruct_ids,
+            language=language,
+            non_streaming_mode=non_streaming,
+            voice=voice,
+        )
+        result = builder.build_custom_voice_inputs(
+            input_id=input_id,
+            semantic_plan=semantic_plan,
+            instruct_id=instruct_id,
         )
     else:
         design_instruction_ids = instruction_ids or (60,)
-        result = builder.build_voice_design_inputs(
-            input_id=input_id,
-            language=language,
-            non_streaming_mode=non_streaming,
-            instruct_id=torch.tensor([list(design_instruction_ids)], dtype=torch.long),
+        semantic_plan = builder.build_semantic_prompt_plan(
+            task="voice_design",
             semantic_input_ids=semantic_input_ids,
             semantic_instruct_ids=tuple(design_instruction_ids),
+            language=language,
+            non_streaming_mode=non_streaming,
+        )
+        result = builder.build_voice_design_inputs(
+            input_id=input_id,
+            semantic_plan=semantic_plan,
+            instruct_id=torch.tensor([list(design_instruction_ids)], dtype=torch.long),
         )
 
     assert len(result) == 5
@@ -394,10 +417,6 @@ def test_semantic_row_encoders_are_direct_and_domain_separated() -> None:
     text_id = 17
     text_codec = sglang_model._semantic_text_codec_row_id(text_id, 3)
     assert text_codec >= 1 << 61
-    prefix = _make_prompt_builder()._semantic_conditioned_prefix_ids(
-        role_ids=[text_id], codec_prefill_ids=(3,)
-    )
-    assert prefix[0] == text_id
     speaker = sglang_model._semantic_speaker_row_id(text_id, artifact_key)
     frame_zero = sglang_model._semantic_frame_row_id(text_id, artifact_key, 0)
     frame_one = sglang_model._semantic_frame_row_id(text_id, artifact_key, 1)
@@ -410,15 +429,13 @@ def test_semantic_row_encoders_are_direct_and_domain_separated() -> None:
 def test_base_missing_speaker_artifact_identity_fails() -> None:
     builder = _make_prompt_builder()
     with pytest.raises(RuntimeError, match="speaker artifact identity"):
-        builder.build_voice_clone_inputs(
-            input_id=_semantic_input_id(20, 21, 22),
-            ref_id=None,
-            voice_clone_prompt=_voice_clone_prompt(ref_code=None),
-            language="auto",
-            non_streaming_mode=False,
+        builder.build_semantic_prompt_plan(
+            task="base",
             semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
             semantic_instruct_ids=None,
-            semantic_ref_ids=None,
+            language="auto",
+            non_streaming_mode=False,
+            voice_clone_prompt=_voice_clone_prompt(ref_code=None),
         )
 
 
@@ -433,15 +450,14 @@ def test_icl_missing_ref_code_artifact_identity_fails() -> None:
     prompt.pop("ref_code_artifact_id")
 
     with pytest.raises(RuntimeError, match="ref-code artifact identity"):
-        builder.build_voice_clone_inputs(
-            input_id=_semantic_input_id(20, 21, 22),
-            ref_id=_semantic_ref_id(50, 51),
-            voice_clone_prompt=prompt,
-            language="auto",
-            non_streaming_mode=False,
+        builder.build_semantic_prompt_plan(
+            task="base",
             semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
             semantic_instruct_ids=None,
             semantic_ref_ids=(40, 41, 42, 50, 51, 50, 51),
+            language="auto",
+            non_streaming_mode=False,
+            voice_clone_prompt=prompt,
         )
 
 
@@ -451,15 +467,14 @@ def test_icl_missing_ref_code_fails() -> None:
     prompt["icl_mode"] = [True]
 
     with pytest.raises(RuntimeError, match="did not provide ref_code"):
-        builder.build_voice_clone_inputs(
-            input_id=_semantic_input_id(20, 21, 22),
-            ref_id=_semantic_ref_id(50, 51),
-            voice_clone_prompt=prompt,
-            language="auto",
-            non_streaming_mode=False,
+        builder.build_semantic_prompt_plan(
+            task="base",
             semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
             semantic_instruct_ids=None,
             semantic_ref_ids=(40, 41, 42, 50, 51, 50, 51),
+            language="auto",
+            non_streaming_mode=False,
+            voice_clone_prompt=prompt,
         )
 
 
@@ -478,26 +493,29 @@ def test_semantic_prompt_rejects_wrong_artifact_domain(
     prompt[artifact_field] = artifact_id
 
     with pytest.raises(ValueError, match=expected_domain):
-        builder.build_voice_clone_inputs(
-            input_id=_semantic_input_id(20, 21, 22),
-            ref_id=_semantic_ref_id(50, 51),
-            voice_clone_prompt=prompt,
-            language="auto",
-            non_streaming_mode=False,
+        builder.build_semantic_prompt_plan(
+            task="base",
             semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
             semantic_instruct_ids=None,
             semantic_ref_ids=(40, 41, 42, 50, 51, 50, 51),
+            language="auto",
+            non_streaming_mode=False,
+            voice_clone_prompt=prompt,
         )
 
 
 def test_voice_design_prompt_allows_missing_instruction() -> None:
     builder = _make_prompt_builder(model_type="voice_design")
-    embeds, _, _, _, prompt_cache_ids = builder.build_voice_design_inputs(
-        input_id=_semantic_input_id(20, 21, 22),
-        language="auto",
-        non_streaming_mode=True,
+    semantic_plan = builder.build_semantic_prompt_plan(
+        task="voice_design",
         semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
         semantic_instruct_ids=None,
+        language="auto",
+        non_streaming_mode=True,
+    )
+    embeds, _, _, _, prompt_cache_ids = builder.build_voice_design_inputs(
+        input_id=_semantic_input_id(20, 21, 22),
+        semantic_plan=semantic_plan,
         instruct_id=None,
     )
 

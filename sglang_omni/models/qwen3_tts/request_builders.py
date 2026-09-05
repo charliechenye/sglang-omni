@@ -5,13 +5,13 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
-import hashlib
 import json
 import queue
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any
+from uuid import uuid4
 
 import torch
 
@@ -712,25 +712,22 @@ def _qwen3_tts_uploaded_voice_cache_key(state: Qwen3TTSState) -> SpeakerCacheKey
     )
 
 
-def _qwen3_tts_artifact_fingerprint(value: torch.Tensor, *, domain: str) -> str:
-    """Fingerprint one stored CPU Qwen3-TTS artifact and its representation."""
+def _new_qwen3_tts_artifact_id(domain: str) -> str:
+    if domain not in {"speaker", "ref_code"}:
+        raise ValueError(f"unsupported Qwen3-TTS artifact identity domain {domain!r}")
+    return f"{domain}:{uuid4().hex}"
 
-    if not isinstance(value, torch.Tensor):
-        raise TypeError("Qwen3-TTS artifact must be a torch.Tensor")
-    if not domain:
-        raise ValueError("Qwen3-TTS artifact fingerprint domain must be non-empty")
-    if value.layout != torch.strided:
-        raise ValueError("Qwen3-TTS artifact must use strided tensor storage")
-    if value.device.type != "cpu":
-        raise ValueError("Qwen3-TTS artifact fingerprint requires a CPU tensor")
 
-    tensor = value.detach().contiguous()
-    metadata = (
-        f"qwen3-tts-artifact|{domain}|{tensor.dtype}|{tuple(tensor.shape)}|"
-    ).encode()
-    contents = tensor.view(torch.uint8).numpy().tobytes()
-    digest = hashlib.blake2b(metadata + contents, digest_size=16).hexdigest()
-    return f"{domain}:{digest}"
+def _qwen3_tts_artifact_id(value: Any, *, domain: str) -> str:
+    if value is None:
+        return _new_qwen3_tts_artifact_id(domain)
+    if not isinstance(value, str):
+        raise ValueError("Qwen3-TTS artifact identity must be a string")
+    prefix = f"{domain}:"
+    identity = value[len(prefix) :] if value.startswith(prefix) else ""
+    if len(identity) != 32 or any(char not in "0123456789abcdef" for char in identity):
+        raise ValueError("Qwen3-TTS artifact identity must be an opaque 128-bit hex ID")
+    return value
 
 
 def _cacheable_qwen3_tts_voice_prompt(
@@ -739,6 +736,14 @@ def _cacheable_qwen3_tts_voice_prompt(
     ref_text: str | None,
 ) -> dict[str, Any]:
     ref_codes = voice_clone_prompt.get("ref_code")
+    speaker_artifact_id = _qwen3_tts_artifact_id(
+        voice_clone_prompt.get("speaker_artifact_id"), domain="speaker"
+    )
+    ref_code_artifact_id = None
+    if ref_codes and all(code is not None for code in ref_codes):
+        ref_code_artifact_id = _qwen3_tts_artifact_id(
+            voice_clone_prompt.get("ref_code_artifact_id"), domain="ref_code"
+        )
     stored_speaker_embeddings = tuple(
         _cacheable_qwen3_tts_tensor(embedding)
         for embedding in voice_clone_prompt["ref_spk_embedding"]
@@ -750,13 +755,13 @@ def _cacheable_qwen3_tts_voice_prompt(
     artifact: dict[str, Any] = {
         "artifact_type": "qwen3_tts_voice_clone_prompt",
         "ref_spk_embedding": stored_speaker_embeddings,
-        "speaker_artifact_id": _qwen3_tts_artifact_fingerprint(
-            stored_speaker_embeddings[0],
-            domain="speaker",
-        ),
+        # Identity is assigned to the realized artifact, never derived from
+        # the encoded tensor contents.
+        "speaker_artifact_id": speaker_artifact_id,
         "icl_mode": tuple(bool(value) for value in voice_clone_prompt["icl_mode"]),
         "ref_text": ref_text,
-        "ref_code_artifact_id": None,
+        "ref_code_artifact_id": ref_code_artifact_id,
+        "ref_code_frames": None,
     }
     if ref_codes and all(code is not None for code in ref_codes):
         stored_ref_codes = tuple(
@@ -767,14 +772,12 @@ def _cacheable_qwen3_tts_voice_prompt(
                 "Qwen3-TTS voice-clone artifact expects exactly one reference code"
             )
         artifact["ref_code"] = stored_ref_codes
-        artifact["ref_code_artifact_id"] = _qwen3_tts_artifact_fingerprint(
-            stored_ref_codes[0], domain="ref_code"
-        )
+        artifact["ref_code_frames"] = int(stored_ref_codes[0].shape[0])
     return artifact
 
 
 def _cacheable_qwen3_tts_tensor(value: torch.Tensor) -> torch.Tensor:
-    return value.detach().to(device="cpu").clone()
+    return value.detach().to(device="cpu", copy=True)
 
 
 def _qwen3_tts_voice_prompt_from_cache(
@@ -789,8 +792,13 @@ def _qwen3_tts_voice_prompt_from_cache(
         "icl_mode": list(artifact["icl_mode"]),
         "speaker_artifact_id": artifact.get("speaker_artifact_id"),
         "ref_code_artifact_id": artifact.get("ref_code_artifact_id"),
+        "ref_code_frames": artifact.get("ref_code_frames"),
     }
     if "ref_code" in artifact:
+        if artifact.get("ref_code_frames") is None:
+            raise RuntimeError(
+                "Qwen3-TTS cached reference artifact is missing frame count"
+            )
         prompt["ref_code"] = [code.detach().clone() for code in artifact["ref_code"]]
     ref_text = artifact.get("ref_text")
     return prompt, str(ref_text) if ref_text is not None else None
@@ -1017,6 +1025,10 @@ class _Qwen3TTSAdhocReferenceHook(
             raise ValueError(
                 "ref_text is required when x_vector_only_mode=False (ICL mode)"
             )
+        speaker_artifact_id = _new_qwen3_tts_artifact_id("speaker")
+        ref_code_artifact_id = (
+            None if item.x_vector_only_mode else _new_qwen3_tts_artifact_id("ref_code")
+        )
         with torch.no_grad():
             normalized = self._wrapper._normalize_audio_inputs([item.ref_audio])
             if len(normalized) != 1:
@@ -1045,6 +1057,11 @@ class _Qwen3TTSAdhocReferenceHook(
             "ref_spk_embedding": [speaker_embedding],
             "x_vector_only_mode": [item.x_vector_only_mode],
             "icl_mode": [not item.x_vector_only_mode],
+            "speaker_artifact_id": speaker_artifact_id,
+            "ref_code_artifact_id": ref_code_artifact_id,
+            "ref_code_frames": (
+                None if item.x_vector_only_mode else int(ref_code.shape[0])
+            ),
         }
         return voice_clone_prompt, item.ref_text
 
@@ -1192,20 +1209,6 @@ def _prepare_qwen3_tts_base_request(
             state,
             desc="Qwen3-TTS ad-hoc reference",
         )
-        if "speaker_artifact_id" not in voice_clone_prompt:
-            identity_artifact = _cacheable_qwen3_tts_voice_prompt(
-                voice_clone_prompt,
-                ref_text=ref_text,
-            )
-            # Keep the fresh tensors for prompt construction; only attach
-            # identity metadata from the CPU representation.
-            voice_clone_prompt = dict(voice_clone_prompt)
-            voice_clone_prompt["speaker_artifact_id"] = identity_artifact[
-                "speaker_artifact_id"
-            ]
-            voice_clone_prompt["ref_code_artifact_id"] = identity_artifact.get(
-                "ref_code_artifact_id"
-            )
     else:
         with torch.no_grad():
             prompt_items = wrapper.create_voice_clone_prompt(
@@ -1231,6 +1234,7 @@ def _prepare_qwen3_tts_base_request(
         voice_clone_prompt["ref_code_artifact_id"] = stored_artifact.get(
             "ref_code_artifact_id"
         )
+        voice_clone_prompt["ref_code_frames"] = stored_artifact.get("ref_code_frames")
 
     device = _qwen3_tts_device(model, wrapper)
     input_id, semantic_input_ids = _tokenize_qwen3_tts_text(
@@ -1251,16 +1255,21 @@ def _prepare_qwen3_tts_base_request(
         state.instructions,
         device=device,
     )
+    semantic_plan = model.build_semantic_prompt_plan(
+        task="base",
+        semantic_input_ids=semantic_input_ids,
+        semantic_instruct_ids=semantic_instruct_ids,
+        semantic_ref_ids=semantic_ref_ids,
+        language=state.language,
+        non_streaming_mode=state.non_streaming_mode,
+        voice_clone_prompt=voice_clone_prompt,
+    )
     with torch.no_grad():
         return model.build_voice_clone_inputs(
             input_id=input_id,
             ref_id=ref_id,
             voice_clone_prompt=voice_clone_prompt,
-            language=state.language,
-            non_streaming_mode=state.non_streaming_mode,
-            semantic_input_ids=semantic_input_ids,
-            semantic_instruct_ids=semantic_instruct_ids,
-            semantic_ref_ids=semantic_ref_ids,
+            semantic_plan=semantic_plan,
             instruct_id=instruct_id,
         )
 
@@ -1282,14 +1291,18 @@ def _prepare_qwen3_tts_custom_voice_request(
         state.instructions,
         device=device,
     )
+    semantic_plan = model.build_semantic_prompt_plan(
+        task="custom_voice",
+        semantic_input_ids=semantic_input_ids,
+        semantic_instruct_ids=semantic_instruct_ids,
+        language=state.language,
+        non_streaming_mode=state.non_streaming_mode,
+        voice=state.voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE,
+    )
     with torch.no_grad():
         return model.build_custom_voice_inputs(
             input_id=input_id,
-            voice=state.voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE,
-            language=state.language,
-            non_streaming_mode=state.non_streaming_mode,
-            semantic_input_ids=semantic_input_ids,
-            semantic_instruct_ids=semantic_instruct_ids,
+            semantic_plan=semantic_plan,
             instruct_id=instruct_id,
         )
 
@@ -1311,13 +1324,17 @@ def _prepare_qwen3_tts_voice_design_request(
         state.instructions,
         device=device,
     )
+    semantic_plan = model.build_semantic_prompt_plan(
+        task="voice_design",
+        semantic_input_ids=semantic_input_ids,
+        semantic_instruct_ids=semantic_instruct_ids,
+        language=state.language,
+        non_streaming_mode=state.non_streaming_mode,
+    )
     with torch.no_grad():
         return model.build_voice_design_inputs(
             input_id=input_id,
-            language=state.language,
-            non_streaming_mode=state.non_streaming_mode,
-            semantic_input_ids=semantic_input_ids,
-            semantic_instruct_ids=semantic_instruct_ids,
+            semantic_plan=semantic_plan,
             instruct_id=instruct_id,
         )
 
