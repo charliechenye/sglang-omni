@@ -60,12 +60,14 @@ _PREDICTOR_TOP_K_LADDER = (4, 8, 16, 32, 50, 64, 128, 256, 512, 1024)
 
 # Semantic prompt IDs are cache identities only. They never feed an embedding
 # lookup: the real projected prompt is attached separately by the Qwen runner.
-# Keep ordinary rows in disjoint tagged positive ranges and reference rows in
-# the negative int64 range. Artifact IDs are opaque CPU-generated identities;
-# folding them once keeps the same 63-bit row-key domain.
+# Keep ordinary rows in disjoint tagged positive ranges, speaker rows in the
+# lower negative half, and frame rows in the upper negative half. Artifact
+# IDs are opaque CPU-generated identities; folding them once keeps the same
+# 62-bit row-key payload domain.
 _SEMANTIC_TOKEN_BITS = 30
 _SEMANTIC_TOKEN_MAX = (1 << _SEMANTIC_TOKEN_BITS) - 1
-_SEMANTIC_ARTIFACT_MASK = (1 << 63) - 1
+_SEMANTIC_FRAME_ROW_TAG = 1 << 62
+_SEMANTIC_ARTIFACT_MASK = _SEMANTIC_FRAME_ROW_TAG - 1
 _SEMANTIC_TEXT_CODEC_TAG = 1 << 61
 _SEMANTIC_FRAME_INDEX_LIMIT = 1 << 31
 
@@ -167,7 +169,7 @@ def _prompt_build_result(
 
 
 def _semantic_artifact_key(value: Any, *, expected_domain: str) -> int:
-    """Reduce one opaque ``domain:128-bit-hex`` artifact ID to 63 bits."""
+    """Reduce one opaque ``domain:128-bit-hex`` artifact ID to 62 bits."""
 
     if not isinstance(value, str):
         raise ValueError("Qwen3-TTS artifact identity must be a string")
@@ -201,7 +203,8 @@ def _pack_speaker_row_id(text_id: int, artifact_key: int) -> int:
 
 
 def _pack_frame_row_id(text_id: int, artifact_key: int, frame_index: int) -> int:
-    return -1 - (artifact_key ^ ((text_id << 31) | (frame_index + 1)))
+    payload = artifact_key ^ ((text_id << 31) | (frame_index + 1))
+    return -1 - (_SEMANTIC_FRAME_ROW_TAG | payload)
 
 
 def _semantic_config_id(value: Any, label: str) -> int:
