@@ -98,6 +98,7 @@ def test_moss_transcribe_diarize_prefill_backend_policy() -> None:
     builder = _make_moss_engine_builder()
 
     assert builder.kv_calibration_collector is None
+    assert builder.prepare_server_args_overrides(None) is None
     assert builder.extra_scheduler_callbacks() == {}
     assert type(builder).supports_breakable_prefill_cuda_graph is True
     defaults = builder.generation_defaults(dtype="bfloat16")
@@ -146,16 +147,100 @@ def test_moss_td_calibration_forces_eager_uncompiled_decoder() -> None:
     defaults = builder.generation_defaults(dtype="bfloat16")
     assert defaults["disable_cuda_graph"] is True
     assert defaults["enable_torch_compile"] is False
+    assert defaults["cuda_graph_backend_decode"] == "disabled"
+    assert defaults["cuda_graph_backend_prefill"] == "disabled"
+    assert defaults["cuda_graph_config"] == {
+        "decode": {"backend": "disabled"},
+        "prefill": {"backend": "disabled"},
+    }
 
     overrides = {
         "disable_cuda_graph": False,
         "enable_torch_compile": True,
+        "cuda_graph_backend_decode": "full",
+        "cuda_graph_backend_prefill": "breakable",
+        "cuda_graph_config": {
+            "decode": {"backend": "full"},
+            "prefill": {"backend": "breakable"},
+        },
     }
-    builder.adjust_overrides(overrides)
-    assert overrides == {
+    normalized = builder.prepare_server_args_overrides(overrides)
+    assert normalized == {
         "disable_cuda_graph": True,
         "enable_torch_compile": False,
+        "cuda_graph_backend_decode": "disabled",
+        "cuda_graph_backend_prefill": "disabled",
+        "cuda_graph_config": {
+            "decode": {"backend": "disabled"},
+            "prefill": {"backend": "disabled"},
+        },
     }
+
+    merged = build_generation_batch_overrides(
+        server_args_overrides=normalized,
+        **builder.generation_defaults(dtype="bfloat16"),
+    )
+    builder.adjust_overrides(merged)
+    assert merged["disable_cuda_graph"] is True
+    assert merged["enable_torch_compile"] is False
+    assert merged["cuda_graph_backend_decode"] == "disabled"
+    assert merged["cuda_graph_backend_prefill"] == "disabled"
+    assert merged["cuda_graph_config"] == {
+        "decode": {"backend": "disabled"},
+        "prefill": {"backend": "disabled"},
+    }
+
+
+def test_moss_td_calibration_resolves_both_sglang_cuda_graph_phases() -> None:
+    """Exercise SGLang's phase resolver after generation-batch merging.
+
+    This catches the precedence bug that a defaults-only assertion misses:
+    explicit breakable/full operator settings and decoder compilation must not
+    survive calibration normalization.
+    """
+
+    from sglang.srt.arg_groups.cuda_graph_hook import handle_cuda_graph_config
+    from sglang.srt.arg_groups.overrides import resolving_view
+    from sglang.srt.server_args import ServerArgs
+
+    builder = _make_moss_engine_builder(
+        kv_calibration_output_path="results/moss_td.raw.json"
+    )
+    operator_overrides = {
+        "disable_cuda_graph": False,
+        "enable_torch_compile": True,
+        "cuda_graph_backend_decode": "full",
+        "cuda_graph_backend_prefill": "breakable",
+        "cuda_graph_config": {
+            "decode": {"backend": "full"},
+            "prefill": {"backend": "breakable"},
+        },
+    }
+    normalized = builder.prepare_server_args_overrides(operator_overrides)
+    merged = build_generation_batch_overrides(
+        server_args_overrides=normalized,
+        **builder.generation_defaults(dtype="bfloat16"),
+    )
+    builder.adjust_overrides(merged)
+
+    server_args_fields = set(ServerArgs.__dataclass_fields__)
+    server_args = ServerArgs(
+        model_path="dummy",
+        **{
+            key: value
+            for key, value in merged.items()
+            if key in server_args_fields
+        },
+    )
+    # This is the same phase-specific resolver used by ServerArgs.resolve_once;
+    # the dummy model keeps the test independent of a model download/config.
+    handle_cuda_graph_config(server_args)
+    resolved = resolving_view(server_args)
+
+    assert server_args.disable_cuda_graph is True
+    assert server_args.enable_torch_compile is False
+    assert resolved.cuda_graph_config.prefill.backend == "disabled"
+    assert resolved.cuda_graph_config.decode.backend == "disabled"
 
 
 def test_factory_calibration_wires_collector_shutdown(
@@ -194,9 +279,11 @@ def test_factory_calibration_wires_collector_shutdown(
         server_args_kwargs.update(kwargs)
         return SimpleNamespace(
             context_length=4096,
+            disable_cuda_graph=kwargs["disable_cuda_graph"],
             enable_torch_compile=False,
             cuda_graph_config=SimpleNamespace(
-                prefill=SimpleNamespace(backend="disabled")
+                decode=SimpleNamespace(backend="disabled"),
+                prefill=SimpleNamespace(backend="disabled"),
             ),
         )
 
@@ -214,13 +301,44 @@ def test_factory_calibration_wires_collector_shutdown(
     assert captured["generation_defaults"]["server_args_overrides"] == {
         "disable_cuda_graph": True,
         "enable_torch_compile": False,
+        "cuda_graph_backend_decode": "disabled",
+        "cuda_graph_backend_prefill": "disabled",
+        "cuda_graph_config": {
+            "decode": {"backend": "disabled"},
+            "prefill": {"backend": "disabled"},
+        },
     }
     assert server_args_kwargs["disable_cuda_graph"] is True
     assert server_args_kwargs["enable_torch_compile"] is False
+    assert server_args_kwargs["cuda_graph_backend_decode"] == "disabled"
+    assert server_args_kwargs["cuda_graph_backend_prefill"] == "disabled"
+    assert server_args_kwargs["cuda_graph_config"] == {
+        "decode": {"backend": "disabled"},
+        "prefill": {"backend": "disabled"},
+    }
     assert captured["model_path"] == "OpenMOSS-Team/MOSS-Transcribe-Diarize"
     assert captured["output_path"] == "results/moss_td.raw.json"
     assert calls["init_cuda_graphs"] == 0
-    assert "shutdown_callback" in calls["scheduler_kwargs"][0]
+    assert "shutdown_callback" not in calls["scheduler_kwargs"][0]
+    assert "post_quiescence_callback" in calls["scheduler_kwargs"][0]
+
+
+def test_moss_td_calibration_build_failure_aborts_collector() -> None:
+    from types import SimpleNamespace
+
+    builder = _make_moss_engine_builder(
+        kv_calibration_output_path="results/moss_td.raw.json"
+    )
+    aborted: list[None] = []
+    builder.kv_calibration_collector = SimpleNamespace(
+        abort=lambda: aborted.append(None)
+    )
+
+    builder.cleanup_build_failure()
+    builder.cleanup_build_failure()
+
+    assert aborted == [None]
+    assert builder.kv_calibration_collector is None
 
 
 @pytest.mark.parametrize(

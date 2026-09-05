@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import json
 import math
+import time
 
 import pytest
 import torch
@@ -21,6 +22,7 @@ from sglang_omni.models.moss_transcribe_diarize.kv_calibration import (
     convert_raw_calibration_to_vllm_legacy,
     read_raw_calibration,
     validate_raw_calibration,
+    validate_vllm_legacy_scale_artifact,
 )
 
 
@@ -110,6 +112,7 @@ def test_collector_hooks_radix_inputs_and_publishes_atomic_raw_artifact(tmp_path
 
     collector.finalize()
     payload = read_raw_calibration(raw_path)
+    collector.finalize()
     assert payload["status"] == "complete"
     assert payload["artifact"] == RAW_ARTIFACT_NAME
     assert payload["collector_version"] == COLLECTOR_VERSION
@@ -124,6 +127,10 @@ def test_collector_hooks_radix_inputs_and_publishes_atomic_raw_artifact(tmp_path
     assert payload["layers"][0]["v_amax"] == 11.0
     assert payload["layers"][27]["k_amax"] == 29.0
     assert payload["layers"][27]["v_amax"] == 38.0
+    assert all(
+        not layer.self_attn.attn._forward_pre_hooks
+        for layer in model.language_model.model.layers
+    )
     assert not list(tmp_path.glob("*.tmp"))
 
 
@@ -210,9 +217,68 @@ def test_finalize_rejects_nonfinite_amax(tmp_path, key_value, value_value):
             None,
         )
 
-    with pytest.raises(CalibrationValidationError, match="finite"):
+    with pytest.raises(CalibrationValidationError):
         collector.finalize()
 
+    assert json.loads(raw_path.read_text(encoding="utf-8"))["status"] == "invalid"
+
+
+def test_nonfinite_observation_stays_sticky_after_later_finite_values(tmp_path):
+    raw_path = tmp_path / "moss_td.raw.json"
+    model = _FakeMossModel()
+    collector = attach_moss_td_kv_calibration(
+        model,
+        model_path="model",
+        output_path=raw_path,
+        git_metadata=("deadbeef", False),
+    )
+    attention = model.language_model.model.layers[0].self_attn.attn
+    attention(
+        torch.ones(1, 1),
+        torch.tensor([[float("nan")]]),
+        torch.ones(1, 1),
+        None,
+    )
+    attention(
+        torch.ones(1, 1),
+        torch.tensor([[999.0]]),
+        torch.tensor([[2.0]]),
+        None,
+    )
+
+    snapshot = collector._payload(status="in_progress")
+    assert snapshot["layers"][0]["k_amax"] == "NaN"
+    with pytest.raises(CalibrationValidationError):
+        collector.finalize()
+
+
+def test_checkpoint_failure_is_sticky_and_cannot_publish_complete(tmp_path):
+    raw_path = tmp_path / "moss_td.raw.json"
+    model = _FakeMossModel()
+    collector = attach_moss_td_kv_calibration(
+        model,
+        model_path="model",
+        output_path=raw_path,
+        checkpoint_interval_s=3600,
+        git_metadata=("deadbeef", False),
+    )
+    collector._next_checkpoint_at = time.monotonic() - 1
+
+    def fail_checkpoint(*, status):
+        del status
+        raise OSError("simulated checkpoint failure")
+
+    collector._write_snapshot = fail_checkpoint
+    with pytest.raises(OSError, match="checkpoint failure"):
+        model.language_model.model.layers[0].self_attn.attn(
+            torch.ones(1, 1),
+            torch.ones(1, 1),
+            torch.ones(1, 1),
+            None,
+        )
+
+    with pytest.raises(CalibrationValidationError, match="checkpoint failed"):
+        collector.finalize()
     assert json.loads(raw_path.read_text(encoding="utf-8"))["status"] == "invalid"
 
 
@@ -269,9 +335,21 @@ def test_validation_rejects_invalid_or_incomplete_artifacts(
         validate_raw_calibration(payload)
 
 
-def test_conversion_requires_margin_and_uses_shared_legacy_scale(tmp_path):
+def test_conversion_requires_margin_and_uses_shared_legacy_scale(
+    tmp_path, monkeypatch
+):
     raw_path = _collect_complete_raw_artifact(tmp_path)
     output_path = tmp_path / "moss_td.kv_scales.json"
+
+    # The actual SGLang consumer is covered below. Keep this schema/math test
+    # runnable in the CPU-only checkout where SGLang is intentionally absent.
+    monkeypatch.setattr(
+        "sglang_omni.models.moss_transcribe_diarize.kv_calibration"
+        ".validate_vllm_legacy_scale_artifact",
+        lambda _path, *, expected_scales: {
+            int(layer): float(value) for layer, value in expected_scales.items()
+        },
+    )
 
     with pytest.raises(TypeError):
         convert_raw_calibration_to_vllm_legacy(raw_path, output_path)
@@ -288,6 +366,60 @@ def test_conversion_requires_margin_and_uses_shared_legacy_scale(tmp_path):
     assert math.isclose(scales["27"], 38.0 / 448.0 * 2.0)
     assert json.loads(output_path.read_text(encoding="utf-8")) == converted
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_conversion_round_trips_actual_sglang_loader(tmp_path):
+    pytest.importorskip("sglang.srt.model_loader.weight_utils")
+
+    raw_path = _collect_complete_raw_artifact(tmp_path)
+    output_path = tmp_path / "moss_td.kv_scales.json"
+    converted = convert_raw_calibration_to_vllm_legacy(
+        raw_path,
+        output_path,
+        margin=2.0,
+    )
+    scales = converted["kv_cache"]["scaling_factor"]["0"]
+    loaded = validate_vllm_legacy_scale_artifact(
+        output_path,
+        expected_scales=scales,
+    )
+    assert loaded == {int(layer): value for layer, value in scales.items()}
+
+
+def test_conversion_keeps_existing_output_when_consumer_validation_fails(
+    tmp_path, monkeypatch
+):
+    raw_path = _collect_complete_raw_artifact(tmp_path)
+    output_path = tmp_path / "moss_td.kv_scales.json"
+    output_path.write_text("old artifact\n", encoding="utf-8")
+
+    def reject_consumer(_path, *, expected_scales):
+        del expected_scales
+        raise CalibrationValidationError("consumer rejected staging artifact")
+
+    monkeypatch.setattr(
+        "sglang_omni.models.moss_transcribe_diarize.kv_calibration"
+        ".validate_vllm_legacy_scale_artifact",
+        reject_consumer,
+    )
+    with pytest.raises(CalibrationValidationError, match="consumer rejected"):
+        convert_raw_calibration_to_vllm_legacy(
+            raw_path,
+            output_path,
+            margin=2.0,
+        )
+    assert output_path.read_text(encoding="utf-8") == "old artifact\n"
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_legacy_loader_validation_rejects_duplicate_json_layer_ids(tmp_path):
+    output_path = tmp_path / "duplicate.json"
+    output_path.write_text(
+        '{"kv_cache":{"scaling_factor":{"0":{"0":1,"0":2}}}}',
+        encoding="utf-8",
+    )
+    with pytest.raises(CalibrationValidationError, match="duplicate JSON key"):
+        validate_vllm_legacy_scale_artifact(output_path)
 
 
 @pytest.mark.parametrize("margin", [0, -1, math.nan, math.inf])

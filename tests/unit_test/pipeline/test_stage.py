@@ -288,7 +288,9 @@ def test_stage_stop_waits_for_scheduler_model_path_terminalization(
         scheduler._request_admission_lock = threading.RLock()
         scheduler._pending_request_admissions = {}
         scheduler._shutdown_lock = threading.Lock()
-        scheduler._shutdown_callback = None
+        callback_events: list[str] = []
+        scheduler._shutdown_callback = lambda: callback_events.append("early")
+        scheduler._post_quiescence_callback = lambda: callback_events.append("late")
 
         def run_loop() -> None:
             entered.set()
@@ -311,11 +313,13 @@ def test_stage_stop_waits_for_scheduler_model_path_terminalization(
         assert await asyncio.to_thread(stop_called.wait, 1.0)
         await asyncio.sleep(0)
         assert not stop_task.done()
+        assert callback_events == ["early"]
 
         release.set()
         await asyncio.wait_for(stop_task, timeout=1.0)
 
         assert stage_obj._scheduler_thread is None
+        assert callback_events == ["early", "late"]
         assert scheduler._prefill_start_done == set()
         assert model_path_ends == [("req-active", "aborted")]
 
@@ -338,6 +342,8 @@ def test_stage_stop_warns_but_succeeds_on_a_stuck_scheduler_thread(
         scheduler._pending_request_admissions = {}
         scheduler._shutdown_lock = threading.Lock()
         scheduler._shutdown_callback = None
+        post_quiescence_calls: list[None] = []
+        scheduler._post_quiescence_callback = lambda: post_quiescence_calls.append(None)
 
         def run_loop() -> None:
             entered.set()
@@ -362,10 +368,12 @@ def test_stage_stop_warns_but_succeeds_on_a_stuck_scheduler_thread(
             assert "scheduler thread did not stop within" in caplog.text
             assert stage_obj._scheduler_thread is not None
             assert stage_obj._scheduler_thread.is_alive()
+            assert post_quiescence_calls == []
         finally:
             release.set()
             if stage_obj._scheduler_thread is not None:
                 await asyncio.to_thread(stage_obj._scheduler_thread.join, 1.0)
+            assert post_quiescence_calls == []
 
     asyncio.run(_run())
 
