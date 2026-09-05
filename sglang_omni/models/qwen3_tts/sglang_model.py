@@ -184,14 +184,7 @@ def _semantic_artifact_key(value: Any, *, expected_domain: str) -> int:
         or any(char not in "0123456789abcdef" for char in digest)
     ):
         raise ValueError("Qwen3-TTS artifact identity must be a valid 128-bit hex ID")
-    try:
-        high = int(digest[:16], 16)
-        low = int(digest[16:], 16)
-    except ValueError as exc:
-        raise ValueError(
-            "Qwen3-TTS artifact identity must be a valid 128-bit hex ID"
-        ) from exc
-    return (high ^ low) & _SEMANTIC_ARTIFACT_MASK
+    return int(digest, 16) & _SEMANTIC_ARTIFACT_MASK
 
 
 def _pack_text_codec_row_id(text_id: int, codec_id: int) -> int:
