@@ -718,9 +718,7 @@ def _new_qwen3_tts_artifact_id(domain: str) -> str:
     return f"{domain}:{uuid4().hex}"
 
 
-def _qwen3_tts_artifact_id(value: Any, *, domain: str) -> str:
-    if value is None:
-        return _new_qwen3_tts_artifact_id(domain)
+def _validate_qwen3_tts_artifact_id(value: Any, *, domain: str) -> str:
     if not isinstance(value, str):
         raise ValueError("Qwen3-TTS artifact identity must be a string")
     prefix = f"{domain}:"
@@ -736,14 +734,22 @@ def _cacheable_qwen3_tts_voice_prompt(
     ref_text: str | None,
 ) -> dict[str, Any]:
     ref_codes = voice_clone_prompt.get("ref_code")
-    speaker_artifact_id = _qwen3_tts_artifact_id(
-        voice_clone_prompt.get("speaker_artifact_id"), domain="speaker"
-    )
+    speaker_artifact_id = voice_clone_prompt.get("speaker_artifact_id")
+    if speaker_artifact_id is None:
+        speaker_artifact_id = _new_qwen3_tts_artifact_id("speaker")
+    else:
+        speaker_artifact_id = _validate_qwen3_tts_artifact_id(
+            speaker_artifact_id, domain="speaker"
+        )
     ref_code_artifact_id = None
     if ref_codes and all(code is not None for code in ref_codes):
-        ref_code_artifact_id = _qwen3_tts_artifact_id(
-            voice_clone_prompt.get("ref_code_artifact_id"), domain="ref_code"
-        )
+        ref_code_artifact_id = voice_clone_prompt.get("ref_code_artifact_id")
+        if ref_code_artifact_id is None:
+            ref_code_artifact_id = _new_qwen3_tts_artifact_id("ref_code")
+        else:
+            ref_code_artifact_id = _validate_qwen3_tts_artifact_id(
+                ref_code_artifact_id, domain="ref_code"
+            )
     stored_speaker_embeddings = tuple(
         _cacheable_qwen3_tts_tensor(embedding)
         for embedding in voice_clone_prompt["ref_spk_embedding"]

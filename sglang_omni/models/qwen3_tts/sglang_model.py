@@ -204,28 +204,6 @@ def _pack_frame_row_id(text_id: int, artifact_key: int, frame_index: int) -> int
     return -1 - (artifact_key ^ ((text_id << 31) | (frame_index + 1)))
 
 
-def _semantic_text_codec_row_id(text_id: int, codec_id: int) -> int:
-    text_token_id = _semantic_token(text_id)
-    codec_token_id = _semantic_token(codec_id)
-    return _pack_text_codec_row_id(text_token_id, codec_token_id)
-
-
-def _semantic_speaker_row_id(text_id: int, artifact_key: int) -> int:
-    text_token_id = _semantic_token(text_id)
-    if not 0 <= artifact_key <= _SEMANTIC_ARTIFACT_MASK:
-        raise ValueError("Qwen3-TTS speaker artifact key is outside the 63-bit range")
-    return _pack_speaker_row_id(text_token_id, artifact_key)
-
-
-def _semantic_frame_row_id(text_id: int, artifact_key: int, frame_index: int) -> int:
-    text_token_id = _semantic_token(text_id)
-    if not 0 <= artifact_key <= _SEMANTIC_ARTIFACT_MASK:
-        raise ValueError("Qwen3-TTS ref-code artifact key is outside the 63-bit range")
-    if not 0 <= frame_index + 1 < _SEMANTIC_FRAME_INDEX_LIMIT:
-        raise RuntimeError("Qwen3-TTS semantic frame index exceeds the supported range")
-    return _pack_frame_row_id(text_token_id, artifact_key, frame_index)
-
-
 def _semantic_config_id(value: Any, label: str) -> int:
     if isinstance(value, torch.Tensor):
         raise ValueError(f"Qwen3-TTS {label} must be a Python integer")

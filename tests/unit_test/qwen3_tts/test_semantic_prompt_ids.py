@@ -410,20 +410,39 @@ def test_semantic_prompt_resolves_codec_prefill_once(
     assert calls == 1
 
 
-def test_semantic_row_encoders_are_direct_and_domain_separated() -> None:
+def test_semantic_row_packers_distinguish_representative_inputs() -> None:
     from sglang_omni.models.qwen3_tts import sglang_model
 
     artifact_key = 0x123456789ABCDEF
+    other_artifact_key = 0x0FEDCBA987654321
     text_id = 17
-    text_codec = sglang_model._semantic_text_codec_row_id(text_id, 3)
+    text_codec = sglang_model._pack_text_codec_row_id(text_id, 3)
     assert text_codec >= 1 << 61
-    speaker = sglang_model._semantic_speaker_row_id(text_id, artifact_key)
-    frame_zero = sglang_model._semantic_frame_row_id(text_id, artifact_key, 0)
-    frame_one = sglang_model._semantic_frame_row_id(text_id, artifact_key, 1)
+    speaker = sglang_model._pack_speaker_row_id(text_id, artifact_key)
+    other_speaker = sglang_model._pack_speaker_row_id(text_id, other_artifact_key)
+    frame_zero = sglang_model._pack_frame_row_id(text_id, artifact_key, 0)
+    frame_one = sglang_model._pack_frame_row_id(text_id, artifact_key, 1)
+    other_frame = sglang_model._pack_frame_row_id(text_id, other_artifact_key, 0)
+    other_text_speaker = sglang_model._pack_speaker_row_id(text_id + 1, artifact_key)
+    other_text_frame = sglang_model._pack_frame_row_id(text_id + 1, artifact_key, 0)
     assert speaker == -1 - (artifact_key ^ (text_id << 31))
     assert frame_zero == -1 - (artifact_key ^ ((text_id << 31) | 1))
     assert speaker < 0 and frame_zero < 0 and frame_one < 0
-    assert len({speaker, frame_zero, frame_one}) == 3
+    assert text_codec not in {speaker, frame_zero}
+    assert (
+        len(
+            {
+                speaker,
+                other_speaker,
+                other_text_speaker,
+                frame_zero,
+                frame_one,
+                other_frame,
+                other_text_frame,
+            }
+        )
+        == 7
+    )
 
 
 def test_base_missing_speaker_artifact_identity_fails() -> None:

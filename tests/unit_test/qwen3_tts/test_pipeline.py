@@ -918,8 +918,11 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
         device = torch.device("cpu")
         root_config = SimpleNamespace(tts_pad_token_id=0)
         model = SimpleNamespace(_feedback_buffer=torch.empty((1, 4)))
-        speech_tokenizer = FakeSpeechTokenizer()
         speaker_encoder_sample_rate = 24000
+
+        def __init__(self) -> None:
+            self.speech_tokenizer = FakeSpeechTokenizer()
+            self.captured_prompts: list[dict] = []
 
         def extract_speaker_embedding(self, *, audio, sr):
             assert audio.shape == (32,)
@@ -931,6 +934,7 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
             return SimpleNamespace()
 
         def build_voice_clone_inputs(self, **kwargs):
+            self.captured_prompts.append(kwargs["voice_clone_prompt"])
             assert kwargs["voice_clone_prompt"]["icl_mode"] in ([True], [False])
             return (
                 torch.ones((1, 2, 4)),
@@ -986,6 +990,22 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
         wrapper=wrapper,
     )
     assert calls == 3
+    assert len(model.captured_prompts) == 4
+    assert (
+        model.captured_prompts[0]["speaker_artifact_id"]
+        == model.captured_prompts[1]["speaker_artifact_id"]
+    )
+    assert (
+        model.captured_prompts[0]["ref_code_artifact_id"]
+        == model.captured_prompts[1]["ref_code_artifact_id"]
+    )
+    # ICL and x-vector use different reference-service options. Separate
+    # artifact identities are a safe false miss, even for identical audio.
+    assert (
+        model.captured_prompts[0]["speaker_artifact_id"]
+        != model.captured_prompts[3]["speaker_artifact_id"]
+    )
+    assert model.captured_prompts[3]["ref_code_artifact_id"] is None
     qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
 
 
@@ -6565,10 +6585,27 @@ def test_qwen3_tts_standalone_preprocessing_ships_tensors_without_registry(
         "_build_qwen3_tts_pad_embed",
         lambda model: torch.zeros(4),
     )
-    qwen3_request_builders.set_qwen3_tts_preprocessing_context(
-        model=FakeModel(), wrapper=FakeWrapper(), standalone=True
-    )
+    model = FakeModel()
+    wrapper = FakeWrapper()
     try:
+        qwen3_request_builders.set_qwen3_tts_preprocessing_context(
+            model=model, wrapper=wrapper, standalone=False
+        )
+        ordinary = qwen3_request_builders.preprocess_qwen3_tts_payload(
+            make_payload(
+                inputs="target", tts_params={"ref_audio": "ref.wav", "ref_text": "ref"}
+            )
+        )
+        ordinary_prepared = qwen3_request_builders.pop_prepared_qwen3_tts_request(
+            ordinary
+        )
+        assert ordinary_prepared is not None
+        ordinary_input_ids = ordinary_prepared.input_ids_list
+
+        qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+        qwen3_request_builders.set_qwen3_tts_preprocessing_context(
+            model=model, wrapper=wrapper, standalone=True
+        )
         payload = make_payload(
             inputs="target",
             tts_params={"ref_audio": "ref.wav", "ref_text": "ref"},
@@ -6590,6 +6627,7 @@ def test_qwen3_tts_standalone_preprocessing_ships_tensors_without_registry(
     )
     assert torch.equal(loaded.ref_code, torch.tensor([[1, 2], [3, 4]]))
     assert len(loaded.input_ids_list) == 2
+    assert loaded.input_ids_list == ordinary_input_ids
 
 
 def test_qwen3_tts_config_loads_frontend_only_outside_engine_process() -> None:
