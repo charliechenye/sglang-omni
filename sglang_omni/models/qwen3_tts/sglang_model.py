@@ -91,39 +91,35 @@ def _semantic_token(value: Any) -> int:
 
 
 def _semantic_token_ids(value: Any) -> list[int]:
-    """Read one small tokenizer result once for semantic row construction."""
+    """Validate CPU-native semantic metadata without a device transfer."""
 
-    if not isinstance(value, torch.Tensor) or value.ndim != 2:
-        raise ValueError("Qwen3-TTS semantic token IDs must be a rank-2 tensor")
-    if int(value.shape[0]) != 1:
-        raise ValueError("Qwen3-TTS semantic token IDs must have batch size one")
-    if value.is_floating_point() or value.is_complex() or value.dtype == torch.bool:
-        raise ValueError("Qwen3-TTS semantic token IDs must use an integer dtype")
-    return [
-        _semantic_token(token_id)
-        for token_id in value.detach()
-        .to(device="cpu", dtype=torch.long)
-        .reshape(-1)
-        .tolist()
-    ]
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("Qwen3-TTS semantic token IDs must be an integer sequence")
+    return [_semantic_token(token_id) for token_id in value]
 
 
 def _semantic_prompt_text_parts(
-    input_id: Any,
-    instruct_id: Any,
-    ref_id: Any = None,
+    semantic_input_ids: Any,
+    semantic_instruct_ids: Any,
+    semantic_ref_ids: Any = None,
 ) -> tuple[list[int], list[int], list[int], list[int] | None]:
-    input_token_ids = _semantic_token_ids(input_id)
+    input_token_ids = _semantic_token_ids(semantic_input_ids)
     role_ids = input_token_ids[:3]
     target_ids = input_token_ids[3:-5]
     instruction_ids = (
-        _semantic_token_ids(instruct_id) if instruct_id is not None else []
+        _semantic_token_ids(semantic_instruct_ids)
+        if semantic_instruct_ids is not None
+        else []
     )
-    reference_ids = _semantic_token_ids(ref_id) if ref_id is not None else None
+    reference_ids = (
+        _semantic_token_ids(semantic_ref_ids) if semantic_ref_ids is not None else None
+    )
     reference_text_ids = reference_ids[3:-2] if reference_ids is not None else None
     if not target_ids:
         raise ValueError("Qwen3-TTS semantic target text must not be empty")
-    if ref_id is not None and (reference_text_ids is None or not reference_text_ids):
+    if semantic_ref_ids is not None and (
+        reference_text_ids is None or not reference_text_ids
+    ):
         raise ValueError("Qwen3-TTS semantic reference text must not be empty")
     return role_ids, target_ids, instruction_ids, reference_text_ids
 
@@ -794,6 +790,9 @@ class Qwen3TTSPromptBuilderMixin:
         voice_clone_prompt: dict[str, Any],
         language: str,
         non_streaming_mode: bool,
+        semantic_input_ids: tuple[int, ...],
+        semantic_instruct_ids: tuple[int, ...] | None,
+        semantic_ref_ids: tuple[int, ...] | None,
         instruct_id: torch.Tensor | None = None,
     ) -> PromptBuildResult:
         is_icl = bool(voice_clone_prompt["icl_mode"][0])
@@ -835,9 +834,9 @@ class Qwen3TTSPromptBuilderMixin:
             semantic_instruction_ids,
             semantic_reference_text_ids,
         ) = _semantic_prompt_text_parts(
-            input_id,
-            instruct_id,
-            ref_id if is_icl else None,
+            semantic_input_ids,
+            semantic_instruct_ids,
+            semantic_ref_ids if is_icl else None,
         )
 
         voice_clone_spk_embeds = self.generate_speaker_prompt(voice_clone_prompt)
@@ -935,6 +934,8 @@ class Qwen3TTSPromptBuilderMixin:
         voice: str,
         language: str,
         non_streaming_mode: bool,
+        semantic_input_ids: tuple[int, ...],
+        semantic_instruct_ids: tuple[int, ...] | None,
         instruct_id: torch.Tensor | None = None,
     ) -> PromptBuildResult:
         spk_id = getattr(self.config, "spk_id", None) or {}
@@ -957,7 +958,10 @@ class Qwen3TTSPromptBuilderMixin:
             semantic_target_ids,
             semantic_instruction_ids,
             _,
-        ) = _semantic_prompt_text_parts(input_id, instruct_id)
+        ) = _semantic_prompt_text_parts(
+            semantic_input_ids,
+            semantic_instruct_ids,
+        )
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self._build_tts_special_embeds(
             dtype=input_id.dtype
@@ -1030,6 +1034,8 @@ class Qwen3TTSPromptBuilderMixin:
         input_id: torch.Tensor,
         language: str,
         non_streaming_mode: bool,
+        semantic_input_ids: tuple[int, ...],
+        semantic_instruct_ids: tuple[int, ...] | None,
         instruct_id: torch.Tensor | None,
     ) -> PromptBuildResult:
         (
@@ -1037,7 +1043,10 @@ class Qwen3TTSPromptBuilderMixin:
             semantic_target_ids,
             semantic_instruction_ids,
             _,
-        ) = _semantic_prompt_text_parts(input_id, instruct_id)
+        ) = _semantic_prompt_text_parts(
+            semantic_input_ids,
+            semantic_instruct_ids,
+        )
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self._build_tts_special_embeds(
             dtype=input_id.dtype

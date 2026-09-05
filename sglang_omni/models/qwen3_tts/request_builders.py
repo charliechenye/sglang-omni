@@ -642,14 +642,62 @@ def _build_qwen3_tts_pad_embed(model: Any) -> torch.Tensor:
         )
 
 
-def _build_instruct_id(wrapper: Any, instructions: str | None) -> torch.Tensor | None:
+def _qwen3_tts_device(model: Any, wrapper: Any) -> Any:
+    device = getattr(model, "device", None)
+    if device is not None:
+        return device
+    return getattr(wrapper, "device", torch.device("cpu"))
+
+
+def _tokenize_qwen3_tts_text(
+    wrapper: Any,
+    text: str,
+    *,
+    device: Any,
+) -> tuple[torch.Tensor, tuple[int, ...]]:
+    processor = getattr(wrapper, "processor", None)
+    if processor is None:
+        raise RuntimeError("Qwen3-TTS wrapper must expose its processor")
+    processor_output = processor(text=text, return_tensors="pt", padding=True)
+    try:
+        input_ids_cpu = processor_output["input_ids"]
+    except (AttributeError, KeyError, TypeError) as exc:
+        raise ValueError("Qwen3-TTS processor output must contain input_ids") from exc
+    if not isinstance(input_ids_cpu, torch.Tensor):
+        raise ValueError("Qwen3-TTS processor input_ids must be a tensor")
+    if input_ids_cpu.device.type != "cpu":
+        raise ValueError("Qwen3-TTS processor input_ids must be CPU-resident")
+    if input_ids_cpu.ndim != 2:
+        raise ValueError("Qwen3-TTS processor input_ids must be rank 2")
+    if int(input_ids_cpu.shape[0]) != 1:
+        raise ValueError("Qwen3-TTS processor input_ids must have batch size one")
+    if (
+        input_ids_cpu.is_floating_point()
+        or input_ids_cpu.is_complex()
+        or input_ids_cpu.dtype == torch.bool
+    ):
+        raise ValueError("Qwen3-TTS processor input_ids must use an integer dtype")
+
+    input_ids_cpu = input_ids_cpu.detach().to(dtype=torch.long)
+    semantic_ids = tuple(
+        int(token_id) for token_id in input_ids_cpu.reshape(-1).tolist()
+    )
+    return input_ids_cpu.to(device=device), semantic_ids
+
+
+def _build_instruct_id(
+    wrapper: Any,
+    instructions: str | None,
+    *,
+    device: Any,
+) -> tuple[torch.Tensor | None, tuple[int, ...] | None]:
     if not instructions:
-        return None
+        return None, None
     if hasattr(wrapper, "_build_instruct_text"):
         instruct_text = wrapper._build_instruct_text(instructions)
     else:
         instruct_text = f"<|im_start|>user\n{instructions}<|im_end|>\n"
-    return wrapper._tokenize_texts([instruct_text])[0]
+    return _tokenize_qwen3_tts_text(wrapper, instruct_text, device=device)
 
 
 def _qwen3_tts_uploaded_voice_cache_key(state: Qwen3TTSState) -> SpeakerCacheKey | None:
@@ -1184,13 +1232,25 @@ def _prepare_qwen3_tts_base_request(
             "ref_code_artifact_id"
         )
 
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
-    ref_id = (
-        wrapper._tokenize_texts([wrapper._build_ref_text(ref_text)])[0]
-        if ref_text
-        else None
+    device = _qwen3_tts_device(model, wrapper)
+    input_id, semantic_input_ids = _tokenize_qwen3_tts_text(
+        wrapper,
+        wrapper._build_assistant_text(state.text),
+        device=device,
     )
-    instruct_id = _build_instruct_id(wrapper, state.instructions)
+    if ref_text:
+        ref_id, semantic_ref_ids = _tokenize_qwen3_tts_text(
+            wrapper,
+            wrapper._build_ref_text(ref_text),
+            device=device,
+        )
+    else:
+        ref_id, semantic_ref_ids = None, None
+    instruct_id, semantic_instruct_ids = _build_instruct_id(
+        wrapper,
+        state.instructions,
+        device=device,
+    )
     with torch.no_grad():
         return model.build_voice_clone_inputs(
             input_id=input_id,
@@ -1198,6 +1258,9 @@ def _prepare_qwen3_tts_base_request(
             voice_clone_prompt=voice_clone_prompt,
             language=state.language,
             non_streaming_mode=state.non_streaming_mode,
+            semantic_input_ids=semantic_input_ids,
+            semantic_instruct_ids=semantic_instruct_ids,
+            semantic_ref_ids=semantic_ref_ids,
             instruct_id=instruct_id,
         )
 
@@ -1208,14 +1271,25 @@ def _prepare_qwen3_tts_custom_voice_request(
     model: Any,
     wrapper: Any,
 ) -> _SemanticPromptBuildResult:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
-    instruct_id = _build_instruct_id(wrapper, state.instructions)
+    device = _qwen3_tts_device(model, wrapper)
+    input_id, semantic_input_ids = _tokenize_qwen3_tts_text(
+        wrapper,
+        wrapper._build_assistant_text(state.text),
+        device=device,
+    )
+    instruct_id, semantic_instruct_ids = _build_instruct_id(
+        wrapper,
+        state.instructions,
+        device=device,
+    )
     with torch.no_grad():
         return model.build_custom_voice_inputs(
             input_id=input_id,
             voice=state.voice or QWEN3_TTS_DEFAULT_CUSTOM_VOICE,
             language=state.language,
             non_streaming_mode=state.non_streaming_mode,
+            semantic_input_ids=semantic_input_ids,
+            semantic_instruct_ids=semantic_instruct_ids,
             instruct_id=instruct_id,
         )
 
@@ -1226,13 +1300,24 @@ def _prepare_qwen3_tts_voice_design_request(
     model: Any,
     wrapper: Any,
 ) -> _SemanticPromptBuildResult:
-    input_id = wrapper._tokenize_texts([wrapper._build_assistant_text(state.text)])[0]
-    instruct_id = _build_instruct_id(wrapper, state.instructions)
+    device = _qwen3_tts_device(model, wrapper)
+    input_id, semantic_input_ids = _tokenize_qwen3_tts_text(
+        wrapper,
+        wrapper._build_assistant_text(state.text),
+        device=device,
+    )
+    instruct_id, semantic_instruct_ids = _build_instruct_id(
+        wrapper,
+        state.instructions,
+        device=device,
+    )
     with torch.no_grad():
         return model.build_voice_design_inputs(
             input_id=input_id,
             language=state.language,
             non_streaming_mode=state.non_streaming_mode,
+            semantic_input_ids=semantic_input_ids,
+            semantic_instruct_ids=semantic_instruct_ids,
             instruct_id=instruct_id,
         )
 
