@@ -263,7 +263,7 @@ def test_real_prompt_builder_emits_one_semantic_id_per_row(
         ),
         (
             {"kind": "icl"},
-            {"kind": "icl", "reference_ids": (999, 51)},
+            {"kind": "icl", "reference_ids": (98, 51)},
             8,
             True,
         ),
@@ -275,13 +275,13 @@ def test_real_prompt_builder_emits_one_semantic_id_per_row(
         ),
         (
             {"kind": "icl", "target_ids": (20, 21, 22)},
-            {"kind": "icl", "target_ids": (999, 21, 22)},
+            {"kind": "icl", "target_ids": (98, 21, 22)},
             10,
             True,
         ),
         (
             {"kind": "xvector"},
-            {"kind": "xvector", "target_ids": (999, 21, 22)},
+            {"kind": "xvector", "target_ids": (98, 21, 22)},
             8,
             True,
         ),
@@ -342,7 +342,7 @@ def test_semantic_prompt_prefix_boundaries(
 
 def test_streaming_target_text_after_visible_boundary_is_prompt_neutral() -> None:
     baseline = _semantic_ids("icl")
-    changed_trailing_target = _semantic_ids("icl", target_ids=(20, 999, 22))
+    changed_trailing_target = _semantic_ids("icl", target_ids=(20, 98, 22))
     assert baseline == changed_trailing_target
 
 
