@@ -154,13 +154,17 @@ def _prompt_build_result(
     )
 
 
-def _semantic_artifact_key(value: Any) -> int:
+def _semantic_artifact_key(value: Any, *, expected_domain: str) -> int:
     """Reduce one existing ``domain:128-bit-hex`` artifact ID to 63 bits."""
 
     if not isinstance(value, str):
         raise ValueError("Qwen3-TTS artifact identity must be a string")
     domain, separator, digest = value.rpartition(":")
-    if domain not in {"speaker", "ref_code"} or not separator or len(digest) != 32:
+    if domain != expected_domain:
+        raise ValueError(
+            f"Qwen3-TTS artifact identity must use the {expected_domain!r} domain"
+        )
+    if not separator or len(digest) != 32:
         raise ValueError("Qwen3-TTS artifact identity must be a valid 128-bit hex ID")
     try:
         high = int(digest[:16], 16)
@@ -810,14 +814,20 @@ class Qwen3TTSPromptBuilderMixin:
             raise RuntimeError(
                 "Qwen3-TTS Base preprocessing did not provide speaker artifact identity"
             )
-        speaker_artifact_key = _semantic_artifact_key(speaker_artifact_id)
+        speaker_artifact_key = _semantic_artifact_key(
+            speaker_artifact_id,
+            expected_domain="speaker",
+        )
         if is_icl:
             ref_code_artifact_id = voice_clone_prompt.get("ref_code_artifact_id")
             if ref_code_artifact_id is None:
                 raise RuntimeError(
                     "Qwen3-TTS ICL preprocessing did not provide ref-code artifact identity"
                 )
-            ref_code_artifact_key = _semantic_artifact_key(ref_code_artifact_id)
+            ref_code_artifact_key = _semantic_artifact_key(
+                ref_code_artifact_id,
+                expected_domain="ref_code",
+            )
 
         (
             semantic_role_ids,

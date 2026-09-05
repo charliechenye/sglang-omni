@@ -444,6 +444,30 @@ def test_icl_missing_ref_code_fails() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("artifact_field", "artifact_id", "expected_domain"),
+    [
+        ("speaker_artifact_id", "ref_code:" + "f" * 32, "speaker"),
+        ("ref_code_artifact_id", "speaker:" + "f" * 32, "ref_code"),
+    ],
+)
+def test_semantic_prompt_rejects_wrong_artifact_domain(
+    artifact_field: str, artifact_id: str, expected_domain: str
+) -> None:
+    builder = _make_prompt_builder()
+    prompt = _semantic_base_prompt(ref_code=torch.tensor([[70, 71, 72], [73, 74, 75]]))
+    prompt[artifact_field] = artifact_id
+
+    with pytest.raises(ValueError, match=expected_domain):
+        builder.build_voice_clone_inputs(
+            input_id=_semantic_input_id(20, 21, 22),
+            ref_id=_semantic_ref_id(50, 51),
+            voice_clone_prompt=prompt,
+            language="auto",
+            non_streaming_mode=False,
+        )
+
+
 def test_negative_reference_ids_survive_array_and_radix_contract() -> None:
     from array import array
 
@@ -466,4 +490,4 @@ def test_negative_reference_ids_survive_array_and_radix_contract() -> None:
     second_key = RadixKey(array("q", second_ids), "qwen3_tts:prompt:v2")
     assert first_key.match(second_key) == 9
     with pytest.raises(ValueError, match="matching extra_key"):
-        first_key.match(RadixKey(req.origin_input_ids, "qwen3_tts:prompt:v1"))
+        first_key.match(RadixKey(req.origin_input_ids, "qwen3_tts:prompt:other"))

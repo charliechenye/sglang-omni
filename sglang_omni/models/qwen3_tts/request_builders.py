@@ -1139,11 +1139,26 @@ def _prepare_qwen3_tts_base_request(
     if cached_prompt is not None:
         voice_clone_prompt, ref_text = cached_prompt
     elif cache_key is None:
+        source_key = _qwen3_tts_ref_audio_input_key(state.ref_audio)
         reference_service = _get_qwen3_tts_adhoc_reference_service(model, wrapper)
         voice_clone_prompt, ref_text = reference_service.get_or_encode(
             state,
             desc="Qwen3-TTS ad-hoc reference",
         )
+        if source_key is None:
+            identity_artifact = _cacheable_qwen3_tts_voice_prompt(
+                voice_clone_prompt,
+                ref_text=ref_text,
+            )
+            # Keep the fresh tensors for prompt construction; only attach
+            # identity metadata from the CPU representation.
+            voice_clone_prompt = dict(voice_clone_prompt)
+            voice_clone_prompt["speaker_artifact_id"] = identity_artifact[
+                "speaker_artifact_id"
+            ]
+            voice_clone_prompt["ref_code_artifact_id"] = identity_artifact.get(
+                "ref_code_artifact_id"
+            )
     else:
         with torch.no_grad():
             prompt_items = wrapper.create_voice_clone_prompt(

@@ -6,6 +6,7 @@ from collections import Counter
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import pytest
 import torch
 
@@ -294,3 +295,72 @@ def test_uploaded_voice_miss_and_hit_use_same_artifact_identity(
     first_prompt, second_prompt = model.captured_prompts
     assert first_prompt["speaker_artifact_id"] == second_prompt["speaker_artifact_id"]
     assert first_prompt["ref_code_artifact_id"] == second_prompt["ref_code_artifact_id"]
+
+
+def test_uncacheable_reference_still_attaches_artifact_identity() -> None:
+    class FakeSpeechTokenizer:
+        def __init__(self) -> None:
+            self.encode_calls = 0
+
+        def encode(self, waveforms: list[np.ndarray], *, sr: int) -> Any:
+            self.encode_calls += 1
+            assert sr == 24000
+            return SimpleNamespace(
+                audio_codes=[
+                    torch.tensor([[10, 20]], dtype=torch.long) for _ in waveforms
+                ]
+            )
+
+    class FakeWrapper(_QwenRequestWrapper):
+        def _normalize_audio_inputs(
+            self, ref_audio: list[np.ndarray]
+        ) -> list[tuple[np.ndarray, int]]:
+            assert len(ref_audio) == 1
+            return [(ref_audio[0], 24000)]
+
+    class FakeModel(_QwenVoiceCloneModel):
+        def __init__(self, speech_tokenizer: FakeSpeechTokenizer) -> None:
+            super().__init__()
+            self.device = torch.device("cpu")
+            self.speech_tokenizer = speech_tokenizer
+            self.speaker_encoder_sample_rate = 24000
+
+        def extract_speaker_embedding(
+            self, *, audio: np.ndarray, sr: int
+        ) -> torch.Tensor:
+            assert audio.shape == (32,)
+            assert sr == 24000
+            return torch.tensor([1.0, 2.0])
+
+    qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
+    waveform = np.zeros(32, dtype=np.float32)
+    assert qwen3_request_builders._qwen3_tts_ref_audio_input_key(waveform) is None
+    tokenizer = FakeSpeechTokenizer()
+    model = FakeModel(tokenizer)
+    wrapper = FakeWrapper(_voice_clone_prompt())
+    state = Qwen3TTSState(
+        text="target",
+        ref_audio=waveform,
+        ref_text="reference",
+    )
+    try:
+        qwen3_request_builders._prepare_qwen3_tts_base_request(
+            state=state,
+            model=model,
+            wrapper=wrapper,
+        )
+        qwen3_request_builders._prepare_qwen3_tts_base_request(
+            state=state,
+            model=model,
+            wrapper=wrapper,
+        )
+        assert tokenizer.encode_calls == 2
+        assert model.captured_prompts[0]["speaker_artifact_id"].startswith("speaker:")
+        assert model.captured_prompts[0]["ref_code_artifact_id"].startswith("ref_code:")
+        assert qwen3_request_builders._ADHOC_REFERENCE_SERVICE_ENTRY is not None
+        assert (
+            qwen3_request_builders._ADHOC_REFERENCE_SERVICE_ENTRY[1].stats()["entries"]
+            == 0
+        )
+    finally:
+        qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
