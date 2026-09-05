@@ -79,6 +79,7 @@ class _QwenRequestWrapper:
     def __init__(self, prompt: dict[str, Any]) -> None:
         self.prompt = prompt
         self.create_calls = 0
+        self.processor = _QwenProcessor()
 
     def create_voice_clone_prompt(self, **kwargs: Any) -> list[Any]:
         del kwargs
@@ -97,9 +98,13 @@ class _QwenRequestWrapper:
     def _build_ref_text(self, text: str) -> str:
         return text
 
-    def _tokenize_texts(self, texts: list[str]) -> list[torch.Tensor]:
-        del texts
-        return [torch.tensor([[1, 2, 3, 4]], dtype=torch.long)]
+
+class _QwenProcessor:
+    def __call__(self, *, text: str, return_tensors: str, padding: bool) -> dict:
+        del text
+        assert return_tensors == "pt"
+        assert padding is True
+        return {"input_ids": torch.tensor([[1, 2, 3, 4]], dtype=torch.long)}
 
 
 class _QwenVoiceCloneModel:

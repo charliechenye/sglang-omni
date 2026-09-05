@@ -259,6 +259,28 @@ def make_payload(
     )
 
 
+class _FakeQwen3TTSProcessor:
+    def __init__(
+        self,
+        calls: list[str] | None = None,
+        token_ids: torch.Tensor | None = None,
+    ) -> None:
+        self.calls = calls
+        self.token_ids = token_ids
+
+    def __call__(self, *, text: str, return_tensors: str, padding: bool) -> dict:
+        assert return_tensors == "pt"
+        assert padding is True
+        if self.calls is not None:
+            self.calls.append(text)
+        token_ids = (
+            self.token_ids
+            if self.token_ids is not None
+            else torch.arange(len(text), dtype=torch.long)
+        )
+        return {"input_ids": token_ids.reshape(1, -1).clone()}
+
+
 def test_qwen3_tts_config_and_registry_contracts() -> None:
     config = Qwen3TTSPipelineConfig(model_path="model")
     assert [stage.name for stage in config.stages] == [
@@ -676,6 +698,7 @@ def test_qwen3_tts_preprocessing_does_not_mutate_global_rng(
         inputs="target",
         tts_params={"ref_audio": "voice.wav", "ref_text": "reference"},
     )
+    tokenize_calls: list[str] = []
 
     class FakeSpeechTokenizer:
         def encode(self, waveforms, *, sr):
@@ -685,12 +708,11 @@ def test_qwen3_tts_preprocessing_does_not_mutate_global_rng(
             )
 
     class FakeWrapper:
+        processor = _FakeQwen3TTSProcessor(tokenize_calls)
+
         def _normalize_audio_inputs(self, ref_audio):
             assert ref_audio == ["voice.wav"]
             return [(np.zeros(32, dtype=np.float32), 24000)]
-
-        def _tokenize_texts(self, texts):
-            return [[idx + 1 for idx, _ in enumerate(texts[0])]]
 
         def _build_assistant_text(self, text):
             return text
@@ -741,6 +763,7 @@ def test_qwen3_tts_preprocessing_does_not_mutate_global_rng(
     )
 
     assert prepared.state.seed is None
+    assert tokenize_calls == ["target", "reference"]
 
 
 def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
@@ -754,6 +777,8 @@ def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
         ref_text = "reference"
 
     class FakeWrapper:
+        processor = _FakeQwen3TTSProcessor()
+
         def create_voice_clone_prompt(self, **kwargs):
             nonlocal calls
             calls += 1
@@ -766,9 +791,6 @@ def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
                 "ref_spk_embedding": [torch.ones(4)],
                 "icl_mode": [True],
             }
-
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
 
         def _build_assistant_text(self, text):
             return text
@@ -869,12 +891,11 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
             )
 
     class FakeWrapper:
+        processor = _FakeQwen3TTSProcessor()
+
         def _normalize_audio_inputs(self, ref_audio):
             assert ref_audio == [data_uri]
             return [(np.zeros(32, dtype=np.float32), 24000)]
-
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
 
         def _build_assistant_text(self, text):
             return text
@@ -1035,12 +1056,11 @@ def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
             )
 
     class FakeWrapper:
+        processor = _FakeQwen3TTSProcessor()
+
         def _normalize_audio_inputs(self, ref_audio):
             both_normalizing.wait(timeout=5.0)
             return [(np.zeros(32, dtype=np.float32), 24000)]
-
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
 
         def _build_assistant_text(self, text):
             return text
@@ -1265,6 +1285,8 @@ def test_qwen3_tts_uploaded_voice_x_vector_cache_omits_ref_code(
         ref_text = None
 
     class FakeWrapper:
+        processor = _FakeQwen3TTSProcessor()
+
         def create_voice_clone_prompt(self, **kwargs):
             nonlocal calls
             calls += 1
@@ -1278,9 +1300,6 @@ def test_qwen3_tts_uploaded_voice_x_vector_cache_omits_ref_code(
                 "ref_spk_embedding": [torch.ones(4)],
                 "icl_mode": [False],
             }
-
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
 
         def _build_assistant_text(self, text):
             return text
@@ -1691,6 +1710,8 @@ def test_qwen3_tts_custom_voice_requires_speaker_table(
             voice="Vivian",
             language="auto",
             non_streaming_mode=True,
+            semantic_input_ids=tuple(range(8)),
+            semantic_instruct_ids=None,
         )
 
 
@@ -1710,6 +1731,8 @@ def test_qwen3_tts_custom_voice_rejects_invalid_speaker(
             voice="Missing",
             language="auto",
             non_streaming_mode=True,
+            semantic_input_ids=tuple(range(8)),
+            semantic_instruct_ids=None,
         )
 
 
@@ -4924,26 +4947,32 @@ def test_qwen3_tts_prepare_custom_voice_uses_semantic_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict] = []
+    tokenize_calls: list[str] = []
 
     class FakeWrapper:
+        processor = _FakeQwen3TTSProcessor(
+            tokenize_calls, token_ids=torch.arange(8, dtype=torch.long)
+        )
+
         def _build_assistant_text(self, text):
             return text
 
         def _build_instruct_text(self, text):
             return text
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(8, dtype=torch.long).unsqueeze(0) for _ in texts]
-
         def _merge_generate_kwargs(self, **kwargs):
             return kwargs
 
     class FakeModel:
         tts_model_type = "custom_voice"
+        device = torch.device("cpu")
         model = SimpleNamespace(_feedback_buffer=torch.zeros(4, 4))
 
         def build_custom_voice_inputs(self, **kwargs):
             calls.append(kwargs)
+            assert kwargs["input_id"].device.type == "cpu"
+            assert kwargs["semantic_input_ids"] == tuple(range(8))
+            assert kwargs["semantic_instruct_ids"] is None
             return (
                 torch.ones(1, 3, 4),
                 torch.ones(1, 3, dtype=torch.long),
@@ -4969,32 +4998,39 @@ def test_qwen3_tts_prepare_custom_voice_uses_semantic_ids(
 
     assert prepared.input_ids_list == [101, 102, 103]
     assert len(calls) == 1
+    assert tokenize_calls == ["target"]
 
 
 def test_qwen3_tts_prepare_voice_design_uses_instruction_path(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict] = []
+    tokenize_calls: list[str] = []
 
     class FakeWrapper:
+        processor = _FakeQwen3TTSProcessor(tokenize_calls)
+
         def _build_assistant_text(self, text):
             return f"assistant:{text}"
 
         def _build_instruct_text(self, text):
             return f"instruct:{text}"
 
-        def _tokenize_texts(self, texts):
-            return [torch.arange(8, dtype=torch.long).unsqueeze(0) for _ in texts]
-
         def _merge_generate_kwargs(self, **kwargs):
             return kwargs
 
     class FakeModel:
         tts_model_type = "voice_design"
+        device = torch.device("cpu")
         model = SimpleNamespace(_feedback_buffer=torch.zeros(4, 4))
 
         def build_voice_design_inputs(self, **kwargs):
             calls.append(kwargs)
+            assert kwargs["input_id"].device.type == "cpu"
+            assert kwargs["semantic_input_ids"] == tuple(range(len(tokenize_calls[0])))
+            assert kwargs["semantic_instruct_ids"] == tuple(
+                range(len(tokenize_calls[1]))
+            )
             return (
                 torch.ones(1, 3, 4),
                 torch.ones(1, 3, dtype=torch.long),
@@ -5025,6 +5061,7 @@ def test_qwen3_tts_prepare_voice_design_uses_instruction_path(
     assert prepared.state.instructions == "A warm adult voice."
     assert len(calls) == 1
     assert calls[0]["instruct_id"] is not None
+    assert tokenize_calls == ["assistant:target", "instruct:A warm adult voice."]
 
 
 def test_qwen3_tts_base_checkpoint_text_only_rejects_custom_voice_default() -> None:
@@ -6451,8 +6488,7 @@ def test_qwen3_tts_standalone_preprocessing_ships_tensors_without_registry(
     qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
 
     class FakeWrapper:
-        def _tokenize_texts(self, texts):
-            return [torch.arange(len(texts[0]), dtype=torch.long).unsqueeze(0)]
+        processor = _FakeQwen3TTSProcessor()
 
         def _build_assistant_text(self, text):
             return text
@@ -6618,6 +6654,8 @@ def test_qwen3_tts_prompt_frontend_builds_a_custom_voice_prompt() -> None:
         voice="vivian",
         language="en",
         non_streaming_mode=False,
+        semantic_input_ids=tuple(int(token) for token in input_id.reshape(-1).tolist()),
+        semantic_instruct_ids=None,
         instruct_id=None,
     )
     assert ref_code is None

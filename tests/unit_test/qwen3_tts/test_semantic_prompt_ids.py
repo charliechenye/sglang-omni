@@ -134,12 +134,15 @@ def _build_semantic_prompt(
             )
         )
     input_id = _semantic_input_id(*target_ids)
+    semantic_input_ids = tuple(int(token) for token in input_id.reshape(-1).tolist())
     instruct_id = (
         torch.tensor([list(instruction_ids)], dtype=torch.long)
         if instruction_ids
         else None
     )
+    semantic_instruct_ids = tuple(instruction_ids) if instruction_ids else None
     if kind == "icl":
+        ref_id = _semantic_ref_id(*reference_ids)
         prompt = _semantic_base_prompt(
             ref_code=(
                 ref_code
@@ -152,11 +155,14 @@ def _build_semantic_prompt(
             prompt["ref_code_artifact_id"] = ref_code_artifact_id
         result = builder.build_voice_clone_inputs(
             input_id=input_id,
-            ref_id=_semantic_ref_id(*reference_ids),
+            ref_id=ref_id,
             voice_clone_prompt=prompt,
             language=language,
             non_streaming_mode=non_streaming,
             instruct_id=instruct_id,
+            semantic_input_ids=semantic_input_ids,
+            semantic_instruct_ids=semantic_instruct_ids,
+            semantic_ref_ids=tuple(int(token) for token in ref_id.reshape(-1).tolist()),
         )
     elif kind == "xvector":
         result = builder.build_voice_clone_inputs(
@@ -168,6 +174,9 @@ def _build_semantic_prompt(
             language=language,
             non_streaming_mode=non_streaming,
             instruct_id=instruct_id,
+            semantic_input_ids=semantic_input_ids,
+            semantic_instruct_ids=semantic_instruct_ids,
+            semantic_ref_ids=None,
         )
     elif kind == "custom":
         result = builder.build_custom_voice_inputs(
@@ -176,17 +185,18 @@ def _build_semantic_prompt(
             language=language,
             non_streaming_mode=non_streaming,
             instruct_id=instruct_id,
+            semantic_input_ids=semantic_input_ids,
+            semantic_instruct_ids=semantic_instruct_ids,
         )
     else:
+        design_instruction_ids = instruction_ids or (60,)
         result = builder.build_voice_design_inputs(
             input_id=input_id,
             language=language,
             non_streaming_mode=non_streaming,
-            instruct_id=(
-                instruct_id
-                if instruct_id is not None
-                else torch.tensor([[60]], dtype=torch.long)
-            ),
+            instruct_id=torch.tensor([list(design_instruction_ids)], dtype=torch.long),
+            semantic_input_ids=semantic_input_ids,
+            semantic_instruct_ids=tuple(design_instruction_ids),
         )
 
     assert len(result) == 5
@@ -406,6 +416,9 @@ def test_base_missing_speaker_artifact_identity_fails() -> None:
             voice_clone_prompt=_voice_clone_prompt(ref_code=None),
             language="auto",
             non_streaming_mode=False,
+            semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
+            semantic_instruct_ids=None,
+            semantic_ref_ids=None,
         )
 
 
@@ -426,6 +439,9 @@ def test_icl_missing_ref_code_artifact_identity_fails() -> None:
             voice_clone_prompt=prompt,
             language="auto",
             non_streaming_mode=False,
+            semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
+            semantic_instruct_ids=None,
+            semantic_ref_ids=(40, 41, 42, 50, 51, 50, 51),
         )
 
 
@@ -441,6 +457,9 @@ def test_icl_missing_ref_code_fails() -> None:
             voice_clone_prompt=prompt,
             language="auto",
             non_streaming_mode=False,
+            semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
+            semantic_instruct_ids=None,
+            semantic_ref_ids=(40, 41, 42, 50, 51, 50, 51),
         )
 
 
@@ -465,6 +484,9 @@ def test_semantic_prompt_rejects_wrong_artifact_domain(
             voice_clone_prompt=prompt,
             language="auto",
             non_streaming_mode=False,
+            semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
+            semantic_instruct_ids=None,
+            semantic_ref_ids=(40, 41, 42, 50, 51, 50, 51),
         )
 
 
@@ -474,6 +496,8 @@ def test_voice_design_prompt_allows_missing_instruction() -> None:
         input_id=_semantic_input_id(20, 21, 22),
         language="auto",
         non_streaming_mode=True,
+        semantic_input_ids=(10, 11, 12, 20, 21, 22, 30, 31, 32, 33, 34),
+        semantic_instruct_ids=None,
         instruct_id=None,
     )
 
