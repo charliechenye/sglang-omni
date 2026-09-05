@@ -468,6 +468,19 @@ def test_semantic_prompt_rejects_wrong_artifact_domain(
         )
 
 
+def test_voice_design_prompt_allows_missing_instruction() -> None:
+    builder = _make_prompt_builder(model_type="voice_design")
+    embeds, _, _, _, prompt_cache_ids = builder.build_voice_design_inputs(
+        input_id=_semantic_input_id(20, 21, 22),
+        language="auto",
+        non_streaming_mode=True,
+        instruct_id=None,
+    )
+
+    assert prompt_cache_ids
+    assert len(prompt_cache_ids) == int(embeds.shape[1])
+
+
 def test_negative_reference_ids_survive_array_and_radix_contract() -> None:
     from array import array
 
