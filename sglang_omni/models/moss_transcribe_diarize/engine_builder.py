@@ -49,6 +49,8 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         request_build_max_workers: int,
         request_build_max_pending: int | None,
         stream_emit_interval_s: float,
+        kv_calibration_output_path: str | None = None,
+        kv_calibration_checkpoint_interval_s: float = 30.0,
     ) -> None:
         self.max_running_requests = max_running_requests
         self.requested_max_new_tokens = max_new_tokens
@@ -75,9 +77,14 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         self.request_build_max_workers = request_build_max_workers
         self.request_build_max_pending = request_build_max_pending
         self.stream_emit_interval_s = stream_emit_interval_s
+        self.kv_calibration_output_path = kv_calibration_output_path
+        self.kv_calibration_checkpoint_interval_s = (
+            kv_calibration_checkpoint_interval_s
+        )
         self.processor: Any = None
         self.tokenizer: Any = None
         self.audio_encoder_service: BatchedAudioEncoderService | None = None
+        self.kv_calibration_collector: Any = None
         self.max_new_tokens = 0
         self.context_length = 0
 
@@ -113,9 +120,13 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         ]
         return {
             "max_running_requests": self.max_running_requests,
-            "disable_cuda_graph": False,
+            "disable_cuda_graph": self.kv_calibration_output_path is not None,
             "disable_overlap_schedule": True,
-            "enable_torch_compile": self.enable_torch_compile,
+            "enable_torch_compile": (
+                False
+                if self.kv_calibration_output_path is not None
+                else self.enable_torch_compile
+            ),
             "torch_compile_max_bs": self.torch_compile_max_bs,
             "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 4096,
@@ -130,6 +141,12 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         # note (Dayuxiaoshui): context_length is an explicit server-args
         # parameter, so consume the operator override before the shared builder
         # expands overrides.
+        if self.kv_calibration_output_path is not None:
+            # Keep this guard at the final builder merge point as well as in the
+            # stage factory: direct builder users must not accidentally capture
+            # a graph or compile away the hooks.
+            overrides["disable_cuda_graph"] = True
+            overrides["enable_torch_compile"] = False
         if "context_length" in overrides:
             self.context_length = int(overrides.pop("context_length"))
 
@@ -145,7 +162,24 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         *,
         generation_cuda_graph_enabled: bool,
     ) -> None:
-        del server_args
+        if self.kv_calibration_output_path is not None:
+            if generation_cuda_graph_enabled or bool(
+                getattr(server_args, "enable_torch_compile", False)
+            ):
+                raise RuntimeError(
+                    "MOSS-TD KV calibration requires CUDA graphs and decoder "
+                    "torch.compile to be disabled"
+                )
+            from sglang_omni.models.moss_transcribe_diarize.kv_calibration import (
+                attach_moss_td_kv_calibration,
+            )
+
+            self.kv_calibration_collector = attach_moss_td_kv_calibration(
+                model,
+                model_path=self.checkpoint_dir,
+                output_path=self.kv_calibration_output_path,
+                checkpoint_interval_s=self.kv_calibration_checkpoint_interval_s,
+            )
         input_feature_len = int(self.processor.feature_extractor.nb_max_frames)
         if self.encoder_torch_compile:
             model.compile_encoder(self.encoder_chunk_buckets, input_feature_len)
@@ -194,3 +228,13 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
             "request_build_max_workers": self.request_build_max_workers,
             "request_build_max_pending": self.request_build_max_pending,
         }
+
+    def extra_scheduler_callbacks(self) -> dict[str, Any]:
+        if self.kv_calibration_collector is None:
+            return {}
+        return {"shutdown_callback": self.kv_calibration_collector.finalize}
+
+    def cleanup_build_failure(self) -> None:
+        if self.kv_calibration_collector is not None:
+            self.kv_calibration_collector.abort()
+            self.kv_calibration_collector = None

@@ -94,6 +94,76 @@ Unlike TTS where the same reference voice is reused across many prompts (high hi
 2. **Chunked prefill suppression**: during chunked prefill (prompt chunks still being processed), all emission is suppressed to prevent intermediate states from being misinterpreted as transcript output.
 3. **Incomplete UTF-8 handling**: accumulated tokens are decoded together. If the result ends with the Unicode replacement character (indicating an incomplete multi-byte sequence split across token boundaries), emission is held until the next token completes the sequence.
 
+## Test-only FP8 KV Calibration
+
+The calibration collector is deliberately opt-in. Set
+`asr.factory.kv_calibration_output_path` to a raw JSON output path; leaving it
+unset installs no hooks and does not change serving. The collector is intended
+for the BF16 `OpenMOSS-Team/MOSS-Transcribe-Diarize` decoder only.
+
+Run a calibration server with eager decoder execution:
+
+```bash
+RAW=results/moss_td_kv_calibration.raw.json
+
+sgl-omni serve \
+  --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --asr.factory.kv_calibration_output_path "$RAW" \
+  --asr.factory.kv_calibration_checkpoint_interval_s 30 \
+  --asr.engine.disable_cuda_graph true \
+  --asr.engine.enable_torch_compile false
+```
+
+Calibration mode enforces `disable_cuda_graph=true` and
+`enable_torch_compile=false` even if the normal MOSS-TD stage defaults are
+present. The explicit flags above make the launch contract visible. Do not set
+`asr.factory.encoder_torch_compile=true` for a calibration run unless the
+encoder experiment is intentional; it is unrelated to the decoder collector.
+The checkpoint interval must be positive.
+
+Send the representative BF16 audio corpus to this server, then stop the server
+gracefully so the stage shutdown callback can finalize the artifact. During the
+run, the file is atomically replaced with `status: "in_progress"` checkpoints.
+Only a graceful finalization can publish `status: "complete"`; an interrupted
+or killed process therefore leaves an artifact that validation rejects.
+
+The hook is registered on each of the 28 per-layer `RadixAttention` modules.
+It observes the positional K/V inputs after QK norm and rotary processing and
+maintains independent device-side K/V maxima. Checkpoint and finalization are
+the only points that copy the single 28×2 maxima tensor to the CPU. The
+completed artifact records `model_path`, `git_head`, `git_dirty`,
+`num_layers`, `observed_layers`, `k_amax`, `v_amax`, collector/schema versions,
+and timestamps. `validate_raw_calibration` rejects anything that is not exactly
+28 observed layers, has a missing layer, has a non-positive maximum, or has a
+NaN/infinity. The `observed_layers` list and `observed_layer_count` are the
+direct evidence that all 28 hooks ran.
+
+Validate and convert the completed raw artifact with an explicit margin:
+
+```bash
+python -m sglang_omni.models.moss_transcribe_diarize.kv_calibration \
+  validate --raw-artifact "$RAW"
+
+python -m sglang_omni.models.moss_transcribe_diarize.kv_calibration \
+  convert \
+  --raw-artifact "$RAW" \
+  --output results/moss_td_kv_scales.json \
+  --margin YOUR_EXPLICIT_MARGIN
+```
+
+There is no default or invented margin. The converter applies the upstream
+formula `scale = amax / 448 * margin`; because PR #1128's legacy schema accepts
+one scale per layer, it uses `max(k_amax, v_amax)` for that layer so both values
+fit. The output is the TP=1 vLLM-legacy JSON consumed by the existing
+`quantization_param_path`/FP8 load path.
+
+Normal serving is unchanged when calibration is off: the output path defaults
+to `None`, no hooks or collector are constructed, the regular CUDA-graph and
+decoder-compile defaults remain in effect, and the canonical FP8 scale-loading
+implementation is not modified. The focused unit tests cover this default
+path as well as artifact validation, atomic checkpointing, hook placement, and
+explicit-margin conversion.
+
 ## Model Usage
 
 ### Launching Commands

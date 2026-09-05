@@ -98,6 +98,8 @@ def create_sglang_moss_transcribe_diarize_executor(
     request_build_max_workers: int = 8,
     request_build_max_pending: int | None = 16,
     stream_emit_interval_s: float = 0.05,
+    kv_calibration_output_path: str | None = None,
+    kv_calibration_checkpoint_interval_s: float = 30.0,
     server_args_overrides: dict[str, Any] | None = None,
 ):
     from sglang_omni.models.moss_transcribe_diarize.engine_builder import (
@@ -109,6 +111,13 @@ def create_sglang_moss_transcribe_diarize_executor(
         if encoder_chunk_buckets is not None
         else _DEFAULT_ENCODER_CHUNK_BUCKETS
     )
+    if kv_calibration_output_path is not None:
+        # Calibration hooks must see eager decoder calls.  The pipeline's
+        # normal MOSS-TD defaults intentionally enable decoder compilation, so
+        # calibration mode owns these two runtime switches explicitly.
+        server_args_overrides = dict(server_args_overrides or {})
+        server_args_overrides["disable_cuda_graph"] = True
+        server_args_overrides["enable_torch_compile"] = False
     return MossTranscribeDiarizeEngineBuilder(
         max_running_requests=max_running_requests,
         max_new_tokens=max_new_tokens,
@@ -135,6 +144,8 @@ def create_sglang_moss_transcribe_diarize_executor(
         request_build_max_workers=request_build_max_workers,
         request_build_max_pending=request_build_max_pending,
         stream_emit_interval_s=stream_emit_interval_s,
+        kv_calibration_output_path=kv_calibration_output_path,
+        kv_calibration_checkpoint_interval_s=kv_calibration_checkpoint_interval_s,
     ).build(
         model_path,
         device=device,
