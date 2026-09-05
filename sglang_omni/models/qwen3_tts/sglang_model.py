@@ -74,62 +74,57 @@ PromptBuildResult = tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor | None,
-    tuple[int, ...] | None,
+    tuple[int, ...],
 ]
 
 
-def _semantic_token(value: Any) -> int | None:
+def _semantic_token(value: Any) -> int:
     try:
         token_id = int(value)
-    except (TypeError, ValueError, OverflowError):
-        return None
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Qwen3-TTS semantic token must be an integer") from exc
     if not 0 <= token_id <= _SEMANTIC_TOKEN_MAX:
-        return None
+        raise ValueError(
+            "Qwen3-TTS semantic token is outside the supported 30-bit range"
+        )
     return token_id
 
 
-def _semantic_token_ids(value: Any) -> list[int] | None:
+def _semantic_token_ids(value: Any) -> list[int]:
     """Read one small tokenizer result once for semantic row construction."""
 
     if not isinstance(value, torch.Tensor) or value.ndim != 2:
-        return None
+        raise ValueError("Qwen3-TTS semantic token IDs must be a rank-2 tensor")
     if int(value.shape[0]) != 1:
-        return None
+        raise ValueError("Qwen3-TTS semantic token IDs must have batch size one")
     if value.is_floating_point() or value.is_complex() or value.dtype == torch.bool:
-        return None
-    ids = [
-        int(token_id)
+        raise ValueError("Qwen3-TTS semantic token IDs must use an integer dtype")
+    return [
+        _semantic_token(token_id)
         for token_id in value.detach()
         .to(device="cpu", dtype=torch.long)
         .reshape(-1)
         .tolist()
     ]
-    return (
-        ids if all(0 <= token_id <= _SEMANTIC_TOKEN_MAX for token_id in ids) else None
-    )
 
 
 def _semantic_prompt_text_parts(
     input_id: Any,
     instruct_id: Any,
     ref_id: Any = None,
-) -> tuple[list[int], list[int], list[int], list[int] | None] | None:
+) -> tuple[list[int], list[int], list[int], list[int] | None]:
     input_token_ids = _semantic_token_ids(input_id)
-    if input_token_ids is None:
-        return None
     role_ids = input_token_ids[:3]
     target_ids = input_token_ids[3:-5]
     instruction_ids = (
         _semantic_token_ids(instruct_id) if instruct_id is not None else []
     )
-    if instruction_ids is None:
-        return None
     reference_ids = _semantic_token_ids(ref_id) if ref_id is not None else None
     reference_text_ids = reference_ids[3:-2] if reference_ids is not None else None
     if not target_ids:
-        return None
+        raise ValueError("Qwen3-TTS semantic target text must not be empty")
     if ref_id is not None and (reference_text_ids is None or not reference_text_ids):
-        return None
+        raise ValueError("Qwen3-TTS semantic reference text must not be empty")
     return role_ids, target_ids, instruction_ids, reference_text_ids
 
 
@@ -139,16 +134,14 @@ def _prompt_build_result(
     attention_mask: torch.Tensor,
     trailing_text_hidden: torch.Tensor,
     ref_code: torch.Tensor | None,
-    prompt_cache_ids: tuple[int, ...] | None,
+    prompt_cache_ids: tuple[int, ...],
 ) -> PromptBuildResult:
-    if prompt_cache_ids is not None and len(prompt_cache_ids) != int(
-        input_embeds.shape[1]
-    ):
+    if len(prompt_cache_ids) != int(input_embeds.shape[1]):
         raise RuntimeError(
             "Qwen3-TTS semantic prompt IDs must match the real prompt row count: "
             f"ids={len(prompt_cache_ids)}, embeddings={input_embeds.shape[1]}"
         )
-    if prompt_cache_ids is not None and any(
+    if any(
         not -(1 << 63) <= int(token_id) < (1 << 63) for token_id in prompt_cache_ids
     ):
         raise ValueError("Qwen3-TTS semantic prompt IDs must fit signed int64")
@@ -161,27 +154,27 @@ def _prompt_build_result(
     )
 
 
-def _semantic_artifact_key(value: Any) -> int | None:
+def _semantic_artifact_key(value: Any) -> int:
     """Reduce one existing ``domain:128-bit-hex`` artifact ID to 63 bits."""
 
     if not isinstance(value, str):
-        return None
+        raise ValueError("Qwen3-TTS artifact identity must be a string")
     domain, separator, digest = value.rpartition(":")
     if domain not in {"speaker", "ref_code"} or not separator or len(digest) != 32:
-        return None
+        raise ValueError("Qwen3-TTS artifact identity must be a valid 128-bit hex ID")
     try:
         high = int(digest[:16], 16)
         low = int(digest[16:], 16)
-    except ValueError:
-        return None
+    except ValueError as exc:
+        raise ValueError(
+            "Qwen3-TTS artifact identity must be a valid 128-bit hex ID"
+        ) from exc
     return (high ^ low) & _SEMANTIC_ARTIFACT_MASK
 
 
-def _semantic_text_codec_row_id(text_id: int, codec_id: int) -> int | None:
+def _semantic_text_codec_row_id(text_id: int, codec_id: int) -> int:
     text_token_id = _semantic_token(text_id)
     codec_token_id = _semantic_token(codec_id)
-    if text_token_id is None or codec_token_id is None:
-        return None
     return (
         _SEMANTIC_TEXT_CODEC_TAG
         | (text_token_id << _SEMANTIC_TOKEN_BITS)
@@ -189,25 +182,21 @@ def _semantic_text_codec_row_id(text_id: int, codec_id: int) -> int | None:
     )
 
 
-def _semantic_speaker_row_id(text_id: int, artifact_key: int) -> int | None:
+def _semantic_speaker_row_id(text_id: int, artifact_key: int) -> int:
     text_token_id = _semantic_token(text_id)
-    if text_token_id is None or not 0 <= artifact_key <= _SEMANTIC_ARTIFACT_MASK:
-        return None
+    if not 0 <= artifact_key <= _SEMANTIC_ARTIFACT_MASK:
+        raise ValueError("Qwen3-TTS speaker artifact key is outside the 63-bit range")
     packed_value = text_token_id << 31
     mixed = artifact_key ^ packed_value
     return -1 - mixed
 
 
-def _semantic_frame_row_id(
-    text_id: int, artifact_key: int, frame_index: int
-) -> int | None:
+def _semantic_frame_row_id(text_id: int, artifact_key: int, frame_index: int) -> int:
     text_token_id = _semantic_token(text_id)
-    if (
-        text_token_id is None
-        or not 0 <= artifact_key <= _SEMANTIC_ARTIFACT_MASK
-        or not 0 <= frame_index + 1 < _SEMANTIC_FRAME_INDEX_LIMIT
-    ):
-        return None
+    if not 0 <= artifact_key <= _SEMANTIC_ARTIFACT_MASK:
+        raise ValueError("Qwen3-TTS ref-code artifact key is outside the 63-bit range")
+    if not 0 <= frame_index + 1 < _SEMANTIC_FRAME_INDEX_LIMIT:
+        raise RuntimeError("Qwen3-TTS semantic frame index exceeds the supported range")
     packed_value = (text_token_id << 31) | (frame_index + 1)
     mixed = artifact_key ^ packed_value
     return -1 - mixed
@@ -667,9 +656,10 @@ class Qwen3TTSPromptBuilderMixin:
         tts_pad_embed: torch.Tensor,
         tts_eos_embed: torch.Tensor,
         non_streaming_mode: bool,
-        target_token_ids: list[int] | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...] | None]:
-        prompt_cache_ids: tuple[int, ...] | None = None
+        target_token_ids: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
+        if not target_token_ids:
+            raise RuntimeError("Qwen3-TTS semantic target IDs are required")
         if non_streaming_mode:
             text_all = self.text_projection(
                 self.get_text_embeddings()(input_id[:, 3:-5])
@@ -696,28 +686,25 @@ class Qwen3TTSPromptBuilderMixin:
                 ],
                 dim=1,
             )
-            if target_token_ids is not None:
-                row_ids = [
-                    _semantic_text_codec_row_id(
-                        text_id=token_id,
-                        codec_id=self.config.codec_pad_id,
-                    )
-                    for token_id in target_token_ids
-                ]
-                row_ids.append(
+            prompt_cache_ids = tuple(
+                [
+                    *(
+                        _semantic_text_codec_row_id(
+                            text_id=token_id,
+                            codec_id=self.config.codec_pad_id,
+                        )
+                        for token_id in target_token_ids
+                    ),
                     _semantic_text_codec_row_id(
                         text_id=self.root_config.tts_eos_token_id,
                         codec_id=self.config.codec_pad_id,
-                    )
-                )
-                row_ids.append(
+                    ),
                     _semantic_text_codec_row_id(
                         text_id=self.root_config.tts_pad_token_id,
                         codec_id=self.config.codec_bos_id,
-                    )
-                )
-                if all(row_id is not None for row_id in row_ids):
-                    prompt_cache_ids = tuple(int(row_id) for row_id in row_ids)
+                    ),
+                ]
+            )
             return talker_input_embed, tts_pad_embed, prompt_cache_ids
 
         first_text = (
@@ -732,13 +719,12 @@ class Qwen3TTSPromptBuilderMixin:
             ],
             dim=1,
         )
-        if target_token_ids:
-            row_id = _semantic_text_codec_row_id(
+        prompt_cache_ids = (
+            _semantic_text_codec_row_id(
                 text_id=target_token_ids[0],
                 codec_id=self.config.codec_bos_id,
-            )
-            if row_id is not None:
-                prompt_cache_ids = (row_id,)
+            ),
+        )
         return talker_input_embed, trailing_text_hidden, prompt_cache_ids
 
     def _apply_instruct_prefix(
@@ -775,7 +761,7 @@ class Qwen3TTSPromptBuilderMixin:
         role_ids: list[int],
         codec_prefill_ids: tuple[int, ...],
         speaker_row_id: int | None = None,
-    ) -> tuple[int, ...] | None:
+    ) -> tuple[int, ...]:
         rows = [
             *role_ids,
             *(
@@ -794,9 +780,7 @@ class Qwen3TTSPromptBuilderMixin:
                 self.config.codec_pad_id,
             )
         )
-        if any(row_id is None for row_id in rows):
-            return None
-        return tuple(int(row_id) for row_id in rows)
+        return tuple(rows)
 
     def build_voice_clone_inputs(
         self,
@@ -808,30 +792,42 @@ class Qwen3TTSPromptBuilderMixin:
         non_streaming_mode: bool,
         instruct_id: torch.Tensor | None = None,
     ) -> PromptBuildResult:
-        ref_code = None
+        is_icl = bool(voice_clone_prompt["icl_mode"][0])
         ref_codes = voice_clone_prompt.get("ref_code")
-        if ref_codes is not None:
-            ref_code = ref_codes[0]
-        is_icl = ref_code is not None and voice_clone_prompt["icl_mode"][0]
+        if is_icl:
+            if not ref_codes or ref_codes[0] is None:
+                raise RuntimeError(
+                    "Qwen3-TTS ICL preprocessing did not provide ref_code"
+                )
+            if ref_id is None:
+                raise RuntimeError(
+                    "Qwen3-TTS ICL preprocessing did not provide reference text tokens"
+                )
+        ref_code = ref_codes[0] if ref_codes else None
 
-        speaker_artifact_key = _semantic_artifact_key(
-            voice_clone_prompt.get("speaker_artifact_id")
-        )
-        ref_code_artifact_key = (
-            _semantic_artifact_key(voice_clone_prompt.get("ref_code_artifact_id"))
-            if is_icl
-            else None
-        )
-        semantic_text_parts = (
-            _semantic_prompt_text_parts(
-                input_id,
-                instruct_id,
-                ref_id if is_icl else None,
+        speaker_artifact_id = voice_clone_prompt.get("speaker_artifact_id")
+        if speaker_artifact_id is None:
+            raise RuntimeError(
+                "Qwen3-TTS Base preprocessing did not provide speaker artifact identity"
             )
-            if speaker_artifact_key is not None
-            and (not is_icl or ref_code_artifact_key is not None)
-            and (not is_icl or ref_id is not None)
-            else None
+        speaker_artifact_key = _semantic_artifact_key(speaker_artifact_id)
+        if is_icl:
+            ref_code_artifact_id = voice_clone_prompt.get("ref_code_artifact_id")
+            if ref_code_artifact_id is None:
+                raise RuntimeError(
+                    "Qwen3-TTS ICL preprocessing did not provide ref-code artifact identity"
+                )
+            ref_code_artifact_key = _semantic_artifact_key(ref_code_artifact_id)
+
+        (
+            semantic_role_ids,
+            semantic_target_ids,
+            semantic_instruction_ids,
+            semantic_reference_text_ids,
+        ) = _semantic_prompt_text_parts(
+            input_id,
+            instruct_id,
+            ref_id if is_icl else None,
         )
 
         voice_clone_spk_embeds = self.generate_speaker_prompt(voice_clone_prompt)
@@ -860,32 +856,20 @@ class Qwen3TTSPromptBuilderMixin:
             tts_pad_embed=tts_pad_embed,
         )
 
-        semantic_prefix_ids = None
-        semantic_target_ids = None
-        semantic_instruction_ids = None
-        semantic_reference_text_ids = None
-        if semantic_text_parts is not None:
-            (
-                semantic_role_ids,
-                semantic_target_ids,
-                semantic_instruction_ids,
-                semantic_reference_text_ids,
-            ) = semantic_text_parts
-            speaker_row_id = _semantic_speaker_row_id(
-                self.root_config.tts_pad_token_id,
-                speaker_artifact_key,
-            )
-            if speaker_row_id is not None:
-                semantic_prefix_ids = self._semantic_conditioned_prefix_ids(
-                    role_ids=semantic_role_ids,
-                    codec_prefill_ids=codec_prefill_ids,
-                    speaker_row_id=speaker_row_id,
-                )
-
-        continuation_ids = None
+        speaker_row_id = _semantic_speaker_row_id(
+            self.root_config.tts_pad_token_id,
+            speaker_artifact_key,
+        )
+        semantic_prefix_ids = self._semantic_conditioned_prefix_ids(
+            role_ids=semantic_role_ids,
+            codec_prefill_ids=codec_prefill_ids,
+            speaker_row_id=speaker_row_id,
+        )
         if is_icl:
-            if ref_id is None:
-                raise ValueError("Qwen3-TTS ICL mode requires ref_text tokens")
+            if semantic_reference_text_ids is None:
+                raise RuntimeError(
+                    "Qwen3-TTS ICL preprocessing did not provide reference text tokens"
+                )
             icl_embed, trailing_text_hidden, continuation_ids = (
                 self.generate_icl_prompt(
                     text_id=input_id[:, 3:-5],
@@ -894,20 +878,12 @@ class Qwen3TTSPromptBuilderMixin:
                     tts_pad_embed=tts_pad_embed,
                     tts_eos_embed=tts_eos_embed,
                     non_streaming_mode=non_streaming_mode,
-                    semantic_text_ids=(
-                        [
-                            *semantic_reference_text_ids,
-                            *semantic_target_ids,
-                            self.root_config.tts_eos_token_id,
-                        ]
-                        if semantic_prefix_ids is not None
-                        else None
-                    ),
-                    ref_code_artifact_key=(
-                        ref_code_artifact_key
-                        if semantic_prefix_ids is not None
-                        else None
-                    ),
+                    semantic_text_ids=[
+                        *semantic_reference_text_ids,
+                        *semantic_target_ids,
+                        self.root_config.tts_eos_token_id,
+                    ],
+                    ref_code_artifact_key=ref_code_artifact_key,
                 )
             )
             talker_input_embed = torch.cat([talker_input_embed, icl_embed], dim=1)
@@ -920,9 +896,7 @@ class Qwen3TTSPromptBuilderMixin:
                     tts_pad_embed=tts_pad_embed,
                     tts_eos_embed=tts_eos_embed,
                     non_streaming_mode=non_streaming_mode,
-                    target_token_ids=(
-                        semantic_target_ids if semantic_prefix_ids is not None else None
-                    ),
+                    target_token_ids=semantic_target_ids,
                 )
             )
 
@@ -932,8 +906,6 @@ class Qwen3TTSPromptBuilderMixin:
         )
         prompt_cache_ids = (
             tuple(semantic_instruction_ids) + semantic_prefix_ids + continuation_ids
-            if semantic_prefix_ids is not None and continuation_ids is not None
-            else None
         )
         attention_mask = torch.ones(
             (1, talker_input_embed.shape[1]), device=self.device, dtype=torch.long
@@ -970,7 +942,12 @@ class Qwen3TTSPromptBuilderMixin:
             )
 
         speaker_id = int(spk_id_map[speaker_key])
-        semantic_text_parts = _semantic_prompt_text_parts(input_id, instruct_id)
+        (
+            semantic_role_ids,
+            semantic_target_ids,
+            semantic_instruction_ids,
+            _,
+        ) = _semantic_prompt_text_parts(input_id, instruct_id)
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self._build_tts_special_embeds(
             dtype=input_id.dtype
@@ -999,26 +976,15 @@ class Qwen3TTSPromptBuilderMixin:
             tts_bos_embed=tts_bos_embed,
             tts_pad_embed=tts_pad_embed,
         )
-        semantic_prefix_ids = None
-        semantic_target_ids = None
-        semantic_instruction_ids = None
-        if semantic_text_parts is not None:
-            (
-                semantic_role_ids,
-                semantic_target_ids,
-                semantic_instruction_ids,
-                _,
-            ) = semantic_text_parts
-            speaker_row_id = _semantic_text_codec_row_id(
-                self.root_config.tts_pad_token_id,
-                speaker_id,
-            )
-            if speaker_row_id is not None:
-                semantic_prefix_ids = self._semantic_conditioned_prefix_ids(
-                    role_ids=semantic_role_ids,
-                    codec_prefill_ids=codec_prefill_ids,
-                    speaker_row_id=speaker_row_id,
-                )
+        speaker_row_id = _semantic_text_codec_row_id(
+            self.root_config.tts_pad_token_id,
+            speaker_id,
+        )
+        semantic_prefix_ids = self._semantic_conditioned_prefix_ids(
+            role_ids=semantic_role_ids,
+            codec_prefill_ids=codec_prefill_ids,
+            speaker_row_id=speaker_row_id,
+        )
         talker_input_embed, trailing_text_hidden, continuation_ids = (
             self._finish_text_prompt(
                 talker_input_embed=talker_input_embed,
@@ -1027,9 +993,7 @@ class Qwen3TTSPromptBuilderMixin:
                 tts_pad_embed=tts_pad_embed,
                 tts_eos_embed=tts_eos_embed,
                 non_streaming_mode=non_streaming_mode,
-                target_token_ids=(
-                    semantic_target_ids if semantic_prefix_ids is not None else None
-                ),
+                target_token_ids=semantic_target_ids,
             )
         )
         talker_input_embed = self._apply_instruct_prefix(
@@ -1038,8 +1002,6 @@ class Qwen3TTSPromptBuilderMixin:
         )
         prompt_cache_ids = (
             tuple(semantic_instruction_ids) + semantic_prefix_ids + continuation_ids
-            if semantic_prefix_ids is not None and continuation_ids is not None
-            else None
         )
         attention_mask = torch.ones(
             (1, talker_input_embed.shape[1]), device=self.device, dtype=torch.long
@@ -1063,7 +1025,12 @@ class Qwen3TTSPromptBuilderMixin:
         if instruct_id is None:
             raise ValueError("Qwen3-TTS VoiceDesign requires instructions")
 
-        semantic_text_parts = _semantic_prompt_text_parts(input_id, instruct_id)
+        (
+            semantic_role_ids,
+            semantic_target_ids,
+            semantic_instruction_ids,
+            _,
+        ) = _semantic_prompt_text_parts(input_id, instruct_id)
 
         tts_bos_embed, tts_eos_embed, tts_pad_embed = self._build_tts_special_embeds(
             dtype=input_id.dtype
@@ -1086,20 +1053,10 @@ class Qwen3TTSPromptBuilderMixin:
             tts_bos_embed=tts_bos_embed,
             tts_pad_embed=tts_pad_embed,
         )
-        semantic_prefix_ids = None
-        semantic_target_ids = None
-        semantic_instruction_ids = None
-        if semantic_text_parts is not None:
-            (
-                semantic_role_ids,
-                semantic_target_ids,
-                semantic_instruction_ids,
-                _,
-            ) = semantic_text_parts
-            semantic_prefix_ids = self._semantic_conditioned_prefix_ids(
-                role_ids=semantic_role_ids,
-                codec_prefill_ids=codec_prefill_ids,
-            )
+        semantic_prefix_ids = self._semantic_conditioned_prefix_ids(
+            role_ids=semantic_role_ids,
+            codec_prefill_ids=codec_prefill_ids,
+        )
         talker_input_embed, trailing_text_hidden, continuation_ids = (
             self._finish_text_prompt(
                 talker_input_embed=talker_input_embed,
@@ -1108,9 +1065,7 @@ class Qwen3TTSPromptBuilderMixin:
                 tts_pad_embed=tts_pad_embed,
                 tts_eos_embed=tts_eos_embed,
                 non_streaming_mode=non_streaming_mode,
-                target_token_ids=(
-                    semantic_target_ids if semantic_prefix_ids is not None else None
-                ),
+                target_token_ids=semantic_target_ids,
             )
         )
         talker_input_embed = self._apply_instruct_prefix(
@@ -1119,8 +1074,6 @@ class Qwen3TTSPromptBuilderMixin:
         )
         prompt_cache_ids = (
             tuple(semantic_instruction_ids) + semantic_prefix_ids + continuation_ids
-            if semantic_prefix_ids is not None and continuation_ids is not None
-            else None
         )
         attention_mask = torch.ones(
             (1, talker_input_embed.shape[1]), device=self.device, dtype=torch.long
@@ -1141,9 +1094,9 @@ class Qwen3TTSPromptBuilderMixin:
         tts_pad_embed: torch.Tensor,
         tts_eos_embed: torch.Tensor,
         non_streaming_mode: bool,
-        semantic_text_ids: list[int] | None = None,
-        ref_code_artifact_key: int | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...] | None]:
+        semantic_text_ids: list[int],
+        ref_code_artifact_key: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[int, ...]]:
         text_embed = self.text_projection(
             self.get_text_embeddings()(torch.cat([ref_id, text_id], dim=-1))
         )
@@ -1174,14 +1127,14 @@ class Qwen3TTSPromptBuilderMixin:
         )
         text_lens = text_embed.shape[1]
         codec_lens = codec_embed.shape[1]
-        prompt_cache_ids: tuple[int, ...] | None = None
-        if (
-            semantic_text_ids is None
-            or len(semantic_text_ids) != int(text_lens)
-            or ref_code_artifact_key is None
-            or int(ref_code.shape[0]) >= _SEMANTIC_FRAME_INDEX_LIMIT
-        ):
-            semantic_text_ids = None
+        if len(semantic_text_ids) != int(text_lens):
+            raise RuntimeError(
+                "Qwen3-TTS semantic ICL text IDs must match the text prompt rows"
+            )
+        if int(ref_code.shape[0]) >= _SEMANTIC_FRAME_INDEX_LIMIT:
+            raise RuntimeError(
+                "Qwen3-TTS semantic frame index exceeds the supported range"
+            )
         if non_streaming_mode:
             icl_input_embed = text_embed + self.get_input_embeddings()(
                 torch.tensor(
@@ -1193,8 +1146,8 @@ class Qwen3TTSPromptBuilderMixin:
             icl_input_embed = torch.cat(
                 [icl_input_embed, codec_embed + tts_pad_embed], dim=1
             )
-            if semantic_text_ids is not None:
-                row_ids = [
+            prompt_cache_ids = tuple(
+                [
                     *(
                         _semantic_text_codec_row_id(
                             text_id=text_id,
@@ -1215,26 +1168,24 @@ class Qwen3TTSPromptBuilderMixin:
                         for frame_index in range(int(ref_code.shape[0]))
                     ),
                 ]
-                if all(row_id is not None for row_id in row_ids):
-                    prompt_cache_ids = tuple(int(row_id) for row_id in row_ids)
+            )
             return icl_input_embed, tts_pad_embed, prompt_cache_ids
         if text_lens > codec_lens:
-            if semantic_text_ids is not None:
-                row_ids = [
+            prompt_cache_ids = tuple(
+                [
                     _semantic_text_codec_row_id(
                         semantic_text_ids[0], self.config.codec_bos_id
-                    )
+                    ),
+                    *(
+                        _semantic_frame_row_id(
+                            semantic_text_ids[index],
+                            ref_code_artifact_key,
+                            index - 1,
+                        )
+                        for index in range(1, int(codec_lens))
+                    ),
                 ]
-                row_ids.extend(
-                    _semantic_frame_row_id(
-                        semantic_text_ids[index],
-                        ref_code_artifact_key,
-                        index - 1,
-                    )
-                    for index in range(1, int(codec_lens))
-                )
-                if all(row_id is not None for row_id in row_ids):
-                    prompt_cache_ids = tuple(int(row_id) for row_id in row_ids)
+            )
             return (
                 text_embed[:, :codec_lens] + codec_embed,
                 text_embed[:, codec_lens:],
@@ -1243,30 +1194,29 @@ class Qwen3TTSPromptBuilderMixin:
         text_embed = torch.cat(
             [text_embed] + [tts_pad_embed] * (codec_lens - text_lens), dim=1
         )
-        if semantic_text_ids is not None:
-            row_ids = [
+        prompt_cache_ids = tuple(
+            [
                 _semantic_text_codec_row_id(
                     semantic_text_ids[0], self.config.codec_bos_id
-                )
+                ),
+                *(
+                    _semantic_frame_row_id(
+                        semantic_text_ids[index],
+                        ref_code_artifact_key,
+                        index - 1,
+                    )
+                    for index in range(1, int(text_lens))
+                ),
+                *(
+                    _semantic_frame_row_id(
+                        self.root_config.tts_pad_token_id,
+                        ref_code_artifact_key,
+                        index - 1,
+                    )
+                    for index in range(int(text_lens), int(codec_lens))
+                ),
             ]
-            row_ids.extend(
-                _semantic_frame_row_id(
-                    semantic_text_ids[index],
-                    ref_code_artifact_key,
-                    index - 1,
-                )
-                for index in range(1, int(text_lens))
-            )
-            row_ids.extend(
-                _semantic_frame_row_id(
-                    self.root_config.tts_pad_token_id,
-                    ref_code_artifact_key,
-                    index - 1,
-                )
-                for index in range(int(text_lens), int(codec_lens))
-            )
-            if all(row_id is not None for row_id in row_ids):
-                prompt_cache_ids = tuple(int(row_id) for row_id in row_ids)
+        )
         return text_embed + codec_embed, tts_pad_embed, prompt_cache_ids
 
 

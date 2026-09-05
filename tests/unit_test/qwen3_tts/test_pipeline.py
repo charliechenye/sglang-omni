@@ -31,7 +31,6 @@ from sglang_omni.models.qwen3_tts.request_builders import (
     Qwen3TTSPreparedRequest,
     Qwen3TTSSGLangRequestData,
     apply_sglang_qwen3_tts_result,
-    build_embedding_cache_key_ids,
     build_qwen3_tts_state,
     build_sglang_qwen3_tts_request,
     derive_qwen3_tts_sampling_seeds,
@@ -547,6 +546,11 @@ def test_qwen3_tts_maps_references_and_keeps_upstream_sampling_defaults() -> Non
     assert state.generation_kwargs == {"max_new_tokens": 2048}
 
 
+def test_qwen3_tts_rejects_empty_text() -> None:
+    with pytest.raises(ValueError, match="requires non-empty text"):
+        build_qwen3_tts_state(make_payload(inputs="   "))
+
+
 def test_qwen3_tts_preserves_explicit_default_like_sampling_values() -> None:
     payload = make_payload(
         inputs={
@@ -618,18 +622,6 @@ def test_qwen3_tts_forwards_tts_engine_stage_sampling_params() -> None:
         "max_new_tokens": 2048,
         "subtalker_dosample": False,
     }
-
-
-def test_qwen3_tts_embedding_cache_keys_are_stable_and_content_based() -> None:
-    """Protects radix-cache keys for Qwen requests that prefill with embeddings."""
-    embeds = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
-    same = embeds.clone()
-    different_same_length = torch.tensor([[1.0, 2.0], [3.0, 5.0]])
-
-    assert build_embedding_cache_key_ids(embeds) == build_embedding_cache_key_ids(same)
-    assert build_embedding_cache_key_ids(embeds) != build_embedding_cache_key_ids(
-        different_same_length
-    )
 
 
 def test_qwen3_tts_maps_ref_audio_form_and_explicit_sampling() -> None:
@@ -728,7 +720,7 @@ def test_qwen3_tts_preprocessing_does_not_mutate_global_rng(
                 torch.ones((1, 2), dtype=torch.long),
                 torch.ones((1, 1, 4)),
                 None,
-                None,
+                (101, 102),
             )
 
         def get_text_embeddings(self):
@@ -799,7 +791,7 @@ def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
                 torch.ones((1, 2), dtype=torch.long),
                 torch.ones((1, 1, 4)),
                 None,
-                None,
+                (101, 102),
             )
 
         def get_text_embeddings(self):
@@ -912,7 +904,7 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
                 torch.ones((1, 2), dtype=torch.long),
                 torch.ones((1, 1, 4)),
                 None,
-                None,
+                (101, 102),
             )
 
         def get_text_embeddings(self):
@@ -1076,7 +1068,7 @@ def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
                 torch.ones((1, 2), dtype=torch.long),
                 torch.ones((1, 1, 4)),
                 None,
-                None,
+                (101, 102),
             )
 
         def get_text_embeddings(self):
@@ -1309,7 +1301,7 @@ def test_qwen3_tts_uploaded_voice_x_vector_cache_omits_ref_code(
                 torch.ones((1, 2), dtype=torch.long),
                 torch.ones((1, 1, 4)),
                 None,
-                None,
+                (101, 102),
             )
 
         def get_text_embeddings(self):
@@ -4865,7 +4857,11 @@ def test_qwen3_tts_prompt_key_and_tail_guard_order(
 
     assert first.req.rid == second.req.rid
     assert list(first.req.origin_input_ids) == list(second.req.origin_input_ids)
-    assert first.req.extra_key == second.req.extra_key == "qwen3_tts:prompt:v1"
+    assert (
+        first.req.extra_key
+        == second.req.extra_key
+        == qwen3_request_builders.QWEN3_TTS_PROMPT_CACHE_KEY
+    )
     assert first.req._omni_prompt_cache_key == second.req._omni_prompt_cache_key
 
     seen = []
@@ -4903,7 +4899,7 @@ def test_qwen3_tts_prompt_key_and_tail_guard_order(
     ]
 
     first.req.reset_for_retract()
-    assert first.req.extra_key == "qwen3_tts:prompt:v1"
+    assert first.req.extra_key == qwen3_request_builders.QWEN3_TTS_PROMPT_CACHE_KEY
     assert first.req.skip_radix_cache_insert
 
 
@@ -4924,85 +4920,7 @@ def test_qwen3_tts_prepared_payload_missing_state_fails_without_rebuild(
         )
 
 
-def test_qwen3_tts_prepare_custom_voice_uses_speaker_path(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    calls: list[tuple[str, object]] = []
-
-    class FakeWrapper:
-        def _build_assistant_text(self, text):
-            return f"assistant:{text}"
-
-        def _build_instruct_text(self, text):
-            return f"instruct:{text}"
-
-        def _tokenize_texts(self, texts):
-            return [torch.arange(8, dtype=torch.long).unsqueeze(0) for _ in texts]
-
-        def _merge_generate_kwargs(self, **kwargs):
-            return kwargs
-
-        def create_voice_clone_prompt(self, **kwargs):
-            calls.append(("base", kwargs))
-            return []
-
-    class FakeModel:
-        tts_model_type = "custom_voice"
-        model = SimpleNamespace(_feedback_buffer=torch.zeros(4, 4))
-
-        def build_custom_voice_inputs(self, **kwargs):
-            calls.append(("custom", kwargs))
-            return (
-                torch.ones(1, 3, 4),
-                torch.ones(1, 3, dtype=torch.long),
-                torch.ones(1, 1, 4),
-                None,
-                None,
-            )
-
-    legacy_calls: list[torch.Tensor] = []
-
-    def legacy_ids(embeds: torch.Tensor) -> list[int]:
-        legacy_calls.append(embeds)
-        return [17, 18, 19]
-
-    monkeypatch.setattr(
-        qwen3_request_builders, "build_embedding_cache_key_ids", legacy_ids
-    )
-    monkeypatch.setattr(
-        qwen3_request_builders,
-        "_build_qwen3_tts_pad_embed",
-        lambda model: torch.zeros(4),
-    )
-
-    prepared = qwen3_request_builders._prepare_qwen3_tts_request(
-        make_payload(
-            inputs="target",
-            tts_params={
-                "task_type": "CustomVoice",
-                "voice": "Ryan",
-                "instructions": "calm",
-            },
-        ),
-        model=FakeModel(),
-        wrapper=FakeWrapper(),
-    )
-
-    assert prepared.state.task_type == "CustomVoice"
-    assert prepared.state.voice == "Ryan"
-    assert (
-        prepared.prompt_cache_key
-        == qwen3_request_builders.QWEN3_TTS_LEGACY_PROMPT_CACHE_KEY
-    )
-    assert len(legacy_calls) == 1
-    assert prepared.input_ids_list == [17, 18, 19]
-    assert [name for name, _ in calls] == ["custom"]
-    kwargs = calls[0][1]
-    assert kwargs["voice"] == "Ryan"
-    assert kwargs["instruct_id"] is not None
-
-
-def test_qwen3_tts_prepare_custom_voice_uses_semantic_ids_without_legacy_hashing(
+def test_qwen3_tts_prepare_custom_voice_uses_semantic_ids(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls: list[dict] = []
@@ -5034,12 +4952,6 @@ def test_qwen3_tts_prepare_custom_voice_uses_semantic_ids_without_legacy_hashing
                 (101, 102, 103),
             )
 
-    def fail_legacy(_: torch.Tensor) -> list[int]:
-        raise AssertionError("supported semantic prompt used legacy embedding hashing")
-
-    monkeypatch.setattr(
-        qwen3_request_builders, "build_embedding_cache_key_ids", fail_legacy
-    )
     monkeypatch.setattr(
         qwen3_request_builders,
         "_build_qwen3_tts_pad_embed",
@@ -5055,10 +4967,6 @@ def test_qwen3_tts_prepare_custom_voice_uses_semantic_ids_without_legacy_hashing
         wrapper=FakeWrapper(),
     )
 
-    assert (
-        prepared.prompt_cache_key
-        == qwen3_request_builders.QWEN3_TTS_SEMANTIC_PROMPT_CACHE_KEY
-    )
     assert prepared.input_ids_list == [101, 102, 103]
     assert len(calls) == 1
 
@@ -5092,7 +5000,7 @@ def test_qwen3_tts_prepare_voice_design_uses_instruction_path(
                 torch.ones(1, 3, dtype=torch.long),
                 torch.ones(1, 1, 4),
                 None,
-                None,
+                (101, 102, 103),
             )
 
     monkeypatch.setattr(
@@ -6437,7 +6345,6 @@ def test_qwen3_tts_decode_isolates_rows_with_out_of_range_codes(
 def _prepared_request_fixture(
     *,
     dtype: torch.dtype,
-    prompt_cache_key: str | None = None,
     input_ids_list: list[int] | None = None,
 ) -> Qwen3TTSPreparedRequest:
     prompt = torch.randn(5, 4).to(dtype)
@@ -6452,9 +6359,6 @@ def _prepared_request_fixture(
         prompt_input_embeds=prompt,
         tts_pad_embed=torch.randn(4).to(dtype),
         gen_kwargs={"max_new_tokens": 8, "top_k": 7},
-        prompt_cache_key=(
-            prompt_cache_key or qwen3_request_builders.QWEN3_TTS_LEGACY_PROMPT_CACHE_KEY
-        ),
     )
 
 
@@ -6470,7 +6374,6 @@ def test_qwen3_tts_prepared_payload_drops_the_consumed_reference_clip() -> None:
 def test_qwen3_tts_prepared_payload_round_trips_tensors_and_clears_fields() -> None:
     prepared = _prepared_request_fixture(
         dtype=torch.bfloat16,
-        prompt_cache_key=qwen3_request_builders.QWEN3_TTS_SEMANTIC_PROMPT_CACHE_KEY,
     )
     payload = make_payload(inputs="target")
     stored = qwen3_request_builders._store_prepared_qwen3_tts_payload(payload, prepared)
@@ -6481,10 +6384,6 @@ def test_qwen3_tts_prepared_payload_round_trips_tensors_and_clears_fields() -> N
     assert isinstance(shipped, torch.Tensor)
     assert shipped.dtype == torch.bfloat16 and shipped.device.type == "cpu"
     assert stored.data["prepared_input_ids"] == [11, 12, 13, 14, 15]
-    assert (
-        stored.data["prepared_prompt_cache_key"]
-        == qwen3_request_builders.QWEN3_TTS_SEMANTIC_PROMPT_CACHE_KEY
-    )
 
     engine_model = SimpleNamespace(
         model=SimpleNamespace(_feedback_buffer=torch.zeros(1, 4, dtype=torch.bfloat16))
@@ -6503,7 +6402,6 @@ def test_qwen3_tts_prepared_payload_round_trips_tensors_and_clears_fields() -> N
     assert torch.equal(loaded.input_ids, prepared.input_ids)
     assert loaded.attention_mask.shape == (1, 5)
     assert loaded.gen_kwargs == prepared.gen_kwargs
-    assert loaded.prompt_cache_key == prepared.prompt_cache_key
     assert loaded.state.text == "hello" and loaded.state.seed == 3
     assert loaded.state.prepared_input_ids is None
     assert not [key for key in stored.data if key.startswith("prepared_")]
@@ -6521,7 +6419,6 @@ def test_qwen3_tts_request_builder_consumes_prepared_payload(
     install_fake_sglang(monkeypatch)
     prepared = _prepared_request_fixture(
         dtype=torch.float32,
-        prompt_cache_key=qwen3_request_builders.QWEN3_TTS_SEMANTIC_PROMPT_CACHE_KEY,
         input_ids_list=[1, -2, 3, -4, 5],
     )
     prepared.ref_code = None
@@ -6540,9 +6437,7 @@ def test_qwen3_tts_request_builder_consumes_prepared_payload(
     assert data.prefill_input_embeds is data.prompt_input_embeds
     assert data.ref_code is None and data.ref_code_len == 0
     assert data.req.origin_input_ids == [1, -2, 3, -4, 5]
-    assert (
-        data.req.extra_key == qwen3_request_builders.QWEN3_TTS_SEMANTIC_PROMPT_CACHE_KEY
-    )
+    assert data.req.extra_key == qwen3_request_builders.QWEN3_TTS_PROMPT_CACHE_KEY
     assert data.max_new_tokens == 8
     assert data.req.sampling_params.top_k == 7
     assert torch.equal(data.pending_text_queue.rows, prepared.trailing_text_hidden)
@@ -6582,7 +6477,7 @@ def test_qwen3_tts_standalone_preprocessing_ships_tensors_without_registry(
                 torch.ones((1, 2), dtype=torch.long),
                 torch.ones((1, 1, 4)),
                 torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
-                None,
+                (101, 102),
             )
 
     monkeypatch.setattr(
@@ -6726,7 +6621,6 @@ def test_qwen3_tts_prompt_frontend_builds_a_custom_voice_prompt() -> None:
         instruct_id=None,
     )
     assert ref_code is None
-    assert prompt_cache_ids is not None
     assert len(prompt_cache_ids) == embeds.shape[1]
     assert embeds.shape[0] == 1 and embeds.shape[-1] == talker.hidden_size
     assert attention_mask.shape == (1, embeds.shape[1])
