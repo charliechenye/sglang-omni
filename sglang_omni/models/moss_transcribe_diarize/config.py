@@ -31,6 +31,10 @@ class MossTDFactoryArgs(FactoryArgs):
 
     encoder_cache_size_bytes: int | None = Field(default=None, ge=0)
     encoder_max_batch_size: int | None = Field(default=None, ge=1)
+    kv_calibration_output_path: str | None = Field(default=None, min_length=1)
+    kv_calibration_checkpoint_interval_s: float | None = Field(
+        default=None, gt=0
+    )
 
 
 class MossTDStageConfig(EngineStageConfig):

@@ -27,7 +27,9 @@ from sglang_omni.scheduling.generation_batch_policy import (
 )
 
 
-def _make_moss_engine_builder() -> MossTranscribeDiarizeEngineBuilder:
+def _make_moss_engine_builder(
+    *, kv_calibration_output_path: str | None = None
+) -> MossTranscribeDiarizeEngineBuilder:
     return MossTranscribeDiarizeEngineBuilder(
         max_running_requests=16,
         max_new_tokens=None,
@@ -50,6 +52,8 @@ def _make_moss_engine_builder() -> MossTranscribeDiarizeEngineBuilder:
         request_build_max_workers=8,
         request_build_max_pending=16,
         stream_emit_interval_s=0.05,
+        kv_calibration_output_path=kv_calibration_output_path,
+        kv_calibration_checkpoint_interval_s=30.0,
     )
 
 
@@ -79,6 +83,8 @@ def test_moss_transcribe_diarize_config_uses_single_batched_stage() -> None:
     assert factory.prefill_coalesce_when_idle is True
     assert factory.prefill_coalesce_requires_pending_builds is True
     assert factory.prefill_coalesce_after_builds_during_decode is True
+    assert factory.kv_calibration_output_path is None
+    assert factory.kv_calibration_checkpoint_interval_s is None
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config(
             "MossTranscribeDiarizeForConditionalGeneration"
@@ -91,6 +97,8 @@ def test_moss_transcribe_diarize_config_uses_single_batched_stage() -> None:
 def test_moss_transcribe_diarize_prefill_backend_policy() -> None:
     builder = _make_moss_engine_builder()
 
+    assert builder.kv_calibration_collector is None
+    assert builder.extra_scheduler_callbacks() == {}
     assert type(builder).supports_breakable_prefill_cuda_graph is True
     defaults = builder.generation_defaults(dtype="bfloat16")
     assert defaults["enable_torch_compile"] is False
@@ -128,6 +136,91 @@ def test_moss_transcribe_diarize_compile_cap_survives_batch_overrides() -> None:
         **builder.generation_defaults(dtype="bfloat16"),
     )
     assert operator["torch_compile_max_bs"] == 8
+
+
+def test_moss_td_calibration_forces_eager_uncompiled_decoder() -> None:
+    builder = _make_moss_engine_builder(
+        kv_calibration_output_path="results/moss_td.raw.json"
+    )
+
+    defaults = builder.generation_defaults(dtype="bfloat16")
+    assert defaults["disable_cuda_graph"] is True
+    assert defaults["enable_torch_compile"] is False
+
+    overrides = {
+        "disable_cuda_graph": False,
+        "enable_torch_compile": True,
+    }
+    builder.adjust_overrides(overrides)
+    assert overrides == {
+        "disable_cuda_graph": True,
+        "enable_torch_compile": False,
+    }
+
+
+def test_factory_calibration_wires_collector_shutdown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from sglang_omni.models.moss_transcribe_diarize import kv_calibration
+    from sglang_omni.scheduling import engine_factory, sglang_backend
+
+    calls = _stub_factory_env(monkeypatch, want_cuda_graph=False)
+    captured: dict[str, object] = {}
+
+    def fake_attach(model, **kwargs):
+        captured.update(kwargs)
+        captured["model"] = model
+        return SimpleNamespace(finalize=lambda: None, abort=lambda: None)
+
+    monkeypatch.setattr(kv_calibration, "attach_moss_td_kv_calibration", fake_attach)
+
+    def capture_overrides(**kwargs):
+        captured["generation_defaults"] = dict(kwargs)
+        return {
+            key: value
+            for key, value in kwargs.items()
+            if key != "server_args_overrides"
+        }
+
+    monkeypatch.setattr(
+        engine_factory, "build_generation_batch_overrides", capture_overrides
+    )
+
+    server_args_kwargs: dict[str, object] = {}
+
+    def capture_server_args(_model_path, **kwargs):
+        server_args_kwargs.update(kwargs)
+        return SimpleNamespace(
+            context_length=4096,
+            enable_torch_compile=False,
+            cuda_graph_config=SimpleNamespace(
+                prefill=SimpleNamespace(backend="disabled")
+            ),
+        )
+
+    monkeypatch.setattr(sglang_backend, "build_sglang_server_args", capture_server_args)
+
+    create_sglang_moss_transcribe_diarize_executor(
+        "OpenMOSS-Team/MOSS-Transcribe-Diarize",
+        kv_calibration_output_path="results/moss_td.raw.json",
+        server_args_overrides={
+            "disable_cuda_graph": False,
+            "enable_torch_compile": True,
+        },
+    )
+
+    assert captured["generation_defaults"]["server_args_overrides"] == {
+        "disable_cuda_graph": True,
+        "enable_torch_compile": False,
+    }
+    assert server_args_kwargs["disable_cuda_graph"] is True
+    assert server_args_kwargs["enable_torch_compile"] is False
+    assert captured["model_path"] == "OpenMOSS-Team/MOSS-Transcribe-Diarize"
+    assert captured["output_path"] == "results/moss_td.raw.json"
+    assert calls["init_cuda_graphs"] == 0
+    assert "shutdown_callback" in calls["scheduler_kwargs"][0]
 
 
 @pytest.mark.parametrize(
