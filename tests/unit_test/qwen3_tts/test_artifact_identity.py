@@ -111,6 +111,10 @@ class _QwenVoiceCloneModel:
     def __init__(self) -> None:
         self.captured_prompts: list[dict[str, Any]] = []
 
+    def build_semantic_prompt_plan(self, **kwargs: Any) -> Any:
+        del kwargs
+        return SimpleNamespace()
+
     def build_voice_clone_inputs(self, **kwargs: Any) -> tuple[torch.Tensor, ...]:
         self.captured_prompts.append(kwargs["voice_clone_prompt"])
         return (
@@ -122,44 +126,37 @@ class _QwenVoiceCloneModel:
         )
 
 
-def test_artifact_fingerprint_covers_domain_dtype_shape_and_contents() -> None:
-    value = torch.tensor([[1.0, 2.0]], dtype=torch.float32)
+def test_artifact_ids_are_opaque_and_do_not_read_tensor_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_numpy(self: torch.Tensor) -> None:
+        raise AssertionError("artifact identity must not inspect tensor bytes")
 
-    assert qwen3_request_builders._qwen3_tts_artifact_fingerprint(
-        value, domain="speaker"
-    ) == qwen3_request_builders._qwen3_tts_artifact_fingerprint(
-        value.clone(), domain="speaker"
-    )
-    assert qwen3_request_builders._qwen3_tts_artifact_fingerprint(
-        torch.tensor([[1.0, 3.0]], dtype=torch.float32), domain="speaker"
-    ) != qwen3_request_builders._qwen3_tts_artifact_fingerprint(value, domain="speaker")
-    assert qwen3_request_builders._qwen3_tts_artifact_fingerprint(
-        value.reshape(2, 1), domain="speaker"
-    ) != qwen3_request_builders._qwen3_tts_artifact_fingerprint(value, domain="speaker")
-    assert qwen3_request_builders._qwen3_tts_artifact_fingerprint(
-        value.to(torch.float64), domain="speaker"
-    ) != qwen3_request_builders._qwen3_tts_artifact_fingerprint(value, domain="speaker")
-    assert qwen3_request_builders._qwen3_tts_artifact_fingerprint(
-        value, domain="speaker"
-    ) != qwen3_request_builders._qwen3_tts_artifact_fingerprint(
-        value, domain="ref_code"
-    )
-
-
-def test_artifact_ids_survive_cache_round_trip_and_separate_ref_code() -> None:
+    monkeypatch.setattr(torch.Tensor, "numpy", fail_numpy)
     first = qwen3_request_builders._cacheable_qwen3_tts_voice_prompt(
         _voice_clone_prompt(ref_code=torch.tensor([[1, 2], [3, 4]], dtype=torch.long)),
         ref_text="reference text",
     )
-    changed_ref_code = qwen3_request_builders._cacheable_qwen3_tts_voice_prompt(
-        _voice_clone_prompt(ref_code=torch.tensor([[1, 2], [3, 5]], dtype=torch.long)),
+    second = qwen3_request_builders._cacheable_qwen3_tts_voice_prompt(
+        _voice_clone_prompt(ref_code=torch.tensor([[1, 2], [3, 4]], dtype=torch.long)),
+        ref_text="reference text",
+    )
+
+    assert first["speaker_artifact_id"].startswith("speaker:")
+    assert first["ref_code_artifact_id"].startswith("ref_code:")
+    assert first["speaker_artifact_id"] != second["speaker_artifact_id"]
+    assert first["ref_code_artifact_id"] != second["ref_code_artifact_id"]
+    assert first["ref_code_frames"] == second["ref_code_frames"] == 2
+
+
+def test_artifact_ids_survive_cache_round_trip() -> None:
+    first = qwen3_request_builders._cacheable_qwen3_tts_voice_prompt(
+        _voice_clone_prompt(ref_code=torch.tensor([[1, 2], [3, 4]], dtype=torch.long)),
         ref_text="reference text",
     )
 
     assert isinstance(first["speaker_artifact_id"], str)
     assert isinstance(first["ref_code_artifact_id"], str)
-    assert first["speaker_artifact_id"] == changed_ref_code["speaker_artifact_id"]
-    assert first["ref_code_artifact_id"] != changed_ref_code["ref_code_artifact_id"]
 
     loaded = qwen3_request_builders._qwen3_tts_voice_prompt_from_cache(first)
     assert loaded is not None
@@ -167,6 +164,8 @@ def test_artifact_ids_survive_cache_round_trip_and_separate_ref_code() -> None:
     assert loaded_ref_text == "reference text"
     assert loaded_prompt["speaker_artifact_id"] == first["speaker_artifact_id"]
     assert loaded_prompt["ref_code_artifact_id"] == first["ref_code_artifact_id"]
+    assert loaded_prompt["ref_code_frames"] == first["ref_code_frames"] == 2
+    assert loaded_prompt["ref_code"][0].data_ptr() != first["ref_code"][0].data_ptr()
 
 
 @pytest.mark.parametrize(
@@ -194,29 +193,12 @@ def test_cacheable_voice_prompt_rejects_multiple_artifacts(
         )
 
 
-def test_reference_service_reuses_identity_without_refingerprint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_reference_service_reuses_identity_on_cache_hit() -> None:
     hook = _QwenArtifactHook()
     service = ReferenceEncodeService(hook, max_items=8, max_bytes=1024 * 1024)
-    fingerprint_domains: list[str] = []
-    original = qwen3_request_builders._qwen3_tts_artifact_fingerprint
-
-    def counted_fingerprint(value: torch.Tensor, *, domain: str) -> str:
-        fingerprint_domains.append(domain)
-        return original(value, domain=domain)
-
-    monkeypatch.setattr(
-        qwen3_request_builders,
-        "_qwen3_tts_artifact_fingerprint",
-        counted_fingerprint,
-    )
     try:
         first_prompt, _ = service.get_or_encode("same")
-        assert fingerprint_domains == ["speaker", "ref_code"]
-
         second_prompt, _ = service.get_or_encode("same")
-        assert fingerprint_domains == ["speaker", "ref_code"]
         assert hook.encode_calls == Counter({"same": 1})
         assert (
             first_prompt["speaker_artifact_id"] == second_prompt["speaker_artifact_id"]
@@ -229,7 +211,7 @@ def test_reference_service_reuses_identity_without_refingerprint(
         service.close()
 
 
-def test_eviction_reencode_reuses_bit_identical_content_identity() -> None:
+def test_eviction_reencode_gets_a_new_artifact_identity() -> None:
     hook = _QwenArtifactHook()
     service = ReferenceEncodeService(hook, max_items=1, max_bytes=1024 * 1024)
     try:
@@ -240,17 +222,17 @@ def test_eviction_reencode_reuses_bit_identical_content_identity() -> None:
         assert hook.encode_calls == Counter({"A": 2, "B": 1})
         assert (
             first_prompt["speaker_artifact_id"]
-            == reencoded_prompt["speaker_artifact_id"]
+            != reencoded_prompt["speaker_artifact_id"]
         )
         assert (
             first_prompt["ref_code_artifact_id"]
-            == reencoded_prompt["ref_code_artifact_id"]
+            != reencoded_prompt["ref_code_artifact_id"]
         )
     finally:
         service.close()
 
 
-def test_x_vector_and_icl_share_identical_speaker_identity() -> None:
+def test_independently_realized_artifacts_do_not_share_identity() -> None:
     icl_artifact = qwen3_request_builders._cacheable_qwen3_tts_voice_prompt(
         _voice_clone_prompt(ref_code=torch.tensor([[10, 20]], dtype=torch.long)),
         ref_text="reference",
@@ -261,7 +243,7 @@ def test_x_vector_and_icl_share_identical_speaker_identity() -> None:
     )
 
     assert (
-        icl_artifact["speaker_artifact_id"] == x_vector_artifact["speaker_artifact_id"]
+        icl_artifact["speaker_artifact_id"] != x_vector_artifact["speaker_artifact_id"]
     )
     assert icl_artifact["ref_code_artifact_id"] is not None
     assert x_vector_artifact["ref_code_artifact_id"] is None
@@ -302,7 +284,9 @@ def test_uploaded_voice_miss_and_hit_use_same_artifact_identity(
     assert first_prompt["ref_code_artifact_id"] == second_prompt["ref_code_artifact_id"]
 
 
-def test_uncacheable_reference_still_attaches_artifact_identity() -> None:
+def test_uncacheable_reference_assigns_identity_without_artifact_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     class FakeSpeechTokenizer:
         def __init__(self) -> None:
             self.encode_calls = 0
@@ -351,6 +335,17 @@ def test_uncacheable_reference_still_attaches_artifact_identity() -> None:
         ref_audio=ref_audio,
         ref_text="reference",
     )
+
+    def fail_cacheable(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError(
+            "uncacheable references must not copy artifacts for identity"
+        )
+
+    monkeypatch.setattr(
+        qwen3_request_builders,
+        "_cacheable_qwen3_tts_voice_prompt",
+        fail_cacheable,
+    )
     try:
         qwen3_request_builders._prepare_qwen3_tts_base_request(
             state=state,
@@ -365,6 +360,11 @@ def test_uncacheable_reference_still_attaches_artifact_identity() -> None:
         assert tokenizer.encode_calls == 2
         assert model.captured_prompts[0]["speaker_artifact_id"].startswith("speaker:")
         assert model.captured_prompts[0]["ref_code_artifact_id"].startswith("ref_code:")
+        assert (
+            model.captured_prompts[0]["speaker_artifact_id"]
+            != model.captured_prompts[1]["speaker_artifact_id"]
+        )
+        assert model.captured_prompts[0]["ref_code_frames"] == 1
         assert qwen3_request_builders._ADHOC_REFERENCE_SERVICE_ENTRY is not None
         assert (
             qwen3_request_builders._ADHOC_REFERENCE_SERVICE_ENTRY[1].stats()["entries"]

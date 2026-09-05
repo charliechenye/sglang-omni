@@ -735,6 +735,10 @@ def test_qwen3_tts_preprocessing_does_not_mutate_global_rng(
             assert sr == 24000
             return torch.ones(4)
 
+        def build_semantic_prompt_plan(self, **kwargs):
+            del kwargs
+            return SimpleNamespace()
+
         def build_voice_clone_inputs(self, **kwargs):
             del kwargs
             return (
@@ -805,6 +809,10 @@ def test_qwen3_tts_uploaded_voice_clone_prompt_uses_shared_cache(
         device = torch.device("cpu")
         root_config = SimpleNamespace(tts_pad_token_id=0)
         model = SimpleNamespace(_feedback_buffer=torch.empty((1, 4)))
+
+        def build_semantic_prompt_plan(self, **kwargs):
+            del kwargs
+            return SimpleNamespace()
 
         def build_voice_clone_inputs(self, **kwargs):
             assert kwargs["voice_clone_prompt"]["icl_mode"] == [True]
@@ -917,6 +925,10 @@ def test_qwen3_tts_adhoc_voice_clone_prompt_uses_reference_service(
             assert audio.shape == (32,)
             assert sr == 24000
             return torch.ones(4)
+
+        def build_semantic_prompt_plan(self, **kwargs):
+            del kwargs
+            return SimpleNamespace()
 
         def build_voice_clone_inputs(self, **kwargs):
             assert kwargs["voice_clone_prompt"]["icl_mode"] in ([True], [False])
@@ -1080,6 +1092,10 @@ def test_qwen3_tts_preprocess_payload_batches_reference_codes_across_requests(
 
         def extract_speaker_embedding(self, *, audio, sr):
             return torch.ones(4)
+
+        def build_semantic_prompt_plan(self, **kwargs):
+            del kwargs
+            return SimpleNamespace()
 
         def build_voice_clone_inputs(self, **kwargs):
             del kwargs
@@ -1311,6 +1327,10 @@ def test_qwen3_tts_uploaded_voice_x_vector_cache_omits_ref_code(
         device = torch.device("cpu")
         root_config = SimpleNamespace(tts_pad_token_id=0)
         model = SimpleNamespace(_feedback_buffer=torch.empty((1, 4)))
+
+        def build_semantic_prompt_plan(self, **kwargs):
+            del kwargs
+            return SimpleNamespace()
 
         def build_voice_clone_inputs(self, **kwargs):
             assert kwargs["voice_clone_prompt"]["icl_mode"] == [False]
@@ -1701,17 +1721,22 @@ def test_qwen3_tts_custom_voice_requires_speaker_table(
     from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
 
     talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    talker.root_config = SimpleNamespace(
+        tts_bos_token_id=1,
+        tts_eos_token_id=2,
+        tts_pad_token_id=3,
+    )
     talker.config = SimpleNamespace(spk_id={})
 
     with pytest.raises(ValueError, match="configured spk_id"):
-        Qwen3TTSTalker.build_custom_voice_inputs(
+        Qwen3TTSTalker.build_semantic_prompt_plan(
             talker,
-            input_id=torch.arange(8, dtype=torch.long).unsqueeze(0),
-            voice="Vivian",
+            task="custom_voice",
+            semantic_input_ids=tuple(range(12)),
+            semantic_instruct_ids=None,
             language="auto",
             non_streaming_mode=True,
-            semantic_input_ids=tuple(range(8)),
-            semantic_instruct_ids=None,
+            voice="Vivian",
         )
 
 
@@ -1722,17 +1747,22 @@ def test_qwen3_tts_custom_voice_rejects_invalid_speaker(
     from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
 
     talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
+    talker.root_config = SimpleNamespace(
+        tts_bos_token_id=1,
+        tts_eos_token_id=2,
+        tts_pad_token_id=3,
+    )
     talker.config = SimpleNamespace(spk_id={"Vivian": 3065})
 
     with pytest.raises(ValueError, match="Unsupported Qwen3-TTS CustomVoice speaker"):
-        Qwen3TTSTalker.build_custom_voice_inputs(
+        Qwen3TTSTalker.build_semantic_prompt_plan(
             talker,
-            input_id=torch.arange(8, dtype=torch.long).unsqueeze(0),
-            voice="Missing",
+            task="custom_voice",
+            semantic_input_ids=tuple(range(12)),
+            semantic_instruct_ids=None,
             language="auto",
             non_streaming_mode=True,
-            semantic_input_ids=tuple(range(8)),
-            semantic_instruct_ids=None,
+            voice="Missing",
         )
 
 
@@ -4968,11 +4998,14 @@ def test_qwen3_tts_prepare_custom_voice_uses_semantic_ids(
         device = torch.device("cpu")
         model = SimpleNamespace(_feedback_buffer=torch.zeros(4, 4))
 
+        def build_semantic_prompt_plan(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(prompt_cache_ids=(101, 102, 103))
+
         def build_custom_voice_inputs(self, **kwargs):
             calls.append(kwargs)
             assert kwargs["input_id"].device.type == "cpu"
-            assert kwargs["semantic_input_ids"] == tuple(range(8))
-            assert kwargs["semantic_instruct_ids"] is None
+            assert kwargs["semantic_plan"].prompt_cache_ids == (101, 102, 103)
             return (
                 torch.ones(1, 3, 4),
                 torch.ones(1, 3, dtype=torch.long),
@@ -5024,13 +5057,14 @@ def test_qwen3_tts_prepare_voice_design_uses_instruction_path(
         device = torch.device("cpu")
         model = SimpleNamespace(_feedback_buffer=torch.zeros(4, 4))
 
+        def build_semantic_prompt_plan(self, **kwargs):
+            del kwargs
+            return SimpleNamespace(prompt_cache_ids=(101, 102, 103))
+
         def build_voice_design_inputs(self, **kwargs):
             calls.append(kwargs)
             assert kwargs["input_id"].device.type == "cpu"
-            assert kwargs["semantic_input_ids"] == tuple(range(len(tokenize_calls[0])))
-            assert kwargs["semantic_instruct_ids"] == tuple(
-                range(len(tokenize_calls[1]))
-            )
+            assert kwargs["semantic_plan"].prompt_cache_ids == (101, 102, 103)
             return (
                 torch.ones(1, 3, 4),
                 torch.ones(1, 3, dtype=torch.long),
@@ -6651,11 +6685,16 @@ def test_qwen3_tts_prompt_frontend_builds_a_custom_voice_prompt() -> None:
         prompt_cache_ids,
     ) = frontend.build_custom_voice_inputs(
         input_id=input_id,
-        voice="vivian",
-        language="en",
-        non_streaming_mode=False,
-        semantic_input_ids=tuple(int(token) for token in input_id.reshape(-1).tolist()),
-        semantic_instruct_ids=None,
+        semantic_plan=frontend.build_semantic_prompt_plan(
+            task="custom_voice",
+            semantic_input_ids=tuple(
+                int(token) for token in input_id.reshape(-1).tolist()
+            ),
+            semantic_instruct_ids=None,
+            language="en",
+            non_streaming_mode=False,
+            voice="vivian",
+        ),
         instruct_id=None,
     )
     assert ref_code is None
