@@ -1139,13 +1139,12 @@ def _prepare_qwen3_tts_base_request(
     if cached_prompt is not None:
         voice_clone_prompt, ref_text = cached_prompt
     elif cache_key is None:
-        source_key = _qwen3_tts_ref_audio_input_key(state.ref_audio)
         reference_service = _get_qwen3_tts_adhoc_reference_service(model, wrapper)
         voice_clone_prompt, ref_text = reference_service.get_or_encode(
             state,
             desc="Qwen3-TTS ad-hoc reference",
         )
-        if source_key is None:
+        if "speaker_artifact_id" not in voice_clone_prompt:
             identity_artifact = _cacheable_qwen3_tts_voice_prompt(
                 voice_clone_prompt,
                 ref_text=ref_text,

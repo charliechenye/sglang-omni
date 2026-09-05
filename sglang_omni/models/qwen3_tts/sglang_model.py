@@ -1032,9 +1032,6 @@ class Qwen3TTSPromptBuilderMixin:
         non_streaming_mode: bool,
         instruct_id: torch.Tensor | None,
     ) -> PromptBuildResult:
-        if instruct_id is None:
-            raise ValueError("Qwen3-TTS VoiceDesign requires instructions")
-
         (
             semantic_role_ids,
             semantic_target_ids,

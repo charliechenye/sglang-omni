@@ -313,10 +313,12 @@ def test_uncacheable_reference_still_attaches_artifact_identity() -> None:
 
     class FakeWrapper(_QwenRequestWrapper):
         def _normalize_audio_inputs(
-            self, ref_audio: list[np.ndarray]
+            self, ref_audio: list[tuple[np.ndarray, int]]
         ) -> list[tuple[np.ndarray, int]]:
             assert len(ref_audio) == 1
-            return [(ref_audio[0], 24000)]
+            waveform, sample_rate = ref_audio[0]
+            assert sample_rate == 24000
+            return [(waveform, sample_rate)]
 
     class FakeModel(_QwenVoiceCloneModel):
         def __init__(self, speech_tokenizer: FakeSpeechTokenizer) -> None:
@@ -334,13 +336,14 @@ def test_uncacheable_reference_still_attaches_artifact_identity() -> None:
 
     qwen3_request_builders.clear_qwen3_tts_preprocessing_context()
     waveform = np.zeros(32, dtype=np.float32)
-    assert qwen3_request_builders._qwen3_tts_ref_audio_input_key(waveform) is None
+    ref_audio = (waveform, 24000)
+    assert qwen3_request_builders._qwen3_tts_ref_audio_input_key(ref_audio) is None
     tokenizer = FakeSpeechTokenizer()
     model = FakeModel(tokenizer)
     wrapper = FakeWrapper(_voice_clone_prompt())
     state = Qwen3TTSState(
         text="target",
-        ref_audio=waveform,
+        ref_audio=ref_audio,
         ref_text="reference",
     )
     try:
