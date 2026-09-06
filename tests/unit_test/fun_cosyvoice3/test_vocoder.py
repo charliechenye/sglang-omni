@@ -217,6 +217,76 @@ def test_decode_batch_same_bucket_batches_flow_once(monkeypatch) -> None:
     assert hift.calls[0][0].shape[0] == 2
 
 
+def test_adaptive_flow_coalescing_preserves_atomic_hift_boundaries(monkeypatch) -> None:
+    items = [
+        (_state(sample_rate=16001, prompt_tokens=0), _codes(24, 1)),
+        (_state(sample_rate=16002, prompt_tokens=0), _codes(25, 2)),
+        (_state(sample_rate=16003, prompt_tokens=0), _codes(26, 3)),
+        (_state(sample_rate=16004, prompt_tokens=0), _codes(27, 4)),
+    ]
+
+    def run_decode(*, span_frames: int, padding_pct: float):
+        flow = _BatchCapableFakeFlow()
+        hift = _FakeHiFT()
+        flow_calls: list[list] = []
+        _install_fake_batch_adapter(monkeypatch, flow_calls)
+        vocoder = stages._CosyVoice3Vocoder(
+            flow,
+            hift,
+            flow_batch_bucket_frames=50,
+            flow_batch_coalesce_span_frames=span_frames,
+            flow_batch_coalesce_max_added_padding_pct=padding_pct,
+        )
+        results = asyncio.run(vocoder.decode_batch(items))
+        hift_memberships = [
+            tuple(int(value) for value in call[0][:, 0, 0].tolist())
+            for call in hift.calls
+        ]
+        return results, flow_calls, hift_memberships
+
+    baseline_results, baseline_flow_calls, baseline_hift = run_decode(
+        span_frames=0, padding_pct=0
+    )
+    adaptive_results, adaptive_flow_calls, adaptive_hift = run_decode(
+        span_frames=64, padding_pct=10
+    )
+
+    assert [sample_rate for _, sample_rate in baseline_results] == [
+        16001,
+        16002,
+        16003,
+        16004,
+    ]
+    assert [sample_rate for _, sample_rate in adaptive_results] == [
+        16001,
+        16002,
+        16003,
+        16004,
+    ]
+    assert [[item.token.shape[1] for item in call] for call in baseline_flow_calls] == [
+        [24, 25],
+        [26, 27],
+    ]
+    assert [[item.token.shape[1] for item in call] for call in adaptive_flow_calls] == [
+        [24, 25, 26, 27]
+    ]
+    assert baseline_hift == [(1, 2), (3, 4)]
+    assert adaptive_hift == baseline_hift
+
+    naive_cross_bucket = list(
+        stages._group_by_padding_waste(
+            [
+                (None, torch.full((1, 80, length), float(index)))
+                for index, length in enumerate([48, 50, 52, 54], start=1)
+            ],
+            max_waste=1.5,
+        )
+    )
+    assert [
+        tuple(int(pair[1][0, 0, 0]) for pair in group) for group in naive_cross_bucket
+    ] == [(1, 2, 3, 4)]
+
+
 def test_decode_batch_runs_hift_once_over_padded_mels(monkeypatch) -> None:
     flow = _BatchCapableFakeFlow()
     hift = _FakeHiFT()
@@ -437,6 +507,31 @@ def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) ->
     assert scheduler._max_batch_wait_s == pytest.approx(0.03)
 
 
+def test_create_vocoder_executor_accepts_b16_with_adaptive_coalescing(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(stages, "resolve_device_spec", lambda device, gpu_id: "cpu")
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(
+        stages,
+        "_load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, device, fp16, **kwargs: (
+            _BatchCapableFakeFlow(),
+            _FakeHiFT(),
+        ),
+    )
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cpu",
+        max_batch_size=16,
+        flow_batch_coalesce_span_frames=64,
+        flow_batch_coalesce_max_added_padding_pct=5,
+    )
+
+    assert scheduler._max_batch_size == 16
+
+
 def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -614,6 +709,8 @@ def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
         "dtype": "bfloat16",
         "flow_batch_bucket_frames": 50,
         "flow_batch_admission_frames": 8000,
+        "flow_batch_coalesce_span_frames": 0,
+        "flow_batch_coalesce_max_added_padding_pct": 0.0,
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_dit_torch_compile": False,
@@ -628,5 +725,7 @@ def test_vocoder_hift_defaults_to_float32(monkeypatch) -> None:
 
     # bfloat16 gave HiFT no speedup, so the default keeps full precision.
     assert vocoder._hift_compute_dtype is None
+    assert vocoder._flow_batch_coalesce_span_frames == 0
+    assert vocoder._flow_batch_coalesce_max_added_padding_pct == 0.0
     with vocoder._hift_autocast():
         assert not torch.is_autocast_enabled()

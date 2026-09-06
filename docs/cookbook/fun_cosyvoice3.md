@@ -78,12 +78,34 @@ prompt-plus-output mel length exceeds that budget runs as a B=1 Flow batch throu
 adapter, and later requests wait for the next scheduler batch. This preserves valid long
 generations while preventing them from being combined with more work.
 
-HiFT is batched the same way: the mels from one Flow bucket are right-zero-padded into a single
-tensor, decoded in one HiFT call, and sliced back to each request's true length, under the
-padding budget `hift_max_padding_waste` (1.5 by default; `1.0` only groups requests that need no
-padding at all). HiFT is prepared for this at load time by folding away its `weight_norm`
-parametrizations. Right-zero-padding matches the zero padding HiFT applies in single-request
-inference, so batched output is identical except in the final mel frame of padded requests.
+Adaptive Flow coalescing is opt-in. Its defaults are
+`flow_batch_coalesce_span_frames: 0` and
+`flow_batch_coalesce_max_added_padding_pct: 0`. When enabled, the planner considers only
+contiguous coarsenings of the existing width-50 atomic Flow buckets (the current default). Its
+padding cap applies to the whole outer vocoder batch, and the exact planning runs synchronously on
+CPU metadata; it does not impose a scheduler batch-size restriction. The historical H200-validated
+preset remains
+`64` frames and `5%`, but it is not claimed to be universally optimal:
+
+```bash
+sgl-omni serve \
+  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --config examples/configs/fun_cosyvoice3_0_5b.yaml \
+  --vocoder.factory.flow_batch_coalesce_span_frames 64 \
+  --vocoder.factory.flow_batch_coalesce_max_added_padding_pct 5
+```
+
+The scheduler still forms batches with its current `max_batch_size` (16) and `max_batch_wait_ms`
+(30) settings. Coalescing changes only Flow solve boundaries. After a coalesced Flow solve, the
+vocoder restores each request's original atomic bucket provenance and applies the existing HiFT
+padding-waste grouping independently inside those buckets. HiFT therefore retains its current
+`float32` dtype and `1.5` padding-waste default.
+
+HiFT mels are right-zero-padded into a single tensor per original atomic Flow bucket, decoded in
+one HiFT call, and sliced back to each request's true length. HiFT is prepared for this at load
+time by folding away its `weight_norm` parametrizations. Right-zero-padding matches the zero
+padding HiFT applies in single-request inference, so batched output is identical except in the
+final mel frame of padded requests.
 
 The built-in Flow implementation supports the pinned CosyVoice PyTorch estimator, an opt-in
 TensorRT estimator (see below), and buffered `streaming=False, finalize=True` inference only.
