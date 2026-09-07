@@ -245,10 +245,16 @@ def test_flow_coalescing_disabled_preserves_bucket_insertion_order() -> None:
     ],
 )
 def test_flow_coalescing_validation(kwargs: dict[str, object], message: str) -> None:
+    config: dict[str, object] = {
+        "coalesce_span_frames": 64,
+        "coalesce_max_added_padding_pct": 5.0,
+    }
+    config.update(kwargs)
+
     with pytest.raises(ValueError, match=message):
         stages._group_flow_requests(
             _make_buckets([10, 20]),
-            **kwargs,
+            **config,
         )
 
 
