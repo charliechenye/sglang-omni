@@ -189,9 +189,11 @@ def test_cosyvoice3_token2wav_chunk_slices_mel_and_hift_delta() -> None:
 def test_cosyvoice3_hift_delta_batch_batches_compatible_first_hops() -> None:
     hift = _RowAwareHiFT()
     vocoder = stages._CosyVoice3Vocoder(_FakeFlow(), hift)
+    mel_backing = torch.stack(
+        [torch.full((2, 3), 1.0), torch.full((2, 3), 2.0)]
+    )
     mels = [
-        torch.full((1, 2, 3), 1.0),
-        torch.full((1, 2, 3), 2.0),
+        mel_backing[index : index + 1] for index in range(mel_backing.shape[0])
     ]
 
     results = vocoder._hift_delta_batch(
@@ -222,6 +224,13 @@ def test_cosyvoice3_hift_delta_batch_batches_compatible_first_hops() -> None:
     torch.testing.assert_close(results[1][1], mels[1])
     assert results[0][1]._base is None
     assert results[1][1]._base is None
+    mel_backing.fill_(0.0)
+    torch.testing.assert_close(
+        results[0][1], torch.full((1, 2, 3), 1.0)
+    )
+    torch.testing.assert_close(
+        results[1][1], torch.full((1, 2, 3), 2.0)
+    )
 
 
 def test_cosyvoice3_hift_delta_batch_preserves_compatible_follow_up_state() -> None:
@@ -283,7 +292,7 @@ def test_hift_delta_batch_falls_back_for_incompatible_follow_up_state() -> None:
         vocoder._hift_delta_batch(
             mels,
             hift_mels=histories,
-            speech_offsets=[4, 8],
+            speech_offsets=[4, 4],
             finalize=False,
         )
         is None
@@ -297,7 +306,7 @@ def test_hift_delta_batch_falls_back_for_incompatible_follow_up_state() -> None:
             speech_offset=offset,
             finalize=False,
         )
-        for mel, history, offset in zip(mels, histories, [4, 8], strict=True)
+        for mel, history, offset in zip(mels, histories, [4, 4], strict=True)
     ]
 
     assert len(hift.calls) == 2
@@ -305,6 +314,58 @@ def test_hift_delta_batch_falls_back_for_incompatible_follow_up_state() -> None:
     torch.testing.assert_close(
         results[0][0],
         torch.arange(4, 16, dtype=torch.float32).reshape(1, -1) + 1000,
+    )
+    torch.testing.assert_close(
+        results[1][0],
+        torch.arange(4, 20, dtype=torch.float32).reshape(1, -1) + 2000,
+    )
+    torch.testing.assert_close(
+        results[0][1], torch.cat([histories[0], mels[0]], dim=2)
+    )
+    torch.testing.assert_close(
+        results[1][1], torch.cat([histories[1], mels[1]], dim=2)
+    )
+
+
+def test_hift_delta_batch_falls_back_for_incompatible_speech_offsets() -> None:
+    hift = _RowAwareHiFT()
+    vocoder = stages._CosyVoice3Vocoder(_FakeFlow(), hift)
+    histories = [
+        torch.full((1, 2, 2), 1.0),
+        torch.full((1, 2, 2), 2.0),
+    ]
+    mels = [
+        torch.full((1, 2, 3), 10.0),
+        torch.full((1, 2, 3), 20.0),
+    ]
+    offsets = [4, 8]
+
+    assert (
+        vocoder._hift_delta_batch(
+            mels,
+            hift_mels=histories,
+            speech_offsets=offsets,
+            finalize=False,
+        )
+        is None
+    )
+    assert hift.calls == []
+
+    results = [
+        vocoder._hift_delta(
+            mel,
+            hift_mel=history,
+            speech_offset=offset,
+            finalize=False,
+        )
+        for mel, history, offset in zip(mels, histories, offsets, strict=True)
+    ]
+
+    assert len(hift.calls) == 2
+    assert [call[0].shape for call in hift.calls] == [(1, 2, 5), (1, 2, 5)]
+    torch.testing.assert_close(
+        results[0][0],
+        torch.arange(4, 20, dtype=torch.float32).reshape(1, -1) + 1000,
     )
     torch.testing.assert_close(
         results[1][0],

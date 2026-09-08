@@ -1058,9 +1058,14 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         results: list[tuple[torch.Tensor, torch.Tensor, int]] = []
         for index in range(len(mels)):
             delta = tts_speech[index : index + 1, held:].detach().cpu()
-            # The row view would retain the complete batched mel allocation.
-            # Each request owns a compact copy of its retained causal history.
-            retained_mel = batched_mel[index : index + 1].detach().clone()
+            if histories_present:
+                # Follow-up rows were built with per-request torch.cat, so this
+                # detach does not retain the complete batched mel allocation.
+                retained_mel = rows[index].detach()
+            else:
+                # Causal Flow returns first-hop rows as views into one packed
+                # output; compact-copy each request's retained history.
+                retained_mel = rows[index].detach().clone()
             results.append((delta, retained_mel, speech_length))
         return results
 
