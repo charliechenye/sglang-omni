@@ -321,6 +321,43 @@ def test_decode_batch_same_bucket_batches_flow_once(monkeypatch) -> None:
     assert hift.calls[0][0].shape[0] == 2
 
 
+def test_adaptive_flow_coalescing_preserves_atomic_hift_boundaries(monkeypatch) -> None:
+    items = [
+        (_state(sample_rate=16001, prompt_tokens=0), _codes(24, 1)),
+        (_state(sample_rate=16002, prompt_tokens=0), _codes(25, 2)),
+        (_state(sample_rate=16003, prompt_tokens=0), _codes(26, 3)),
+        (_state(sample_rate=16004, prompt_tokens=0), _codes(27, 4)),
+    ]
+
+    flow = _BatchCapableFakeFlow()
+    hift = _FakeHiFT()
+    flow_calls: list[list] = []
+    _install_fake_batch_adapter(monkeypatch, flow_calls)
+    vocoder = stages._CosyVoice3Vocoder(
+        flow,
+        hift,
+        flow_batch_bucket_frames=50,
+        flow_batch_coalesce_span_frames=64,
+        flow_batch_coalesce_max_added_padding_pct=10,
+    )
+    results = asyncio.run(vocoder.decode_batch(items))
+    hift_memberships = [
+        tuple(int(value) for value in call[0][:, 0, 0].tolist())
+        for call in hift.calls
+    ]
+
+    assert [sample_rate for _, sample_rate in results] == [
+        16001,
+        16002,
+        16003,
+        16004,
+    ]
+    assert [[item.token.shape[1] for item in call] for call in flow_calls] == [
+        [24, 25, 26, 27]
+    ]
+    assert hift_memberships == [(1, 2), (3, 4)]
+
+
 def test_decode_batch_runs_hift_once_over_padded_mels(monkeypatch) -> None:
     flow = _BatchCapableFakeFlow()
     hift = _FakeHiFT()
@@ -578,6 +615,8 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         max_batch_wait_ms=7,
         flow_batch_bucket_frames=100,
         flow_batch_admission_frames=200,
+        flow_batch_coalesce_span_frames=64,
+        flow_batch_coalesce_max_added_padding_pct=5,
     )
 
     assert isinstance(scheduler, FunCosyVoice3StreamingVocoderScheduler)
@@ -585,6 +624,8 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
     assert scheduler._max_batch_wait_s == pytest.approx(0.007)
     assert scheduler._max_batch_cost == 200
     assert callable(scheduler._request_cost_fn)
+    assert scheduler._vocoder._flow_batch_coalesce_span_frames == 64
+    assert scheduler._vocoder._flow_batch_coalesce_max_added_padding_pct == 5
     state = _state(prompt_tokens=1)
     state.audio_codes = _codes(2)
     assert scheduler._request_cost_fn(_payload(state)) == 100
@@ -815,6 +856,8 @@ def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
         "dtype": "bfloat16",
         "flow_batch_bucket_frames": 50,
         "flow_batch_admission_frames": 8000,
+        "flow_batch_coalesce_span_frames": 0,
+        "flow_batch_coalesce_max_added_padding_pct": 0.0,
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_flow_estimator_trt": False,
