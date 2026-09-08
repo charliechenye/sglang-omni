@@ -342,8 +342,7 @@ def test_adaptive_flow_coalescing_preserves_atomic_hift_boundaries(monkeypatch) 
     )
     results = asyncio.run(vocoder.decode_batch(items))
     hift_memberships = [
-        tuple(int(value) for value in call[0][:, 0, 0].tolist())
-        for call in hift.calls
+        tuple(int(value) for value in call[0][:, 0, 0].tolist()) for call in hift.calls
     ]
 
     assert [sample_rate for _, sample_rate in results] == [

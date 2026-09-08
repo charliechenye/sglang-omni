@@ -5,8 +5,8 @@ from __future__ import annotations
 
 import importlib
 import logging
-import time
 import math
+import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
@@ -615,7 +615,8 @@ def _prepare_hift_for_inference(hift: Any) -> None:
     # note (Dayuxiaoshui): folding weight_norm is the only load-time step
     # batched decode needs. The pinned CausalHiFTGenerator already squeezes
     # the source to [B, T] before its STFT and casts f0_predictor to float64
-    # inside inference(). Different padded execution shapes may still produce
+    # inside inference().
+    # note (chenye): Different padded execution shapes may still produce
     # small floating-point waveform differences.
     folded = _fold_weight_norm(hift)
     logger.info(
@@ -828,8 +829,9 @@ class _PreparedFlowRequest:
     sample_rate: int
     flow_input: FlowBatchInput
     total_mel_frames: int
-    # Immutable provenance keeps buffered HiFT grouping scoped to its atomic
-    # Flow bucket even when adjacent buckets share one Flow solve.
+    # note(chenye): Immutable provenance keeps buffered HiFT grouping
+    # scoped to its atomic Flow bucket even when adjacent buckets share
+    # one Flow solve.
     baseline_bucket_key: int
 
 
@@ -969,7 +971,8 @@ def _group_flow_requests(
         coalesce_span_frames, coalesce_max_added_padding_pct
     )
     if coalesce_span_frames == 0:
-        # Disabled behavior deliberately preserves current grouping and order.
+        # note(chenye): Disabled behavior deliberately preserves current grouping
+        # and order.
         return list(buckets.values())
     if not buckets:
         return []
@@ -983,11 +986,12 @@ def _group_flow_requests(
         for _, requests in atomic_groups
     )
     if baseline_work == 0:
-        # Let Flow validation handle malformed zero-length inputs.
+        # note(chenye): Let Flow validation handle malformed zero length inputs.
         return baseline_groups
 
-    # Stage A: minimum padded work for each exact Flow solve count. The cap is
-    # checked against the complete partition, not independently per segment.
+    # note(chenye): Stage A: minimum padded work for each exact Flow solve count.
+    # The cap is checked against the complete partition, not independently per
+    # segment.
     minimum_work = _minimum_flow_work_solver(
         segment_matrix, max_merged_span=coalesce_span_frames
     )
@@ -995,13 +999,10 @@ def _group_flow_requests(
     optimal_work: int | None = None
     for count in range(1, len(atomic_groups) + 1):
         work = minimum_work(0, count)
-        if (
-            work is not None
-            and _within_flow_padding_cap(
-                work,
-                baseline_work,
-                coalesce_max_added_padding_pct,
-            )
+        if work is not None and _within_flow_padding_cap(
+            work,
+            baseline_work,
+            coalesce_max_added_padding_pct,
         ):
             solve_count = count
             optimal_work = work
@@ -1009,7 +1010,7 @@ def _group_flow_requests(
 
     assert solve_count is not None and optimal_work is not None
 
-    # Stage B: scan the finite set of achievable maximum spans.
+    # note(chenye): Stage B: scan the finite set of achievable maximum spans.
     candidate_spans = sorted(
         {
             segment.newly_merged_span
@@ -1029,7 +1030,7 @@ def _group_flow_requests(
     else:
         raise AssertionError("atomic Flow partition must be reachable")
 
-    # Stage C: reconstruct the lexicographically smallest range signature.
+    # note(chenye): Stage C: reconstruct the lexicographically smallest range signature.
     min_work = _minimum_flow_work_solver(
         segment_matrix, max_merged_span=optimal_max_merged_span
     )
@@ -1040,7 +1041,7 @@ def _group_flow_requests(
     atomic_count = len(atomic_groups)
     while groups_left > 0:
         last_end = atomic_count - groups_left + 1
-        # The earliest feasible end is the lexicographically smallest choice.
+        # note(chenye): The earliest feasible end is the lexicographically smallest choice.
         for end in range(start + 1, last_end + 1):
             segment = segment_matrix[start][end]
             if segment is None or segment.newly_merged_span > optimal_max_merged_span:
@@ -1189,8 +1190,8 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
 
                 pairs = list(zip(flow_group, mel_list, strict=True))
 
-                # Flow groups are contiguous atomic-bucket flattenings, so
-                # groupby restores the unchanged HiFT policy per provenance key.
+                # note(chenye): Flow groups are contiguous atomic-bucket flattenings,
+                # so groupby restores the unchanged HiFT policy per provenance key.
                 for _, atomic_pairs_iter in groupby(
                     pairs, key=lambda pair: pair[0].baseline_bucket_key
                 ):
@@ -1199,12 +1200,8 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
                         atomic_pairs,
                         max_waste=self._hift_max_padding_waste,
                     ):
-                        wavs = self._mel2wav_batch(
-                            [mel for _, mel in group]
-                        )
-                        for (request, _), wav in zip(
-                            group, wavs, strict=True
-                        ):
+                        wavs = self._mel2wav_batch([mel for _, mel in group])
+                        for (request, _), wav in zip(group, wavs, strict=True):
                             results[request.index] = (
                                 wav,
                                 request.sample_rate,
