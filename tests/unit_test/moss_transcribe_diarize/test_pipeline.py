@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -27,7 +28,9 @@ from sglang_omni.scheduling.generation_batch_policy import (
 )
 
 
-def _make_moss_engine_builder() -> MossTranscribeDiarizeEngineBuilder:
+def _make_moss_engine_builder(
+    *, fa3_force_no_split: bool = False
+) -> MossTranscribeDiarizeEngineBuilder:
     return MossTranscribeDiarizeEngineBuilder(
         max_running_requests=16,
         max_new_tokens=None,
@@ -50,6 +53,38 @@ def _make_moss_engine_builder() -> MossTranscribeDiarizeEngineBuilder:
         request_build_max_workers=8,
         request_build_max_pending=16,
         stream_emit_interval_s=0.05,
+        fa3_force_no_split=fa3_force_no_split,
+    )
+
+
+def _fake_flash_attention_backend(*, fa_impl_ver: int = 3):
+    from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+
+    backend = object.__new__(FlashAttentionBackend)
+    backend.fa_impl_ver = fa_impl_ver
+    backend.num_splits = 0
+    backend.decode_num_splits = 0
+    return backend
+
+
+def _run_moss_setup_model(
+    builder: MossTranscribeDiarizeEngineBuilder,
+    backend: object,
+    *,
+    decode_backend: object | None = None,
+    decode_backend_group: list[object] | None = None,
+) -> None:
+    model_runner = SimpleNamespace(
+        attn_backend=backend,
+        decode_attn_backend=decode_backend,
+        decode_attn_backend_group=decode_backend_group or [],
+    )
+    builder.setup_model(
+        model_worker=SimpleNamespace(model_runner=model_runner),
+        checkpoint_dir="dummy",
+        device="cpu",
+        gpu_id=0,
+        server_args=SimpleNamespace(),
     )
 
 
@@ -68,6 +103,7 @@ def test_moss_transcribe_diarize_config_uses_single_batched_stage() -> None:
     factory = config.stages[0].factory
     engine = config.stages[0].engine
     assert factory.device == "cuda:0"
+    assert factory.fa3_force_no_split is False
     assert engine.max_running_requests == 16
     assert engine.enable_torch_compile is True
     assert engine.torch_compile_max_bs == 4
@@ -215,6 +251,65 @@ def test_moss_transcribe_diarize_stage_reserves_encoder_headroom() -> None:
     assert signature.parameters["encoder_torch_compile"].default is False
 
 
+@pytest.mark.parametrize(
+    ("enabled", "expected_splits"),
+    [(False, 0), (True, 1)],
+    ids=["disabled", "enabled"],
+)
+def test_moss_fa3_no_split_policy_for_standard_backend(
+    enabled: bool,
+    expected_splits: int,
+) -> None:
+    backend = _fake_flash_attention_backend()
+    _run_moss_setup_model(
+        _make_moss_engine_builder(fa3_force_no_split=enabled),
+        backend,
+    )
+
+    assert (backend.num_splits, backend.decode_num_splits) == (
+        expected_splits,
+        expected_splits,
+    )
+
+
+@pytest.mark.parametrize(
+    ("decode_backend", "decode_backend_group"),
+    [
+        (object(), []),
+        (None, [object()]),
+    ],
+    ids=["separate_decode_backend", "decode_backend_group"],
+)
+def test_moss_fa3_no_split_rejects_unsupported_topology(
+    decode_backend: object | None,
+    decode_backend_group: list[object],
+) -> None:
+    backend = _fake_flash_attention_backend()
+    with pytest.raises(RuntimeError, match="requires a single FA3"):
+        _run_moss_setup_model(
+            _make_moss_engine_builder(fa3_force_no_split=True),
+            backend,
+            decode_backend=decode_backend,
+            decode_backend_group=decode_backend_group,
+        )
+
+
+@pytest.mark.parametrize(
+    "backend",
+    [
+        object(),
+        _fake_flash_attention_backend(fa_impl_ver=4),
+    ],
+    ids=["non_flash_attention", "fa4"],
+)
+def test_moss_fa3_no_split_rejects_unsupported_backend(backend: object) -> None:
+    with pytest.raises(RuntimeError, match="requires a single FA3"):
+        _run_moss_setup_model(
+            _make_moss_engine_builder(fa3_force_no_split=True),
+            backend,
+        )
+
+
 def test_compile_encoder_sets_runner_and_warms_each_bucket(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -284,8 +379,6 @@ def test_compile_encoder_drops_bucket_whose_warmup_fails(
 
 
 def _stub_factory_env(monkeypatch: pytest.MonkeyPatch, *, want_cuda_graph: bool):
-    from types import SimpleNamespace
-
     from transformers import AutoProcessor
 
     from sglang_omni import platforms
@@ -391,6 +484,30 @@ def _stub_factory_env(monkeypatch: pytest.MonkeyPatch, *, want_cuda_graph: bool)
         lambda **k: calls["scheduler_kwargs"].append(k) or SimpleNamespace(),
     )
     return calls
+
+
+def test_factory_forwards_fa3_no_split(monkeypatch: pytest.MonkeyPatch) -> None:
+    from sglang_omni.models.moss_transcribe_diarize import engine_builder
+
+    captured: dict[str, object] = {}
+
+    class FakeBuilder:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def build(self, *args: object, **kwargs: object) -> object:
+            return object()
+
+    monkeypatch.setattr(
+        engine_builder, "MossTranscribeDiarizeEngineBuilder", FakeBuilder
+    )
+
+    create_sglang_moss_transcribe_diarize_executor(
+        "dummy",
+        fa3_force_no_split=True,
+    )
+
+    assert captured["fa3_force_no_split"] is True
 
 
 def test_factory_compiles_encoder_and_skips_cuda_graph_when_flag_on(

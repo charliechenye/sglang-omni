@@ -90,6 +90,7 @@ def create_sglang_moss_transcribe_diarize_executor(
     prefill_coalesce_when_idle: bool = True,
     prefill_coalesce_requires_pending_builds: bool = True,
     prefill_coalesce_after_builds_during_decode: bool = True,
+    fa3_force_no_split: bool = False,
     encoder_chunk_buckets: list[int] | None = None,
     encoder_torch_compile: bool = False,
     encoder_max_batch_size: int = 2,
@@ -132,6 +133,7 @@ def create_sglang_moss_transcribe_diarize_executor(
         prefill_coalesce_after_builds_during_decode=(
             prefill_coalesce_after_builds_during_decode
         ),
+        fa3_force_no_split=fa3_force_no_split,
         request_build_max_workers=request_build_max_workers,
         request_build_max_pending=request_build_max_pending,
         stream_emit_interval_s=stream_emit_interval_s,

@@ -29,6 +29,7 @@ _MAX_PIPELINE_INTRAOP_THREADS = 8
 class MossTDFactoryArgs(FactoryArgs):
     """MOSS-TD's own constructor knobs, typed like the shared ones."""
 
+    fa3_force_no_split: bool = False
     encoder_cache_size_bytes: int | None = Field(default=None, ge=0)
     encoder_max_batch_size: int | None = Field(default=None, ge=1)
 

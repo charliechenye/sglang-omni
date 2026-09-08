@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
@@ -16,6 +17,8 @@ from sglang_omni.scheduling.generation_batch_policy import (
     CudaGraphBackend,
     build_default_prefill_cuda_graph_bs,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
@@ -49,6 +52,7 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         request_build_max_workers: int,
         request_build_max_pending: int | None,
         stream_emit_interval_s: float,
+        fa3_force_no_split: bool = False,
     ) -> None:
         self.max_running_requests = max_running_requests
         self.requested_max_new_tokens = max_new_tokens
@@ -75,6 +79,7 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         self.request_build_max_workers = request_build_max_workers
         self.request_build_max_pending = request_build_max_pending
         self.stream_emit_interval_s = stream_emit_interval_s
+        self.fa3_force_no_split = fa3_force_no_split
         self.processor: Any = None
         self.tokenizer: Any = None
         self.audio_encoder_service: BatchedAudioEncoderService | None = None
@@ -137,6 +142,47 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         # note (Dayuxiaoshui): adapters must use the context length finalized by
         # ServerArgs, matching the pre-refactor factory behavior.
         self.context_length = int(server_args.context_length)
+
+    def setup_model(
+        self,
+        *,
+        model_worker: Any,
+        checkpoint_dir: str,
+        device: str,
+        gpu_id: int,
+        server_args: Any,
+    ) -> None:
+        """Apply MOSS-TD's opt-in FA3 policy before CUDA graph capture."""
+        if not self.fa3_force_no_split:
+            return
+
+        model_runner = model_worker.model_runner
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        backend = model_runner.attn_backend
+        if (
+            getattr(model_runner, "decode_attn_backend", None) is not None
+            or getattr(model_runner, "decode_attn_backend_group", None)
+            or not isinstance(backend, FlashAttentionBackend)
+            or getattr(backend, "fa_impl_ver", None) != 3
+        ):
+            raise RuntimeError(
+                "MOSS-TD fa3_force_no_split requires a single FA3 "
+                "FlashAttentionBackend with no separate decode backend or "
+                f"backend group; got {type(backend).__name__} "
+                f"(fa_impl_ver={getattr(backend, 'fa_impl_ver', None)!r})"
+            )
+
+        logger.info(
+            "MOSS-TD FA3 policy: forcing no-split before CUDA graph capture "
+            "num_splits=%s->1 decode_num_splits=%s->1",
+            backend.num_splits,
+            backend.decode_num_splits,
+        )
+        backend.num_splits = 1
+        backend.decode_num_splits = 1
 
     def setup_model_resources(
         self,
