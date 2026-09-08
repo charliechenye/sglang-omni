@@ -108,7 +108,8 @@ class _FakeHiFT(torch.nn.Module):
 
     def inference(self, *, speech_feat, finalize):
         self.calls.append((speech_feat, finalize))
-        return torch.arange(speech_feat.shape[-1]).reshape(1, -1).float(), None
+        waveform = torch.arange(speech_feat.shape[-1]).reshape(1, -1).float()
+        return waveform.repeat(speech_feat.shape[0], 1), None
 
 
 def _drain(scheduler: FunCosyVoice3StreamingVocoderScheduler) -> list[OutgoingMessage]:
@@ -185,6 +186,8 @@ def test_streaming_vocoder_emits_causal_chunk_then_finalizes_remainder() -> None
     assert flow.calls[0]["streaming"] is True
     assert flow.calls[0]["finalize"] is False
     assert int(flow.calls[0]["token"].shape[1]) == 28
+    assert len(scheduler._vocoder._hift.calls) == 1
+    assert scheduler._vocoder._hift.calls[0][1] is False
     assert _waveform(messages[0].data).shape == (50,)
 
     scheduler._on_done("req-stream")
@@ -193,6 +196,8 @@ def test_streaming_vocoder_emits_causal_chunk_then_finalizes_remainder() -> None
     assert LEFTOVER_FLOW_STREAMING is False
     assert flow.calls[1]["streaming"] is False
     assert flow.calls[1]["finalize"] is True
+    assert len(scheduler._vocoder._hift.calls) == 2
+    assert scheduler._vocoder._hift.calls[1][1] is True
     assert _waveform(messages[0].data).shape == (6,)
     assert messages[1].data.data["modality"] == "audio"
     assert messages[1].data.data["sample_rate"] == 24000
@@ -229,6 +234,8 @@ def test_streaming_vocoder_pads_prompt_and_decodes_first_hop_at_28() -> None:
     assert int(flow.calls[0]["token"].shape[1]) == 28
     assert flow.calls[0]["streaming"] is True
     assert flow.calls[0]["finalize"] is False
+    assert len(scheduler._vocoder._hift.calls) == 1
+    assert scheduler._vocoder._hift.calls[0][1] is False
     assert _waveform(messages[0].data).shape == (TOKEN_HOP_LEN * TOKEN_MEL_RATIO,)
 
 
@@ -373,6 +380,9 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
         TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
         2 * TOKEN_HOP_LEN * TOKEN_MEL_RATIO,
     ]
+    assert len(scheduler._vocoder._hift.calls) == 2
+    assert [call[0].shape[0] for call in scheduler._vocoder._hift.calls] == [1, 1]
+    assert all(call[1] is False for call in scheduler._vocoder._hift.calls)
 
     scheduler._handle_message(
         IncomingMessage(request_id=request_id, type="stream_done"), None
@@ -393,6 +403,8 @@ def test_ar_to_vocoder_grows_hops_then_finalizes_remainder() -> None:
     assert remainder.shape == (PRE_LOOKAHEAD_LEN * TOKEN_MEL_RATIO,)
     assert flow.calls[-1]["streaming"] is False
     assert flow.calls[-1]["finalize"] is True
+    assert len(scheduler._vocoder._hift.calls) == 3
+    assert scheduler._vocoder._hift.calls[-1][1] is True
     total = np.concatenate(pcm_chunks + [remainder])
     assert total.shape == (len(generated) * TOKEN_MEL_RATIO,)
 
@@ -447,6 +459,9 @@ def test_equal_first_hops_share_one_causal_flow_batch() -> None:
     assert flow.decoder.estimator.calls
     assert flow.decoder.estimator.calls[0]["streaming"] is True
     assert flow.decoder.estimator.calls[0]["x"].shape[0] == 4
+    assert len(scheduler._vocoder._hift.calls) == 1
+    assert scheduler._vocoder._hift.calls[0][0].shape[0] == 2
+    assert scheduler._vocoder._hift.calls[0][1] is False
     messages = _drain(scheduler)
     assert [message.type for message in messages] == ["stream", "stream"]
     assert {_waveform(message.data).shape[0] for message in messages} == {
@@ -500,6 +515,8 @@ def test_late_payloads_share_one_causal_flow_batch() -> None:
     assert flow.decoder.estimator.calls
     assert flow.decoder.estimator.calls[0]["streaming"] is True
     assert flow.decoder.estimator.calls[0]["x"].shape[0] == 4
+    assert len(scheduler._vocoder._hift.calls) == 1
+    assert scheduler._vocoder._hift.calls[0][0].shape[0] == 2
     messages = _drain(scheduler)
     assert [message.type for message in messages] == ["stream", "stream"]
 
@@ -547,6 +564,8 @@ def test_queued_peer_chunk_joins_first_hop_batch_during_wait() -> None:
         failed = scheduler._pump_streams()
     assert failed == []
     assert flow.decoder.estimator.calls[0]["x"].shape[0] == 4
+    assert len(scheduler._vocoder._hift.calls) == 1
+    assert scheduler._vocoder._hift.calls[0][0].shape[0] == 2
 
 
 def _packed_scheduler(*, max_batch_size: int = 8):
@@ -593,6 +612,9 @@ def test_equal_follow_up_hops_share_one_causal_flow_batch() -> None:
     assert follow_calls
     assert follow_calls[0]["streaming"] is True
     assert follow_calls[0]["x"].shape[0] == 4
+    assert len(scheduler._vocoder._hift.calls) == 2
+    assert scheduler._vocoder._hift.calls[1][0].shape[0] == 2
+    assert scheduler._vocoder._hift.calls[1][1] is False
     messages = [m for m in _drain(scheduler) if m.type == "stream"]
     shapes = {_waveform(m.data).shape[0] for m in messages}
     assert 100 in shapes
@@ -632,6 +654,41 @@ def test_mixed_prompt_follow_ups_share_one_causal_flow_batch() -> None:
     assert follow_calls
     assert follow_calls[0]["streaming"] is True
     assert follow_calls[0]["x"].shape[0] == 4
+    assert len(scheduler._vocoder._hift.calls) == 2
+    assert scheduler._vocoder._hift.calls[1][0].shape[0] == 2
+
+
+def test_incompatible_follow_up_state_falls_back_to_serial_hift() -> None:
+    flow, scheduler = _packed_scheduler()
+    for request_id in ("req-a", "req-b"):
+        scheduler._on_streaming_new_request(request_id, _aligned_payload(request_id))
+        scheduler._ingest_stream_item(request_id, _item(list(range(28))))
+    with scheduler._state_lock:
+        failed = scheduler._pump_streams()
+    assert failed == []
+    assert len(scheduler._vocoder._hift.calls) == 1
+
+    state_b = scheduler._stream_states["req-b"]
+    assert state_b.hift_mel is not None
+    state_b.hift_mel = torch.cat(
+        [state_b.hift_mel, state_b.hift_mel[:, :, :1]], dim=2
+    )
+
+    for request_id in ("req-a", "req-b"):
+        scheduler._ingest_stream_item(
+            request_id, _item([i % 31 for i in range(28, 78)])
+        )
+    with scheduler._state_lock:
+        failed = scheduler._pump_streams()
+    assert failed == []
+    assert len(scheduler._vocoder._hift.calls) == 3
+    assert [call[0].shape[0] for call in scheduler._vocoder._hift.calls[1:]] == [1, 1]
+    assert scheduler._vocoder._hift.calls[1][0].shape[2] != (
+        scheduler._vocoder._hift.calls[2][0].shape[2]
+    )
+    assert scheduler._stream_states["req-a"].speech_offset != (
+        scheduler._stream_states["req-b"].speech_offset
+    )
 
 
 def test_c1_follow_up_stays_native_and_does_not_wait() -> None:
@@ -674,6 +731,8 @@ def test_queued_peer_chunk_joins_follow_up_batch_during_wait() -> None:
     assert failed == []
     follow_calls = flow.decoder.estimator.calls[first_calls:]
     assert follow_calls[0]["x"].shape[0] == 4
+    assert len(scheduler._vocoder._hift.calls) == 2
+    assert scheduler._vocoder._hift.calls[1][0].shape[0] == 2
 
 
 def test_backlogged_request_runs_one_hop_per_step() -> None:

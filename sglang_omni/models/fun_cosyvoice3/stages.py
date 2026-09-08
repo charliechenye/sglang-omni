@@ -930,7 +930,7 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         )
 
     def first_hop_batch(self, items: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
-        """Causal Flow for equal-shape hops. HiFT stays per request.
+        """Causal Flow for equal-shape hops; HiFT is adapted separately.
 
         # note (guozhihao-224): first hops and follow-up hops share this
         # path; the scheduler slices new frames at token_offset.
@@ -958,6 +958,111 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         held = max(int(speech_offset), 0)
         delta = tts_speech[:, held:].detach().cpu()
         return delta, tts_mel.detach(), int(tts_speech.shape[1])
+
+    def _hift_delta_batch(
+        self,
+        mels: Sequence[torch.Tensor],
+        *,
+        hift_mels: Sequence[torch.Tensor | None],
+        speech_offsets: Sequence[int],
+        finalize: bool,
+    ) -> list[tuple[torch.Tensor, torch.Tensor, int]] | None:
+        """Run one safe, equal-shape causal HiFT batch.
+
+        ``None`` means that the request-local state is not compatible with a
+        single causal HiFT call. The caller must use ``_hift_delta`` for that
+        group instead of padding or otherwise changing causal state semantics.
+        This adapter is intentionally limited to non-final causal hops;
+        final residualization remains request-local.
+        """
+        if len(mels) <= 1 or finalize:
+            return None
+        if len(hift_mels) != len(mels) or len(speech_offsets) != len(mels):
+            raise ValueError(
+                "causal HiFT batch metadata must match the number of mel rows"
+            )
+
+        first_mel = mels[0]
+        if (
+            not isinstance(first_mel, torch.Tensor)
+            or first_mel.ndim != 3
+            or first_mel.shape[0] != 1
+            or first_mel.shape[1] <= 0
+            or first_mel.shape[2] <= 0
+        ):
+            return None
+        mel_shape = tuple(first_mel.shape[1:])
+        for mel in mels:
+            if (
+                not isinstance(mel, torch.Tensor)
+                or mel.ndim != 3
+                or mel.shape[0] != 1
+                or tuple(mel.shape[1:]) != mel_shape
+                or mel.device != first_mel.device
+                or mel.dtype != first_mel.dtype
+            ):
+                return None
+
+        histories_present = hift_mels[0] is not None
+        if any((history is not None) != histories_present for history in hift_mels):
+            return None
+
+        histories: list[torch.Tensor] = []
+        if histories_present:
+            first_history = hift_mels[0]
+            assert first_history is not None
+            if (
+                not isinstance(first_history, torch.Tensor)
+                or first_history.ndim != 3
+                or first_history.shape[0] != 1
+                or first_history.shape[1] != first_mel.shape[1]
+                or first_history.shape[2] <= 0
+                or first_history.device != first_mel.device
+                or first_history.dtype != first_mel.dtype
+            ):
+                return None
+            history_shape = tuple(first_history.shape[1:])
+            for history in hift_mels:
+                if (
+                    history is None
+                    or not isinstance(history, torch.Tensor)
+                    or history.ndim != 3
+                    or history.shape[0] != 1
+                    or tuple(history.shape[1:]) != history_shape
+                    or history.device != first_mel.device
+                    or history.dtype != first_mel.dtype
+                ):
+                    return None
+                histories.append(history)
+
+        try:
+            offsets = tuple(int(offset) for offset in speech_offsets)
+        except (TypeError, ValueError):
+            return None
+        if len(set(offsets)) != 1:
+            return None
+
+        if histories_present:
+            rows = [
+                torch.cat([history, mel], dim=2)
+                for history, mel in zip(histories, mels, strict=True)
+            ]
+        else:
+            rows = list(mels)
+        batched_mel = torch.cat(rows, dim=0)
+        tts_speech, _ = self._hift.inference(
+            speech_feat=batched_mel, finalize=finalize
+        )
+        held = max(offsets[0], 0)
+        speech_length = int(tts_speech.shape[1])
+        results: list[tuple[torch.Tensor, torch.Tensor, int]] = []
+        for index in range(len(mels)):
+            delta = tts_speech[index : index + 1, held:].detach().cpu()
+            # The row view would retain the complete batched mel allocation.
+            # Each request owns a compact copy of its retained causal history.
+            retained_mel = batched_mel[index : index + 1].detach().clone()
+            results.append((delta, retained_mel, speech_length))
+        return results
 
     def _make_flow_input(
         self,

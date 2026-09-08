@@ -674,19 +674,36 @@ class FunCosyVoice3StreamingVocoderScheduler(
             )
         mels = self._vocoder.first_hop_batch(items)
         offset_frames = int(plan.token_offset) * TOKEN_MEL_RATIO
-        decoded: dict[str, torch.Tensor] = {}
-        for (request_id, state), mel in zip(participants, mels, strict=True):
+        current_mels: list[torch.Tensor] = []
+        for mel in mels:
             if mel.shape[-1] < offset_frames:
                 raise RuntimeError(
                     "Fun-CosyVoice3 causal Flow batch returned "
                     f"{mel.shape[-1]} frames, need offset {offset_frames}"
                 )
-            delta, hift_mel, speech_offset = self._vocoder._hift_delta(
-                mel[:, :, offset_frames:],
-                hift_mel=state.hift_mel,
-                speech_offset=state.speech_offset,
-                finalize=False,
-            )
+            current_mels.append(mel[:, :, offset_frames:])
+
+        hift_results = self._vocoder._hift_delta_batch(
+            current_mels,
+            hift_mels=[state.hift_mel for _, state in participants],
+            speech_offsets=[state.speech_offset for _, state in participants],
+            finalize=False,
+        )
+        if hift_results is None:
+            hift_results = [
+                self._vocoder._hift_delta(
+                    mel,
+                    hift_mel=state.hift_mel,
+                    speech_offset=state.speech_offset,
+                    finalize=False,
+                )
+                for mel, (_, state) in zip(current_mels, participants, strict=True)
+            ]
+
+        decoded: dict[str, torch.Tensor] = {}
+        for (request_id, state), (delta, hift_mel, speech_offset) in zip(
+            participants, hift_results, strict=True
+        ):
             state.token_offset += plan.hop
             self._advance_hop_len(state)
             state.hift_mel = hift_mel
