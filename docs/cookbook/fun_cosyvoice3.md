@@ -208,6 +208,16 @@ HiFT vocoding follows the same batching pattern. Mels from a Flow bucket are rig
 
 Adaptive Flow coalescing is enabled by default for buffered, non-streaming requests. The existing 50-frame Flow buckets remain atomic, while adjacent buckets may share one Flow solve when the merged raw mel-length span is at most `flow_batch_coalesce_span_frames` (default `384`) and the total added padded Flow work stays within `flow_batch_coalesce_max_added_padding_pct` (default `20`). Set both options to `0` to disable coalescing.
 
+Disable adaptive Flow coalescing:
+
+```bash
+sgl-omni serve \
+  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
+  --port 8000 \
+  --vocoder.factory.flow_batch_coalesce_span_frames 0 \
+  --vocoder.factory.flow_batch_coalesce_max_added_padding_pct 0
+```
+
 Change the mel-frame bucket size, for example to 100 frames:
 
 ```bash

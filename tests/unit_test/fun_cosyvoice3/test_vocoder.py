@@ -655,6 +655,31 @@ def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) ->
     ), "default admission budget no longer holds a useful batch"
     assert scheduler._max_batch_size == 16
     assert scheduler._max_batch_wait_s == pytest.approx(0.03)
+    assert scheduler._vocoder._flow_batch_coalesce_span_frames == 384
+    assert scheduler._vocoder._flow_batch_coalesce_max_added_padding_pct == 20.0
+
+
+def test_create_vocoder_executor_can_disable_flow_coalescing(monkeypatch) -> None:
+    monkeypatch.setattr(stages, "resolve_device_spec", lambda device, gpu_id: "cpu")
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    monkeypatch.setattr(
+        stages,
+        "_load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, device, fp16, **kwargs: (
+            _BatchCapableFakeFlow(),
+            _FakeHiFT(),
+        ),
+    )
+
+    scheduler = stages.create_vocoder_executor(
+        "model",
+        device="cpu",
+        flow_batch_coalesce_span_frames=0,
+        flow_batch_coalesce_max_added_padding_pct=0,
+    )
+
+    assert scheduler._vocoder._flow_batch_coalesce_span_frames == 0
+    assert scheduler._vocoder._flow_batch_coalesce_max_added_padding_pct == 0
 
 
 def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> None:
@@ -931,8 +956,8 @@ def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
         "dtype": "bfloat16",
         "flow_batch_bucket_frames": 50,
         "flow_batch_admission_frames": 8000,
-        "flow_batch_coalesce_span_frames": 0,
-        "flow_batch_coalesce_max_added_padding_pct": 0.0,
+        "flow_batch_coalesce_span_frames": 384,
+        "flow_batch_coalesce_max_added_padding_pct": 20.0,
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_flow_estimator_trt": False,

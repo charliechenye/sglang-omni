@@ -46,8 +46,8 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
     assert vocoder.factory.model_extra == {
         "flow_batch_bucket_frames": 50,
         "flow_batch_admission_frames": 8000,
-        "flow_batch_coalesce_span_frames": 0,
-        "flow_batch_coalesce_max_added_padding_pct": 0.0,
+        "flow_batch_coalesce_span_frames": 384,
+        "flow_batch_coalesce_max_added_padding_pct": 20.0,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
