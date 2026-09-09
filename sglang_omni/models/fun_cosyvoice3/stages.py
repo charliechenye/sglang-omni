@@ -905,7 +905,6 @@ def _precompute_flow_segments(
             assert maximum_total is not None
             newly_merged_span = 0 if end - start == 1 else maximum_total - minimum_total
             if newly_merged_span > coalesce_span_frames:
-                # The span cannot decrease as this contiguous range grows.
                 break
             segment_matrix[start][end] = _FlowSegment(
                 requests=tuple(flattened),
@@ -962,7 +961,8 @@ def _group_flow_requests(
     coalesce_span_frames: int,
     coalesce_max_added_padding_pct: float,
 ) -> list[list[_PreparedFlowRequest]]:
-    """Choose an exact objective-optimal contiguous coarsening of Flow buckets.
+    """note(chenye): Choose an exact objective optimal contiguous coarsening of
+    Flow buckets.
 
     The three DP stages mirror the frozen objective order: solve count, padded
     work, maximum newly merged span, then the bucket-range signature.
