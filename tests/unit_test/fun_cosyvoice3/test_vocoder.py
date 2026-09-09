@@ -249,6 +249,30 @@ def _codes(length: int, value: int = 1) -> torch.Tensor:
     return torch.full((length,), value, dtype=torch.long)
 
 
+def _flow_buckets(
+    totals: list[int], *, bucket_frames: int
+) -> dict[int, list[stages._PreparedFlowRequest]]:
+    flow_input = stages.FlowBatchInput(
+        token=torch.empty((1, 0), dtype=torch.int32),
+        prompt_token=torch.empty((1, 0), dtype=torch.int32),
+        prompt_feat=torch.empty((1, 0, 80)),
+        embedding=torch.empty((1, 192)),
+    )
+    buckets: dict[int, list[stages._PreparedFlowRequest]] = {}
+    for index, total in enumerate(totals):
+        bucket_key = (total + bucket_frames - 1) // bucket_frames
+        buckets.setdefault(bucket_key, []).append(
+            stages._PreparedFlowRequest(
+                index=index,
+                sample_rate=24000,
+                flow_input=flow_input,
+                total_mel_frames=total,
+                baseline_bucket_key=bucket_key,
+            )
+        )
+    return buckets
+
+
 def _install_fake_batch_adapter(monkeypatch, calls: list[list]) -> None:
     def fake_infer(flow, inputs):
         del flow
@@ -321,12 +345,14 @@ def test_decode_batch_same_bucket_batches_flow_once(monkeypatch) -> None:
     assert hift.calls[0][0].shape[0] == 2
 
 
-def test_adaptive_flow_coalescing_preserves_atomic_hift_boundaries(monkeypatch) -> None:
+def test_decode_batch_coalesces_flow_preserving_hift_groups_and_order(
+    monkeypatch,
+) -> None:
     items = [
-        (_state(sample_rate=16001, prompt_tokens=0), _codes(24, 1)),
-        (_state(sample_rate=16002, prompt_tokens=0), _codes(25, 2)),
         (_state(sample_rate=16003, prompt_tokens=0), _codes(26, 3)),
+        (_state(sample_rate=16001, prompt_tokens=0), _codes(24, 1)),
         (_state(sample_rate=16004, prompt_tokens=0), _codes(27, 4)),
+        (_state(sample_rate=16002, prompt_tokens=0), _codes(25, 2)),
     ]
 
     flow = _BatchCapableFakeFlow()
@@ -345,16 +371,66 @@ def test_adaptive_flow_coalescing_preserves_atomic_hift_boundaries(monkeypatch) 
         tuple(int(value) for value in call[0][:, 0, 0].tolist()) for call in hift.calls
     ]
 
-    assert [sample_rate for _, sample_rate in results] == [
-        16001,
-        16002,
-        16003,
-        16004,
-    ]
+    assert [sample_rate for _, sample_rate in results] == [16003, 16001, 16004, 16002]
     assert [[item.token.shape[1] for item in call] for call in flow_calls] == [
         [24, 25, 26, 27]
     ]
     assert hift_memberships == [(1, 2), (3, 4)]
+
+
+@pytest.mark.parametrize(
+    ("totals", "bucket_frames", "span_frames", "padding_pct", "expected"),
+    [
+        pytest.param(
+            [10, 13, 30, 33],
+            10,
+            4,
+            5,
+            [[10], [13], [30, 33]],
+            id="global-padding-cap",
+        ),
+        pytest.param(
+            [10, 10, 10, 11, 13],
+            1,
+            3,
+            10,
+            [[10, 10, 10], [11, 13]],
+            id="minimum-padded-work",
+        ),
+        pytest.param(
+            [10, 10, 20, 40],
+            10,
+            40,
+            30,
+            [[10, 10, 20], [40]],
+            id="maximum-merged-span",
+        ),
+        pytest.param(
+            list(range(10, 161, 10)),
+            10,
+            150,
+            100,
+            [list(range(10, 161, 10))],
+            id="b16-production-regime",
+        ),
+    ],
+)
+def test_flow_coalescing_partition_policy(
+    totals: list[int],
+    bucket_frames: int,
+    span_frames: int,
+    padding_pct: float,
+    expected: list[list[int]],
+) -> None:
+    groups = stages._group_flow_requests(
+        _flow_buckets(totals, bucket_frames=bucket_frames),
+        coalesce_span_frames=span_frames,
+        coalesce_max_added_padding_pct=padding_pct,
+    )
+
+    assert [
+        [request.total_mel_frames for request in group] for group in groups
+    ] == expected
 
 
 def test_decode_batch_runs_hift_once_over_padded_mels(monkeypatch) -> None:
