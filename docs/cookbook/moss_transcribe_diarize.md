@@ -101,42 +101,52 @@ The calibration collector is deliberately opt-in. Set
 unset installs no hooks and does not change serving. The collector is intended
 for the BF16 `OpenMOSS-Team/MOSS-Transcribe-Diarize` decoder only.
 
-Run a calibration server with eager decoder execution:
+Calibration and the FP8 serving smoke below require a CUDA GPU. Use a fresh
+output path for every run; calibration and conversion refuse to overwrite an
+existing artifact.
+
+On the H200 devbox, run a calibration server with eager decoder execution:
 
 ```bash
 RAW=results/moss_td_kv_calibration.raw.json
+test ! -e "$RAW" || { echo "choose a fresh RAW path" >&2; exit 1; }
 
-sgl-omni serve \
+CUDA_VISIBLE_DEVICES=0 sgl-omni serve \
   --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --dtype bfloat16 \
   --asr.factory.kv_calibration_output_path "$RAW" \
-  --asr.factory.kv_calibration_checkpoint_interval_s 30 \
   --asr.engine.disable_cuda_graph true \
-  --asr.engine.enable_torch_compile false
+  --asr.engine.enable_torch_compile false \
+  --asr.factory.encoder_torch_compile false
 ```
 
 Calibration mode enforces `disable_cuda_graph=true` and
 `enable_torch_compile=false` even if the normal MOSS-TD stage defaults are
 present. It also resolves both phase backends to `disabled` in the final
-SGLang `ServerArgs`, including when an operator supplied
-`cuda_graph_backend_prefill`, `cuda_graph_backend_decode`, or a nested
-`cuda_graph_config`. The explicit flags above make the launch contract
-visible. Do not set `asr.factory.encoder_torch_compile=true` for a calibration
-run unless the encoder experiment is intentional; it is unrelated to the
-decoder collector. The checkpoint interval must be positive.
+SGLang `ServerArgs`, including when an operator supplied graph overrides. The
+explicit flags above make the launch contract visible.
 
 Start a fresh, dedicated server for the selected calibration corpus. Send only
 the intended BF16 audio samples in the intended order; do not add unrelated
 synthetic warmup, precondition, or smoke-test audio unless it is deliberately
 part of the calibration corpus. Then stop the server gracefully. The stage
 waits for the scheduler thread to exit before its calibration finalizer runs.
-During the run, the file is atomically replaced with `status: "in_progress"`
-checkpoints. Only a graceful post-quiescence finalization can publish
-`status: "complete"`; an interrupted, killed, timed-out, or checkpoint-failed
-run remains unusable and validation rejects it.
+The file starts as `status: "in_progress"`. Only a graceful post-quiescence
+finalization can publish `status: "complete"`; an interrupted, killed,
+timed-out, or failed run remains unusable and validation rejects it.
+
+For a one-request smoke corpus, the request can be sent with:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F model=OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  -F file=@tests/data/query_to_cars.wav \
+  -F response_format=verbose_json
+```
 
 The hook is registered on each of the 28 per-layer `RadixAttention` modules.
 It observes the positional K/V inputs after QK norm and rotary processing and
-maintains independent device-side K/V maxima. Checkpoint and finalization are
+maintains independent device-side K/V maxima. Attachment and finalization are
 the only points that copy the single 28×2 maxima tensor to the CPU. The
 completed artifact records `model_path`, `git_head`, `git_dirty`,
 `num_layers`, `observed_layers`, `k_amax`, `v_amax`, collector/schema versions,
@@ -153,12 +163,31 @@ Validate and convert the completed raw artifact with an explicit margin:
 python -m sglang_omni.models.moss_transcribe_diarize.kv_calibration \
   validate --raw-artifact "$RAW"
 
+SCALES=results/moss_td_kv_scales.json
+test ! -e "$SCALES" || { echo "choose a fresh SCALES path" >&2; exit 1; }
 python -m sglang_omni.models.moss_transcribe_diarize.kv_calibration \
   convert \
   --raw-artifact "$RAW" \
-  --output results/moss_td_kv_scales.json \
+  --output "$SCALES" \
   --margin YOUR_EXPLICIT_MARGIN
 ```
+
+For the GPU verification, inspect that `observed_layer_count` is 28 and that
+`observed_layers` is `[0, 1, ..., 27]` before converting. Then start one normal
+FP8-KV serving smoke with the converted file and send one representative
+request:
+
+```bash
+SCALES=results/moss_td_kv_scales.json
+CUDA_VISIBLE_DEVICES=0 sgl-omni serve \
+  --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
+  --kv-cache-dtype fp8_e4m3 \
+  --quantization-param-path "$SCALES"
+```
+
+The smoke is successful only if the server loads the scale file, serves the
+request without a scale-type error, and exits cleanly. Compare its transcript
+with the BF16 calibration server; this is a correctness smoke, not a benchmark.
 
 There is no default or invented margin. The converter applies the upstream
 formula `scale = amax / 448 * margin`; because PR #1128's legacy schema accepts

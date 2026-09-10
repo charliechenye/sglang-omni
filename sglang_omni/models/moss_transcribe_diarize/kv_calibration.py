@@ -6,7 +6,7 @@ modules.  At that boundary Qwen3 has already applied K/RoPE processing and the
 same K/V tensors are about to be handed to SGLang's attention/cache path.
 
 The hot path only performs device-side reductions and updates.  Host copies
-and atomic JSON writes happen at the configured checkpoint interval and during
+and atomic JSON writes happen when the collector is attached and during
 explicit finalization on stage shutdown.
 """
 
@@ -20,7 +20,6 @@ import os
 import subprocess
 import tempfile
 import threading
-import time
 from collections.abc import Mapping, Sequence
 from numbers import Real
 from pathlib import Path
@@ -140,19 +139,6 @@ def _atomic_write_json(
         raise
 
 
-def _reject_json_constant(value: str) -> None:
-    raise ValueError(f"non-standard JSON constant {value!r} is not allowed")
-
-
-def _reject_duplicate_json_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
-    result: dict[str, Any] = {}
-    for key, value in pairs:
-        if key in result:
-            raise CalibrationValidationError(f"duplicate JSON key {key!r}")
-        result[key] = value
-    return result
-
-
 def _require_json_integer(value: Any, *, field: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
         raise CalibrationValidationError(f"{field} must be an integer")
@@ -172,9 +158,9 @@ def _validate_amax(value: Any, *, field: str) -> None:
 def validate_raw_calibration(payload: Mapping[str, Any]) -> None:
     """Validate a completed MOSS-TD raw calibration payload.
 
-    The status check is deliberate: an atomically written checkpoint is still
-    not a usable calibration until the collector has been finalized and all
-    observations have passed these checks.
+    The status check is deliberate: an atomically written in-progress artifact
+    is not usable until the collector has been finalized and all observations
+    have passed these checks.
     """
 
     if not isinstance(payload, Mapping):
@@ -282,11 +268,7 @@ def read_raw_calibration(path: str | os.PathLike[str]) -> dict[str, Any]:
 
     artifact_path = Path(path).expanduser()
     try:
-        payload = json.loads(
-            artifact_path.read_text(encoding="utf-8"),
-            object_pairs_hook=_reject_duplicate_json_keys,
-            parse_constant=_reject_json_constant,
-        )
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         raise CalibrationValidationError(
             f"could not read valid JSON from {artifact_path}: {exc}"
@@ -308,7 +290,7 @@ def _json_safe_float(value: float) -> float | str:
 
 
 def _device_amax(tensor: torch.Tensor) -> torch.Tensor:
-    """Reduce a tensor on-device while preserving any non-finite observation."""
+    """Reduce a tensor on-device and mark non-finite input as NaN."""
 
     detached = tensor.detach()
     candidate = detached.abs().amax().to(dtype=torch.float32)
@@ -317,6 +299,23 @@ def _device_amax(tensor: torch.Tensor) -> torch.Tensor:
         has_nonfinite,
         torch.full_like(candidate, float("nan")),
         candidate,
+    )
+
+
+def _merge_device_amax(
+    current: torch.Tensor,
+    candidate: torch.Tensor,
+) -> torch.Tensor:
+    """Keep the largest finite value, with NaN as a sticky invalid marker."""
+
+    return torch.where(
+        torch.isfinite(current),
+        torch.where(
+            torch.isfinite(candidate),
+            torch.maximum(current, candidate),
+            candidate,
+        ),
+        current,
     )
 
 
@@ -330,7 +329,6 @@ class MossTDKVCalibrationCollector:
         model_path: str,
         output_path: str | os.PathLike[str],
         device: torch.device | str,
-        checkpoint_interval_s: float = 30.0,
         git_metadata: tuple[str, bool] | None = None,
     ) -> None:
         self._attention_modules = tuple(attention_modules)
@@ -341,41 +339,25 @@ class MossTDKVCalibrationCollector:
             )
         if not isinstance(model_path, str) or not model_path.strip():
             raise ValueError("model_path must be a non-empty string")
-        if isinstance(checkpoint_interval_s, bool):
-            raise ValueError("checkpoint_interval_s must be a positive number")
-        try:
-            checkpoint_interval_s = float(checkpoint_interval_s)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                "checkpoint_interval_s must be a positive number"
-            ) from exc
-        if not math.isfinite(checkpoint_interval_s) or checkpoint_interval_s <= 0.0:
-            raise ValueError(
-                "checkpoint_interval_s must be a finite positive number"
-            )
-
-        self._model_path = model_path
         self._output_path = Path(output_path).expanduser()
         if not self._output_path.name:
             raise ValueError("output_path must name an artifact file")
         if self._output_path.exists() and self._output_path.is_dir():
             raise ValueError("output_path must not be a directory")
-        self._checkpoint_interval_s = checkpoint_interval_s
+        if self._output_path.exists():
+            raise FileExistsError(
+                f"refusing to overwrite existing calibration artifact: "
+                f"{self._output_path}"
+            )
         self._device = torch.device(device)
         self._state_lock = threading.RLock()
         self._running_amax = torch.zeros(
             (EXPECTED_NUM_LAYERS, 2), dtype=torch.float32, device=self._device
         )
-        self._nonfinite_amax = torch.zeros(
-            (EXPECTED_NUM_LAYERS, 2), dtype=torch.bool, device=self._device
-        )
         self._seen_layers: set[int] = set()
-        self._hook_calls = 0
         self._handles: list[Any] = []
         self._closed = False
-        self._checkpoint_error: str | None = None
         self._timestamp = _utc_timestamp()
-        self._next_checkpoint_at = time.monotonic() + checkpoint_interval_s
         if git_metadata is None:
             git_metadata = _git_metadata()
         git_head, git_dirty = git_metadata
@@ -435,7 +417,6 @@ class MossTDKVCalibrationCollector:
         with self._state_lock:
             if self._closed:
                 return
-            self._hook_calls += 1
             if len(inputs) < 3:
                 raise RuntimeError(
                     f"layer {layer_index} RadixAttention hook received fewer than "
@@ -464,70 +445,29 @@ class MossTDKVCalibrationCollector:
             with torch.no_grad():
                 key_amax = _device_amax(key)
                 value_amax = _device_amax(value)
-                for slot, candidate, nonfinite_slot in (
+                for slot, candidate in (
                     (
                         self._running_amax[layer_index, 0],
                         key_amax,
-                        self._nonfinite_amax[layer_index, 0],
                     ),
                     (
                         self._running_amax[layer_index, 1],
                         value_amax,
-                        self._nonfinite_amax[layer_index, 1],
                     ),
                 ):
-                    # Preserve every non-finite observation in both the
-                    # reduction and a sticky device-side flag, independent of
-                    # backend reduction semantics.
-                    candidate_nonfinite = ~torch.isfinite(candidate)
-                    nonfinite_slot.copy_(
-                        torch.logical_or(nonfinite_slot, candidate_nonfinite)
-                    )
-                    finite_max = torch.maximum(slot, candidate)
-                    slot.copy_(
-                        torch.where(
-                            torch.isfinite(candidate), finite_max, candidate
-                        )
-                    )
+                    slot.copy_(_merge_device_amax(slot, candidate))
             self._seen_layers.add(layer_index)
-            self._maybe_checkpoint()
-
-    def _maybe_checkpoint(self) -> None:
-        if self._closed or self._checkpoint_error is not None:
-            return
-        now = time.monotonic()
-        if now < self._next_checkpoint_at:
-            return
-        try:
-            self._write_snapshot(status="in_progress")
-        except BaseException as exc:
-            # A failed checkpoint must be sticky.  Otherwise a later graceful
-            # stop could silently publish a complete artifact even though the
-            # requested durable checkpoint was never written.
-            self._checkpoint_error = str(exc) or type(exc).__name__
-            raise
-        self._next_checkpoint_at = now + self._checkpoint_interval_s
 
     def _snapshot_values(self) -> list[list[float | str]]:
-        # .cpu() is intentionally only used at periodic checkpoints/finalize;
-        # it synchronizes once for the whole 28x2 tensor rather than once per
-        # layer or decode step.
+        # .cpu() is intentionally only used at attach/finalize; it synchronizes
+        # once for the whole 28x2 tensor rather than once per layer or decode.
         values = self._running_amax.detach().cpu().tolist()
-        nonfinite = self._nonfinite_amax.detach().cpu().tolist()
         return [
             [
-                (
-                    "NaN"
-                    if nonfinite[index][0]
-                    else _json_safe_float(float(key))
-                ),
-                (
-                    "NaN"
-                    if nonfinite[index][1]
-                    else _json_safe_float(float(value))
-                ),
+                _json_safe_float(float(key)),
+                _json_safe_float(float(value)),
             ]
-            for index, (key, value) in enumerate(values)
+            for key, value in values
         ]
 
     def _payload(
@@ -551,8 +491,6 @@ class MossTDKVCalibrationCollector:
                     }
                     for index in range(EXPECTED_NUM_LAYERS)
                 ],
-                "last_checkpoint_timestamp": _utc_timestamp(),
-                "hook_calls": self._hook_calls,
             }
             if validation_error is not None:
                 payload["validation_error"] = validation_error
@@ -587,23 +525,6 @@ class MossTDKVCalibrationCollector:
                 return
             try:
                 self._remove_hooks()
-                if self._checkpoint_error is not None:
-                    error = (
-                        "calibration checkpoint failed; refusing to publish a "
-                        f"complete artifact: {self._checkpoint_error}"
-                    )
-                    payload = self._payload(
-                        status="invalid",
-                        validation_error=error,
-                    )
-                    try:
-                        _atomic_write_json(self._output_path, payload)
-                    except BaseException as exc:
-                        raise CalibrationValidationError(
-                            f"{error}; could not write invalid artifact: {exc}"
-                        ) from exc
-                    raise CalibrationValidationError(error)
-
                 payload = self._payload(status="complete")
                 try:
                     validate_raw_calibration(payload)
@@ -672,7 +593,6 @@ def attach_moss_td_kv_calibration(
     *,
     model_path: str,
     output_path: str | os.PathLike[str],
-    checkpoint_interval_s: float = 30.0,
     git_metadata: tuple[str, bool] | None = None,
 ) -> MossTDKVCalibrationCollector:
     """Attach the opt-in MOSS-TD calibration collector to a loaded model."""
@@ -688,7 +608,6 @@ def attach_moss_td_kv_calibration(
         model_path=model_path,
         output_path=output_path,
         device=parameter.device,
-        checkpoint_interval_s=checkpoint_interval_s,
         git_metadata=git_metadata,
     )
 
@@ -717,6 +636,11 @@ def convert_raw_calibration_to_vllm_legacy(
 
     margin_float = _validate_margin(margin)
     raw = read_raw_calibration(raw_artifact_path)
+    output = Path(output_path).expanduser()
+    if output.exists():
+        raise FileExistsError(
+            f"refusing to overwrite existing KV scale artifact: {output}"
+        )
     layers = sorted(raw["layers"], key=lambda layer: int(layer["layer"]))
     scaling_factor: dict[str, float] = {}
     for layer in layers:
@@ -739,7 +663,7 @@ def convert_raw_calibration_to_vllm_legacy(
         },
     }
     _atomic_write_json(
-        Path(output_path).expanduser(),
+        output,
         payload,
         validator=lambda staged_path: validate_vllm_legacy_scale_artifact(
             staged_path,
@@ -764,19 +688,6 @@ def validate_vllm_legacy_scale_artifact(
     """
 
     artifact_path = Path(path).expanduser()
-    try:
-        json.loads(
-            artifact_path.read_text(encoding="utf-8"),
-            object_pairs_hook=_reject_duplicate_json_keys,
-            parse_constant=_reject_json_constant,
-        )
-    except (OSError, json.JSONDecodeError, ValueError) as exc:
-        if isinstance(exc, CalibrationValidationError):
-            raise
-        raise CalibrationValidationError(
-            f"could not read valid vLLM-legacy JSON from {artifact_path}: {exc}"
-        ) from exc
-
     try:
         from sglang.srt.model_loader.weight_utils import kv_cache_scales_loader
     except (ImportError, ModuleNotFoundError) as exc:

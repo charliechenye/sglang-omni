@@ -6,6 +6,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import resolved_view
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
 
 from sglang_omni.models.moss_transcribe_diarize import CAPABILITIES, request_builders
@@ -21,8 +22,8 @@ from sglang_omni.scheduling.generation_batch_policy import (
 
 
 def _force_calibration_server_args_overrides(
-    server_args_overrides: Mapping[str, Any] | None,
-) -> dict[str, Any]:
+    overrides: dict[str, Any],
+) -> None:
     """Make every decoder CUDA-graph/compile input eager for calibration.
 
     SGLang gives nested ``cuda_graph_config`` precedence over convenience
@@ -32,13 +33,12 @@ def _force_calibration_server_args_overrides(
     collector.
     """
 
-    normalized = dict(server_args_overrides or {})
-    normalized["disable_cuda_graph"] = True
-    normalized["enable_torch_compile"] = False
-    normalized["cuda_graph_backend_decode"] = CudaGraphBackend.DISABLED
-    normalized["cuda_graph_backend_prefill"] = CudaGraphBackend.DISABLED
+    overrides["disable_cuda_graph"] = True
+    overrides["enable_torch_compile"] = False
+    overrides["cuda_graph_backend_decode"] = CudaGraphBackend.DISABLED
+    overrides["cuda_graph_backend_prefill"] = CudaGraphBackend.DISABLED
 
-    config = normalized.get("cuda_graph_config")
+    config = overrides.get("cuda_graph_config")
     if isinstance(config, CudaGraphConfig):
         config = config.to_dict()
     elif config is None:
@@ -63,8 +63,7 @@ def _force_calibration_server_args_overrides(
             phase_config = dict(phase_config)
         phase_config["backend"] = CudaGraphBackend.DISABLED
         config[phase] = phase_config
-    normalized["cuda_graph_config"] = config
-    return normalized
+    overrides["cuda_graph_config"] = config
 
 
 class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
@@ -99,7 +98,6 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         request_build_max_pending: int | None,
         stream_emit_interval_s: float,
         kv_calibration_output_path: str | None = None,
-        kv_calibration_checkpoint_interval_s: float = 30.0,
     ) -> None:
         self.max_running_requests = max_running_requests
         self.requested_max_new_tokens = max_new_tokens
@@ -127,9 +125,6 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         self.request_build_max_pending = request_build_max_pending
         self.stream_emit_interval_s = stream_emit_interval_s
         self.kv_calibration_output_path = kv_calibration_output_path
-        self.kv_calibration_checkpoint_interval_s = (
-            kv_calibration_checkpoint_interval_s
-        )
         self.processor: Any = None
         self.tokenizer: Any = None
         self.audio_encoder_service: BatchedAudioEncoderService | None = None
@@ -167,51 +162,47 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
             2,
             *build_default_prefill_cuda_graph_bs(4096),
         ]
-        defaults = {
+        return {
             "max_running_requests": self.max_running_requests,
-            "disable_cuda_graph": self.kv_calibration_output_path is not None,
+            "disable_cuda_graph": False,
             "disable_overlap_schedule": True,
-            "enable_torch_compile": (
-                False
-                if self.kv_calibration_output_path is not None
-                else self.enable_torch_compile
-            ),
+            "enable_torch_compile": self.enable_torch_compile,
             "torch_compile_max_bs": self.torch_compile_max_bs,
             "mem_fraction_static": self.mem_fraction_static,
             "max_prefill_tokens": 4096,
             "chunked_prefill_size": 4096,
             "sampling_backend": "pytorch",
-            "cuda_graph_backend_prefill": (
-                CudaGraphBackend.DISABLED
-                if self.kv_calibration_output_path is not None
-                else CudaGraphBackend.BREAKABLE
-            ),
+            "cuda_graph_backend_prefill": CudaGraphBackend.BREAKABLE,
             "cuda_graph_bs_prefill": prefill_cuda_graph_bs,
             "dtype": dtype,
         }
-        if self.kv_calibration_output_path is not None:
-            defaults.update(_force_calibration_server_args_overrides(None))
-        return defaults
-
-    def prepare_server_args_overrides(
-        self,
-        server_args_overrides: Mapping[str, Any] | None,
-    ) -> Mapping[str, Any] | None:
-        if self.kv_calibration_output_path is None:
-            return server_args_overrides
-        return _force_calibration_server_args_overrides(server_args_overrides)
 
     def adjust_overrides(self, overrides: dict[str, Any]) -> None:
         # note (Dayuxiaoshui): context_length is an explicit server-args
         # parameter, so consume the operator override before the shared builder
         # expands overrides.
-        if self.kv_calibration_output_path is not None:
-            # Keep this guard at the final builder merge point as well as in the
-            # pre-merge hook: direct builder users must not accidentally capture
-            # a graph or compile away the hooks.
-            overrides.update(_force_calibration_server_args_overrides(overrides))
         if "context_length" in overrides:
             self.context_length = int(overrides.pop("context_length"))
+        if self.kv_calibration_output_path is not None:
+            _force_calibration_server_args_overrides(overrides)
+
+    def validate_before_infrastructure(self, server_args: Any) -> None:
+        super().validate_before_infrastructure(server_args)
+        if self.kv_calibration_output_path is None:
+            return
+        resolved = resolved_view(server_args)
+        if (
+            not resolved.disable_cuda_graph
+            or resolved.enable_torch_compile
+            or resolved.cuda_graph_config.decode.backend
+            != CudaGraphBackend.DISABLED
+            or resolved.cuda_graph_config.prefill.backend
+            != CudaGraphBackend.DISABLED
+        ):
+            raise RuntimeError(
+                "MOSS-TD KV calibration requires the resolved decoder to be "
+                "eager: CUDA graphs and torch.compile must be disabled"
+            )
 
     def customize_server_args(self, server_args: Any) -> None:
         # note (Dayuxiaoshui): adapters must use the context length finalized by
@@ -225,14 +216,8 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
         *,
         generation_cuda_graph_enabled: bool,
     ) -> None:
+        del server_args
         if self.kv_calibration_output_path is not None:
-            if generation_cuda_graph_enabled or bool(
-                getattr(server_args, "enable_torch_compile", False)
-            ):
-                raise RuntimeError(
-                    "MOSS-TD KV calibration requires CUDA graphs and decoder "
-                    "torch.compile to be disabled"
-                )
             from sglang_omni.models.moss_transcribe_diarize.kv_calibration import (
                 attach_moss_td_kv_calibration,
             )
@@ -241,7 +226,6 @@ class MossTranscribeDiarizeEngineBuilder(AsrEngineBuilder):
                 model,
                 model_path=self.checkpoint_dir,
                 output_path=self.kv_calibration_output_path,
-                checkpoint_interval_s=self.kv_calibration_checkpoint_interval_s,
             )
         input_feature_len = int(self.processor.feature_extractor.nb_max_frames)
         if self.encoder_torch_compile:

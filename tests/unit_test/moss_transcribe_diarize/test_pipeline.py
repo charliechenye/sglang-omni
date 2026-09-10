@@ -53,7 +53,6 @@ def _make_moss_engine_builder(
         request_build_max_pending=16,
         stream_emit_interval_s=0.05,
         kv_calibration_output_path=kv_calibration_output_path,
-        kv_calibration_checkpoint_interval_s=30.0,
     )
 
 
@@ -84,7 +83,6 @@ def test_moss_transcribe_diarize_config_uses_single_batched_stage() -> None:
     assert factory.prefill_coalesce_requires_pending_builds is True
     assert factory.prefill_coalesce_after_builds_during_decode is True
     assert factory.kv_calibration_output_path is None
-    assert factory.kv_calibration_checkpoint_interval_s is None
     assert (
         PIPELINE_CONFIG_REGISTRY.get_config(
             "MossTranscribeDiarizeForConditionalGeneration"
@@ -98,7 +96,6 @@ def test_moss_transcribe_diarize_prefill_backend_policy() -> None:
     builder = _make_moss_engine_builder()
 
     assert builder.kv_calibration_collector is None
-    assert builder.prepare_server_args_overrides(None) is None
     assert builder.extra_scheduler_callbacks() == {}
     assert type(builder).supports_breakable_prefill_cuda_graph is True
     defaults = builder.generation_defaults(dtype="bfloat16")
@@ -139,58 +136,6 @@ def test_moss_transcribe_diarize_compile_cap_survives_batch_overrides() -> None:
     assert operator["torch_compile_max_bs"] == 8
 
 
-def test_moss_td_calibration_forces_eager_uncompiled_decoder() -> None:
-    builder = _make_moss_engine_builder(
-        kv_calibration_output_path="results/moss_td.raw.json"
-    )
-
-    defaults = builder.generation_defaults(dtype="bfloat16")
-    assert defaults["disable_cuda_graph"] is True
-    assert defaults["enable_torch_compile"] is False
-    assert defaults["cuda_graph_backend_decode"] == "disabled"
-    assert defaults["cuda_graph_backend_prefill"] == "disabled"
-    assert defaults["cuda_graph_config"] == {
-        "decode": {"backend": "disabled"},
-        "prefill": {"backend": "disabled"},
-    }
-
-    overrides = {
-        "disable_cuda_graph": False,
-        "enable_torch_compile": True,
-        "cuda_graph_backend_decode": "full",
-        "cuda_graph_backend_prefill": "breakable",
-        "cuda_graph_config": {
-            "decode": {"backend": "full"},
-            "prefill": {"backend": "breakable"},
-        },
-    }
-    normalized = builder.prepare_server_args_overrides(overrides)
-    assert normalized == {
-        "disable_cuda_graph": True,
-        "enable_torch_compile": False,
-        "cuda_graph_backend_decode": "disabled",
-        "cuda_graph_backend_prefill": "disabled",
-        "cuda_graph_config": {
-            "decode": {"backend": "disabled"},
-            "prefill": {"backend": "disabled"},
-        },
-    }
-
-    merged = build_generation_batch_overrides(
-        server_args_overrides=normalized,
-        **builder.generation_defaults(dtype="bfloat16"),
-    )
-    builder.adjust_overrides(merged)
-    assert merged["disable_cuda_graph"] is True
-    assert merged["enable_torch_compile"] is False
-    assert merged["cuda_graph_backend_decode"] == "disabled"
-    assert merged["cuda_graph_backend_prefill"] == "disabled"
-    assert merged["cuda_graph_config"] == {
-        "decode": {"backend": "disabled"},
-        "prefill": {"backend": "disabled"},
-    }
-
-
 def test_moss_td_calibration_resolves_both_sglang_cuda_graph_phases() -> None:
     """Exercise SGLang's phase resolver after generation-batch merging.
 
@@ -216,9 +161,8 @@ def test_moss_td_calibration_resolves_both_sglang_cuda_graph_phases() -> None:
             "prefill": {"backend": "breakable"},
         },
     }
-    normalized = builder.prepare_server_args_overrides(operator_overrides)
     merged = build_generation_batch_overrides(
-        server_args_overrides=normalized,
+        server_args_overrides=operator_overrides,
         **builder.generation_defaults(dtype="bfloat16"),
     )
     builder.adjust_overrides(merged)
@@ -241,6 +185,7 @@ def test_moss_td_calibration_resolves_both_sglang_cuda_graph_phases() -> None:
     assert server_args.enable_torch_compile is False
     assert resolved.cuda_graph_config.prefill.backend == "disabled"
     assert resolved.cuda_graph_config.decode.backend == "disabled"
+    builder.validate_before_infrastructure(server_args)
 
 
 def test_factory_calibration_wires_collector_shutdown(
@@ -262,7 +207,6 @@ def test_factory_calibration_wires_collector_shutdown(
     monkeypatch.setattr(kv_calibration, "attach_moss_td_kv_calibration", fake_attach)
 
     def capture_overrides(**kwargs):
-        captured["generation_defaults"] = dict(kwargs)
         return {
             key: value
             for key, value in kwargs.items()
@@ -280,7 +224,7 @@ def test_factory_calibration_wires_collector_shutdown(
         return SimpleNamespace(
             context_length=4096,
             disable_cuda_graph=kwargs["disable_cuda_graph"],
-            enable_torch_compile=False,
+            enable_torch_compile=kwargs["enable_torch_compile"],
             cuda_graph_config=SimpleNamespace(
                 decode=SimpleNamespace(backend="disabled"),
                 prefill=SimpleNamespace(backend="disabled"),
@@ -298,16 +242,6 @@ def test_factory_calibration_wires_collector_shutdown(
         },
     )
 
-    assert captured["generation_defaults"]["server_args_overrides"] == {
-        "disable_cuda_graph": True,
-        "enable_torch_compile": False,
-        "cuda_graph_backend_decode": "disabled",
-        "cuda_graph_backend_prefill": "disabled",
-        "cuda_graph_config": {
-            "decode": {"backend": "disabled"},
-            "prefill": {"backend": "disabled"},
-        },
-    }
     assert server_args_kwargs["disable_cuda_graph"] is True
     assert server_args_kwargs["enable_torch_compile"] is False
     assert server_args_kwargs["cuda_graph_backend_decode"] == "disabled"
@@ -568,6 +502,7 @@ def _stub_factory_env(monkeypatch: pytest.MonkeyPatch, *, want_cuda_graph: bool)
             ),
         ),
     )
+    monkeypatch.setattr(engine_builder, "resolved_view", lambda args: args)
     monkeypatch.setattr(
         engine_factory, "validate_generation_batch_policy", lambda **k: None
     )

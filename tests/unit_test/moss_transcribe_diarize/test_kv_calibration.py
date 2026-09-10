@@ -6,7 +6,6 @@ from __future__ import annotations
 import copy
 import json
 import math
-import time
 
 import pytest
 import torch
@@ -70,7 +69,6 @@ def _collect_complete_raw_artifact(tmp_path):
         model,
         model_path="OpenMOSS-Team/MOSS-Transcribe-Diarize",
         output_path=raw_path,
-        checkpoint_interval_s=3600,
         git_metadata=("f62fd76cc9b2cc589db2c2e34f325870c1a5fd73", True),
     )
     query = torch.ones(1, 2)
@@ -92,7 +90,6 @@ def test_collector_hooks_radix_inputs_and_publishes_atomic_raw_artifact(tmp_path
         model,
         model_path="OpenMOSS-Team/MOSS-Transcribe-Diarize",
         output_path=raw_path,
-        checkpoint_interval_s=3600,
         git_metadata=("deadbeef", False),
     )
 
@@ -144,13 +141,15 @@ def test_attach_rejects_a_decoder_that_is_not_exactly_28_layers(tmp_path):
         )
 
 
-def test_checkpoint_interval_must_be_positive(tmp_path):
-    with pytest.raises(ValueError, match="positive"):
+def test_attach_requires_a_fresh_output_path(tmp_path):
+    raw_path = tmp_path / "raw.json"
+    raw_path.write_text("old artifact\n", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="overwrite existing"):
         attach_moss_td_kv_calibration(
             _FakeMossModel(),
             model_path="model",
-            output_path=tmp_path / "raw.json",
-            checkpoint_interval_s=0,
+            output_path=raw_path,
             git_metadata=("deadbeef", False),
         )
 
@@ -178,7 +177,6 @@ def test_finalize_rejects_missing_layer_observation(tmp_path):
         model,
         model_path="model",
         output_path=raw_path,
-        checkpoint_interval_s=3600,
         git_metadata=("deadbeef", False),
     )
     for layer_id, module in enumerate(model.language_model.model.layers[:-1]):
@@ -206,7 +204,6 @@ def test_finalize_rejects_nonfinite_amax(tmp_path, key_value, value_value):
         model,
         model_path="model",
         output_path=raw_path,
-        checkpoint_interval_s=3600,
         git_metadata=("deadbeef", False),
     )
     for layer_id, module in enumerate(model.language_model.model.layers):
@@ -220,65 +217,6 @@ def test_finalize_rejects_nonfinite_amax(tmp_path, key_value, value_value):
     with pytest.raises(CalibrationValidationError):
         collector.finalize()
 
-    assert json.loads(raw_path.read_text(encoding="utf-8"))["status"] == "invalid"
-
-
-def test_nonfinite_observation_stays_sticky_after_later_finite_values(tmp_path):
-    raw_path = tmp_path / "moss_td.raw.json"
-    model = _FakeMossModel()
-    collector = attach_moss_td_kv_calibration(
-        model,
-        model_path="model",
-        output_path=raw_path,
-        git_metadata=("deadbeef", False),
-    )
-    attention = model.language_model.model.layers[0].self_attn.attn
-    attention(
-        torch.ones(1, 1),
-        torch.tensor([[float("nan")]]),
-        torch.ones(1, 1),
-        None,
-    )
-    attention(
-        torch.ones(1, 1),
-        torch.tensor([[999.0]]),
-        torch.tensor([[2.0]]),
-        None,
-    )
-
-    snapshot = collector._payload(status="in_progress")
-    assert snapshot["layers"][0]["k_amax"] == "NaN"
-    with pytest.raises(CalibrationValidationError):
-        collector.finalize()
-
-
-def test_checkpoint_failure_is_sticky_and_cannot_publish_complete(tmp_path):
-    raw_path = tmp_path / "moss_td.raw.json"
-    model = _FakeMossModel()
-    collector = attach_moss_td_kv_calibration(
-        model,
-        model_path="model",
-        output_path=raw_path,
-        checkpoint_interval_s=3600,
-        git_metadata=("deadbeef", False),
-    )
-    collector._next_checkpoint_at = time.monotonic() - 1
-
-    def fail_checkpoint(*, status):
-        del status
-        raise OSError("simulated checkpoint failure")
-
-    collector._write_snapshot = fail_checkpoint
-    with pytest.raises(OSError, match="checkpoint failure"):
-        model.language_model.model.layers[0].self_attn.attn(
-            torch.ones(1, 1),
-            torch.ones(1, 1),
-            torch.ones(1, 1),
-            None,
-        )
-
-    with pytest.raises(CalibrationValidationError, match="checkpoint failed"):
-        collector.finalize()
     assert json.loads(raw_path.read_text(encoding="utf-8"))["status"] == "invalid"
 
 
@@ -386,23 +324,12 @@ def test_conversion_round_trips_actual_sglang_loader(tmp_path):
     assert loaded == {int(layer): value for layer, value in scales.items()}
 
 
-def test_conversion_keeps_existing_output_when_consumer_validation_fails(
-    tmp_path, monkeypatch
-):
+def test_conversion_requires_a_fresh_output_path(tmp_path):
     raw_path = _collect_complete_raw_artifact(tmp_path)
     output_path = tmp_path / "moss_td.kv_scales.json"
     output_path.write_text("old artifact\n", encoding="utf-8")
 
-    def reject_consumer(_path, *, expected_scales):
-        del expected_scales
-        raise CalibrationValidationError("consumer rejected staging artifact")
-
-    monkeypatch.setattr(
-        "sglang_omni.models.moss_transcribe_diarize.kv_calibration"
-        ".validate_vllm_legacy_scale_artifact",
-        reject_consumer,
-    )
-    with pytest.raises(CalibrationValidationError, match="consumer rejected"):
+    with pytest.raises(FileExistsError, match="overwrite existing"):
         convert_raw_calibration_to_vllm_legacy(
             raw_path,
             output_path,
@@ -410,16 +337,6 @@ def test_conversion_keeps_existing_output_when_consumer_validation_fails(
         )
     assert output_path.read_text(encoding="utf-8") == "old artifact\n"
     assert not list(tmp_path.glob("*.tmp"))
-
-
-def test_legacy_loader_validation_rejects_duplicate_json_layer_ids(tmp_path):
-    output_path = tmp_path / "duplicate.json"
-    output_path.write_text(
-        '{"kv_cache":{"scaling_factor":{"0":{"0":1,"0":2}}}}',
-        encoding="utf-8",
-    )
-    with pytest.raises(CalibrationValidationError, match="duplicate JSON key"):
-        validate_vllm_legacy_scale_artifact(output_path)
 
 
 @pytest.mark.parametrize("margin", [0, -1, math.nan, math.inf])
