@@ -113,7 +113,6 @@ test ! -e "$RAW" || { echo "choose a fresh RAW path" >&2; exit 1; }
 
 CUDA_VISIBLE_DEVICES=0 sgl-omni serve \
   --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
-  --dtype bfloat16 \
   --asr.factory.kv_calibration_output_path "$RAW" \
   --asr.engine.disable_cuda_graph true \
   --asr.engine.enable_torch_compile false \
@@ -181,8 +180,8 @@ request:
 SCALES=results/moss_td_kv_scales.json
 CUDA_VISIBLE_DEVICES=0 sgl-omni serve \
   --model-path OpenMOSS-Team/MOSS-Transcribe-Diarize \
-  --kv-cache-dtype fp8_e4m3 \
-  --quantization-param-path "$SCALES"
+  --asr.engine.kv_cache_dtype fp8_e4m3 \
+  --asr.engine.quantization_param_path "$SCALES"
 ```
 
 The smoke is successful only if the server loads the scale file, serves the

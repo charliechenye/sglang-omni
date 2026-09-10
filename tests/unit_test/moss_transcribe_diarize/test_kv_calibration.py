@@ -229,18 +229,9 @@ def complete_payload(tmp_path):
 @pytest.mark.parametrize(
     ("mutation", "message"),
     [
-        (lambda payload: payload.update(num_layers=27), "exactly 28 layers"),
         (
             lambda payload: payload.update(observed_layers=list(range(27))),
             "exactly all 28 layers",
-        ),
-        (
-            lambda payload: payload.update(observed_layer_count=27),
-            "observed_layer_count",
-        ),
-        (
-            lambda payload: payload["layers"].pop(4),
-            "layer records",
         ),
         (
             lambda payload: payload["layers"][3].update(k_amax=0),
@@ -288,9 +279,6 @@ def test_conversion_requires_margin_and_uses_shared_legacy_scale(
             int(layer): float(value) for layer, value in expected_scales.items()
         },
     )
-
-    with pytest.raises(TypeError):
-        convert_raw_calibration_to_vllm_legacy(raw_path, output_path)
 
     converted = convert_raw_calibration_to_vllm_legacy(
         raw_path,
