@@ -615,9 +615,8 @@ def _prepare_hift_for_inference(hift: Any) -> None:
     # note (Dayuxiaoshui): folding weight_norm is the only load-time step
     # batched decode needs. The pinned CausalHiFTGenerator already squeezes
     # the source to [B, T] before its STFT and casts f0_predictor to float64
-    # inside inference().
-    # note (chenye): Different padded execution shapes may still produce
-    # small floating-point waveform differences.
+    # inside inference(), and right-zero-padded mels reproduce per-request
+    # output bit-for-bit except in the final mel frame of padded requests.
     folded = _fold_weight_norm(hift)
     logger.info(
         "Prepared Fun-CosyVoice3 HiFT for inference (folded %d weight_norm "
@@ -829,9 +828,6 @@ class _PreparedFlowRequest:
     sample_rate: int
     flow_input: FlowBatchInput
     total_mel_frames: int
-    # note(chenye): Immutable provenance keeps buffered HiFT grouping
-    # scoped to its atomic Flow bucket even when adjacent buckets share
-    # one Flow solve.
     baseline_bucket_key: int
 
 
@@ -961,18 +957,12 @@ def _group_flow_requests(
     coalesce_span_frames: int,
     coalesce_max_added_padding_pct: float,
 ) -> list[list[_PreparedFlowRequest]]:
-    """note(chenye): Choose an exact objective optimal contiguous coarsening of
-    Flow buckets.
-
-    The three DP stages mirror the frozen objective order: solve count, padded
-    work, maximum newly merged span, then the bucket-range signature.
-    """
+    """note(chenye): Coarsen contiguous Flow buckets by solve count, padded work,
+    merged span, then deterministic bucket-range order."""
     _validate_flow_batch_coalescing_config(
         coalesce_span_frames, coalesce_max_added_padding_pct
     )
     if coalesce_span_frames == 0:
-        # note(chenye): Disabled behavior deliberately preserves current grouping
-        # and order.
         return list(buckets.values())
     if not buckets:
         return []
@@ -986,12 +976,9 @@ def _group_flow_requests(
         for _, requests in atomic_groups
     )
     if baseline_work == 0:
-        # note(chenye): Let Flow validation handle malformed zero length inputs.
+        # note(chenye): Avoid division by zero; Flow validates empty inputs later.
         return baseline_groups
 
-    # note(chenye): Stage A: minimum padded work for each exact Flow solve count.
-    # The cap is checked against the complete partition, not independently per
-    # segment.
     minimum_work = _minimum_flow_work_solver(
         segment_matrix, max_merged_span=coalesce_span_frames
     )
@@ -1010,7 +997,6 @@ def _group_flow_requests(
 
     assert solve_count is not None and optimal_work is not None
 
-    # note(chenye): Stage B: scan the finite set of achievable maximum spans.
     candidate_spans = sorted(
         {
             segment.newly_merged_span
@@ -1030,7 +1016,6 @@ def _group_flow_requests(
     else:
         raise AssertionError("atomic Flow partition must be reachable")
 
-    # note(chenye): Stage C: reconstruct the lexicographically smallest range signature.
     min_work = _minimum_flow_work_solver(
         segment_matrix, max_merged_span=optimal_max_merged_span
     )
@@ -1041,7 +1026,7 @@ def _group_flow_requests(
     atomic_count = len(atomic_groups)
     while groups_left > 0:
         last_end = atomic_count - groups_left + 1
-        # note(chenye): The earliest feasible end is the lexicographically smallest choice.
+        # note(chenye): Earliest feasible ends implement the deterministic range tie-break.
         for end in range(start + 1, last_end + 1):
             segment = segment_matrix[start][end]
             if segment is None or segment.newly_merged_span > optimal_max_merged_span:
@@ -1190,8 +1175,7 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
 
                 pairs = list(zip(flow_group, mel_list, strict=True))
 
-                # note(chenye): Flow groups are contiguous atomic-bucket flattenings,
-                # so groupby restores the unchanged HiFT policy per provenance key.
+                # note(chenye): Atomic buckets stay contiguous, so groupby restores HiFT groups.
                 for _, atomic_pairs_iter in groupby(
                     pairs, key=lambda pair: pair[0].baseline_bucket_key
                 ):

@@ -406,11 +406,11 @@ def test_decode_batch_coalesces_flow_preserving_hift_groups_and_order(
             id="maximum-merged-span",
         ),
         pytest.param(
-            list(range(10, 161, 10)),
-            10,
-            150,
-            100,
-            [list(range(10, 161, 10))],
+            [450] + [500] * 15,
+            50,
+            384,
+            20,
+            [[450] + [500] * 15],
             id="b16-production-regime",
         ),
     ],
@@ -659,29 +659,6 @@ def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) ->
     assert scheduler._vocoder._flow_batch_coalesce_max_added_padding_pct == 20.0
 
 
-def test_create_vocoder_executor_can_disable_flow_coalescing(monkeypatch) -> None:
-    monkeypatch.setattr(stages, "resolve_device_spec", lambda device, gpu_id: "cpu")
-    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
-    monkeypatch.setattr(
-        stages,
-        "_load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, device, fp16, **kwargs: (
-            _BatchCapableFakeFlow(),
-            _FakeHiFT(),
-        ),
-    )
-
-    scheduler = stages.create_vocoder_executor(
-        "model",
-        device="cpu",
-        flow_batch_coalesce_span_frames=0,
-        flow_batch_coalesce_max_added_padding_pct=0,
-    )
-
-    assert scheduler._vocoder._flow_batch_coalesce_span_frames == 0
-    assert scheduler._vocoder._flow_batch_coalesce_max_added_padding_pct == 0
-
-
 def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
@@ -715,8 +692,8 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         max_batch_wait_ms=7,
         flow_batch_bucket_frames=100,
         flow_batch_admission_frames=200,
-        flow_batch_coalesce_span_frames=64,
-        flow_batch_coalesce_max_added_padding_pct=5,
+        flow_batch_coalesce_span_frames=0,
+        flow_batch_coalesce_max_added_padding_pct=0,
     )
 
     assert isinstance(scheduler, FunCosyVoice3StreamingVocoderScheduler)
@@ -724,8 +701,8 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
     assert scheduler._max_batch_wait_s == pytest.approx(0.007)
     assert scheduler._max_batch_cost == 200
     assert callable(scheduler._request_cost_fn)
-    assert scheduler._vocoder._flow_batch_coalesce_span_frames == 64
-    assert scheduler._vocoder._flow_batch_coalesce_max_added_padding_pct == 5
+    assert scheduler._vocoder._flow_batch_coalesce_span_frames == 0
+    assert scheduler._vocoder._flow_batch_coalesce_max_added_padding_pct == 0
     state = _state(prompt_tokens=1)
     state.audio_codes = _codes(2)
     assert scheduler._request_cost_fn(_payload(state)) == 100
