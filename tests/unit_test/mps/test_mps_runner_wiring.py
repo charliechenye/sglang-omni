@@ -189,13 +189,12 @@ class _FakeMps:
         close_error: BaseException | None = None,
         spawn_env: dict[str, str] | None = None,
         probe_result: dict[str, str] | None = None,
-        probe_gate: asyncio.Event | None = None,
     ) -> None:
         self.events = events
         self.close_error = close_error
         self.spawn_env = spawn_env or {"CUDA_MPS_PIPE_DIRECTORY": "/tmp/mps-pipe"}
         self.probe_result = probe_result or {}
-        self.probe_gate = probe_gate
+        self.probe_calls = 0
         self.started = False
         self.verified = False
         self.close_process_start_attempts: set[str] | None = None
@@ -224,8 +223,7 @@ class _FakeMps:
         return {process_name}
 
     async def probe_failures(self) -> dict[str, str]:
-        if self.probe_gate is not None:
-            await self.probe_gate.wait()
+        self.probe_calls += 1
         return dict(self.probe_result)
 
     async def close(
@@ -503,41 +501,42 @@ async def test_attempted_mps_process_start_keeps_fail_closed_cleanup(
 
 
 @pytest.mark.asyncio
-async def test_mps_watchdog_fails_serving_before_launcher_cleanup(
-    short_base,
-    monkeypatch,
-    caplog,
-):
+async def test_mps_steady_state_does_not_probe_control_plane(short_base, monkeypatch):
     events: list[str] = []
-    entered = asyncio.Event()
-    release = asyncio.Event()
-    group = _FakeGroup(events, shutdown_gate=(entered, release))
-    dirty = MpsDirtyStateError("dirty state persisted")
-    probe_gate = asyncio.Event()
+    group = _FakeGroup(events)
     fake_mps = _FakeMps(
         events,
-        close_error=dirty,
         probe_result={FAKE_GPU_UUID: "daemon identity changed"},
-        probe_gate=probe_gate,
     )
     _patch_runner(monkeypatch, events, group, fake_mps)
-    runner = mp_runner.MultiProcessPipelineRunner(_make_config(short_base))
+    runner = mp_runner.MultiProcessPipelineRunner(_make_config(short_base, mps="on"))
     await runner.start()
 
-    probe_gate.set()
-    with pytest.raises(RuntimeError, match="MPS health check failed") as exc_info:
+    await asyncio.sleep(0)
+
+    assert fake_mps.probe_calls == 0
+    assert runner._fatal_error is None
+    await runner.stop()
+
+
+@pytest.mark.asyncio
+async def test_mps_runner_still_fails_when_stage_process_dies(short_base, monkeypatch):
+    events: list[str] = []
+    group = _FakeGroup(events)
+    fake_mps = _FakeMps(
+        events,
+        probe_result={FAKE_GPU_UUID: "daemon identity changed"},
+    )
+    _patch_runner(monkeypatch, events, group, fake_mps)
+    runner = mp_runner.MultiProcessPipelineRunner(_make_config(short_base, mps="on"))
+    await runner.start()
+
+    group.dead = True
+    with pytest.raises(RuntimeError, match="Dead stage process") as exc_info:
         await runner.wait_failed()
 
-    stop_task = asyncio.create_task(runner.stop())
-    await entered.wait()
-    assert not stop_task.done()
-    release.set()
-    await stop_task
-
-    assert "MPS teardown incomplete: dirty state persisted" in caplog.text
-    assert FAKE_GPU_UUID in str(exc_info.value)
-    assert "daemon identity changed" in str(exc_info.value)
-    assert exc_info.value.__cause__ is dirty
+    assert "MPS health check" not in str(exc_info.value)
+    await runner.stop()
 
 
 @pytest.mark.asyncio

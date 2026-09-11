@@ -728,20 +728,6 @@ class MultiProcessPipelineRunner:
                     logger.error("%s", error)
                     await self._fail_runtime(error)
                     return
-            if self._mps is not None:
-                probe_failures = await self._mps.probe_failures()
-                if probe_failures:
-                    details = "; ".join(
-                        f"{gpu_uuid}: {reason}"
-                        for gpu_uuid, reason in sorted(probe_failures.items())
-                    )
-                    error = RuntimeError(
-                        f"MPS health check failed on physical GPU(s) ({details}); "
-                        "failing the pipeline instead of serving degraded"
-                    )
-                    logger.error("%s", error)
-                    await self._fail_runtime(error)
-                    return
             await asyncio.sleep(5.0)
 
     async def _fail_runtime(self, error: BaseException) -> None:
