@@ -86,8 +86,6 @@ class MpsControlClient(Protocol):
 
     def start_daemon(self, pipe_dir: Path, log_dir: Path, gpu_uuid: str) -> None: ...
 
-    def read_daemon_identity(self, pipe_dir: Path) -> int: ...
-
     def read_daemon_process_identity(self, pipe_dir: Path) -> MpsProcessIdentity: ...
 
     def read_server_process_identity(
@@ -111,7 +109,6 @@ class MpsControlClient(Protocol):
 
 @dataclass
 class _ExistingState:
-    daemon_pid: int | None = None
     daemon_identity: MpsProcessIdentity | None = None
     owners: dict[int, bool] = field(default_factory=dict)
     owner_statuses: dict[int, str] = field(default_factory=dict)
@@ -222,7 +219,6 @@ class MpsManager:
         state = self._inspect_existing_state()
         if (
             not state.errors
-            and state.daemon_pid is not None
             and state.daemon_identity is not None
             and state.clients is not None
             and state.owners
@@ -232,7 +228,7 @@ class MpsManager:
             owner_fd = self._publish_owner()
             logger.info(
                 "Joining shared MPS daemon pid %d on %s (owners: %s)",
-                state.daemon_pid,
+                state.daemon_identity.pid,
                 self.gpu_uuid,
                 sorted(state.owners),
             )
@@ -302,7 +298,6 @@ class MpsManager:
             state.daemon_identity = self.client.read_daemon_process_identity(
                 self.paths.pipe_dir
             )
-            state.daemon_pid = state.daemon_identity.pid
         except MpsControlError as exc:
             state.errors.append(f"daemon identity: {exc}")
         try:
@@ -326,8 +321,8 @@ class MpsManager:
 
     def _dirty_state_report(self, state: _ExistingState) -> str:
         daemon = (
-            f"pid {state.daemon_pid} with verified native identity"
-            if state.daemon_pid is not None
+            f"pid {state.daemon_identity.pid} with verified native identity"
+            if state.daemon_identity is not None
             else "identity unverified"
         )
         owners = {
