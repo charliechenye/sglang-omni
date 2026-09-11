@@ -69,6 +69,19 @@ def _make_config(base_path: Path, *, mps: str = "auto") -> PipelineConfig:
     return ConfigResolver(base).resolve(ConfigPatchSet([patch])).config
 
 
+def _patch_monitor_sleep(monkeypatch: pytest.MonkeyPatch) -> asyncio.Event:
+    original_sleep = asyncio.sleep
+    monitor_checkpoint = asyncio.Event()
+
+    async def checkpoint(delay: float) -> None:
+        if delay == 5.0:
+            monitor_checkpoint.set()
+        await original_sleep(0)
+
+    monkeypatch.setattr(mp_runner.asyncio, "sleep", checkpoint)
+    return monitor_checkpoint
+
+
 class _FakeCoordinator:
     def __init__(self, events: list[str], *args, **kwargs) -> None:
         del args, kwargs
@@ -502,6 +515,7 @@ async def test_attempted_mps_process_start_keeps_fail_closed_cleanup(
 
 @pytest.mark.asyncio
 async def test_mps_steady_state_does_not_probe_control_plane(short_base, monkeypatch):
+    monitor_checkpoint = _patch_monitor_sleep(monkeypatch)
     events: list[str] = []
     group = _FakeGroup(events)
     fake_mps = _FakeMps(
@@ -512,7 +526,7 @@ async def test_mps_steady_state_does_not_probe_control_plane(short_base, monkeyp
     runner = mp_runner.MultiProcessPipelineRunner(_make_config(short_base, mps="on"))
     await runner.start()
 
-    await asyncio.sleep(0)
+    await asyncio.wait_for(monitor_checkpoint.wait(), timeout=1.0)
 
     assert fake_mps.probe_calls == 0
     assert runner._fatal_error is None
@@ -521,6 +535,7 @@ async def test_mps_steady_state_does_not_probe_control_plane(short_base, monkeyp
 
 @pytest.mark.asyncio
 async def test_mps_runner_still_fails_when_stage_process_dies(short_base, monkeypatch):
+    monitor_checkpoint = _patch_monitor_sleep(monkeypatch)
     events: list[str] = []
     group = _FakeGroup(events)
     fake_mps = _FakeMps(
@@ -531,10 +546,12 @@ async def test_mps_runner_still_fails_when_stage_process_dies(short_base, monkey
     runner = mp_runner.MultiProcessPipelineRunner(_make_config(short_base, mps="on"))
     await runner.start()
 
+    await asyncio.wait_for(monitor_checkpoint.wait(), timeout=1.0)
     group.dead = True
     with pytest.raises(RuntimeError, match="Dead stage process") as exc_info:
         await runner.wait_failed()
 
+    assert fake_mps.probe_calls == 0
     assert "MPS health check" not in str(exc_info.value)
     await runner.stop()
 
@@ -568,12 +585,7 @@ async def test_mps_off_keeps_merge_base_spawn_and_failure_order(
     group = _FakeGroup(events, shutdown_gate=(entered, release))
     _patch_runner(monkeypatch, events, group, fake_mps=None)
 
-    original_sleep = asyncio.sleep
-
-    async def checkpoint(_delay: float) -> None:
-        await original_sleep(0)
-
-    monkeypatch.setattr(mp_runner.asyncio, "sleep", checkpoint)
+    _patch_monitor_sleep(monkeypatch)
 
     def unexpected_mps(*args, **kwargs):
         del args, kwargs
