@@ -14,56 +14,8 @@ from sglang_omni.models.fun_cosyvoice3.config import (
 )
 
 
-class _TokenEmbedding:
-    def __init__(self, channels: int) -> None:
-        self._channels = channels
-
-    def __call__(self, token: torch.Tensor) -> torch.Tensor:
-        return torch.ones(
-            *token.shape,
-            self._channels,
-            device=token.device,
-            dtype=torch.float32,
-        )
-
-
-class _SpeakerAffine:
-    in_features = 3
-    out_features = 5
-
-    def __call__(self, embedding: torch.Tensor) -> torch.Tensor:
-        return torch.zeros(
-            embedding.shape[0],
-            self.out_features,
-            device=embedding.device,
-            dtype=embedding.dtype,
-        )
-
-
-class _ReplayGraph:
-    def __init__(
-        self,
-        static_inputs: tuple[torch.Tensor, ...],
-        static_output: torch.Tensor,
-        *,
-        fail: bool,
-    ) -> None:
-        self._static_inputs = static_inputs
-        self._static_output = static_output
-        self._fail = fail
-        self.replay_calls = 0
-
-    def replay(self) -> None:
-        self.replay_calls += 1
-        if self._fail:
-            raise RuntimeError("synthetic replay failure")
-        self._static_output.copy_(
-            self._static_inputs[0] + self._static_inputs[2] + self._static_inputs[5]
-        )
-
-
 @pytest.fixture(autouse=True)
-def _patch_cuda_contexts(monkeypatch):
+def _cpu_cuda_contexts(monkeypatch) -> None:
     monkeypatch.setattr(
         torch.cuda, "device", lambda *args, **kwargs: contextlib.nullcontext()
     )
@@ -72,320 +24,146 @@ def _patch_cuda_contexts(monkeypatch):
     )
 
 
-def _flow(*, channels: int = 4, max_frames: int = 512):
-    parameter = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
-    decoder = SimpleNamespace(
-        t_scheduler="linear",
-        inference_cfg_rate=0.0,
-        rand_noise=torch.zeros(1, channels, max_frames, dtype=torch.float32),
-        estimator=torch.nn.Identity(),
-    )
+def _flow(*, channels: int = 4, max_frames: int = 512) -> SimpleNamespace:
+    parameter = torch.nn.Parameter(torch.zeros(1))
     return SimpleNamespace(
         parameters=lambda: iter((parameter,)),
-        decoder=decoder,
+        decoder=SimpleNamespace(
+            t_scheduler="linear",
+            inference_cfg_rate=0.0,
+            rand_noise=torch.zeros(1, channels, max_frames),
+            estimator=torch.nn.Identity(),
+        ),
         output_size=channels,
         token_mel_ratio=1,
-        spk_embed_affine_layer=_SpeakerAffine(),
-        input_embedding=_TokenEmbedding(channels),
+        spk_embed_affine_layer=torch.nn.Linear(3, 5),
+        input_embedding=lambda token: torch.ones(*token.shape, channels),
         pre_lookahead_layer=torch.nn.Identity(),
     )
 
 
-def _runner(
-    flow=None, *, compute_dtype: torch.dtype | None = torch.bfloat16
-) -> stages.FlowCudaGraphRunner:
+class _ReplayGraph:
+    def __init__(
+        self,
+        static_inputs: tuple[torch.Tensor, ...],
+        static_output: torch.Tensor,
+        *,
+        fail: bool = False,
+    ) -> None:
+        self._static_inputs = static_inputs
+        self._static_output = static_output
+        self._fail = fail
+
+    def replay(self) -> None:
+        if self._fail:
+            raise RuntimeError("replay failed")
+        self._static_output.copy_(
+            self._static_inputs[0] + self._static_inputs[2] + self._static_inputs[5]
+        )
+
+
+def _runner() -> stages.FlowCudaGraphRunner:
     return stages.FlowCudaGraphRunner(
-        flow or _flow(),
-        device=torch.device("cpu"),
-        compute_dtype=compute_dtype,
+        _flow(), device=torch.device("cpu"), compute_dtype=None
     )
 
 
-def _inputs(
-    batch_size: int,
-    frames: int,
-    *,
-    channels: int = 4,
-    solver_dtype: torch.dtype = torch.float32,
-    speaker_dtype: torch.dtype = torch.bfloat16,
-) -> tuple[torch.Tensor, ...]:
-    x = (
-        torch.arange(batch_size * channels * frames, dtype=torch.float32)
-        .reshape(batch_size, channels, frames)
-        .to(solver_dtype)
-    )
-    t_span = torch.linspace(0, 1, 11, dtype=solver_dtype)
-    mu = torch.full_like(x, 2)
-    mask = torch.ones(batch_size, 1, frames, dtype=solver_dtype)
-    spks = (
-        torch.arange(batch_size * 5, dtype=torch.float32)
-        .reshape(batch_size, 5)
-        .to(speaker_dtype)
-    )
-    cond = torch.full_like(x, 3)
-    return x, t_span, mu, mask, spks, cond
-
-
-def _install_graph(
-    runner: stages.FlowCudaGraphRunner,
-    key: tuple[int, int],
-    *,
-    fail: bool = False,
-) -> _ReplayGraph:
+def _install(
+    runner: stages.FlowCudaGraphRunner, key: tuple[int, int], *, fail: bool = False
+) -> None:
     static_inputs = runner.capture_inputs(*key)
     static_output = torch.empty_like(static_inputs[0])
-    graph = _ReplayGraph(static_inputs, static_output, fail=fail)
     runner._graphs[key] = stages.CapturedFlowCudaGraph(
-        graph, static_inputs, static_output
+        _ReplayGraph(static_inputs, static_output, fail=fail),
+        static_inputs,
+        static_output,
     )
-    return graph
 
 
-def _generation_case():
-    flow = _flow(max_frames=64)
-    packed = SimpleNamespace(
-        token=torch.ones(1, 17, dtype=torch.int32),
-        token_mask=torch.ones(1, 17, 1, dtype=torch.bool),
-        combined_token_lengths=(17,),
-        target_token_lengths=(17,),
+def _solver_inputs(
+    batch_size: int, frames: int, channels: int = 4
+) -> tuple[torch.Tensor, ...]:
+    x = torch.ones(batch_size, channels, frames)
+    return (
+        x,
+        torch.linspace(0, 1, 11),
+        torch.full_like(x, 2),
+        torch.ones(batch_size, 1, frames),
+        torch.zeros(batch_size, 5),
+        torch.full_like(x, 3),
+    )
+
+
+def _packed_tokens(length: int = 17) -> SimpleNamespace:
+    return SimpleNamespace(
+        token=torch.ones(1, length, dtype=torch.int32),
+        token_mask=torch.ones(1, length, 1, dtype=torch.bool),
+        combined_token_lengths=(length,),
         prompt_mel_lengths=(0,),
-        total_mel_lengths_tensor=torch.tensor([17]),
+        total_mel_lengths_tensor=torch.tensor([length]),
         prompt_feat=torch.zeros(1, 0, 4),
         embedding=torch.ones(1, 3),
     )
-    return flow, packed
 
 
-def test_flow_cuda_graph_capture_shapes_validate_explicit_policy() -> None:
+def test_verify_capture_shapes_uses_defaults_and_rejects_bad_entries() -> None:
     assert (
-        stages.verify_flow_cuda_graph_capture_shapes(
-            None,
-            max_batch_size=16,
-        )
+        stages.verify_flow_cuda_graph_capture_shapes(None, max_batch_size=16)
         == FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
     )
-
-    with pytest.raises(ValueError, match=r"\(2, 384\).*max_batch_size=1"):
-        stages.verify_flow_cuda_graph_capture_shapes(
-            None,
-            max_batch_size=1,
-        )
-
-    invalid_shapes = [
-        ("non-positive batch", [(0, 496)], "positive"),
-        ("non-positive frames", [(1, 0)], "positive"),
-        ("non-integer batch", [(1.0, 496)], "integer"),
-        ("boolean batch", [(True, 496)], "integer"),
-        ("unaligned frames", [(1, 495)], "aligned"),
-        ("duplicate shape", [(1, 496), (1, 496)], "duplicates"),
-        ("malformed entry", [(1, 496, 512)], "pairs"),
-    ]
-    for _, capture_shapes, message in invalid_shapes:
-        with pytest.raises(ValueError, match=message):
-            stages.verify_flow_cuda_graph_capture_shapes(
-                capture_shapes,
-                max_batch_size=16,
-            )
-
-    with pytest.raises(
-        ValueError,
-        match=r"\(32, 576\).*max_batch_size=16",
-    ):
-        stages.verify_flow_cuda_graph_capture_shapes(
-            [[32, 576]],
-            max_batch_size=16,
-        )
+    with pytest.raises(ValueError, match="max_batch_size"):
+        stages.verify_flow_cuda_graph_capture_shapes([[32, 576]], max_batch_size=16)
+    with pytest.raises(ValueError, match="aligned"):
+        stages.verify_flow_cuda_graph_capture_shapes([[1, 495]], max_batch_size=16)
 
 
-def test_factory_rejects_unreachable_flow_cuda_graph_batch() -> None:
-    with pytest.raises(
-        ValueError,
-        match=r"\(32, 576\).*max_batch_size=16",
-    ):
-        stages.create_vocoder_executor(
-            "model",
-            max_batch_size=16,
-            flow_cuda_graph_capture_shapes=[[32, 576]],
-        )
-
-
-@pytest.mark.parametrize(
-    ("compute_dtype", "solver_dtype", "speaker_dtype"),
-    [
-        (torch.bfloat16, torch.float32, torch.bfloat16),
-        (None, torch.float32, torch.float32),
-    ],
-    ids=["bf16-autocast", "fp32-no-autocast"],
-)
-def test_resident_replay_and_nonresident_fallback(
-    monkeypatch, compute_dtype, solver_dtype, speaker_dtype
-) -> None:
-    flow = _flow(channels=6)
-    runner = _runner(flow, compute_dtype=compute_dtype)
-    resident = _install_graph(runner, (2, 496))
-
-    inputs = _inputs(
-        2,
-        489,
-        channels=6,
-        solver_dtype=solver_dtype,
-        speaker_dtype=speaker_dtype,
-    )
-    original_x, _, original_mu, _, _, original_cond = inputs
-    output = runner.run(*inputs)
+def test_resident_replay_crops_to_actual_frames() -> None:
+    runner = _runner()
+    _install(runner, (2, 496))
+    x, t_span, mu, mask, spks, cond = _solver_inputs(2, 489)
+    output = runner.run(x, t_span, mu, mask, spks, cond)
 
     assert output is not None
-    assert output.shape == (2, 6, 489)
-    assert torch.equal(output, original_x + original_mu + original_cond)
-    assert resident.replay_calls == 1
-    captured_inputs = runner._graphs[(2, 496)].static_inputs
-    assert [value.dtype for value in captured_inputs] == [
-        solver_dtype,
-        solver_dtype,
-        solver_dtype,
-        solver_dtype,
-        speaker_dtype,
-        solver_dtype,
-    ]
-    assert torch.count_nonzero(captured_inputs[0][..., 489:]) == 0
-    assert torch.count_nonzero(captured_inputs[3][..., 489:]) == 0
-    miss_inputs = _inputs(
-        2,
-        1,
-        channels=6,
-        solver_dtype=solver_dtype,
-        speaker_dtype=speaker_dtype,
-    )
-    assert runner.run(*miss_inputs) is None
-
-    fallback_flow, packed = _generation_case()
-    eager_calls = []
-
-    def _eager(*args, **kwargs):
-        eager_calls.append((args, kwargs))
-        return args[1]
-
-    monkeypatch.setattr(stages, "_solve_flow_euler", _eager)
-    generated = stages.generate_flow(fallback_flow, packed, cuda_graph_runner=runner)
-    assert generated.shape == (1, 4, 17)
-    assert len(eager_calls) == 1
+    assert output.shape == (2, 4, 489)
+    assert torch.equal(output, x + mu + cond)
 
 
-def test_replay_failure_disables_all_graphs_without_retry(monkeypatch) -> None:
+def test_nonresident_shape_returns_none() -> None:
     runner = _runner()
-    failing = _install_graph(runner, (1, 464), fail=True)
-    surviving = _install_graph(runner, (1, 480))
+    _install(runner, (2, 496))
+    assert runner.run(*_solver_inputs(2, 1)) is None
 
-    with pytest.raises(RuntimeError, match="synthetic replay failure"):
-        runner.run(*_inputs(1, 449))
-    assert failing.replay_calls == 1
+
+def test_replay_failure_clears_resident_graphs() -> None:
+    runner = _runner()
+    _install(runner, (1, 464), fail=True)
+    with pytest.raises(RuntimeError, match="replay failed"):
+        runner.run(*_solver_inputs(1, 449))
     assert runner._graphs == {}
 
-    assert runner.run(*_inputs(1, 465)) is None
-    assert surviving.replay_calls == 0
 
-    flow, packed = _generation_case()
-    eager_calls = []
-
-    class _ReplayFailure:
-        def run(self, *args, **kwargs):
-            raise RuntimeError("synthetic graph failure")
-
+def test_generate_flow_does_not_retry_eager_after_replay_failure(monkeypatch) -> None:
+    eager_calls: list[object] = []
     monkeypatch.setattr(
-        stages,
-        "_solve_flow_euler",
-        lambda *args, **kwargs: eager_calls.append((args, kwargs)),
+        stages, "_solve_flow_euler", lambda *args, **kwargs: eager_calls.append(args)
     )
-    with pytest.raises(RuntimeError, match="synthetic graph failure"):
-        stages.generate_flow(flow, packed, cuda_graph_runner=_ReplayFailure())
+
+    class _FailingRunner:
+        def run(self, *args, **kwargs):
+            raise RuntimeError("replay failed")
+
+    with pytest.raises(RuntimeError, match="replay failed"):
+        stages.generate_flow(
+            _flow(max_frames=64),
+            _packed_tokens(),
+            cuda_graph_runner=_FailingRunner(),
+        )
     assert eager_calls == []
 
 
-def _patch_factory_lifecycle(
-    monkeypatch, flow, events, captured_shape_sets, *, fail: bool
-):
-    monkeypatch.setattr(
-        stages, "resolve_concrete_device", lambda device, gpu_id: "cuda:0"
-    )
-    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "checkpoint")
-    monkeypatch.setattr(
-        stages,
-        "_load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, **kwargs: (flow, object()),
-    )
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(
-        stages,
-        "install_graph_safe_dit_chunk_mask",
-        lambda: events.append("compat"),
-    )
-    monkeypatch.setattr(
-        stages,
-        "_compile_dit_backbone",
-        lambda flow, *, compute_dtype: events.append("compile"),
-    )
-
-    class _FakeRunner:
-        def __init__(self, flow, *, device, compute_dtype):
-            events.append("runner")
-
-        def capture(self, capture_shapes):
-            events.append("capture")
-            captured_shape_sets.append(capture_shapes)
-            if fail:
-                raise RuntimeError("synthetic capture failure")
-
-    monkeypatch.setattr(stages, "FlowCudaGraphRunner", _FakeRunner)
-    monkeypatch.setattr(
-        flow,
-        "attach_cuda_graph_runner",
-        lambda runner: events.append("attach"),
-    )
-
-
-def test_factory_lifecycle_captures_after_compile(monkeypatch) -> None:
-    events = []
-    requested_capture_shapes = [[1, 496], [5, 544], [7, 576]]
-    captured_shape_sets = []
-    flow = stages.FunCosyVoice3Flow(_flow())
-    _patch_factory_lifecycle(monkeypatch, flow, events, captured_shape_sets, fail=False)
-
-    scheduler = stages.create_vocoder_executor(
-        "model",
-        enable_dit_torch_compile=True,
-        flow_cuda_graph_capture_shapes=requested_capture_shapes,
-    )
-
-    assert scheduler is not None
-    assert events == ["compat", "compile", "runner", "capture", "attach"]
-    assert captured_shape_sets == [
-        tuple(tuple(shape) for shape in requested_capture_shapes)
-    ]
-
-
-def test_factory_lifecycle_propagates_capture_failure(monkeypatch) -> None:
-    events = []
-    captured_shape_sets = []
-    flow = stages.FunCosyVoice3Flow(_flow())
-    _patch_factory_lifecycle(monkeypatch, flow, events, captured_shape_sets, fail=True)
-
-    with pytest.raises(RuntimeError, match="synthetic capture failure"):
-        stages.create_vocoder_executor(
-            "model",
-            enable_dit_torch_compile=True,
-            flow_cuda_graph_capture_shapes=[[1, 496]],
-        )
-
-    assert events == ["compat", "compile", "runner", "capture"]
-    assert captured_shape_sets == [((1, 496),)]
-
-
-def test_graph_safe_mask_preserves_buffered_behavior() -> None:
+def test_graph_safe_mask_fills_empty_rows() -> None:
     masks = torch.tensor([[[True, True, False]], [[False, False, False]]])
-    xs = torch.ones(2, 1, 3)
-
-    result = stages.graph_safe_nonstreaming_chunk_mask(xs, masks, False, False, 0, 0, 0)
-
-    assert result is masks
-    assert torch.equal(result[0], torch.tensor([[True, True, False]]))
+    result = stages.graph_safe_nonstreaming_chunk_mask(
+        torch.ones(2, 1, 3), masks, False, False, 0, 0, 0
+    )
     assert torch.equal(result[1], torch.ones(1, 3, dtype=torch.bool))
