@@ -861,6 +861,7 @@ def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:
         "flow_cuda_graph_capture_shapes": expected_capture_shapes,
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
+        "enable_flow_cuda_graph": True,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,

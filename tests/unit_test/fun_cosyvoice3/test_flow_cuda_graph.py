@@ -93,8 +93,8 @@ def _flow(*, channels: int = 4, max_frames: int = 512):
 
 def _runner(
     flow=None, *, compute_dtype: torch.dtype | None = torch.bfloat16
-) -> stages._FlowCudaGraphRunner:
-    return stages._FlowCudaGraphRunner(
+) -> stages.FlowCudaGraphRunner:
+    return stages.FlowCudaGraphRunner(
         flow or _flow(),
         device=torch.device("cpu"),
         compute_dtype=compute_dtype,
@@ -127,15 +127,15 @@ def _inputs(
 
 
 def _install_graph(
-    runner: stages._FlowCudaGraphRunner,
+    runner: stages.FlowCudaGraphRunner,
     key: tuple[int, int],
     *,
     fail: bool = False,
 ) -> _ReplayGraph:
-    static_inputs = runner._capture_inputs(*key)
+    static_inputs = runner.capture_inputs(*key)
     static_output = torch.empty_like(static_inputs[0])
     graph = _ReplayGraph(static_inputs, static_output, fail=fail)
-    runner._graphs[key] = stages._CapturedFlowCudaGraph(
+    runner._graphs[key] = stages.CapturedFlowCudaGraph(
         graph, static_inputs, static_output
     )
     return graph
@@ -158,17 +158,17 @@ def _generation_case():
 
 def test_flow_cuda_graph_capture_shapes_validate_explicit_policy() -> None:
     assert (
-        stages._resolve_flow_cuda_graph_capture_shapes(
+        stages.verify_flow_cuda_graph_capture_shapes(
             None,
             max_batch_size=16,
         )
         == FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
     )
 
-    with pytest.raises(ValueError, match=r"\(3, 448\).*max_batch_size=2"):
-        stages._resolve_flow_cuda_graph_capture_shapes(
+    with pytest.raises(ValueError, match=r"\(2, 384\).*max_batch_size=1"):
+        stages.verify_flow_cuda_graph_capture_shapes(
             None,
-            max_batch_size=2,
+            max_batch_size=1,
         )
 
     invalid_shapes = [
@@ -182,7 +182,7 @@ def test_flow_cuda_graph_capture_shapes_validate_explicit_policy() -> None:
     ]
     for _, capture_shapes, message in invalid_shapes:
         with pytest.raises(ValueError, match=message):
-            stages._resolve_flow_cuda_graph_capture_shapes(
+            stages.verify_flow_cuda_graph_capture_shapes(
                 capture_shapes,
                 max_batch_size=16,
             )
@@ -191,7 +191,7 @@ def test_flow_cuda_graph_capture_shapes_validate_explicit_policy() -> None:
         ValueError,
         match=r"\(32, 576\).*max_batch_size=16",
     ):
-        stages._resolve_flow_cuda_graph_capture_shapes(
+        stages.verify_flow_cuda_graph_capture_shapes(
             [[32, 576]],
             max_batch_size=16,
         )
@@ -266,7 +266,7 @@ def test_resident_replay_and_nonresident_fallback(
         return args[1]
 
     monkeypatch.setattr(stages, "_solve_flow_euler", _eager)
-    generated = stages._generate_flow(fallback_flow, packed, cuda_graph_runner=runner)
+    generated = stages.generate_flow(fallback_flow, packed, cuda_graph_runner=runner)
     assert generated.shape == (1, 4, 17)
     assert len(eager_calls) == 1
 
@@ -297,24 +297,17 @@ def test_replay_failure_disables_all_graphs_without_retry(monkeypatch) -> None:
         lambda *args, **kwargs: eager_calls.append((args, kwargs)),
     )
     with pytest.raises(RuntimeError, match="synthetic graph failure"):
-        stages._generate_flow(flow, packed, cuda_graph_runner=_ReplayFailure())
+        stages.generate_flow(flow, packed, cuda_graph_runner=_ReplayFailure())
     assert eager_calls == []
 
 
-@pytest.mark.parametrize("capture_fails", [False, True])
-def test_factory_lifecycle_keeps_compile_and_serving_independent(
-    monkeypatch, capture_fails: bool
-) -> None:
-    events = []
-    requested_capture_shapes = [[1, 496], [5, 544], [7, 576]]
-    captured_shape_sets = []
-    flow = stages.FunCosyVoice3Flow(_flow())
-
+def _patch_factory_lifecycle(
+    monkeypatch, flow, events, captured_shape_sets, *, fail: bool
+):
     monkeypatch.setattr(
         stages, "resolve_concrete_device", lambda device, gpu_id: "cuda:0"
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "checkpoint")
-
     monkeypatch.setattr(
         stages,
         "_load_cosyvoice3_flow_hift",
@@ -323,7 +316,7 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
         stages,
-        "_enable_flow_cuda_graph_dit_compat",
+        "install_graph_safe_dit_chunk_mask",
         lambda: events.append("compat"),
     )
     monkeypatch.setattr(
@@ -339,40 +332,59 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
         def capture(self, capture_shapes):
             events.append("capture")
             captured_shape_sets.append(capture_shapes)
-            if capture_fails:
+            if fail:
                 raise RuntimeError("synthetic capture failure")
 
-    monkeypatch.setattr(stages, "_FlowCudaGraphRunner", _FakeRunner)
+    monkeypatch.setattr(stages, "FlowCudaGraphRunner", _FakeRunner)
     monkeypatch.setattr(
         flow,
         "attach_cuda_graph_runner",
         lambda runner: events.append("attach"),
     )
 
+
+def test_factory_lifecycle_captures_after_compile(monkeypatch) -> None:
+    events = []
+    requested_capture_shapes = [[1, 496], [5, 544], [7, 576]]
+    captured_shape_sets = []
+    flow = stages.FunCosyVoice3Flow(_flow())
+    _patch_factory_lifecycle(monkeypatch, flow, events, captured_shape_sets, fail=False)
+
     scheduler = stages.create_vocoder_executor(
         "model",
         enable_dit_torch_compile=True,
-        enable_flow_cuda_graph=True,
         flow_cuda_graph_capture_shapes=requested_capture_shapes,
     )
 
     assert scheduler is not None
-    expected = ["compat", "compile", "runner", "capture"]
-    if not capture_fails:
-        expected.append("attach")
-    assert events == expected
+    assert events == ["compat", "compile", "runner", "capture", "attach"]
     assert captured_shape_sets == [
         tuple(tuple(shape) for shape in requested_capture_shapes)
     ]
+
+
+def test_factory_lifecycle_propagates_capture_failure(monkeypatch) -> None:
+    events = []
+    captured_shape_sets = []
+    flow = stages.FunCosyVoice3Flow(_flow())
+    _patch_factory_lifecycle(monkeypatch, flow, events, captured_shape_sets, fail=True)
+
+    with pytest.raises(RuntimeError, match="synthetic capture failure"):
+        stages.create_vocoder_executor(
+            "model",
+            enable_dit_torch_compile=True,
+            flow_cuda_graph_capture_shapes=[[1, 496]],
+        )
+
+    assert events == ["compat", "compile", "runner", "capture"]
+    assert captured_shape_sets == [((1, 496),)]
 
 
 def test_graph_safe_mask_preserves_buffered_behavior() -> None:
     masks = torch.tensor([[[True, True, False]], [[False, False, False]]])
     xs = torch.ones(2, 1, 3)
 
-    result = stages._graph_safe_nonstreaming_chunk_mask(
-        xs, masks, False, False, 0, 0, 0
-    )
+    result = stages.graph_safe_nonstreaming_chunk_mask(xs, masks, False, False, 0, 0, 0)
 
     assert result is masks
     assert torch.equal(result[0], torch.tensor([[True, True, False]]))

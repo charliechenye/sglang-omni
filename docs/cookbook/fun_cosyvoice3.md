@@ -224,7 +224,7 @@ On the other hand, decrease the admission budget to reduce latency and lower pea
 
 ### Vocoder Configuration
 
-Vocoder configuration controls batching, precision, and acceleration. The scheduler accepts `max_batch_size` (16) and `max_batch_wait_ms` (30) to tune batch assembly. Flow uses `dtype` (bfloat16) for autocast, while HiFT uses `hift_dtype` (float32), independent of Flow; bfloat16 shows no speedup on H200 and reduces fidelity. Two mutually exclusive accelerators are available: `enable_dit_torch_compile` and `enable_flow_estimator_trt`.
+Vocoder configuration controls batching, precision, and acceleration. The scheduler accepts `max_batch_size` (16) and `max_batch_wait_ms` (30) to tune batch assembly. Flow uses `dtype` (bfloat16) for autocast, while HiFT uses `hift_dtype` (float32), independent of Flow; bfloat16 shows no speedup on H200 and reduces fidelity. Buffered Flow CUDA Graphs are on by default. `enable_dit_torch_compile` and `enable_flow_estimator_trt` stay opt-in and mutually exclusive.
 
 The TTS engine stage accepts `onnx_intra_op_threads` (16) for the speech tokenizer and speaker encoder ONNX sessions. Preprocessing takes `max_concurrency` (8) to limit concurrent reference conditioning requests.
 
@@ -240,38 +240,6 @@ sgl-omni serve \
 ```
 
 Do not enable it together with TensorRT.
-
-### CUDA Graphs for buffered Flow
-
-`enable_flow_cuda_graph` is opt-in. Current qualification was performed with CUDA + BF16.
-Graphs are captured at startup for buffered Flow requests; nonresident shapes use the
-normal solver and are never captured at request time. Resident graphs consume additional
-GPU memory. The option can be combined with `enable_dit_torch_compile`.
-
-Operators may override the resident startup capture set through
-`vocoder.factory.flow_cuda_graph_capture_shapes`:
-
-```yaml
-stages:
-  vocoder:
-    factory:
-      enable_flow_cuda_graph: true
-      flow_cuda_graph_capture_shapes:
-        - [1, 496]
-        - [5, 544]
-        - [16, 576]
-```
-
-This parameter controls only which shapes are captured at startup. It does not
-enable CUDA Graphs by itself, trigger runtime or lazy capture, or remove the
-normal solver fallback for nonresident shapes.
-
-```bash
-sgl-omni serve \
-  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
-  --vocoder.factory.enable_flow_cuda_graph true \
-  --port 8000
-```
 
 ### TensorRT for the DiT backbone
 

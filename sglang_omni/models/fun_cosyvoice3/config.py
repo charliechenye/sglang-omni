@@ -14,8 +14,11 @@ from sglang_omni.config import (
 
 _PKG = "sglang_omni.models.fun_cosyvoice3"
 
+FLOW_CUDA_GRAPH_FRAME_ALIGNMENT = 16
+
+# Resident graphs target ~2 GB. Keep dense B=1 coverage in the common length
+# range and a small B=2 set for concurrent buffered solves.
 FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES: tuple[tuple[int, int], ...] = (
-    (1, 288),
     (1, 304),
     (1, 320),
     (1, 336),
@@ -37,16 +40,11 @@ FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES: tuple[tuple[int, int], ..
     (1, 592),
     (1, 608),
     (1, 640),
-    (1, 656),
-    (1, 672),
-    (2, 368),
     (2, 384),
     (2, 400),
     (2, 448),
     (2, 496),
     (2, 544),
-    (2, 560),
-    (3, 448),
 )
 
 _DIT_ACCELERATOR_CONFLICT = (
@@ -112,16 +110,17 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 flow_batch_admission_frames=8000,
                 flow_merge_max_gap_frames=384,
                 flow_merge_pad_budget_percent=25.0,
-                flow_cuda_graph_capture_shapes=[
-                    list(shape)
-                    for shape in FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
-                ],
                 # Note (chenyang): Adjacent length-sorted requests may share a Flow solve
                 # when their mel-length gap and total added padding stay within these limits.
                 max_batch_size=16,
                 max_batch_wait_ms=30,
                 # note (guozhihao-224, chenyang):
-                # torch.compile is opt-in via enable_dit_torch_compile.
+                # CUDA Graph is on by default. torch.compile and TensorRT stay opt-in.
+                enable_flow_cuda_graph=True,
+                flow_cuda_graph_capture_shapes=[
+                    list(shape)
+                    for shape in FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
+                ],
                 enable_flow_estimator_trt=False,
                 token_hop_len=25,
                 token_max_hop_len=100,
