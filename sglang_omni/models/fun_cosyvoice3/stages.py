@@ -15,7 +15,10 @@ import torch
 import torch.nn.functional as F
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 
-from sglang_omni.models.fun_cosyvoice3.config import reject_conflicting_dit_accelerators
+from sglang_omni.models.fun_cosyvoice3.config import (
+    FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
+    reject_conflicting_dit_accelerators,
+)
 from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     execute_flow_estimator,
     is_flow_estimator_trt,
@@ -53,41 +56,6 @@ _AUTOCAST_DTYPES: dict[str, torch.dtype | None] = {
     "float16": torch.float16,
     "bfloat16": torch.bfloat16,
 }
-
-_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES: tuple[tuple[int, int], ...] = (
-    (1, 288),
-    (1, 304),
-    (1, 320),
-    (1, 336),
-    (1, 352),
-    (1, 368),
-    (1, 384),
-    (1, 400),
-    (1, 416),
-    (1, 432),
-    (1, 448),
-    (1, 464),
-    (1, 480),
-    (1, 496),
-    (1, 512),
-    (1, 528),
-    (1, 544),
-    (1, 560),
-    (1, 576),
-    (1, 592),
-    (1, 608),
-    (1, 640),
-    (1, 656),
-    (1, 672),
-    (2, 368),
-    (2, 384),
-    (2, 400),
-    (2, 448),
-    (2, 496),
-    (2, 544),
-    (2, 560),
-    (3, 448),
-)
 
 _COSYVOICE_INSTALL_HINT = (
     "Fun-CosyVoice3 support requires the `cosyvoice` package. "
@@ -344,6 +312,64 @@ def _flow_t_span(
 
 def _align_flow_cuda_graph_frames(frames: int) -> int:
     return (frames + 15) // 16 * 16
+
+
+def _resolve_flow_cuda_graph_capture_shapes(
+    capture_shapes: Sequence[tuple[int, int]] | None,
+) -> tuple[tuple[int, int], ...]:
+    if capture_shapes is None:
+        return FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
+    if isinstance(capture_shapes, (str, bytes)) or not isinstance(
+        capture_shapes, Sequence
+    ):
+        raise ValueError(
+            "flow_cuda_graph_capture_shapes must be a sequence of (batch, frames)"
+        )
+    if not capture_shapes:
+        raise ValueError("flow_cuda_graph_capture_shapes must not be empty")
+
+    resolved: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for index, shape in enumerate(capture_shapes):
+        if (
+            isinstance(shape, (str, bytes))
+            or not isinstance(shape, Sequence)
+            or len(shape) != 2
+        ):
+            raise ValueError(
+                "flow_cuda_graph_capture_shapes entries must be "
+                f"(batch, frames) pairs; entry {index} is {shape!r}"
+            )
+        batch_size, frames = shape
+        if (
+            isinstance(batch_size, bool)
+            or not isinstance(batch_size, int)
+            or isinstance(frames, bool)
+            or not isinstance(frames, int)
+        ):
+            raise ValueError(
+                "flow_cuda_graph_capture_shapes entries must contain integer "
+                f"batch and frame values; entry {index} is {shape!r}"
+            )
+        if batch_size <= 0 or frames <= 0:
+            raise ValueError(
+                "flow_cuda_graph_capture_shapes entries must have positive "
+                f"batch and frame values; entry {index} is {shape!r}"
+            )
+        if _align_flow_cuda_graph_frames(frames) != frames:
+            raise ValueError(
+                "flow_cuda_graph_capture_shapes frame values must be aligned "
+                f"to 16; entry {index} is {shape!r}"
+            )
+        key = (batch_size, frames)
+        if key in seen:
+            raise ValueError(
+                "flow_cuda_graph_capture_shapes must not contain duplicates; "
+                f"found {key!r}"
+            )
+        seen.add(key)
+        resolved.append(key)
+    return tuple(resolved)
 
 
 def _graph_safe_nonstreaming_chunk_mask(
@@ -1552,6 +1578,7 @@ def create_vocoder_executor(
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = False,
     enable_flow_cuda_graph: bool = False,
+    flow_cuda_graph_capture_shapes: Sequence[tuple[int, int]] | None = None,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
     hift_max_padding_waste: float = 1.5,
@@ -1565,6 +1592,9 @@ def create_vocoder_executor(
 
     if flow_batch_admission_frames <= 0:
         raise ValueError("flow_batch_admission_frames must be greater than zero")
+    capture_shapes = _resolve_flow_cuda_graph_capture_shapes(
+        flow_cuda_graph_capture_shapes
+    )
 
     reject_conflicting_dit_accelerators(
         enable_dit_torch_compile=enable_dit_torch_compile,
@@ -1619,7 +1649,7 @@ def create_vocoder_executor(
                 device=device_obj,
                 compute_dtype=compute_dtype,
             )
-            runner.capture(_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES)
+            runner.capture(capture_shapes)
         except Exception as exc:
             logger.warning(
                 "Fun-CosyVoice3 Flow CUDA graph startup failed (%s: %s); "

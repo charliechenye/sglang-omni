@@ -7,7 +7,10 @@ import torch
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.runtime import resolve_stage_typed_kwargs
 from sglang_omni.models.fun_cosyvoice3 import CAPABILITIES
-from sglang_omni.models.fun_cosyvoice3.config import FunCosyVoice3PipelineConfig
+from sglang_omni.models.fun_cosyvoice3.config import (
+    FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
+    FunCosyVoice3PipelineConfig,
+)
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from tests.unit_test.pipeline.helpers import build_compiled_process_topology
@@ -38,6 +41,9 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
     vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
+    expected_capture_shapes = [
+        list(shape) for shape in FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
+    ]
     assert vocoder.factory.dtype == "bfloat16"
     # max_batch_size / max_batch_wait_ms are declared fields on FactoryArgs, so
     # they are validated eagerly rather than passing through as extras.
@@ -47,6 +53,7 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
         "flow_batch_admission_frames": 8000,
         "flow_merge_max_gap_frames": 384,
         "flow_merge_pad_budget_percent": 25.0,
+        "flow_cuda_graph_capture_shapes": expected_capture_shapes,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
@@ -68,6 +75,11 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
             "vocoder.factory.flow_batch_admission_frames": 4000,
             "vocoder.factory.flow_merge_max_gap_frames": 40,
             "vocoder.factory.flow_merge_pad_budget_percent": 3,
+            "vocoder.factory.flow_cuda_graph_capture_shapes": [
+                [1, 496],
+                [5, 544],
+                [7, 576],
+            ],
         }
     )
     vocoder = next(stage for stage in merged.stages if stage.name == "vocoder")
@@ -76,6 +88,7 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
         "flow_batch_admission_frames": 4000,
         "flow_merge_max_gap_frames": 40,
         "flow_merge_pad_budget_percent": 3,
+        "flow_cuda_graph_capture_shapes": [[1, 496], [5, 544], [7, 576]],
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
@@ -85,6 +98,11 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
     assert args["flow_batch_admission_frames"] == 4000
     assert args["flow_merge_max_gap_frames"] == 40
     assert args["flow_merge_pad_budget_percent"] == 3
+    assert args["flow_cuda_graph_capture_shapes"] == [
+        [1, 496],
+        [5, 544],
+        [7, 576],
+    ]
 
 
 def test_fun_cosyvoice3_state_round_trip_preserves_wire_contract() -> None:

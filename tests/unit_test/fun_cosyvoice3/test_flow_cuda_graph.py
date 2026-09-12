@@ -9,6 +9,9 @@ import pytest
 import torch
 
 import sglang_omni.models.fun_cosyvoice3.stages as stages
+from sglang_omni.models.fun_cosyvoice3.config import (
+    FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
+)
 
 
 class _TokenEmbedding:
@@ -153,6 +156,24 @@ def _generation_case():
     return flow, packed
 
 
+def test_flow_cuda_graph_capture_shapes_validate_explicit_policy() -> None:
+    assert (
+        stages._resolve_flow_cuda_graph_capture_shapes(None)
+        is FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
+    )
+
+    invalid_shapes = [
+        ("non-positive batch", [(0, 496)], "positive"),
+        ("non-positive frames", [(1, 0)], "positive"),
+        ("unaligned frames", [(1, 495)], "aligned"),
+        ("duplicate shape", [(1, 496), (1, 496)], "duplicates"),
+        ("malformed entry", [(1, 496, 512)], "pairs"),
+    ]
+    for _, capture_shapes, message in invalid_shapes:
+        with pytest.raises(ValueError, match=message):
+            stages._resolve_flow_cuda_graph_capture_shapes(capture_shapes)
+
+
 @pytest.mark.parametrize(
     ("compute_dtype", "solver_dtype", "speaker_dtype"),
     [
@@ -250,6 +271,8 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     monkeypatch, capture_fails: bool
 ) -> None:
     events = []
+    requested_capture_shapes = [(1, 496), (5, 544), (7, 576)]
+    captured_shape_sets = []
     flow = stages.FunCosyVoice3Flow(_flow())
 
     monkeypatch.setattr(
@@ -280,6 +303,7 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
 
         def capture(self, capture_shapes):
             events.append("capture")
+            captured_shape_sets.append(capture_shapes)
             if capture_fails:
                 raise RuntimeError("synthetic capture failure")
 
@@ -294,6 +318,7 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
         "model",
         enable_dit_torch_compile=True,
         enable_flow_cuda_graph=True,
+        flow_cuda_graph_capture_shapes=requested_capture_shapes,
     )
 
     assert scheduler is not None
@@ -301,6 +326,7 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     if not capture_fails:
         expected.append("attach")
     assert events == expected
+    assert captured_shape_sets == [tuple(requested_capture_shapes)]
 
 
 def test_graph_safe_mask_preserves_buffered_behavior() -> None:
