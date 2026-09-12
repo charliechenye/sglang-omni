@@ -12,12 +12,11 @@ from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
-from cosyvoice.flow.DiT import dit as cosyvoice_dit_module
+from cosyvoice.flow.DiT import dit as cosyvoice_dit
 from cosyvoice.utils.mask import add_optional_chunk_mask as cosyvoice_chunk_mask
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 
 from sglang_omni.models.fun_cosyvoice3.config import (
-    FLOW_CUDA_GRAPH_FRAME_BUCKET,
     FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
     reject_conflicting_dit_accelerators,
 )
@@ -303,6 +302,14 @@ def _solve_flow_euler(
     return x.float()
 
 
+# Note (chenyang):
+# Mel-frame step size for buffered flow CUDA Graph keys. Capture shapes
+# must use a T that is a multiple of this step size. For example, 489
+# frames would be padded to 496 frames, replayed, and then cropped back
+# to 489 frames.
+FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
+
+
 def verify_flow_cuda_graph_capture_shapes(
     capture_shapes: Sequence[Sequence[int]] | None,
     *,
@@ -420,7 +427,7 @@ def install_graph_safe_dit_chunk_mask() -> None:
             enable_full_context,
         )
 
-    cosyvoice_dit_module.add_optional_chunk_mask = _chunk_mask
+    cosyvoice_dit.add_optional_chunk_mask = _chunk_mask
 
 
 @dataclass

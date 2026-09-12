@@ -14,15 +14,6 @@ from sglang_omni.config import (
 
 _PKG = "sglang_omni.models.fun_cosyvoice3"
 
-
-FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
-
-# Note (chenyang):
-# Mel-frame step size for buffered flow CUDA Graph keys. Capture shapes
-# must use a T that is a multiple of this step size. For example, 489
-# frames would be padded to 496 frames, replayed, and then cropped back
-# to 489 frames.
-
 FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES: tuple[tuple[int, int], ...] = (
     (1, 304),
     (1, 320),
