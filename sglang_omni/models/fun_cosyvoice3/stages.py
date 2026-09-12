@@ -63,6 +63,13 @@ _COSYVOICE_INSTALL_HINT = (
 
 _CHUNK_MASK_COMPILE_DISABLED = False
 
+FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
+# Note (chenyang):
+# Mel-frame step size for buffered flow CUDA Graph keys. Capture shapes
+# must use a T that is a multiple of this step size. For example, 489
+# frames would be padded to 496 frames, replayed, and then cropped back
+# to 489 frames.
+
 
 @dataclass(frozen=True)
 class FlowBatchInput:
@@ -297,14 +304,6 @@ def _solve_flow_euler(
         if step < len(t_span) - 1:
             dt = t_span[step + 1] - t
     return x.float()
-
-
-# Note (chenyang):
-# Mel-frame step size for buffered flow CUDA Graph keys. Capture shapes
-# must use a T that is a multiple of this step size. For example, 489
-# frames would be padded to 496 frames, replayed, and then cropped back
-# to 489 frames.
-FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
 
 
 def verify_flow_cuda_graph_capture_shapes(
