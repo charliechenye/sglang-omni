@@ -10,7 +10,10 @@ import pytest
 import torch
 
 from sglang_omni.models.fun_cosyvoice3 import stages
-from sglang_omni.models.fun_cosyvoice3.config import FunCosyVoice3PipelineConfig
+from sglang_omni.models.fun_cosyvoice3.config import (
+    FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
+    FunCosyVoice3PipelineConfig,
+)
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
     FunCosyVoice3StreamingVocoderScheduler,
@@ -846,12 +849,16 @@ def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:
         for stage in FunCosyVoice3PipelineConfig(model_path="model").stages
         if stage.name == "vocoder"
     )
+    expected_capture_shapes = [
+        list(shape) for shape in FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
+    ]
 
     assert vocoder_stage.factory.model_dump(exclude_none=True) == {
         "dtype": "bfloat16",
         "flow_batch_admission_frames": 8000,
         "flow_merge_max_gap_frames": 384,
         "flow_merge_pad_budget_percent": 25.0,
+        "flow_cuda_graph_capture_shapes": expected_capture_shapes,
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_flow_estimator_trt": False,
