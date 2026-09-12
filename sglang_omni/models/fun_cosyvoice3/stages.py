@@ -17,7 +17,7 @@ from cosyvoice.utils.mask import add_optional_chunk_mask as cosyvoice_chunk_mask
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 
 from sglang_omni.models.fun_cosyvoice3.config import (
-    FLOW_CUDA_GRAPH_FRAME_ALIGNMENT,
+    FLOW_CUDA_GRAPH_FRAME_BUCKET,
     FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
     reject_conflicting_dit_accelerators,
 )
@@ -353,10 +353,10 @@ def verify_flow_cuda_graph_capture_shapes(
                 "flow_cuda_graph_capture_shapes entry "
                 f"{key!r} exceeds max_batch_size={max_batch_size}"
             )
-        if frames % FLOW_CUDA_GRAPH_FRAME_ALIGNMENT != 0:
+        if frames % FLOW_CUDA_GRAPH_FRAME_BUCKET != 0:
             raise ValueError(
-                "flow_cuda_graph_capture_shapes frame values must be aligned "
-                f"to {FLOW_CUDA_GRAPH_FRAME_ALIGNMENT}; entry {index} is {shape!r}"
+                "flow_cuda_graph_capture_shapes frame values must be multiples "
+                f"of {FLOW_CUDA_GRAPH_FRAME_BUCKET}; entry {index} is {shape!r}"
             )
         if key in seen:
             raise ValueError(
@@ -541,9 +541,9 @@ class FlowCudaGraphRunner:
             return None
         batch_size, actual_frames = int(x.shape[0]), int(x.shape[2])
         bucket_frames = (
-            (actual_frames + FLOW_CUDA_GRAPH_FRAME_ALIGNMENT - 1)
-            // FLOW_CUDA_GRAPH_FRAME_ALIGNMENT
-            * FLOW_CUDA_GRAPH_FRAME_ALIGNMENT
+            (actual_frames + FLOW_CUDA_GRAPH_FRAME_BUCKET - 1)
+            // FLOW_CUDA_GRAPH_FRAME_BUCKET
+            * FLOW_CUDA_GRAPH_FRAME_BUCKET
         )
         captured = self._graphs.get((batch_size, bucket_frames))
         if captured is None:

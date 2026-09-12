@@ -113,7 +113,7 @@ def test_verify_capture_shapes_uses_defaults_and_rejects_bad_entries() -> None:
     )
     with pytest.raises(ValueError, match="max_batch_size"):
         stages.verify_flow_cuda_graph_capture_shapes([[32, 576]], max_batch_size=16)
-    with pytest.raises(ValueError, match="aligned"):
+    with pytest.raises(ValueError, match="multiples"):
         stages.verify_flow_cuda_graph_capture_shapes([[1, 495]], max_batch_size=16)
 
 
