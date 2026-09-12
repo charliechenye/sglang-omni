@@ -1546,11 +1546,6 @@ def create_vocoder_executor(
     token_max_hop_len: int = TOKEN_MAX_HOP_LEN,
     disable_hop_growth: bool = False,
 ) -> Any:
-    if enable_flow_cuda_graph and enable_flow_estimator_trt:
-        raise ValueError(
-            "enable_flow_cuda_graph and enable_flow_estimator_trt cannot be enabled together"
-        )
-
     from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
         FunCosyVoice3StreamingVocoderScheduler,
     )

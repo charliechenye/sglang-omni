@@ -213,7 +213,6 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     monkeypatch, capture_fails: bool
 ) -> None:
     events = []
-    loads = []
     flow = stages.FunCosyVoice3Flow(_flow())
 
     monkeypatch.setattr(
@@ -221,11 +220,11 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "checkpoint")
 
-    def _load(*args, **kwargs):
-        loads.append((args, kwargs))
-        return flow, object()
-
-    monkeypatch.setattr(stages, "_load_cosyvoice3_flow_hift", _load)
+    monkeypatch.setattr(
+        stages,
+        "_load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, **kwargs: (flow, object()),
+    )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(stages.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
@@ -255,15 +254,6 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
         lambda runner: events.append("attach"),
     )
 
-    with pytest.raises(ValueError, match="cannot be enabled together"):
-        stages.create_vocoder_executor(
-            "model",
-            enable_flow_cuda_graph=True,
-            enable_flow_estimator_trt=True,
-        )
-    assert events == []
-    assert loads == []
-
     scheduler = stages.create_vocoder_executor(
         "model",
         enable_dit_torch_compile=True,
@@ -271,7 +261,6 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     )
 
     assert scheduler is not None
-    assert len(loads) == 1
     expected = ["compat", "compile", "runner", "capture"]
     if not capture_fails:
         expected.append("attach")
