@@ -858,8 +858,11 @@ def group_flow_requests(
 
         best_plan: tuple[int, int, tuple[int, ...]] | None = None
         shortest_frames = ordered[suffix_start].total_mel_frames
-        last_group_end = request_count - remaining_group_count + 1
-        for group_end in range(suffix_start + 1, last_group_end + 1):
+        group_end_limit = request_count - remaining_group_count + 1
+        # Note (chenyang): group_end_limit is max possible end index
+        # for the current group, since each remaining group must have
+        # at least one request.
+        for group_end in range(suffix_start + 1, group_end_limit + 1):
             longest_frames = ordered[group_end - 1].total_mel_frames
             group_gap_frames = longest_frames - shortest_frames
             if group_gap_frames > flow_merge_max_gap_frames:
