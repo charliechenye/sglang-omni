@@ -158,20 +158,55 @@ def _generation_case():
 
 def test_flow_cuda_graph_capture_shapes_validate_explicit_policy() -> None:
     assert (
-        stages._resolve_flow_cuda_graph_capture_shapes(None)
-        is FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
+        stages._resolve_flow_cuda_graph_capture_shapes(
+            None,
+            max_batch_size=16,
+        )
+        == FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
     )
+
+    with pytest.raises(ValueError, match=r"\(3, 448\).*max_batch_size=2"):
+        stages._resolve_flow_cuda_graph_capture_shapes(
+            None,
+            max_batch_size=2,
+        )
 
     invalid_shapes = [
         ("non-positive batch", [(0, 496)], "positive"),
         ("non-positive frames", [(1, 0)], "positive"),
+        ("non-integer batch", [(1.0, 496)], "integer"),
+        ("boolean batch", [(True, 496)], "integer"),
         ("unaligned frames", [(1, 495)], "aligned"),
         ("duplicate shape", [(1, 496), (1, 496)], "duplicates"),
         ("malformed entry", [(1, 496, 512)], "pairs"),
     ]
     for _, capture_shapes, message in invalid_shapes:
         with pytest.raises(ValueError, match=message):
-            stages._resolve_flow_cuda_graph_capture_shapes(capture_shapes)
+            stages._resolve_flow_cuda_graph_capture_shapes(
+                capture_shapes,
+                max_batch_size=16,
+            )
+
+    with pytest.raises(
+        ValueError,
+        match=r"\(32, 576\).*max_batch_size=16",
+    ):
+        stages._resolve_flow_cuda_graph_capture_shapes(
+            [[32, 576]],
+            max_batch_size=16,
+        )
+
+
+def test_factory_rejects_unreachable_flow_cuda_graph_batch() -> None:
+    with pytest.raises(
+        ValueError,
+        match=r"\(32, 576\).*max_batch_size=16",
+    ):
+        stages.create_vocoder_executor(
+            "model",
+            max_batch_size=16,
+            flow_cuda_graph_capture_shapes=[[32, 576]],
+        )
 
 
 @pytest.mark.parametrize(
@@ -271,7 +306,7 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     monkeypatch, capture_fails: bool
 ) -> None:
     events = []
-    requested_capture_shapes = [(1, 496), (5, 544), (7, 576)]
+    requested_capture_shapes = [[1, 496], [5, 544], [7, 576]]
     captured_shape_sets = []
     flow = stages.FunCosyVoice3Flow(_flow())
 
@@ -326,7 +361,9 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     if not capture_fails:
         expected.append("attach")
     assert events == expected
-    assert captured_shape_sets == [tuple(requested_capture_shapes)]
+    assert captured_shape_sets == [
+        tuple(tuple(shape) for shape in requested_capture_shapes)
+    ]
 
 
 def test_graph_safe_mask_preserves_buffered_behavior() -> None:

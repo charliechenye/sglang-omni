@@ -315,10 +315,12 @@ def _align_flow_cuda_graph_frames(frames: int) -> int:
 
 
 def _resolve_flow_cuda_graph_capture_shapes(
-    capture_shapes: Sequence[tuple[int, int]] | None,
+    capture_shapes: Sequence[Sequence[int]] | None,
+    *,
+    max_batch_size: int,
 ) -> tuple[tuple[int, int], ...]:
     if capture_shapes is None:
-        return FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
+        capture_shapes = FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
     if isinstance(capture_shapes, (str, bytes)) or not isinstance(
         capture_shapes, Sequence
     ):
@@ -356,12 +358,17 @@ def _resolve_flow_cuda_graph_capture_shapes(
                 "flow_cuda_graph_capture_shapes entries must have positive "
                 f"batch and frame values; entry {index} is {shape!r}"
             )
+        key = (batch_size, frames)
+        if batch_size > max_batch_size:
+            raise ValueError(
+                "flow_cuda_graph_capture_shapes entry "
+                f"{key!r} exceeds max_batch_size={max_batch_size}"
+            )
         if _align_flow_cuda_graph_frames(frames) != frames:
             raise ValueError(
                 "flow_cuda_graph_capture_shapes frame values must be aligned "
                 f"to 16; entry {index} is {shape!r}"
             )
-        key = (batch_size, frames)
         if key in seen:
             raise ValueError(
                 "flow_cuda_graph_capture_shapes must not contain duplicates; "
@@ -1578,7 +1585,7 @@ def create_vocoder_executor(
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = False,
     enable_flow_cuda_graph: bool = False,
-    flow_cuda_graph_capture_shapes: Sequence[tuple[int, int]] | None = None,
+    flow_cuda_graph_capture_shapes: Sequence[Sequence[int]] | None = None,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
     hift_max_padding_waste: float = 1.5,
@@ -1593,7 +1600,8 @@ def create_vocoder_executor(
     if flow_batch_admission_frames <= 0:
         raise ValueError("flow_batch_admission_frames must be greater than zero")
     capture_shapes = _resolve_flow_cuda_graph_capture_shapes(
-        flow_cuda_graph_capture_shapes
+        flow_cuda_graph_capture_shapes,
+        max_batch_size=max_batch_size,
     )
 
     reject_conflicting_dit_accelerators(

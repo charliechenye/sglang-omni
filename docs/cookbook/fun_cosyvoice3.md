@@ -248,6 +248,24 @@ Graphs are captured at startup for buffered Flow requests; nonresident shapes us
 normal solver and are never captured at request time. Resident graphs consume additional
 GPU memory. The option can be combined with `enable_dit_torch_compile`.
 
+Operators may override the resident startup capture set through
+`vocoder.factory.flow_cuda_graph_capture_shapes`:
+
+```yaml
+stages:
+  vocoder:
+    factory:
+      enable_flow_cuda_graph: true
+      flow_cuda_graph_capture_shapes:
+        - [1, 496]
+        - [5, 544]
+        - [16, 576]
+```
+
+This parameter controls only which shapes are captured at startup. It does not
+enable CUDA Graphs by itself, trigger runtime or lazy capture, or remove the
+normal solver fallback for nonresident shapes.
+
 ```bash
 sgl-omni serve \
   --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
