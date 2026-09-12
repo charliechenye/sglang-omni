@@ -70,11 +70,11 @@ def _patch_cuda_contexts(monkeypatch):
 
 
 def _flow(*, channels: int = 4, max_frames: int = 512):
-    parameter = torch.nn.Parameter(torch.zeros(1, dtype=torch.bfloat16))
+    parameter = torch.nn.Parameter(torch.zeros(1, dtype=torch.float32))
     decoder = SimpleNamespace(
         t_scheduler="linear",
         inference_cfg_rate=0.0,
-        rand_noise=torch.zeros(1, channels, max_frames, dtype=torch.bfloat16),
+        rand_noise=torch.zeros(1, channels, max_frames, dtype=torch.float32),
         estimator=torch.nn.Identity(),
     )
     return SimpleNamespace(
@@ -88,29 +88,35 @@ def _flow(*, channels: int = 4, max_frames: int = 512):
     )
 
 
-def _runner(flow=None) -> stages._FlowCudaGraphRunner:
+def _runner(
+    flow=None, *, compute_dtype: torch.dtype | None = torch.bfloat16
+) -> stages._FlowCudaGraphRunner:
     return stages._FlowCudaGraphRunner(
         flow or _flow(),
         device=torch.device("cpu"),
-        compute_dtype=torch.bfloat16,
+        compute_dtype=compute_dtype,
     )
 
 
 def _inputs(
-    batch_size: int, frames: int, *, channels: int = 4
+    batch_size: int,
+    frames: int,
+    *,
+    channels: int = 4,
+    dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, ...]:
     x = (
         torch.arange(batch_size * channels * frames, dtype=torch.float32)
         .reshape(batch_size, channels, frames)
-        .to(torch.bfloat16)
+        .to(dtype)
     )
-    t_span = torch.linspace(0, 1, 11, dtype=torch.bfloat16)
+    t_span = torch.linspace(0, 1, 11, dtype=dtype)
     mu = torch.full_like(x, 2)
-    mask = torch.ones(batch_size, 1, frames, dtype=torch.bfloat16)
+    mask = torch.ones(batch_size, 1, frames, dtype=dtype)
     spks = (
         torch.arange(batch_size * 5, dtype=torch.float32)
         .reshape(batch_size, 5)
-        .to(torch.bfloat16)
+        .to(dtype)
     )
     cond = torch.full_like(x, 3)
     return x, t_span, mu, mask, spks, cond
@@ -146,12 +152,19 @@ def _generation_case():
     return flow, packed
 
 
-def test_resident_replay_and_nonresident_fallback(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("compute_dtype", "runtime_dtype"),
+    [(torch.bfloat16, torch.bfloat16), (None, torch.float32)],
+    ids=["bf16-autocast", "fp32-no-autocast"],
+)
+def test_resident_replay_and_nonresident_fallback(
+    monkeypatch, compute_dtype, runtime_dtype
+) -> None:
     flow = _flow(channels=6)
-    runner = _runner(flow)
+    runner = _runner(flow, compute_dtype=compute_dtype)
     resident = _install_graph(runner, (2, 496))
 
-    inputs = _inputs(2, 489, channels=6)
+    inputs = _inputs(2, 489, channels=6, dtype=runtime_dtype)
     original_x, _, original_mu, _, _, original_cond = inputs
     output = runner.run(*inputs)
 
@@ -160,9 +173,10 @@ def test_resident_replay_and_nonresident_fallback(monkeypatch) -> None:
     assert torch.equal(output, original_x + original_mu + original_cond)
     assert resident.replay_calls == 1
     captured_inputs = runner._graphs[(2, 496)].static_inputs
+    assert all(value.dtype == runtime_dtype for value in captured_inputs)
     assert torch.count_nonzero(captured_inputs[0][..., 489:]) == 0
     assert torch.count_nonzero(captured_inputs[3][..., 489:]) == 0
-    miss_inputs = _inputs(2, 1, channels=6)
+    miss_inputs = _inputs(2, 1, channels=6, dtype=runtime_dtype)
     assert runner.run(*miss_inputs) is None
 
     fallback_flow, packed = _generation_case()
@@ -226,7 +240,6 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
         lambda checkpoint_dir, **kwargs: (flow, object()),
     )
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
-    monkeypatch.setattr(stages.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         stages,
         "_enable_flow_cuda_graph_dit_compat",

@@ -425,7 +425,7 @@ class _FlowCudaGraphRunner:
         flow: Any,
         *,
         device: torch.device,
-        compute_dtype: torch.dtype,
+        compute_dtype: torch.dtype | None,
     ) -> None:
         self._flow = flow
         self._device = torch.device(device)
@@ -434,6 +434,7 @@ class _FlowCudaGraphRunner:
 
     def _capture_inputs(self, batch_size: int, frames: int) -> tuple[torch.Tensor, ...]:
         model_device, parameter_dtype = _flow_device_and_dtype(self._flow)
+        input_dtype = self._compute_dtype or parameter_dtype
         decoder = self._flow.decoder
         noise = decoder.rand_noise
         channels = int(self._flow.output_size)
@@ -447,16 +448,14 @@ class _FlowCudaGraphRunner:
                 "Flow CUDA graph capture needs rand_noise with shape "
                 f"[1, {channels}, >= {frames}], got {tuple(noise.shape)}"
             )
-        x = noise[:, :, :frames].to(device=model_device, dtype=parameter_dtype)
+        x = noise[:, :, :frames].to(device=model_device, dtype=input_dtype)
         x = x.expand(batch_size, -1, -1).clone()
-        t_span = _flow_t_span(decoder, device=model_device, dtype=parameter_dtype)
+        t_span = _flow_t_span(decoder, device=model_device, dtype=input_dtype)
         mu = torch.zeros_like(x)
-        mask = torch.ones(
-            batch_size, 1, frames, device=model_device, dtype=parameter_dtype
-        )
+        mask = torch.ones(batch_size, 1, frames, device=model_device, dtype=input_dtype)
         speaker_dim = int(self._flow.spk_embed_affine_layer.out_features)
         spks = torch.zeros(
-            batch_size, speaker_dim, device=model_device, dtype=self._compute_dtype
+            batch_size, speaker_dim, device=model_device, dtype=input_dtype
         )
         cond = torch.zeros_like(x)
         return x, t_span, mu, mask, spks, cond
@@ -471,7 +470,11 @@ class _FlowCudaGraphRunner:
         stream.wait_stream(torch.cuda.current_stream(self._device))
         with (
             torch.cuda.stream(stream),
-            torch.autocast(device_type="cuda", dtype=self._compute_dtype),
+            torch.autocast(
+                device_type="cuda",
+                dtype=self._compute_dtype,
+                enabled=self._compute_dtype is not None,
+            ),
         ):
             _forward()
         stream.synchronize()
@@ -483,7 +486,11 @@ class _FlowCudaGraphRunner:
                 stream=stream,
                 capture_error_mode="thread_local",
             ),
-            torch.autocast(device_type="cuda", dtype=self._compute_dtype),
+            torch.autocast(
+                device_type="cuda",
+                dtype=self._compute_dtype,
+                enabled=self._compute_dtype is not None,
+            ),
         ):
             static_output = _forward()
         stream.synchronize()
@@ -554,7 +561,11 @@ class _FlowCudaGraphRunner:
         try:
             with (
                 torch.cuda.device(self._device),
-                torch.autocast(device_type="cuda", dtype=self._compute_dtype),
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=self._compute_dtype,
+                    enabled=self._compute_dtype is not None,
+                ),
             ):
                 for static, value in zip(captured.static_inputs, inputs, strict=True):
                     static.copy_(value)
@@ -1575,15 +1586,13 @@ def create_vocoder_executor(
     device_obj = torch.device(device)
     flow_cg_enabled = (
         enable_flow_cuda_graph
-        and current_platform.is_cuda()
         and device_obj.type == "cuda"
         and torch.cuda.is_available()
-        and compute_dtype == torch.bfloat16
     )
     if enable_flow_cuda_graph and not flow_cg_enabled:
         logger.warning(
             "Fun-CosyVoice3 Flow CUDA graphs are disabled: the validated "
-            "path requires a CUDA device with the bfloat16 vocoder configuration"
+            "path requires a vocoder device with the CUDA graph runtime"
         )
 
     if flow_cg_enabled:
@@ -1606,7 +1615,7 @@ def create_vocoder_executor(
             runner = _FlowCudaGraphRunner(
                 flow,
                 device=device_obj,
-                compute_dtype=cast(torch.dtype, compute_dtype),
+                compute_dtype=compute_dtype,
             )
             runner.capture(_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES)
         except Exception as exc:

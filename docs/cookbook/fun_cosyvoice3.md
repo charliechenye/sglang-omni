@@ -243,7 +243,7 @@ Do not enable it together with TensorRT.
 
 ### CUDA Graphs for buffered Flow
 
-`enable_flow_cuda_graph` is opt-in and targets the validated CUDA + BF16 configuration.
+`enable_flow_cuda_graph` is opt-in. Current qualification was performed with CUDA + BF16.
 Graphs are captured at startup for buffered Flow requests; nonresident shapes use the
 normal solver and are never captured at request time. Resident graphs consume additional
 GPU memory. The option can be combined with `enable_dit_torch_compile`.
