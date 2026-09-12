@@ -340,7 +340,9 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
         [24, 25],
         [50, 51],
     ]
-    assert hift_memberships == [(1, 2, 3, 4)]
+    # Mel lengths 48/50 vs 100/102 exceed default HiFT waste=1.5, so HiFT
+    # keeps the same cut Flow already made. Result order is still original.
+    assert hift_memberships == [(1, 2), (3, 4)]
 
 
 @pytest.mark.parametrize(

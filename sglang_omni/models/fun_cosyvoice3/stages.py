@@ -458,7 +458,7 @@ class FunCosyVoice3Flow:
 
     def __init__(self, flow: Any) -> None:
         self._flow = flow
-        self._pending_solves: list[tuple[int, _FlowSolveTimer]] = []
+        self._last_solve: tuple[int, _FlowSolveTimer] | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._flow, name)
@@ -475,21 +475,20 @@ class FunCosyVoice3Flow:
         return self
 
     def log_last_solve(self) -> None:
-        # note (db-ol): the vocoder calls this after all buffered audio reaches
-        # the host. Pending end events are skipped, never waited for.
-        if not self._pending_solves:
+        # note (db-ol): the vocoder calls this after the bucket's audio reached
+        # the host. A still pending end event is skipped, never waited for.
+        if self._last_solve is None:
             return
-        pending_solves = self._pending_solves
-        self._pending_solves = []
-        for items, timer in pending_solves:
-            elapsed_ms = timer.elapsed_ms()
-            if elapsed_ms is None:
-                continue
-            logger.debug(
-                "Fun-CosyVoice3 flow solve: batch_items=%d solve_elapsed_ms=%.1f",
-                items,
-                elapsed_ms,
-            )
+        items, timer = self._last_solve
+        self._last_solve = None
+        elapsed_ms = timer.elapsed_ms()
+        if elapsed_ms is None:
+            return
+        logger.debug(
+            "Fun-CosyVoice3 flow solve: batch_items=%d solve_elapsed_ms=%.1f",
+            items,
+            elapsed_ms,
+        )
 
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
@@ -499,7 +498,7 @@ class FunCosyVoice3Flow:
         timer = None
         if logger.isEnabledFor(logging.DEBUG):
             timer = _FlowSolveTimer(packed.token.device)
-            self._pending_solves.append((len(inputs), timer))
+            self._last_solve = (len(inputs), timer)
         generated = _generate_flow(self._flow, packed, timer=timer)
         return _split_generated_mels(
             self._flow,
@@ -828,14 +827,6 @@ class _PreparedFlowRequest:
     total_mel_frames: int
 
 
-def _within_flow_padding_cap(
-    padded_work: int,
-    baseline_work: int,
-    pad_budget_percent: float,
-) -> bool:
-    return (padded_work / baseline_work - 1) * 100 <= pad_budget_percent + 1e-9
-
-
 def group_flow_requests(
     requests: Sequence[_PreparedFlowRequest],
     *,
@@ -889,8 +880,9 @@ def group_flow_requests(
 
     for group_count in range(1, request_count + 1):
         plan = best(0, group_count, 0)
-        if plan is not None and _within_flow_padding_cap(
-            plan[0], baseline_work, merge_pad_budget_percent
+        if (
+            plan is not None
+            and (plan[0] / baseline_work - 1) * 100 <= merge_pad_budget_percent + 1e-9
         ):
             start = 0
             groups: list[list[_PreparedFlowRequest]] = []

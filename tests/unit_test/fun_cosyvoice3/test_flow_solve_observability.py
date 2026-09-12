@@ -74,7 +74,7 @@ def _decode_and_collect(
             (state, torch.ones(51, dtype=torch.long)),
         ]
         if split
-        else [(state, torch.tensor([1, 2])), (state, torch.tensor([3]))]
+        else [(state, torch.tensor([1, 2])), (state, torch.tensor([3, 4]))]
     )
     with caplog.at_level(logging.DEBUG, logger=stages.logger.name):
         asyncio.run(vocoder.decode_batch(items))
@@ -83,11 +83,9 @@ def _decode_and_collect(
 
 def test_decode_batch_logs_one_line_per_solve(caplog) -> None:
     messages = _decode_and_collect(_SolvableFlow(), caplog, split=True)
-    assert len(messages) == 2
-    assert all("batch_items=2" in message for message in messages)
-    assert all(
-        float(message.rsplit("solve_elapsed_ms=", 1)[1]) > 0.0 for message in messages
-    )
+    assert len(messages) == 1
+    assert "batch_items=2" in messages[0]
+    assert float(messages[0].rsplit("solve_elapsed_ms=", 1)[1]) > 0.0
 
 
 def test_flow_solve_is_timed_only_when_debug_is_enabled(caplog, monkeypatch) -> None:
@@ -132,10 +130,10 @@ def test_pending_solve_timer_reports_no_elapsed_time() -> None:
 
 def test_pending_solve_events_are_skipped_not_awaited(caplog) -> None:
     flow = stages.FunCosyVoice3Flow(_SolvableFlow())
-    flow._pending_solves = [(1, _timer_with_pending_end())]
+    flow._last_solve = (1, _timer_with_pending_end())
     with caplog.at_level(logging.DEBUG, logger=stages.logger.name):
         flow.log_last_solve()
-    assert flow._pending_solves == []
+    assert flow._last_solve is None
     assert not [r for r in caplog.records if "flow solve:" in r.getMessage()]
 
 
