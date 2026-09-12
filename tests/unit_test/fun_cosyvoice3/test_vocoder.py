@@ -348,8 +348,8 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
 @pytest.mark.parametrize(
     (
         "totals",
-        "merge_max_gap_frames",
-        "merge_pad_budget_percent",
+        "flow_merge_max_gap_frames",
+        "flow_merge_pad_budget_percent",
         "expected",
     ),
     [
@@ -385,14 +385,14 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
 )
 def test_flow_merge_partition_policy(
     totals: list[int],
-    merge_max_gap_frames: int,
-    merge_pad_budget_percent: float,
+    flow_merge_max_gap_frames: int,
+    flow_merge_pad_budget_percent: float,
     expected: list[list[int]],
 ) -> None:
     groups = stages.group_flow_requests(
         _flow_requests(totals),
-        merge_max_gap_frames=merge_max_gap_frames,
-        merge_pad_budget_percent=merge_pad_budget_percent,
+        flow_merge_max_gap_frames=flow_merge_max_gap_frames,
+        flow_merge_pad_budget_percent=flow_merge_pad_budget_percent,
     )
 
     assert [

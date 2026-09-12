@@ -830,8 +830,8 @@ class _PreparedFlowRequest:
 def group_flow_requests(
     requests: Sequence[_PreparedFlowRequest],
     *,
-    merge_max_gap_frames: int,
-    merge_pad_budget_percent: float,
+    flow_merge_max_gap_frames: int,
+    flow_merge_pad_budget_percent: float,
 ) -> list[list[_PreparedFlowRequest]]:
     """Group length-sorted requests under the adaptive Flow objective."""
     ordered = tuple(
@@ -862,7 +862,7 @@ def group_flow_requests(
         for group_end in range(suffix_start + 1, last_group_end + 1):
             longest_frames = ordered[group_end - 1].total_mel_frames
             group_gap_frames = longest_frames - shortest_frames
-            if group_gap_frames > merge_max_gap_frames:
+            if group_gap_frames > flow_merge_max_gap_frames:
                 break
             suffix_plan = optimal_suffix_partition(
                 suffix_start=group_end,
@@ -890,7 +890,8 @@ def group_flow_requests(
         )
         if (
             plan is not None
-            and (plan[0] / baseline_work - 1) * 100 <= merge_pad_budget_percent + 1e-9
+            and (plan[0] / baseline_work - 1) * 100
+            <= flow_merge_pad_budget_percent + 1e-9
         ):
             start = 0
             groups: list[list[_PreparedFlowRequest]] = []
@@ -999,8 +1000,8 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         results: list[tuple[Any, int] | None] = [None] * len(items)
         flow_groups = group_flow_requests(
             prepared,
-            merge_max_gap_frames=self._flow_merge_max_gap_frames,
-            merge_pad_budget_percent=self._flow_merge_pad_budget_percent,
+            flow_merge_max_gap_frames=self._flow_merge_max_gap_frames,
+            flow_merge_pad_budget_percent=self._flow_merge_pad_budget_percent,
         )
 
         for flow_group in flow_groups:
