@@ -103,11 +103,9 @@ def _packed_tokens(length: int = 17) -> SimpleNamespace:
     )
 
 
-def test_verify_capture_shapes_rejects_bad_entries() -> None:
-    with pytest.raises(ValueError, match="max_batch_size"):
-        stages.verify_flow_cuda_graph_capture_shapes([[32, 576]], max_batch_size=16)
+def test_verify_capture_shapes_rejects_unaligned_frames() -> None:
     with pytest.raises(ValueError, match="multiples"):
-        stages.verify_flow_cuda_graph_capture_shapes([[1, 495]], max_batch_size=16)
+        stages.verify_flow_cuda_graph_capture_shapes(((1, 495),))
 
 
 def test_resident_replay_crops_to_actual_frames() -> None:

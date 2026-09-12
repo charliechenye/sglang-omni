@@ -301,65 +301,21 @@ def solve_flow_euler(
 
 def verify_flow_cuda_graph_capture_shapes(
     capture_shapes: tuple[tuple[int, int], ...],
-    *,
-    max_batch_size: int,
 ) -> tuple[tuple[int, int], ...]:
-    if isinstance(capture_shapes, (str, bytes)) or not isinstance(
-        capture_shapes, Sequence
-    ):
-        raise ValueError(
-            "flow_cuda_graph_capture_shapes must be a sequence of (batch, frames)"
-        )
     if not capture_shapes:
         raise ValueError("flow_cuda_graph_capture_shapes must not be empty")
-
-    resolved: list[tuple[int, int]] = []
-    seen: set[tuple[int, int]] = set()
-    for index, shape in enumerate(capture_shapes):
-        if (
-            isinstance(shape, (str, bytes))
-            or not isinstance(shape, Sequence)
-            or len(shape) != 2
-        ):
-            raise ValueError(
-                "flow_cuda_graph_capture_shapes entries must be "
-                f"(batch, frames) pairs; entry {index} is {shape!r}"
-            )
-        batch_size, frames = shape
-        if (
-            isinstance(batch_size, bool)
-            or not isinstance(batch_size, int)
-            or isinstance(frames, bool)
-            or not isinstance(frames, int)
-        ):
-            raise ValueError(
-                "flow_cuda_graph_capture_shapes entries must contain integer "
-                f"batch and frame values; entry {index} is {shape!r}"
-            )
+    for batch_size, frames in capture_shapes:
         if batch_size <= 0 or frames <= 0:
             raise ValueError(
                 "flow_cuda_graph_capture_shapes entries must have positive "
-                f"batch and frame values; entry {index} is {shape!r}"
-            )
-        key = (batch_size, frames)
-        if batch_size > max_batch_size:
-            raise ValueError(
-                "flow_cuda_graph_capture_shapes entry "
-                f"{key!r} exceeds max_batch_size={max_batch_size}"
+                f"batch and frame values; got {(batch_size, frames)!r}"
             )
         if frames % FLOW_CUDA_GRAPH_FRAME_BUCKET != 0:
             raise ValueError(
                 "flow_cuda_graph_capture_shapes frame values must be multiples "
-                f"of {FLOW_CUDA_GRAPH_FRAME_BUCKET}; entry {index} is {shape!r}"
+                f"of {FLOW_CUDA_GRAPH_FRAME_BUCKET}; got {(batch_size, frames)!r}"
             )
-        if key in seen:
-            raise ValueError(
-                "flow_cuda_graph_capture_shapes must not contain duplicates; "
-                f"found {key!r}"
-            )
-        seen.add(key)
-        resolved.append(key)
-    return tuple(resolved)
+    return capture_shapes
 
 
 def graph_safe_nonstreaming_chunk_mask(
@@ -498,7 +454,7 @@ class FlowCudaGraphRunner:
         return CapturedFlowCudaGraph(graph, static_inputs, static_output)
 
     @torch.inference_mode()
-    def capture(self, capture_shapes: Sequence[tuple[int, int]]) -> None:
+    def capture(self, capture_shapes: tuple[tuple[int, int], ...]) -> None:
         graphs: dict[tuple[int, int], CapturedFlowCudaGraph] = {}
         stream = torch.cuda.Stream(device=self.device)
         stream.wait_stream(torch.cuda.current_stream(self.device))
@@ -1486,7 +1442,7 @@ def create_vocoder_executor(
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = False,
     enable_flow_cuda_graph: bool = True,
-    flow_cuda_graph_capture_shapes: Sequence[Sequence[int]] | None = None,
+    flow_cuda_graph_capture_shapes: tuple[tuple[int, int], ...] | None = None,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
     hift_max_padding_waste: float = 1.5,
@@ -1535,7 +1491,6 @@ def create_vocoder_executor(
     if enable_flow_cuda_graph:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
             flow_cuda_graph_capture_shapes,
-            max_batch_size=max_batch_size,
         )
         runner = FlowCudaGraphRunner(
             flow,
