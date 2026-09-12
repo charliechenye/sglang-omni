@@ -202,11 +202,14 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 ### Flow Decoder Batching
 
-The buffered vocoder batches requests through a two-stage pipeline. The scheduler collects up to 16 requests over at most 30 ms, then the adaptive Flow planner sorts admitted requests by exact total mel length and partitions them into Flow solves. The exact-frame admission budget (`flow_batch_admission_frames`, default 8000 frames) controls batch assembly; requests exceeding this budget run as independent `B=1` batches.
+For complete buffered requests, scheduler admission uses exact mel frames (`flow_batch_admission_frames`, default `8000`). Adaptive Flow grouping is enabled by default: it sorts admitted requests by total mel length and lets adjacent requests share one Flow solve when the maximum within-group length gap and global added-padding budget stay within:
 
-HiFT vocoding independently groups the produced mels by its padding-waste policy, right-zero-pads each group into one HiFT call, and slices back to each request's true length. The padding budget (`hift_max_padding_waste`, default 1.5) limits wasted computation.
+```text
+flow_merge_max_gap_frames = 384
+flow_merge_pad_budget_pct = 20
+```
 
-Adaptive Flow grouping is enabled by default for buffered, non-streaming requests. Adjacent requests in sorted exact-length order may share one Flow solve when the maximum within-group length gap is at most `flow_merge_max_gap_frames` (default `384`) and total added padded Flow work stays within `flow_merge_pad_budget_pct` (default `20`).
+HiFT grouping is independent and applies its existing `hift_max_padding_waste` policy to the produced mels. Causal streaming uses a separate Flow + HiFT path.
 
 Increase the normal Flow batching budget only after measuring the target GPU.
 
