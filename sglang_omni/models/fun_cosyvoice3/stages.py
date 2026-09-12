@@ -1013,14 +1013,11 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         flow: Any,
         hift: Any,
         compute_dtype: torch.dtype | None = None,
-        flow_batch_bucket_frames: int = 50,
         hift_compute_dtype: str = "float32",
         hift_max_padding_waste: float = 1.5,
         flow_merge_max_gap_frames: int = 384,
         flow_merge_pad_budget_pct: float = 20.0,
     ) -> None:
-        if flow_batch_bucket_frames <= 0:
-            raise ValueError("flow_batch_bucket_frames must be greater than zero")
         _validate_flow_merge_config(
             flow_merge_max_gap_frames,
             flow_merge_pad_budget_pct,
@@ -1045,7 +1042,6 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         )
         self._hift = hift
         self._compute_dtype = compute_dtype
-        self._flow_batch_bucket_frames = flow_batch_bucket_frames
         self._flow_merge_max_gap_frames = flow_merge_max_gap_frames
         self._flow_merge_pad_budget_pct = flow_merge_pad_budget_pct
         self._hift_compute_dtype = _AUTOCAST_DTYPES[hift_compute_dtype]
@@ -1255,26 +1251,13 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
             embedding=embedding,
         )
 
-    def _flow_bucket_key(self, item: FlowBatchInput) -> int:
-        return self._flow_bucket_key_for_total(self._flow_total_mel_frames(item))
-
-    def _flow_bucket_key_for_total(self, total_mel: int) -> int:
-        return (
-            total_mel + self._flow_batch_bucket_frames - 1
-        ) // self._flow_batch_bucket_frames
-
     def _flow_total_mel_frames(self, item: FlowBatchInput) -> int:
         total_tokens = item.prompt_token.shape[1] + item.token.shape[1]
         return total_tokens * self._flow.token_mel_ratio
 
     def _flow_scheduler_cost(self, payload: StagePayload) -> int:
         state, codes = self.prepare_item(payload)
-        total_mel = self._flow_total_mel_frames(self._make_flow_input(state, codes))
-        return (
-            (total_mel + self._flow_batch_bucket_frames - 1)
-            // self._flow_batch_bucket_frames
-            * self._flow_batch_bucket_frames
-        )
+        return self._flow_total_mel_frames(self._make_flow_input(state, codes))
 
     def _mel2wav(self, tts_mel: torch.Tensor) -> torch.Tensor:
         with self._hift_autocast():
@@ -1346,7 +1329,6 @@ def create_vocoder_executor(
     dtype: str = "bfloat16",
     max_batch_size: int = 16,
     max_batch_wait_ms: int = 30,
-    flow_batch_bucket_frames: int = 50,
     flow_batch_admission_frames: int = _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES,
     flow_merge_max_gap_frames: int = 384,
     flow_merge_pad_budget_pct: float = 20.0,
@@ -1394,7 +1376,6 @@ def create_vocoder_executor(
         flow,
         hift,
         compute_dtype=compute_dtype,
-        flow_batch_bucket_frames=flow_batch_bucket_frames,
         flow_merge_max_gap_frames=flow_merge_max_gap_frames,
         flow_merge_pad_budget_pct=flow_merge_pad_budget_pct,
         hift_compute_dtype=hift_dtype,

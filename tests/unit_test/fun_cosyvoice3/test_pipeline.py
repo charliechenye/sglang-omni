@@ -44,7 +44,6 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
     assert vocoder.factory.max_batch_size == 16
     assert vocoder.factory.max_batch_wait_ms == 30
     assert vocoder.factory.model_extra == {
-        "flow_batch_bucket_frames": 50,
         "flow_batch_admission_frames": 8000,
         "flow_merge_max_gap_frames": 384,
         "flow_merge_pad_budget_pct": 20.0,
@@ -66,7 +65,6 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
     manager = ConfigManager(config)
     merged = manager.merge_config(
         {
-            "vocoder.factory.flow_batch_bucket_frames": 100,
             "vocoder.factory.flow_batch_admission_frames": 4000,
             "vocoder.factory.flow_merge_max_gap_frames": 40,
             "vocoder.factory.flow_merge_pad_budget_pct": 3,
@@ -75,7 +73,6 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
     vocoder = next(stage for stage in merged.stages if stage.name == "vocoder")
 
     assert vocoder.factory.model_extra == {
-        "flow_batch_bucket_frames": 100,
         "flow_batch_admission_frames": 4000,
         "flow_merge_max_gap_frames": 40,
         "flow_merge_pad_budget_pct": 3,
@@ -85,7 +82,6 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
         "disable_hop_growth": False,
     }
     args = resolve_stage_typed_kwargs(vocoder)
-    assert args["flow_batch_bucket_frames"] == 100
     assert args["flow_batch_admission_frames"] == 4000
     assert args["flow_merge_max_gap_frames"] == 40
     assert args["flow_merge_pad_budget_pct"] == 3

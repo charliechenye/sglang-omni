@@ -202,32 +202,13 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 ### Flow Decoder Batching
 
-The buffered vocoder batches requests through a two-stage pipeline. The scheduler collects up to 16 requests over at most 30 ms, then groups them by mel length in 50-frame buckets. Each bucket, including single-request buckets, invokes `Flow.inference()` once, where padding, masking, and CFM decoding are handled internally. To prevent long requests from blocking later ones, a bucket-rounded admission budget (`flow_batch_admission_frames`, default 8000 frames) controls batch assembly; requests exceeding this budget run as independent `B=1` batches.
+The buffered vocoder batches requests through a two-stage pipeline. The scheduler collects up to 16 requests over at most 30 ms, then the adaptive Flow planner sorts admitted requests by exact total mel length and partitions them into Flow solves. The exact-frame admission budget (`flow_batch_admission_frames`, default 8000 frames) controls batch assembly; requests exceeding this budget run as independent `B=1` batches.
 
-HiFT vocoding follows the same batching pattern. Mels from a Flow bucket are right-zero-padded into a single tensor, decoded in one HiFT call, and sliced back to each request's true length. The padding budget (`hift_max_padding_waste`, default 1.5) limits wasted computation; since right-padding matches HiFT's single-request behavior, batched output is equivalent to individual inference except on padded frames. This design trades off throughput against latency while maintaining output correctness.
+HiFT vocoding independently groups the produced mels by its padding-waste policy, right-zero-pads each group into one HiFT call, and slices back to each request's true length. The padding budget (`hift_max_padding_waste`, default 1.5) limits wasted computation.
 
-Adaptive Flow coalescing is enabled by default for buffered, non-streaming requests. The existing 50-frame Flow buckets remain atomic, while adjacent buckets may share one Flow solve when the merged raw mel-length span is at most `flow_merge_max_gap_frames` (default `384`) and the total added padded Flow work stays within `flow_merge_pad_budget_pct` (default `20`). Set both options to `0` to disable coalescing.
+Adaptive Flow grouping is enabled by default for buffered, non-streaming requests. Adjacent requests in sorted exact-length order may share one Flow solve when the maximum within-group length gap is at most `flow_merge_max_gap_frames` (default `384`) and total added padded Flow work stays within `flow_merge_pad_budget_pct` (default `20`).
 
-Disable adaptive Flow coalescing:
-
-```bash
-sgl-omni serve \
-  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
-  --port 8000 \
-  --vocoder.factory.flow_merge_max_gap_frames 0 \
-  --vocoder.factory.flow_merge_pad_budget_pct 0
-```
-
-Change the mel-frame bucket size, for example to 100 frames:
-
-```bash
-sgl-omni serve \
-  --model-path FunAudioLLM/Fun-CosyVoice3-0.5B-2512 \
-  --port 8000 \
-  --vocoder.factory.flow_batch_bucket_frames 100
-```
-
-This would increase the throughput at the cost of latency and higher peak GPU memory. Increase the normal Flow batching budget only after measuring the target GPU.
+Increase the normal Flow batching budget only after measuring the target GPU.
 
 ```bash
 sgl-omni serve \
@@ -477,5 +458,5 @@ Use `--lang zh --no-ref-text` for the Chinese cross-lingual split. See
 - **Speed control.** Applied once, on the decoded waveform, by the shared `/v1/audio/speech` response-encoding path.
 - **Voice conversion.** Voice conversion is outside the current zero-shot TTS scope.
 - **Streaming decode.** Causal Flow + HiFT emit PCM after each hop (hop grows 25 → 50 → 100 by default). Quality can differ slightly from the buffered whole-utterance path. Opt-in TensorRT (`enable_flow_estimator_trt`) also accelerates streaming hops; do not enable it together with `enable_dit_torch_compile`. TRT freezes DiT attention, so streaming+TRT is not bit-exact with PyTorch streaming. Keep the Module TRT wrapper when streaming: CosyVoice's raw TRT enqueue is incompatible with packed hop-batch CFG shapes.
-- **Flow batch scope.** Flow batching supports the CosyVoice PyTorch estimator and the opt-in TensorRT estimator. HiFT batches only the mels produced by one Flow bucket while padding waste stays within `hift_max_padding_waste`. Streaming coalesces first/follow-up hops across requests (`_can_batch_stream_chunks`, short peer wait) so TTFP stays low under load.
+- **Flow batch scope.** Flow batching supports the CosyVoice PyTorch estimator and the opt-in TensorRT estimator. Buffered HiFT grouping is independent and uses `hift_max_padding_waste`. Streaming coalesces first/follow-up hops across requests (`_can_batch_stream_chunks`, short peer wait) so TTFP stays low under load.
 - **cosyvoice dependency.** The `cosyvoice` package has no PyPI release and must be installed from GitHub. Matcha-TTS is a required submodule and must also be importable; only the CosyVoice Flow and HiFT paths are used by the vocoder.
