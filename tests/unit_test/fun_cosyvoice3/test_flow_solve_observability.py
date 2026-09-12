@@ -63,7 +63,7 @@ def _decode_and_collect(
         flow,
         _FakeHiFT(),
         flow_merge_max_gap_frames=4 if split else 384,
-        flow_merge_pad_budget_pct=20,
+        flow_merge_pad_budget_percent=20,
     )
     state = FunCosyVoice3State(flow_embedding=torch.ones(1, 192))
     items = (

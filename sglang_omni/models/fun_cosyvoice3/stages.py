@@ -5,10 +5,10 @@ from __future__ import annotations
 
 import importlib
 import logging
-import math
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, cast
 
 import torch
@@ -828,37 +828,21 @@ class _PreparedFlowRequest:
     total_mel_frames: int
 
 
-def _validate_flow_merge_config(
-    max_gap_frames: int,
-    pad_budget_pct: float,
-) -> None:
-    if max_gap_frames < 0:
-        raise ValueError(
-            "flow_merge_max_gap_frames must be greater than or equal to zero"
-        )
-    if not math.isfinite(pad_budget_pct) or pad_budget_pct < 0:
-        raise ValueError(
-            "flow_merge_pad_budget_pct must be finite and "
-            "greater than or equal to zero"
-        )
-
-
 def _within_flow_padding_cap(
     padded_work: int,
     baseline_work: int,
-    pad_budget_pct: float,
+    pad_budget_percent: float,
 ) -> bool:
-    return (padded_work / baseline_work - 1) * 100 <= pad_budget_pct + 1e-9
+    return (padded_work / baseline_work - 1) * 100 <= pad_budget_percent + 1e-9
 
 
-def _group_flow_requests(
+def group_flow_requests(
     requests: Sequence[_PreparedFlowRequest],
     *,
     merge_max_gap_frames: int,
-    merge_pad_budget_pct: float,
+    merge_pad_budget_percent: float,
 ) -> list[list[_PreparedFlowRequest]]:
-    """Group requests by the fixed solve-count, work, gap, and order objective."""
-    _validate_flow_merge_config(merge_max_gap_frames, merge_pad_budget_pct)
+    """Group length-sorted requests under the adaptive Flow objective."""
     ordered = tuple(
         sorted(requests, key=lambda request: (request.total_mel_frames, request.index))
     )
@@ -866,121 +850,56 @@ def _group_flow_requests(
         return []
 
     baseline_work = sum(request.total_mel_frames for request in ordered)
-    if baseline_work == 0:
-        return [list(ordered)]
-
     request_count = len(ordered)
 
-    def minimum_work_by_group_count(max_gap_frames: int) -> list[int | None]:
-        minimum_work: list[list[int | None]] = [
-            [None] * (request_count + 1) for _ in range(request_count + 1)
-        ]
-        minimum_work[0][0] = 0
+    @lru_cache(maxsize=None)
+    def best(
+        start: int,
+        groups_left: int,
+        max_gap_so_far: int,
+    ) -> tuple[int, int, tuple[int, ...]] | None:
+        if groups_left == 0:
+            return (0, max_gap_so_far, ()) if start == request_count else None
+        if request_count - start < groups_left:
+            return None
 
-        for end in range(1, request_count + 1):
-            maximum_length = ordered[end - 1].total_mel_frames
-            for group_count in range(1, end + 1):
-                best_work: int | None = None
-                for start in range(group_count - 1, end):
-                    previous = minimum_work[start][group_count - 1]
-                    if previous is None:
-                        continue
-                    minimum_length = ordered[start].total_mel_frames
-                    if maximum_length - minimum_length > max_gap_frames:
-                        continue
-                    candidate = previous + (end - start) * maximum_length
-                    if best_work is None or candidate < best_work:
-                        best_work = candidate
-                minimum_work[end][group_count] = best_work
-
-        return minimum_work[request_count]
-
-    # Stage A: find the first solve count whose minimum work fits the cap.
-    minimum_work = minimum_work_by_group_count(merge_max_gap_frames)
-    solve_count: int | None = None
-    optimal_work: int | None = None
-    for group_count in range(1, request_count + 1):
-        work = minimum_work[group_count]
-        if work is not None and _within_flow_padding_cap(
-            work, baseline_work, merge_pad_budget_pct
-        ):
-            solve_count = group_count
-            optimal_work = work
-            break
-
-    assert solve_count is not None and optimal_work is not None
-
-    # Stage B: find the smallest maximum group gap that still attains Stage A.
-    candidate_gaps = sorted(
-        {
-            ordered[end - 1].total_mel_frames - ordered[start].total_mel_frames
-            for start in range(request_count)
-            for end in range(start + 1, request_count + 1)
-            if ordered[end - 1].total_mel_frames - ordered[start].total_mel_frames
-            <= merge_max_gap_frames
-        }
-    )
-    low = 0
-    high = len(candidate_gaps) - 1
-    while low < high:
-        middle = (low + high) // 2
-        if minimum_work_by_group_count(candidate_gaps[middle])[solve_count] == (
-            optimal_work
-        ):
-            high = middle
-        else:
-            low = middle + 1
-    optimal_max_gap = candidate_gaps[low]
-
-    # Stage C: reconstruct the lexicographically smallest boundary signature.
-    suffix_work: list[list[int | None]] = [
-        [None] * (solve_count + 1) for _ in range(request_count + 1)
-    ]
-    suffix_work[request_count][0] = 0
-    for start in range(request_count - 1, -1, -1):
-        minimum_length = ordered[start].total_mel_frames
-        for groups_left in range(1, min(solve_count, request_count - start) + 1):
-            best_work: int | None = None
-            last_end = request_count - groups_left + 1
-            for end in range(start + 1, last_end + 1):
-                maximum_length = ordered[end - 1].total_mel_frames
-                if maximum_length - minimum_length > optimal_max_gap:
-                    break
-                suffix = suffix_work[end][groups_left - 1]
-                if suffix is None:
-                    continue
-                candidate = (end - start) * maximum_length + suffix
-                if best_work is None or candidate < best_work:
-                    best_work = candidate
-            suffix_work[start][groups_left] = best_work
-
-    groups: list[list[_PreparedFlowRequest]] = []
-    start = 0
-    groups_left = solve_count
-    remaining_work = optimal_work
-    while groups_left:
+        best_plan: tuple[int, int, tuple[int, ...]] | None = None
         minimum_length = ordered[start].total_mel_frames
         last_end = request_count - groups_left + 1
         for end in range(start + 1, last_end + 1):
             maximum_length = ordered[end - 1].total_mel_frames
-            if maximum_length - minimum_length > optimal_max_gap:
+            group_gap = maximum_length - minimum_length
+            if group_gap > merge_max_gap_frames:
                 break
-            suffix = suffix_work[end][groups_left - 1]
+            suffix = best(
+                end,
+                groups_left - 1,
+                max(max_gap_so_far, group_gap),
+            )
             if suffix is None:
                 continue
-            group_work = (end - start) * maximum_length
-            if group_work + suffix != remaining_work:
-                continue
-            groups.append(list(ordered[start:end]))
-            start = end
-            groups_left -= 1
-            remaining_work = suffix
-            break
-        else:
-            raise AssertionError("failed to reconstruct optimal Flow grouping")
+            candidate = (
+                (end - start) * maximum_length + suffix[0],
+                suffix[1],
+                (end,) + suffix[2],
+            )
+            if best_plan is None or candidate < best_plan:
+                best_plan = candidate
+        return best_plan
 
-    assert start == request_count and remaining_work == 0
-    return groups
+    for group_count in range(1, request_count + 1):
+        plan = best(0, group_count, 0)
+        if plan is not None and _within_flow_padding_cap(
+            plan[0], baseline_work, merge_pad_budget_percent
+        ):
+            start = 0
+            groups: list[list[_PreparedFlowRequest]] = []
+            for end in plan[2]:
+                groups.append(list(ordered[start:end]))
+                start = end
+            return groups
+
+    raise AssertionError("valid Flow requests must have a feasible partition")
 
 
 def _group_by_padding_waste(
@@ -1016,12 +935,8 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         hift_compute_dtype: str = "float32",
         hift_max_padding_waste: float = 1.5,
         flow_merge_max_gap_frames: int = 384,
-        flow_merge_pad_budget_pct: float = 20.0,
+        flow_merge_pad_budget_percent: float = 20.0,
     ) -> None:
-        _validate_flow_merge_config(
-            flow_merge_max_gap_frames,
-            flow_merge_pad_budget_pct,
-        )
         if hift_max_padding_waste < 1.0:
             raise ValueError("hift_max_padding_waste must be at least 1.0")
         if hift_compute_dtype not in _AUTOCAST_DTYPES:
@@ -1043,7 +958,7 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         self._hift = hift
         self._compute_dtype = compute_dtype
         self._flow_merge_max_gap_frames = flow_merge_max_gap_frames
-        self._flow_merge_pad_budget_pct = flow_merge_pad_budget_pct
+        self._flow_merge_pad_budget_percent = flow_merge_pad_budget_percent
         self._hift_compute_dtype = _AUTOCAST_DTYPES[hift_compute_dtype]
         self._hift_max_padding_waste = hift_max_padding_waste
         self._hift_samples_per_mel_frame: int | None = None
@@ -1082,10 +997,10 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
             )
 
         results: list[tuple[Any, int] | None] = [None] * len(items)
-        flow_groups = _group_flow_requests(
+        flow_groups = group_flow_requests(
             prepared,
             merge_max_gap_frames=self._flow_merge_max_gap_frames,
-            merge_pad_budget_pct=self._flow_merge_pad_budget_pct,
+            merge_pad_budget_percent=self._flow_merge_pad_budget_percent,
         )
 
         flow_outputs: list[tuple[_PreparedFlowRequest, torch.Tensor]] = []
@@ -1331,7 +1246,7 @@ def create_vocoder_executor(
     max_batch_wait_ms: int = 30,
     flow_batch_admission_frames: int = _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES,
     flow_merge_max_gap_frames: int = 384,
-    flow_merge_pad_budget_pct: float = 20.0,
+    flow_merge_pad_budget_percent: float = 20.0,
     enable_dit_torch_compile: bool = False,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
@@ -1347,10 +1262,6 @@ def create_vocoder_executor(
     if flow_batch_admission_frames <= 0:
         raise ValueError("flow_batch_admission_frames must be greater than zero")
 
-    _validate_flow_merge_config(
-        flow_merge_max_gap_frames,
-        flow_merge_pad_budget_pct,
-    )
     reject_conflicting_dit_accelerators(
         enable_dit_torch_compile=enable_dit_torch_compile,
         enable_flow_estimator_trt=enable_flow_estimator_trt,
@@ -1377,7 +1288,7 @@ def create_vocoder_executor(
         hift,
         compute_dtype=compute_dtype,
         flow_merge_max_gap_frames=flow_merge_max_gap_frames,
-        flow_merge_pad_budget_pct=flow_merge_pad_budget_pct,
+        flow_merge_pad_budget_percent=flow_merge_pad_budget_percent,
         hift_compute_dtype=hift_dtype,
         hift_max_padding_waste=hift_max_padding_waste,
     )

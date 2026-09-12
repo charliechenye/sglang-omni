@@ -76,7 +76,9 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 dtype="bfloat16",
                 flow_batch_admission_frames=8000,
                 flow_merge_max_gap_frames=384,
-                flow_merge_pad_budget_pct=20.0,
+                # Note (chenyang): Adjacent length-sorted requests may share a Flow solve
+                # when their mel-length gap and total added padding stay within these limits.
+                flow_merge_pad_budget_percent=20.0,
                 max_batch_size=16,
                 max_batch_wait_ms=30,
                 # note (guozhihao-224, chenyang):
