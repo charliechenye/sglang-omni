@@ -41,9 +41,6 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
     assert stages_by_name["vocoder"].can_accept_stream_before_payload is True
 
     vocoder = next(stage for stage in config.stages if stage.name == "vocoder")
-    expected_capture_shapes = [
-        list(shape) for shape in FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
-    ]
     assert vocoder.factory.dtype == "bfloat16"
     # max_batch_size / max_batch_wait_ms are declared fields on FactoryArgs, so
     # they are validated eagerly rather than passing through as extras.
@@ -57,7 +54,7 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
         "flow_batch_admission_frames": 8000,
         "flow_merge_max_gap_frames": 384,
         "flow_merge_pad_budget_percent": 25.0,
-        "flow_cuda_graph_capture_shapes": expected_capture_shapes,
+        "flow_cuda_graph_capture_shapes": FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
         "enable_flow_cuda_graph": True,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,

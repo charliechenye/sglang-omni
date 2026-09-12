@@ -18,10 +18,10 @@ _PKG = "sglang_omni.models.fun_cosyvoice3"
 FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
 
 # Note (chenyang):
-# Mel-frame step for buffered Flow CUDA Graph keys. Capture shapes must
-# use a T that is a multiple of this bucket. Replay rounds the real T up
-# to the next multiple and looks up that exact (batch, T) graph.
-# For example, 489 frames would be padded to 496, replayed, then crops back to 489.
+# Mel-frame step size for buffered flow CUDA Graph keys. Capture shapes
+# must use a T that is a multiple of this step size. For example, 489
+# frames would be padded to 496 frames, replayed, and then cropped back
+# to 489 frames.
 
 FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES: tuple[tuple[int, int], ...] = (
     (1, 304),
@@ -119,13 +119,10 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 # when their mel-length gap and total added padding stay within these limits.
                 max_batch_size=16,
                 max_batch_wait_ms=30,
+                enable_flow_cuda_graph=True,
+                flow_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
                 # note (guozhihao-224, chenyang):
                 # Follow SGLang, CUDA Graph is on by default. torch.compile and TensorRT stay opt-in.
-                enable_flow_cuda_graph=True,
-                flow_cuda_graph_capture_shapes=[
-                    list(shape)
-                    for shape in FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
-                ],
                 enable_flow_estimator_trt=False,
                 token_hop_len=25,
                 token_max_hop_len=100,

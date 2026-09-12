@@ -849,16 +849,12 @@ def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:
         for stage in FunCosyVoice3PipelineConfig(model_path="model").stages
         if stage.name == "vocoder"
     )
-    expected_capture_shapes = [
-        list(shape) for shape in FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
-    ]
-
     assert vocoder_stage.factory.model_dump(exclude_none=True) == {
         "dtype": "bfloat16",
         "flow_batch_admission_frames": 8000,
         "flow_merge_max_gap_frames": 384,
         "flow_merge_pad_budget_percent": 25.0,
-        "flow_cuda_graph_capture_shapes": expected_capture_shapes,
+        "flow_cuda_graph_capture_shapes": FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_flow_cuda_graph": True,
