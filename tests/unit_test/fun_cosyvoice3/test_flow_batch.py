@@ -8,7 +8,7 @@ import torch
 from sglang_omni.models.fun_cosyvoice3.stages import (
     FlowBatchInput,
     FunCosyVoice3Flow,
-    _pack_flow_inputs,
+    pack_flow_inputs,
 )
 
 
@@ -158,7 +158,7 @@ def test_pack_flow_inputs_keeps_prompt_and_target_contiguous() -> None:
         _input([0], prompt_token=[5, 6, 7]),
     ]
 
-    packed = _pack_flow_inputs(flow, items)
+    packed = pack_flow_inputs(flow, items)
 
     assert packed.token.dtype == torch.int32
     assert packed.token.tolist() == [[4, 0, 8, 0], [5, 6, 7, 0]]
@@ -173,7 +173,7 @@ def test_pack_flow_inputs_keeps_prompt_and_target_contiguous() -> None:
 
 
 def test_pack_flow_inputs_builds_variable_length_token_masks() -> None:
-    packed = _pack_flow_inputs(
+    packed = pack_flow_inputs(
         _FakeFlow(),
         [
             _input([0], prompt_token=[]),

@@ -27,7 +27,7 @@ def test_modelscope_guard_restores_changed_root_handler_levels(
 
     monkeypatch.setattr(stages.importlib, "import_module", _import_like_modelscope)
     try:
-        stages._import_modelscope_preserving_root_handlers()
+        stages.import_modelscope_preserving_root_handlers()
         assert demoted.level == logging.INFO
         assert untouched.level == logging.WARNING
     finally:

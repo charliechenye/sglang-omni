@@ -70,7 +70,7 @@ def _install(
 ) -> None:
     static_inputs = runner.capture_inputs(*key)
     static_output = torch.empty_like(static_inputs[0])
-    runner._graphs[key] = stages.CapturedFlowCudaGraph(
+    runner.graphs[key] = stages.CapturedFlowCudaGraph(
         _ReplayGraph(static_inputs, static_output, fail=fail),
         static_inputs,
         static_output,
@@ -132,13 +132,13 @@ def test_replay_failure_clears_resident_graphs() -> None:
     _install(runner, (1, 464), fail=True)
     with pytest.raises(RuntimeError, match="replay failed"):
         runner.run(*_solver_inputs(1, 449))
-    assert runner._graphs == {}
+    assert runner.graphs == {}
 
 
 def test_generate_flow_does_not_retry_eager_after_replay_failure(monkeypatch) -> None:
     eager_calls: list[object] = []
     monkeypatch.setattr(
-        stages, "_solve_flow_euler", lambda *args, **kwargs: eager_calls.append(args)
+        stages, "solve_flow_euler", lambda *args, **kwargs: eager_calls.append(args)
     )
 
     class _FailingRunner:

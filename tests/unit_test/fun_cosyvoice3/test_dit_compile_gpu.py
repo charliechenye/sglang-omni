@@ -55,7 +55,7 @@ def test_compile_dit_backbone_dynamic_shapes_match_eager() -> None:
     original_forward = estimator.forward
     param_names = set(dict(estimator.named_parameters()))
 
-    stages._configure_dit_torch_compile()
+    stages.configure_dit_torch_compile()
     estimator.forward = torch.compile(estimator.forward, dynamic=True)
 
     with torch.no_grad():
