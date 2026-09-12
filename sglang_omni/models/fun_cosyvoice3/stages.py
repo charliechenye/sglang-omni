@@ -827,7 +827,7 @@ class _PreparedFlowRequest:
     total_mel_frames: int
 
 
-def group_flow_requests(
+def adaptive_flow_requests_grouping(
     requests: Sequence[_PreparedFlowRequest],
     *,
     flow_merge_max_gap_frames: int,
@@ -840,7 +840,7 @@ def group_flow_requests(
     if not ordered:
         return []
 
-    baseline_work = sum(request.total_mel_frames for request in ordered)
+    non_patching_workload = sum(request.total_mel_frames for request in ordered)
     request_count = len(ordered)
 
     @lru_cache(maxsize=None)
@@ -893,7 +893,7 @@ def group_flow_requests(
         )
         if (
             plan is not None
-            and (plan[0] / baseline_work - 1) * 100
+            and (plan[0] / non_patching_workload - 1) * 100
             <= flow_merge_pad_budget_percent + 1e-9
         ):
             start = 0
@@ -1001,7 +1001,7 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
             )
 
         results: list[tuple[Any, int] | None] = [None] * len(items)
-        flow_groups = group_flow_requests(
+        flow_groups = adaptive_flow_requests_grouping(
             prepared,
             flow_merge_max_gap_frames=self._flow_merge_max_gap_frames,
             flow_merge_pad_budget_percent=self._flow_merge_pad_budget_percent,

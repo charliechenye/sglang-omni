@@ -389,7 +389,7 @@ def test_flow_merge_partition_policy(
     flow_merge_pad_budget_percent: float,
     expected: list[list[int]],
 ) -> None:
-    groups = stages.group_flow_requests(
+    groups = stages.adaptive_flow_requests_grouping(
         _flow_requests(totals),
         flow_merge_max_gap_frames=flow_merge_max_gap_frames,
         flow_merge_pad_budget_percent=flow_merge_pad_budget_percent,
