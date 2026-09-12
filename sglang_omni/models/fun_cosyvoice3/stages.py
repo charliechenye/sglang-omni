@@ -833,15 +833,21 @@ def adaptive_flow_requests_grouping(
     flow_merge_max_gap_frames: int,
     flow_merge_pad_budget_percent: float,
 ) -> list[list[_PreparedFlowRequest]]:
-    """Group length-sorted requests under the adaptive Flow objective."""
-    ordered = tuple(
+    """Adaptive flow grouping to merge requests with similar padding waste.
+
+    Note (chenyang):
+    detailed discussion in https://github.com/sgl-project/sglang-omni/pull/1899
+    """
+    ordered_requests = tuple(
         sorted(requests, key=lambda request: (request.total_mel_frames, request.index))
     )
-    if not ordered:
+    if not ordered_requests:
         return []
 
-    non_patching_workload = sum(request.total_mel_frames for request in ordered)
-    request_count = len(ordered)
+    non_patching_workload = sum(
+        request.total_mel_frames for request in ordered_requests
+    )
+    request_count = len(ordered_requests)
 
     @lru_cache(maxsize=None)
     def optimal_suffix_partition(
@@ -857,13 +863,13 @@ def adaptive_flow_requests_grouping(
             return None
 
         best_plan: tuple[int, int, tuple[int, ...]] | None = None
-        shortest_frames = ordered[suffix_start].total_mel_frames
+        shortest_frames = ordered_requests[suffix_start].total_mel_frames
         group_end_limit = request_count - remaining_group_count + 1
         # Note (chenyang): group_end_limit is max possible end index
         # for the current group, since each remaining group must have
         # at least one request.
         for group_end in range(suffix_start + 1, group_end_limit + 1):
-            longest_frames = ordered[group_end - 1].total_mel_frames
+            longest_frames = ordered_requests[group_end - 1].total_mel_frames
             group_gap_frames = longest_frames - shortest_frames
             if group_gap_frames > flow_merge_max_gap_frames:
                 break
@@ -899,7 +905,7 @@ def adaptive_flow_requests_grouping(
             start = 0
             groups: list[list[_PreparedFlowRequest]] = []
             for end in plan[2]:
-                groups.append(list(ordered[start:end]))
+                groups.append(list(ordered_requests[start:end]))
                 start = end
             return groups
 
