@@ -7,11 +7,8 @@ import importlib
 import logging
 import math
 import time
-from collections import defaultdict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
-from functools import lru_cache
-from itertools import groupby
 from typing import Any, cast
 
 import torch
@@ -461,7 +458,7 @@ class FunCosyVoice3Flow:
 
     def __init__(self, flow: Any) -> None:
         self._flow = flow
-        self._last_solve: tuple[int, _FlowSolveTimer] | None = None
+        self._pending_solves: list[tuple[int, _FlowSolveTimer]] = []
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._flow, name)
@@ -478,20 +475,21 @@ class FunCosyVoice3Flow:
         return self
 
     def log_last_solve(self) -> None:
-        # note (db-ol): the vocoder calls this after the bucket's audio reached
-        # the host. A still pending end event is skipped, never waited for.
-        if self._last_solve is None:
+        # note (db-ol): the vocoder calls this after all buffered audio reaches
+        # the host. Pending end events are skipped, never waited for.
+        if not self._pending_solves:
             return
-        items, timer = self._last_solve
-        self._last_solve = None
-        elapsed_ms = timer.elapsed_ms()
-        if elapsed_ms is None:
-            return
-        logger.debug(
-            "Fun-CosyVoice3 flow solve: batch_items=%d solve_elapsed_ms=%.1f",
-            items,
-            elapsed_ms,
-        )
+        pending_solves = self._pending_solves
+        self._pending_solves = []
+        for items, timer in pending_solves:
+            elapsed_ms = timer.elapsed_ms()
+            if elapsed_ms is None:
+                continue
+            logger.debug(
+                "Fun-CosyVoice3 flow solve: batch_items=%d solve_elapsed_ms=%.1f",
+                items,
+                elapsed_ms,
+            )
 
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
@@ -501,7 +499,7 @@ class FunCosyVoice3Flow:
         timer = None
         if logger.isEnabledFor(logging.DEBUG):
             timer = _FlowSolveTimer(packed.token.device)
-            self._last_solve = (len(inputs), timer)
+            self._pending_solves.append((len(inputs), timer))
         generated = _generate_flow(self._flow, packed, timer=timer)
         return _split_generated_mels(
             self._flow,
@@ -828,14 +826,6 @@ class _PreparedFlowRequest:
     sample_rate: int
     flow_input: FlowBatchInput
     total_mel_frames: int
-    baseline_bucket_key: int
-
-
-@dataclass(frozen=True)
-class _FlowSegment:
-    requests: tuple[_PreparedFlowRequest, ...]
-    padded_work: int
-    newly_merged_span: int
 
 
 def _validate_flow_merge_config(
@@ -851,96 +841,6 @@ def _validate_flow_merge_config(
             "flow_merge_pad_budget_pct must be finite and "
             "greater than or equal to zero"
         )
-    if max_gap_frames == 0 and pad_budget_pct != 0:
-        raise ValueError(
-            "flow_merge_pad_budget_pct must be zero when "
-            "flow_merge_max_gap_frames is zero"
-        )
-
-
-def _precompute_flow_segments(
-    buckets: dict[int, list[_PreparedFlowRequest]],
-    *,
-    merge_max_gap_frames: int,
-) -> tuple[
-    tuple[tuple[int, tuple[_PreparedFlowRequest, ...]], ...],
-    list[list[_FlowSegment | None]],
-]:
-    atomic_groups = tuple(
-        (bucket_key, tuple(requests))
-        for bucket_key, requests in sorted(buckets.items())
-    )
-    segment_matrix: list[list[_FlowSegment | None]] = [
-        [None] * (len(atomic_groups) + 1) for _ in range(len(atomic_groups) + 1)
-    ]
-
-    for start in range(len(atomic_groups)):
-        flattened: list[_PreparedFlowRequest] = []
-        minimum_total: int | None = None
-        maximum_total: int | None = None
-        for end in range(start + 1, len(atomic_groups) + 1):
-            _, atomic_requests = atomic_groups[end - 1]
-            flattened.extend(atomic_requests)
-            atomic_minimum = min(
-                request.total_mel_frames for request in atomic_requests
-            )
-            atomic_maximum = max(
-                request.total_mel_frames for request in atomic_requests
-            )
-            minimum_total = (
-                atomic_minimum
-                if minimum_total is None
-                else min(minimum_total, atomic_minimum)
-            )
-            maximum_total = (
-                atomic_maximum
-                if maximum_total is None
-                else max(maximum_total, atomic_maximum)
-            )
-            assert minimum_total is not None
-            assert maximum_total is not None
-            newly_merged_span = 0 if end - start == 1 else maximum_total - minimum_total
-            if newly_merged_span > merge_max_gap_frames:
-                break
-            segment_matrix[start][end] = _FlowSegment(
-                requests=tuple(flattened),
-                padded_work=len(flattened) * maximum_total,
-                newly_merged_span=newly_merged_span,
-            )
-
-    return atomic_groups, segment_matrix
-
-
-def _minimum_flow_work_solver(
-    segments: Sequence[Sequence[_FlowSegment | None]],
-    *,
-    max_merged_span: int,
-) -> Callable[[int, int], int | None]:
-    """Return memoized minimum padded work for a suffix and solve count."""
-    atomic_count = len(segments) - 1
-
-    @lru_cache(maxsize=None)
-    def min_work(start: int, groups_left: int) -> int | None:
-        if groups_left == 0:
-            return 0 if start == atomic_count else None
-        if atomic_count - start < groups_left:
-            return None
-
-        best: int | None = None
-        last_end = atomic_count - groups_left + 1
-        for end in range(start + 1, last_end + 1):
-            segment = segments[start][end]
-            if segment is None or segment.newly_merged_span > max_merged_span:
-                continue
-            suffix_work = min_work(end, groups_left - 1)
-            if suffix_work is None:
-                continue
-            candidate = segment.padded_work + suffix_work
-            if best is None or candidate < best:
-                best = candidate
-        return best
-
-    return min_work
 
 
 def _within_flow_padding_cap(
@@ -952,98 +852,135 @@ def _within_flow_padding_cap(
 
 
 def _group_flow_requests(
-    buckets: dict[int, list[_PreparedFlowRequest]],
+    requests: Sequence[_PreparedFlowRequest],
     *,
     merge_max_gap_frames: int,
     merge_pad_budget_pct: float,
 ) -> list[list[_PreparedFlowRequest]]:
-    """note(chenye): Coarsen contiguous Flow buckets by solve count, padded work,
-    merged span, then deterministic bucket-range order."""
+    """Group requests by the fixed solve-count, work, gap, and order objective."""
     _validate_flow_merge_config(merge_max_gap_frames, merge_pad_budget_pct)
-    if merge_max_gap_frames == 0:
-        return list(buckets.values())
-    if not buckets:
+    ordered = tuple(
+        sorted(requests, key=lambda request: (request.total_mel_frames, request.index))
+    )
+    if not ordered:
         return []
 
-    atomic_groups, segment_matrix = _precompute_flow_segments(
-        buckets, merge_max_gap_frames=merge_max_gap_frames
-    )
-    baseline_groups = [list(requests) for _, requests in atomic_groups]
-    baseline_work = sum(
-        len(requests) * max(request.total_mel_frames for request in requests)
-        for _, requests in atomic_groups
-    )
+    baseline_work = sum(request.total_mel_frames for request in ordered)
     if baseline_work == 0:
-        # note(chenye): Avoid division by zero; Flow validates empty inputs later.
-        return baseline_groups
+        return [list(ordered)]
 
-    minimum_work = _minimum_flow_work_solver(
-        segment_matrix, max_merged_span=merge_max_gap_frames
-    )
+    request_count = len(ordered)
+
+    def minimum_work_by_group_count(max_gap_frames: int) -> list[int | None]:
+        minimum_work: list[list[int | None]] = [
+            [None] * (request_count + 1) for _ in range(request_count + 1)
+        ]
+        minimum_work[0][0] = 0
+
+        for end in range(1, request_count + 1):
+            maximum_length = ordered[end - 1].total_mel_frames
+            for group_count in range(1, end + 1):
+                best_work: int | None = None
+                for start in range(group_count - 1, end):
+                    previous = minimum_work[start][group_count - 1]
+                    if previous is None:
+                        continue
+                    minimum_length = ordered[start].total_mel_frames
+                    if maximum_length - minimum_length > max_gap_frames:
+                        continue
+                    candidate = previous + (end - start) * maximum_length
+                    if best_work is None or candidate < best_work:
+                        best_work = candidate
+                minimum_work[end][group_count] = best_work
+
+        return minimum_work[request_count]
+
+    # Stage A: find the first solve count whose minimum work fits the cap.
+    minimum_work = minimum_work_by_group_count(merge_max_gap_frames)
     solve_count: int | None = None
     optimal_work: int | None = None
-    for count in range(1, len(atomic_groups) + 1):
-        work = minimum_work(0, count)
+    for group_count in range(1, request_count + 1):
+        work = minimum_work[group_count]
         if work is not None and _within_flow_padding_cap(
-            work,
-            baseline_work,
-            merge_pad_budget_pct,
+            work, baseline_work, merge_pad_budget_pct
         ):
-            solve_count = count
+            solve_count = group_count
             optimal_work = work
             break
 
     assert solve_count is not None and optimal_work is not None
 
-    candidate_spans = sorted(
+    # Stage B: find the smallest maximum group gap that still attains Stage A.
+    candidate_gaps = sorted(
         {
-            segment.newly_merged_span
-            for row in segment_matrix
-            for segment in row
-            if segment is not None
+            ordered[end - 1].total_mel_frames - ordered[start].total_mel_frames
+            for start in range(request_count)
+            for end in range(start + 1, request_count + 1)
+            if ordered[end - 1].total_mel_frames - ordered[start].total_mel_frames
+            <= merge_max_gap_frames
         }
     )
-    for optimal_max_merged_span in candidate_spans:
-        if (
-            _minimum_flow_work_solver(
-                segment_matrix, max_merged_span=optimal_max_merged_span
-            )(0, solve_count)
-            == optimal_work
+    low = 0
+    high = len(candidate_gaps) - 1
+    while low < high:
+        middle = (low + high) // 2
+        if minimum_work_by_group_count(candidate_gaps[middle])[solve_count] == (
+            optimal_work
         ):
-            break
-    else:
-        raise AssertionError("atomic Flow partition must be reachable")
+            high = middle
+        else:
+            low = middle + 1
+    optimal_max_gap = candidate_gaps[low]
 
-    min_work = _minimum_flow_work_solver(
-        segment_matrix, max_merged_span=optimal_max_merged_span
-    )
-    reconstructed: list[list[_PreparedFlowRequest]] = []
+    # Stage C: reconstruct the lexicographically smallest boundary signature.
+    suffix_work: list[list[int | None]] = [
+        [None] * (solve_count + 1) for _ in range(request_count + 1)
+    ]
+    suffix_work[request_count][0] = 0
+    for start in range(request_count - 1, -1, -1):
+        minimum_length = ordered[start].total_mel_frames
+        for groups_left in range(1, min(solve_count, request_count - start) + 1):
+            best_work: int | None = None
+            last_end = request_count - groups_left + 1
+            for end in range(start + 1, last_end + 1):
+                maximum_length = ordered[end - 1].total_mel_frames
+                if maximum_length - minimum_length > optimal_max_gap:
+                    break
+                suffix = suffix_work[end][groups_left - 1]
+                if suffix is None:
+                    continue
+                candidate = (end - start) * maximum_length + suffix
+                if best_work is None or candidate < best_work:
+                    best_work = candidate
+            suffix_work[start][groups_left] = best_work
+
+    groups: list[list[_PreparedFlowRequest]] = []
     start = 0
     groups_left = solve_count
     remaining_work = optimal_work
-    atomic_count = len(atomic_groups)
-    while groups_left > 0:
-        last_end = atomic_count - groups_left + 1
-        # note(chenye): Earliest feasible ends implement the deterministic range tie-break.
+    while groups_left:
+        minimum_length = ordered[start].total_mel_frames
+        last_end = request_count - groups_left + 1
         for end in range(start + 1, last_end + 1):
-            segment = segment_matrix[start][end]
-            if segment is None or segment.newly_merged_span > optimal_max_merged_span:
-                continue
-            suffix_work = min_work(end, groups_left - 1)
-            if (
-                suffix_work is not None
-                and segment.padded_work + suffix_work == remaining_work
-            ):
-                reconstructed.append(list(segment.requests))
-                start = end
-                groups_left -= 1
-                remaining_work = suffix_work
+            maximum_length = ordered[end - 1].total_mel_frames
+            if maximum_length - minimum_length > optimal_max_gap:
                 break
+            suffix = suffix_work[end][groups_left - 1]
+            if suffix is None:
+                continue
+            group_work = (end - start) * maximum_length
+            if group_work + suffix != remaining_work:
+                continue
+            groups.append(list(ordered[start:end]))
+            start = end
+            groups_left -= 1
+            remaining_work = suffix
+            break
         else:
-            raise AssertionError("optimal Flow partition reconstruction failed")
+            raise AssertionError("failed to reconstruct optimal Flow grouping")
 
-    assert start == atomic_count and remaining_work == 0
-    return reconstructed
+    assert start == request_count and remaining_work == 0
+    return groups
 
 
 def _group_by_padding_waste(
@@ -1136,27 +1073,26 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
     async def decode_batch(
         self, items: list[tuple[FunCosyVoice3State, torch.Tensor]]
     ) -> list[tuple[Any, int]]:
-        buckets: dict[int, list[_PreparedFlowRequest]] = defaultdict(list)
+        prepared: list[_PreparedFlowRequest] = []
         for index, (state, codes) in enumerate(items):
             flow_input = self._make_flow_input(state, codes)
-            total_mel_frames = self._flow_total_mel_frames(flow_input)
-            baseline_bucket_key = self._flow_bucket_key_for_total(total_mel_frames)
-            request = _PreparedFlowRequest(
-                index=index,
-                sample_rate=state.sample_rate,
-                flow_input=flow_input,
-                total_mel_frames=total_mel_frames,
-                baseline_bucket_key=baseline_bucket_key,
+            prepared.append(
+                _PreparedFlowRequest(
+                    index=index,
+                    sample_rate=state.sample_rate,
+                    flow_input=flow_input,
+                    total_mel_frames=self._flow_total_mel_frames(flow_input),
+                )
             )
-            buckets[baseline_bucket_key].append(request)
 
         results: list[tuple[Any, int] | None] = [None] * len(items)
         flow_groups = _group_flow_requests(
-            buckets,
+            prepared,
             merge_max_gap_frames=self._flow_merge_max_gap_frames,
             merge_pad_budget_pct=self._flow_merge_pad_budget_pct,
         )
 
+        flow_outputs: list[tuple[_PreparedFlowRequest, torch.Tensor]] = []
         for flow_group in flow_groups:
             with torch.autocast(
                 device_type=current_platform.device_type,
@@ -1166,26 +1102,17 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
                 mel_list = self._flow.inference(
                     [request.flow_input for request in flow_group]
                 )
+            flow_outputs.extend(zip(flow_group, mel_list, strict=True))
 
-                pairs = list(zip(flow_group, mel_list, strict=True))
+        for group in _group_by_padding_waste(
+            flow_outputs,
+            max_waste=self._hift_max_padding_waste,
+        ):
+            wavs = self._mel2wav_batch([mel for _, mel in group])
+            for (request, _), wav in zip(group, wavs, strict=True):
+                results[request.index] = (wav, request.sample_rate)
 
-                # note(chenye): Atomic buckets stay contiguous, so groupby restores HiFT groups.
-                for _, atomic_pairs_iter in groupby(
-                    pairs, key=lambda pair: pair[0].baseline_bucket_key
-                ):
-                    atomic_pairs = list(atomic_pairs_iter)
-                    for group in _group_by_padding_waste(
-                        atomic_pairs,
-                        max_waste=self._hift_max_padding_waste,
-                    ):
-                        wavs = self._mel2wav_batch([mel for _, mel in group])
-                        for (request, _), wav in zip(group, wavs, strict=True):
-                            results[request.index] = (
-                                wav,
-                                request.sample_rate,
-                            )
-
-            self._flow.log_last_solve()
+        self._flow.log_last_solve()
 
         if any(result is None for result in results):
             raise RuntimeError("Fun-CosyVoice3 vocoder did not decode every request")

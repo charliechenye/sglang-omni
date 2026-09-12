@@ -249,28 +249,22 @@ def _codes(length: int, value: int = 1) -> torch.Tensor:
     return torch.full((length,), value, dtype=torch.long)
 
 
-def _flow_buckets(
-    totals: list[int], *, bucket_frames: int
-) -> dict[int, list[stages._PreparedFlowRequest]]:
+def _flow_requests(totals: list[int]) -> list[stages._PreparedFlowRequest]:
     flow_input = stages.FlowBatchInput(
         token=torch.empty((1, 0), dtype=torch.int32),
         prompt_token=torch.empty((1, 0), dtype=torch.int32),
         prompt_feat=torch.empty((1, 0, 80)),
         embedding=torch.empty((1, 192)),
     )
-    buckets: dict[int, list[stages._PreparedFlowRequest]] = {}
-    for index, total in enumerate(totals):
-        bucket_key = (total + bucket_frames - 1) // bucket_frames
-        buckets.setdefault(bucket_key, []).append(
-            stages._PreparedFlowRequest(
-                index=index,
-                sample_rate=24000,
-                flow_input=flow_input,
-                total_mel_frames=total,
-                baseline_bucket_key=bucket_key,
-            )
+    return [
+        stages._PreparedFlowRequest(
+            index=index,
+            sample_rate=24000,
+            flow_input=flow_input,
+            total_mel_frames=total,
         )
-    return buckets
+        for index, total in enumerate(totals)
+    ]
 
 
 def _install_fake_batch_adapter(monkeypatch, calls: list[list]) -> None:
@@ -316,42 +310,13 @@ def test_decode_payload_size_one_uses_batch_adapter(monkeypatch) -> None:
     assert [len(call) for call in batch_calls] == [1]
 
 
-def test_decode_batch_singleton_buckets_use_batch_adapter(monkeypatch) -> None:
-    flow = _BatchCapableFakeFlow()
-    hift = _FakeHiFT()
-    batch_calls: list[list] = []
-    _install_fake_batch_adapter(monkeypatch, batch_calls)
-    vocoder = stages._CosyVoice3Vocoder(flow, hift)
-
-    asyncio.run(vocoder.decode_batch([(_state(), _codes(2)), (_state(), _codes(26))]))
-
-    assert [len(call) for call in batch_calls] == [1, 1]
-    assert len(hift.calls) == 2
-
-
-def test_decode_batch_same_bucket_batches_flow_once(monkeypatch) -> None:
-    flow = _BatchCapableFakeFlow()
-    hift = _FakeHiFT()
-    batch_calls: list[list] = []
-    _install_fake_batch_adapter(monkeypatch, batch_calls)
-    vocoder = stages._CosyVoice3Vocoder(flow, hift)
-
-    asyncio.run(vocoder.decode_batch([(_state(), _codes(2)), (_state(), _codes(3))]))
-
-    assert len(batch_calls) == 1
-    assert len(batch_calls[0]) == 2
-    # HiFT runs once over the padded batch rather than once per request.
-    assert len(hift.calls) == 1
-    assert hift.calls[0][0].shape[0] == 2
-
-
 def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
     monkeypatch,
 ) -> None:
     items = [
-        (_state(sample_rate=16003, prompt_tokens=0), _codes(26, 3)),
+        (_state(sample_rate=16003, prompt_tokens=0), _codes(50, 3)),
         (_state(sample_rate=16001, prompt_tokens=0), _codes(24, 1)),
-        (_state(sample_rate=16004, prompt_tokens=0), _codes(27, 4)),
+        (_state(sample_rate=16004, prompt_tokens=0), _codes(51, 4)),
         (_state(sample_rate=16002, prompt_tokens=0), _codes(25, 2)),
     ]
 
@@ -362,9 +327,8 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
     vocoder = stages._CosyVoice3Vocoder(
         flow,
         hift,
-        flow_batch_bucket_frames=50,
-        flow_merge_max_gap_frames=64,
-        flow_merge_pad_budget_pct=10,
+        flow_merge_max_gap_frames=4,
+        flow_merge_pad_budget_pct=20,
     )
     results = asyncio.run(vocoder.decode_batch(items))
     hift_memberships = [
@@ -373,15 +337,15 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
 
     assert [sample_rate for _, sample_rate in results] == [16003, 16001, 16004, 16002]
     assert [[item.token.shape[1] for item in call] for call in flow_calls] == [
-        [24, 25, 26, 27]
+        [24, 25],
+        [50, 51],
     ]
-    assert hift_memberships == [(1, 2), (3, 4)]
+    assert hift_memberships == [(1, 2, 3, 4)]
 
 
 @pytest.mark.parametrize(
     (
         "totals",
-        "bucket_frames",
         "merge_max_gap_frames",
         "merge_pad_budget_pct",
         "expected",
@@ -389,7 +353,6 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
     [
         pytest.param(
             [10, 13, 30, 33],
-            10,
             4,
             5,
             [[10], [13], [30, 33]],
@@ -397,7 +360,6 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
         ),
         pytest.param(
             [10, 10, 10, 11, 13],
-            1,
             3,
             10,
             [[10, 10, 10], [11, 13]],
@@ -405,7 +367,6 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
         ),
         pytest.param(
             [10, 10, 20, 40],
-            10,
             40,
             30,
             [[10, 10, 20], [40]],
@@ -413,7 +374,6 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
         ),
         pytest.param(
             [450] + [500] * 15,
-            50,
             384,
             20,
             [[450] + [500] * 15],
@@ -423,13 +383,12 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
 )
 def test_flow_merge_partition_policy(
     totals: list[int],
-    bucket_frames: int,
     merge_max_gap_frames: int,
     merge_pad_budget_pct: float,
     expected: list[list[int]],
 ) -> None:
     groups = stages._group_flow_requests(
-        _flow_buckets(totals, bucket_frames=bucket_frames),
+        _flow_requests(totals),
         merge_max_gap_frames=merge_max_gap_frames,
         merge_pad_budget_pct=merge_pad_budget_pct,
     )
@@ -486,45 +445,6 @@ def test_decode_batch_long_singleton_uses_batch_adapter(monkeypatch) -> None:
 
     assert [len(call) for call in batch_calls] == [1]
     assert batch_calls[0][0].token.shape[1] == 2200
-
-
-def test_decode_batch_different_buckets_do_not_share_padding(monkeypatch) -> None:
-    flow = _BatchCapableFakeFlow()
-    batch_calls: list[list] = []
-    _install_fake_batch_adapter(monkeypatch, batch_calls)
-    vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
-    items = [
-        (_state(), _codes(9)),
-        (_state(), _codes(10)),
-        (_state(), _codes(25)),
-        (_state(), _codes(26)),
-    ]
-
-    asyncio.run(vocoder.decode_batch(items))
-
-    assert [len(call) for call in batch_calls] == [2, 2]
-    assert [[item.token.shape[1] for item in call] for call in batch_calls] == [
-        [9, 10],
-        [25, 26],
-    ]
-
-
-def test_decode_batch_preserves_input_order_across_buckets(monkeypatch) -> None:
-    flow = _BatchCapableFakeFlow()
-    batch_calls: list[list] = []
-    _install_fake_batch_adapter(monkeypatch, batch_calls)
-    vocoder = stages._CosyVoice3Vocoder(flow, _FakeHiFT())
-    items = [
-        (_state(sample_rate=16001), _codes(9, 1)),
-        (_state(sample_rate=16002), _codes(25, 2)),
-        (_state(sample_rate=16003), _codes(10, 3)),
-        (_state(sample_rate=16004), _codes(26, 4)),
-    ]
-
-    results = asyncio.run(vocoder.decode_batch(items))
-
-    assert [sample_rate for _, sample_rate in results] == [16001, 16002, 16003, 16004]
-    assert [len(call) for call in batch_calls] == [2, 2]
 
 
 def test_vocoder_rejects_non_pytorch_flow_estimator() -> None:
