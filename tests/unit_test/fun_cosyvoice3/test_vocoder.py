@@ -511,21 +511,12 @@ def test_decode_batch_does_not_retry_after_batch_failure(monkeypatch) -> None:
         )
 
 
-def test_vocoder_rejects_non_positive_flow_bucket_size() -> None:
-    with pytest.raises(ValueError, match="flow_batch_bucket_frames"):
-        stages._CosyVoice3Vocoder(
-            _BatchCapableFakeFlow(), _FakeHiFT(), flow_batch_bucket_frames=0
-        )
-
-
-def test_flow_scheduler_cost_rounds_to_bucket() -> None:
-    vocoder = stages._CosyVoice3Vocoder(
-        _BatchCapableFakeFlow(), _FakeHiFT(), flow_batch_bucket_frames=50
-    )
+def test_flow_scheduler_cost_uses_exact_frames() -> None:
+    vocoder = stages._CosyVoice3Vocoder(_BatchCapableFakeFlow(), _FakeHiFT())
     state = _state(prompt_tokens=1)
     state.audio_codes = _codes(2)
 
-    assert vocoder._flow_scheduler_cost(_payload(state)) == 50
+    assert vocoder._flow_scheduler_cost(_payload(state)) == 6
 
 
 def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None:
@@ -616,7 +607,6 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         dtype="float16",
         max_batch_size=6,
         max_batch_wait_ms=7,
-        flow_batch_bucket_frames=100,
         flow_batch_admission_frames=200,
         flow_merge_max_gap_frames=0,
         flow_merge_pad_budget_pct=0,
@@ -631,7 +621,7 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
     assert scheduler._vocoder._flow_merge_pad_budget_pct == 0
     state = _state(prompt_tokens=1)
     state.audio_codes = _codes(2)
-    assert scheduler._request_cost_fn(_payload(state)) == 100
+    assert scheduler._request_cost_fn(_payload(state)) == 6
     assert captured == {
         "checkpoint_dir": "/checkpoint",
         "device": "cpu",
@@ -848,7 +838,7 @@ def test_create_vocoder_executor_rejects_non_positive_admission_budget(
         )
 
 
-def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
+def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:
     vocoder_stage = next(
         stage
         for stage in FunCosyVoice3PipelineConfig(model_path="model").stages
@@ -857,7 +847,6 @@ def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
 
     assert vocoder_stage.factory.model_dump(exclude_none=True) == {
         "dtype": "bfloat16",
-        "flow_batch_bucket_frames": 50,
         "flow_batch_admission_frames": 8000,
         "flow_merge_max_gap_frames": 384,
         "flow_merge_pad_budget_pct": 20.0,
