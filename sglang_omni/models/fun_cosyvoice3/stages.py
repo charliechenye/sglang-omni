@@ -945,7 +945,7 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         hift_compute_dtype: str = "float32",
         hift_max_padding_waste: float = 1.5,
         flow_merge_max_gap_frames: int = 384,
-        flow_merge_pad_budget_percent: float = 20.0,
+        flow_merge_pad_budget_percent: float = 25.0,
     ) -> None:
         if hift_max_padding_waste < 1.0:
             raise ValueError("hift_max_padding_waste must be at least 1.0")
@@ -1252,7 +1252,7 @@ def create_vocoder_executor(
     max_batch_wait_ms: int = 30,
     flow_batch_admission_frames: int = _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES,
     flow_merge_max_gap_frames: int = 384,
-    flow_merge_pad_budget_percent: float = 20.0,
+    flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = False,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",

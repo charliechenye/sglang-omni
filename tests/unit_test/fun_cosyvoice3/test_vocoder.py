@@ -328,7 +328,7 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
         flow,
         hift,
         flow_merge_max_gap_frames=4,
-        flow_merge_pad_budget_percent=20,
+        flow_merge_pad_budget_percent=25,
     )
     results = asyncio.run(vocoder.decode_batch(items))
     hift_memberships = [
@@ -377,7 +377,7 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
         pytest.param(
             [450] + [500] * 15,
             384,
-            20,
+            25,
             [[450] + [500] * 15],
             id="b16-production-regime",
         ),
@@ -575,7 +575,7 @@ def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) ->
     assert scheduler._max_batch_size == 16
     assert scheduler._max_batch_wait_s == pytest.approx(0.03)
     assert scheduler._vocoder._flow_merge_max_gap_frames == 384
-    assert scheduler._vocoder._flow_merge_pad_budget_percent == 20.0
+    assert scheduler._vocoder._flow_merge_pad_budget_percent == 25.0
 
 
 def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> None:
@@ -851,7 +851,7 @@ def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:
         "dtype": "bfloat16",
         "flow_batch_admission_frames": 8000,
         "flow_merge_max_gap_frames": 384,
-        "flow_merge_pad_budget_percent": 20.0,
+        "flow_merge_pad_budget_percent": 25.0,
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_flow_estimator_trt": False,
