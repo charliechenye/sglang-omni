@@ -300,7 +300,7 @@ def solve_flow_euler(
 
 
 def verify_flow_cuda_graph_capture_shapes(
-    capture_shapes: Sequence[Sequence[int]],
+    capture_shapes: tuple[tuple[int, int], ...],
     *,
     max_batch_size: int,
 ) -> tuple[tuple[int, int], ...]:
