@@ -345,7 +345,7 @@ def test_decode_batch_same_bucket_batches_flow_once(monkeypatch) -> None:
     assert hift.calls[0][0].shape[0] == 2
 
 
-def test_decode_batch_coalesces_flow_preserving_hift_groups_and_order(
+def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
     monkeypatch,
 ) -> None:
     items = [
@@ -363,8 +363,8 @@ def test_decode_batch_coalesces_flow_preserving_hift_groups_and_order(
         flow,
         hift,
         flow_batch_bucket_frames=50,
-        flow_batch_coalesce_span_frames=64,
-        flow_batch_coalesce_max_added_padding_pct=10,
+        flow_merge_max_gap_frames=64,
+        flow_merge_pad_budget_pct=10,
     )
     results = asyncio.run(vocoder.decode_batch(items))
     hift_memberships = [
@@ -379,7 +379,13 @@ def test_decode_batch_coalesces_flow_preserving_hift_groups_and_order(
 
 
 @pytest.mark.parametrize(
-    ("totals", "bucket_frames", "span_frames", "padding_pct", "expected"),
+    (
+        "totals",
+        "bucket_frames",
+        "merge_max_gap_frames",
+        "merge_pad_budget_pct",
+        "expected",
+    ),
     [
         pytest.param(
             [10, 13, 30, 33],
@@ -415,17 +421,17 @@ def test_decode_batch_coalesces_flow_preserving_hift_groups_and_order(
         ),
     ],
 )
-def test_flow_coalescing_partition_policy(
+def test_flow_merge_partition_policy(
     totals: list[int],
     bucket_frames: int,
-    span_frames: int,
-    padding_pct: float,
+    merge_max_gap_frames: int,
+    merge_pad_budget_pct: float,
     expected: list[list[int]],
 ) -> None:
     groups = stages._group_flow_requests(
         _flow_buckets(totals, bucket_frames=bucket_frames),
-        coalesce_span_frames=span_frames,
-        coalesce_max_added_padding_pct=padding_pct,
+        merge_max_gap_frames=merge_max_gap_frames,
+        merge_pad_budget_pct=merge_pad_budget_pct,
     )
 
     assert [
@@ -655,8 +661,8 @@ def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) ->
     ), "default admission budget no longer holds a useful batch"
     assert scheduler._max_batch_size == 16
     assert scheduler._max_batch_wait_s == pytest.approx(0.03)
-    assert scheduler._vocoder._flow_batch_coalesce_span_frames == 384
-    assert scheduler._vocoder._flow_batch_coalesce_max_added_padding_pct == 20.0
+    assert scheduler._vocoder._flow_merge_max_gap_frames == 384
+    assert scheduler._vocoder._flow_merge_pad_budget_pct == 20.0
 
 
 def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> None:
@@ -692,8 +698,8 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
         max_batch_wait_ms=7,
         flow_batch_bucket_frames=100,
         flow_batch_admission_frames=200,
-        flow_batch_coalesce_span_frames=0,
-        flow_batch_coalesce_max_added_padding_pct=0,
+        flow_merge_max_gap_frames=0,
+        flow_merge_pad_budget_pct=0,
     )
 
     assert isinstance(scheduler, FunCosyVoice3StreamingVocoderScheduler)
@@ -701,8 +707,8 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
     assert scheduler._max_batch_wait_s == pytest.approx(0.007)
     assert scheduler._max_batch_cost == 200
     assert callable(scheduler._request_cost_fn)
-    assert scheduler._vocoder._flow_batch_coalesce_span_frames == 0
-    assert scheduler._vocoder._flow_batch_coalesce_max_added_padding_pct == 0
+    assert scheduler._vocoder._flow_merge_max_gap_frames == 0
+    assert scheduler._vocoder._flow_merge_pad_budget_pct == 0
     state = _state(prompt_tokens=1)
     state.audio_codes = _codes(2)
     assert scheduler._request_cost_fn(_payload(state)) == 100
@@ -933,8 +939,8 @@ def test_pipeline_config_sets_flow_batch_bucket_by_default() -> None:
         "dtype": "bfloat16",
         "flow_batch_bucket_frames": 50,
         "flow_batch_admission_frames": 8000,
-        "flow_batch_coalesce_span_frames": 384,
-        "flow_batch_coalesce_max_added_padding_pct": 20.0,
+        "flow_merge_max_gap_frames": 384,
+        "flow_merge_pad_budget_pct": 20.0,
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_flow_estimator_trt": False,

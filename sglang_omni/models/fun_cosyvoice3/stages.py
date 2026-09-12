@@ -838,30 +838,30 @@ class _FlowSegment:
     newly_merged_span: int
 
 
-def _validate_flow_batch_coalescing_config(
-    span_frames: int,
-    max_added_padding_pct: float,
+def _validate_flow_merge_config(
+    max_gap_frames: int,
+    pad_budget_pct: float,
 ) -> None:
-    if span_frames < 0:
+    if max_gap_frames < 0:
         raise ValueError(
-            "flow_batch_coalesce_span_frames must be greater than or equal to zero"
+            "flow_merge_max_gap_frames must be greater than or equal to zero"
         )
-    if not math.isfinite(max_added_padding_pct) or max_added_padding_pct < 0:
+    if not math.isfinite(pad_budget_pct) or pad_budget_pct < 0:
         raise ValueError(
-            "flow_batch_coalesce_max_added_padding_pct must be finite and "
+            "flow_merge_pad_budget_pct must be finite and "
             "greater than or equal to zero"
         )
-    if span_frames == 0 and max_added_padding_pct != 0:
+    if max_gap_frames == 0 and pad_budget_pct != 0:
         raise ValueError(
-            "flow_batch_coalesce_max_added_padding_pct must be zero when "
-            "flow_batch_coalesce_span_frames is zero"
+            "flow_merge_pad_budget_pct must be zero when "
+            "flow_merge_max_gap_frames is zero"
         )
 
 
 def _precompute_flow_segments(
     buckets: dict[int, list[_PreparedFlowRequest]],
     *,
-    coalesce_span_frames: int,
+    merge_max_gap_frames: int,
 ) -> tuple[
     tuple[tuple[int, tuple[_PreparedFlowRequest, ...]], ...],
     list[list[_FlowSegment | None]],
@@ -900,7 +900,7 @@ def _precompute_flow_segments(
             assert minimum_total is not None
             assert maximum_total is not None
             newly_merged_span = 0 if end - start == 1 else maximum_total - minimum_total
-            if newly_merged_span > coalesce_span_frames:
+            if newly_merged_span > merge_max_gap_frames:
                 break
             segment_matrix[start][end] = _FlowSegment(
                 requests=tuple(flattened),
@@ -946,29 +946,27 @@ def _minimum_flow_work_solver(
 def _within_flow_padding_cap(
     padded_work: int,
     baseline_work: int,
-    max_added_padding_pct: float,
+    pad_budget_pct: float,
 ) -> bool:
-    return (padded_work / baseline_work - 1) * 100 <= max_added_padding_pct + 1e-9
+    return (padded_work / baseline_work - 1) * 100 <= pad_budget_pct + 1e-9
 
 
 def _group_flow_requests(
     buckets: dict[int, list[_PreparedFlowRequest]],
     *,
-    coalesce_span_frames: int,
-    coalesce_max_added_padding_pct: float,
+    merge_max_gap_frames: int,
+    merge_pad_budget_pct: float,
 ) -> list[list[_PreparedFlowRequest]]:
     """note(chenye): Coarsen contiguous Flow buckets by solve count, padded work,
     merged span, then deterministic bucket-range order."""
-    _validate_flow_batch_coalescing_config(
-        coalesce_span_frames, coalesce_max_added_padding_pct
-    )
-    if coalesce_span_frames == 0:
+    _validate_flow_merge_config(merge_max_gap_frames, merge_pad_budget_pct)
+    if merge_max_gap_frames == 0:
         return list(buckets.values())
     if not buckets:
         return []
 
     atomic_groups, segment_matrix = _precompute_flow_segments(
-        buckets, coalesce_span_frames=coalesce_span_frames
+        buckets, merge_max_gap_frames=merge_max_gap_frames
     )
     baseline_groups = [list(requests) for _, requests in atomic_groups]
     baseline_work = sum(
@@ -980,7 +978,7 @@ def _group_flow_requests(
         return baseline_groups
 
     minimum_work = _minimum_flow_work_solver(
-        segment_matrix, max_merged_span=coalesce_span_frames
+        segment_matrix, max_merged_span=merge_max_gap_frames
     )
     solve_count: int | None = None
     optimal_work: int | None = None
@@ -989,7 +987,7 @@ def _group_flow_requests(
         if work is not None and _within_flow_padding_cap(
             work,
             baseline_work,
-            coalesce_max_added_padding_pct,
+            merge_pad_budget_pct,
         ):
             solve_count = count
             optimal_work = work
@@ -1081,14 +1079,14 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         flow_batch_bucket_frames: int = 50,
         hift_compute_dtype: str = "float32",
         hift_max_padding_waste: float = 1.5,
-        flow_batch_coalesce_span_frames: int = 384,
-        flow_batch_coalesce_max_added_padding_pct: float = 20.0,
+        flow_merge_max_gap_frames: int = 384,
+        flow_merge_pad_budget_pct: float = 20.0,
     ) -> None:
         if flow_batch_bucket_frames <= 0:
             raise ValueError("flow_batch_bucket_frames must be greater than zero")
-        _validate_flow_batch_coalescing_config(
-            flow_batch_coalesce_span_frames,
-            flow_batch_coalesce_max_added_padding_pct,
+        _validate_flow_merge_config(
+            flow_merge_max_gap_frames,
+            flow_merge_pad_budget_pct,
         )
         if hift_max_padding_waste < 1.0:
             raise ValueError("hift_max_padding_waste must be at least 1.0")
@@ -1111,10 +1109,8 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         self._hift = hift
         self._compute_dtype = compute_dtype
         self._flow_batch_bucket_frames = flow_batch_bucket_frames
-        self._flow_batch_coalesce_span_frames = flow_batch_coalesce_span_frames
-        self._flow_batch_coalesce_max_added_padding_pct = (
-            flow_batch_coalesce_max_added_padding_pct
-        )
+        self._flow_merge_max_gap_frames = flow_merge_max_gap_frames
+        self._flow_merge_pad_budget_pct = flow_merge_pad_budget_pct
         self._hift_compute_dtype = _AUTOCAST_DTYPES[hift_compute_dtype]
         self._hift_max_padding_waste = hift_max_padding_waste
         self._hift_samples_per_mel_frame: int | None = None
@@ -1157,10 +1153,8 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
         results: list[tuple[Any, int] | None] = [None] * len(items)
         flow_groups = _group_flow_requests(
             buckets,
-            coalesce_span_frames=self._flow_batch_coalesce_span_frames,
-            coalesce_max_added_padding_pct=(
-                self._flow_batch_coalesce_max_added_padding_pct
-            ),
+            merge_max_gap_frames=self._flow_merge_max_gap_frames,
+            merge_pad_budget_pct=self._flow_merge_pad_budget_pct,
         )
 
         for flow_group in flow_groups:
@@ -1427,8 +1421,8 @@ def create_vocoder_executor(
     max_batch_wait_ms: int = 30,
     flow_batch_bucket_frames: int = 50,
     flow_batch_admission_frames: int = _DEFAULT_FLOW_BATCH_ADMISSION_FRAMES,
-    flow_batch_coalesce_span_frames: int = 384,
-    flow_batch_coalesce_max_added_padding_pct: float = 20.0,
+    flow_merge_max_gap_frames: int = 384,
+    flow_merge_pad_budget_pct: float = 20.0,
     enable_dit_torch_compile: bool = False,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
@@ -1444,9 +1438,9 @@ def create_vocoder_executor(
     if flow_batch_admission_frames <= 0:
         raise ValueError("flow_batch_admission_frames must be greater than zero")
 
-    _validate_flow_batch_coalescing_config(
-        flow_batch_coalesce_span_frames,
-        flow_batch_coalesce_max_added_padding_pct,
+    _validate_flow_merge_config(
+        flow_merge_max_gap_frames,
+        flow_merge_pad_budget_pct,
     )
     reject_conflicting_dit_accelerators(
         enable_dit_torch_compile=enable_dit_torch_compile,
@@ -1474,10 +1468,8 @@ def create_vocoder_executor(
         hift,
         compute_dtype=compute_dtype,
         flow_batch_bucket_frames=flow_batch_bucket_frames,
-        flow_batch_coalesce_span_frames=flow_batch_coalesce_span_frames,
-        flow_batch_coalesce_max_added_padding_pct=(
-            flow_batch_coalesce_max_added_padding_pct
-        ),
+        flow_merge_max_gap_frames=flow_merge_max_gap_frames,
+        flow_merge_pad_budget_pct=flow_merge_pad_budget_pct,
         hift_compute_dtype=hift_dtype,
         hift_max_padding_waste=hift_max_padding_waste,
     )
