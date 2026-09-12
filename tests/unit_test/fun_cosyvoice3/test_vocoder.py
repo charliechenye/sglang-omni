@@ -53,7 +53,7 @@ class _BatchCapableFakeFlow(torch.nn.Module):
         self.token_mel_ratio = 2
         self.input_embedding = torch.nn.Embedding(32, 80)
         self.spk_embed_affine_layer = torch.nn.Linear(192, 80)
-        self.pre_lookahead_layer = torch.nn.Identity()
+        self.pre_lookahead_layer = lambda x, context=None: x
         self.decoder = SimpleNamespace(
             rand_noise=torch.zeros(1, 80, 1000),
             t_scheduler="cosine",

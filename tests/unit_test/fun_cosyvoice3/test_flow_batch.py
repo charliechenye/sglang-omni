@@ -115,7 +115,7 @@ class _FakeFlow(torch.nn.Module):
         self.token_mel_ratio = token_mel_ratio
         self.input_embedding = torch.nn.Embedding(32, channels)
         self.spk_embed_affine_layer = torch.nn.Linear(3, channels, bias=False)
-        self.pre_lookahead_layer = torch.nn.Identity()
+        self.pre_lookahead_layer = lambda x, context=None: x
         self.decoder = _FakeDecoder(
             channels, max_frames=max_frames, estimator=estimator
         )

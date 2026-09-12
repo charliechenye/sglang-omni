@@ -35,7 +35,7 @@ def _flow(*, channels: int = 4, max_frames: int = 512) -> SimpleNamespace:
         token_mel_ratio=1,
         spk_embed_affine_layer=torch.nn.Linear(3, 5),
         input_embedding=lambda token: torch.ones(*token.shape, channels),
-        pre_lookahead_layer=torch.nn.Identity(),
+        pre_lookahead_layer=lambda x, context=None: x,
     )
 
 

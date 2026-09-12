@@ -230,11 +230,7 @@ def apply_pre_lookahead(
     if lengths is None or len(set(int(length) for length in lengths)) <= 1:
         body = token_embedding[:, :-lookahead]
         context = token_embedding[:, -lookahead:]
-        try:
-            return layer(body, context=context)
-        except TypeError:
-            # note (guozhihao-224): unit fakes use Identity, which has no context kwarg.
-            return layer(body)
+        return layer(body, context=context)
     # note (guozhihao-224): packing left-aligns and pads to max combined
     # length. Slice [:, -lookahead:] would read pad on shorter rows.
     body_lens = [max(int(length) - lookahead, 0) for length in lengths]
@@ -246,10 +242,7 @@ def apply_pre_lookahead(
         context = token_embedding[
             index : index + 1, int(length) - lookahead : int(length)
         ]
-        try:
-            hidden = layer(body, context=context)
-        except TypeError:
-            hidden = layer(body)
+        hidden = layer(body, context=context)
         if hidden.shape[1] < max_body:
             hidden = F.pad(hidden, (0, 0, 0, max_body - int(hidden.shape[1])))
         pieces.append(hidden)
