@@ -304,16 +304,16 @@ def verify_flow_cuda_graph_capture_shapes(
 ) -> tuple[tuple[int, int], ...]:
     if not capture_shapes:
         raise ValueError("flow_cuda_graph_capture_shapes must not be empty")
-    for batch_size, frames in capture_shapes:
-        if batch_size <= 0 or frames <= 0:
+    for batch_size, mel_frame in capture_shapes:
+        if batch_size <= 0 or mel_frame <= 0:
             raise ValueError(
                 "flow_cuda_graph_capture_shapes entries must have positive "
-                f"batch and frame values; got {(batch_size, frames)!r}"
+                f"batch and mel_frame values; got {(batch_size, mel_frame)!r}"
             )
-        if frames % FLOW_CUDA_GRAPH_FRAME_BUCKET != 0:
+        if mel_frame % FLOW_CUDA_GRAPH_FRAME_BUCKET != 0:
             raise ValueError(
-                "flow_cuda_graph_capture_shapes frame values must be multiples "
-                f"of {FLOW_CUDA_GRAPH_FRAME_BUCKET}; got {(batch_size, frames)!r}"
+                "flow_cuda_graph_capture_shapes mel_frame values must be multiples "
+                f"of {FLOW_CUDA_GRAPH_FRAME_BUCKET}; got {(batch_size, mel_frame)!r}"
             )
     return capture_shapes
 
