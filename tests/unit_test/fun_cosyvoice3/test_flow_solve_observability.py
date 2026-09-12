@@ -83,9 +83,11 @@ def _decode_and_collect(
 
 def test_decode_batch_logs_one_line_per_solve(caplog) -> None:
     messages = _decode_and_collect(_SolvableFlow(), caplog, split=True)
-    assert len(messages) == 1
-    assert "batch_items=2" in messages[0]
-    assert float(messages[0].rsplit("solve_elapsed_ms=", 1)[1]) > 0.0
+    assert len(messages) == 2
+    assert all("batch_items=2" in message for message in messages)
+    assert all(
+        float(message.rsplit("solve_elapsed_ms=", 1)[1]) > 0.0 for message in messages
+    )
 
 
 def test_flow_solve_is_timed_only_when_debug_is_enabled(caplog, monkeypatch) -> None:

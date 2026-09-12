@@ -995,7 +995,6 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
             merge_pad_budget_percent=self._flow_merge_pad_budget_percent,
         )
 
-        flow_outputs: list[tuple[_PreparedFlowRequest, torch.Tensor]] = []
         for flow_group in flow_groups:
             with torch.autocast(
                 device_type=current_platform.device_type,
@@ -1005,17 +1004,14 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
                 mel_list = self._flow.inference(
                     [request.flow_input for request in flow_group]
                 )
-            flow_outputs.extend(zip(flow_group, mel_list, strict=True))
-
-        for group in _group_by_padding_waste(
-            flow_outputs,
-            max_waste=self._hift_max_padding_waste,
-        ):
-            wavs = self._mel2wav_batch([mel for _, mel in group])
-            for (request, _), wav in zip(group, wavs, strict=True):
-                results[request.index] = (wav, request.sample_rate)
-
-        self._flow.log_last_solve()
+            for group in _group_by_padding_waste(
+                list(zip(flow_group, mel_list, strict=True)),
+                max_waste=self._hift_max_padding_waste,
+            ):
+                wavs = self._mel2wav_batch([mel for _, mel in group])
+                for (request, _), wav in zip(group, wavs, strict=True):
+                    results[request.index] = (wav, request.sample_rate)
+            self._flow.log_last_solve()
 
         if any(result is None for result in results):
             raise RuntimeError("Fun-CosyVoice3 vocoder did not decode every request")
