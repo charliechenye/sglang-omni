@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import importlib
 import logging
-import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -13,14 +12,9 @@ from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
+from cosyvoice.flow.DiT import dit as cosyvoice_dit_module
+from cosyvoice.utils.mask import add_optional_chunk_mask as cosyvoice_chunk_mask
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
-
-try:
-    from cosyvoice.flow.DiT import dit as cosyvoice_dit_module
-    from cosyvoice.utils.mask import add_optional_chunk_mask as cosyvoice_chunk_mask
-except ImportError:
-    cosyvoice_dit_module = None
-    cosyvoice_chunk_mask = None
 
 from sglang_omni.models.fun_cosyvoice3.config import (
     FLOW_CUDA_GRAPH_FRAME_ALIGNMENT,
@@ -394,9 +388,6 @@ def graph_safe_nonstreaming_chunk_mask(
 
 
 def install_graph_safe_dit_chunk_mask() -> None:
-    if cosyvoice_dit_module is None or cosyvoice_chunk_mask is None:
-        raise ImportError(_COSYVOICE_INSTALL_HINT)
-
     def _chunk_mask(
         xs: torch.Tensor,
         masks: torch.Tensor,
@@ -528,7 +519,7 @@ class FlowCudaGraphRunner:
         self._graphs = graphs
 
     @staticmethod
-    def right_pad_time(
+    def right_pad_frames(
         value: torch.Tensor, actual_frames: int, bucket_frames: int
     ) -> torch.Tensor:
         padding = bucket_frames - actual_frames
@@ -558,18 +549,19 @@ class FlowCudaGraphRunner:
         if captured is None:
             return None
 
-        time_inputs = (x, mu, mask, cond)
+        frame_inputs = (x, mu, mask, cond)
         if any(
-            value.ndim == 0 or value.shape[-1] != actual_frames for value in time_inputs
+            value.ndim == 0 or value.shape[-1] != actual_frames
+            for value in frame_inputs
         ):
             return None
         inputs = (
-            self.right_pad_time(x, actual_frames, bucket_frames),
+            self.right_pad_frames(x, actual_frames, bucket_frames),
             t_span,
-            self.right_pad_time(mu, actual_frames, bucket_frames),
-            self.right_pad_time(mask, actual_frames, bucket_frames),
+            self.right_pad_frames(mu, actual_frames, bucket_frames),
+            self.right_pad_frames(mask, actual_frames, bucket_frames),
             spks,
-            self.right_pad_time(cond, actual_frames, bucket_frames),
+            self.right_pad_frames(cond, actual_frames, bucket_frames),
         )
         if not all(
             static.shape == value.shape
@@ -598,44 +590,6 @@ class FlowCudaGraphRunner:
                 f"frames={bucket_frames}; disabled all Flow CUDA graphs"
             )
             raise
-
-
-class _FlowSolveTimer:
-    """Elapsed time of one Euler solve, read back without waiting on the device.
-
-    On an accelerator two stream events bracket the solve and the elapsed time
-    is only available once the end event has completed. On CPU the ops run
-    synchronously, so perf_counter around the call is already exact.
-    """
-
-    def __init__(self, device: torch.device) -> None:
-        self._on_device = device.type != "cpu"
-        if self._on_device:
-            self._stream = torch.accelerator.current_stream(device)
-            self._start = torch.Event(device=device, enable_timing=True)
-            self._end = torch.Event(device=device, enable_timing=True)
-        else:
-            self._start = self._end = 0.0
-
-    def start(self) -> None:
-        if self._on_device:
-            self._start.record(self._stream)
-        else:
-            self._start = time.perf_counter()
-
-    def stop(self) -> None:
-        if self._on_device:
-            self._end.record(self._stream)
-        else:
-            self._end = time.perf_counter()
-
-    def elapsed_ms(self) -> float | None:
-        """Return the solve time, or None while the end event is still pending."""
-        if not self._on_device:
-            return (self._end - self._start) * 1000.0
-        if not self._end.query():
-            return None
-        return self._start.elapsed_time(self._end)
 
 
 @torch.inference_mode()
@@ -759,7 +713,6 @@ class FunCosyVoice3Flow:
 
     def __init__(self, flow: Any) -> None:
         self._flow = flow
-        self._last_solve: tuple[int, _FlowSolveTimer] | None = None
         self._cuda_graph_runner: FlowCudaGraphRunner | None = None
 
     def __getattr__(self, name: str) -> Any:
@@ -779,39 +732,14 @@ class FunCosyVoice3Flow:
     def attach_cuda_graph_runner(self, runner: FlowCudaGraphRunner) -> None:
         self._cuda_graph_runner = runner
 
-    def log_last_solve(self) -> None:
-        # note (db-ol): the vocoder calls this after the bucket's audio reached
-        # the host. A still pending end event is skipped, never waited for.
-        if self._last_solve is None:
-            return
-        items, timer = self._last_solve
-        self._last_solve = None
-        elapsed_ms = timer.elapsed_ms()
-        if elapsed_ms is None:
-            return
-        logger.debug(
-            "Fun-CosyVoice3 flow solve: batch_items=%d solve_elapsed_ms=%.1f",
-            items,
-            elapsed_ms,
-        )
-
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
         packed = _pack_flow_inputs(self._flow, inputs)
-        # note (db-ol): the solve is timed only while the debug record can be
-        # seen, so the default INFO path runs it untouched.
-        timer = None
-        if logger.isEnabledFor(logging.DEBUG):
-            timer = _FlowSolveTimer(packed.token.device)
-            self._last_solve = (len(inputs), timer)
-            timer.start()
         generated = generate_flow(
             self._flow,
             packed,
             cuda_graph_runner=self._cuda_graph_runner,
         )
-        if timer is not None:
-            timer.stop()
         return _split_generated_mels(
             self._flow,
             packed,
@@ -1339,7 +1267,6 @@ class _CosyVoice3Vocoder(BatchVocoderBase):
                 wavs = self._mel2wav_batch([mel for _, mel in group])
                 for (request, _), wav in zip(group, wavs, strict=True):
                     results[request.index] = (wav, request.sample_rate)
-            self._flow.log_last_solve()
 
         if any(result is None for result in results):
             raise RuntimeError("Fun-CosyVoice3 vocoder did not decode every request")

@@ -16,8 +16,8 @@ _PKG = "sglang_omni.models.fun_cosyvoice3"
 
 FLOW_CUDA_GRAPH_FRAME_ALIGNMENT = 16
 
-# Resident graphs target ~2 GB. Keep dense B=1 coverage in the common length
-# range and a small B=2 set for concurrent buffered solves.
+# TODO (chenyang): Update these shapes for Fun-CosyVoice3.
+
 FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES: tuple[tuple[int, int], ...] = (
     (1, 304),
     (1, 320),
@@ -115,7 +115,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 max_batch_size=16,
                 max_batch_wait_ms=30,
                 # note (guozhihao-224, chenyang):
-                # CUDA Graph is on by default. torch.compile and TensorRT stay opt-in.
+                # Follow SGLang, CUDA Graph is on by default. torch.compile and TensorRT stay opt-in.
                 enable_flow_cuda_graph=True,
                 flow_cuda_graph_capture_shapes=[
                     list(shape)
