@@ -844,42 +844,50 @@ def group_flow_requests(
     request_count = len(ordered)
 
     @lru_cache(maxsize=None)
-    def best(
-        start: int,
-        groups_left: int,
-        max_gap_so_far: int,
+    def optimal_suffix_partition(
+        suffix_start: int,
+        remaining_group_count: int,
+        current_max_group_gap_frames: int,
     ) -> tuple[int, int, tuple[int, ...]] | None:
-        if groups_left == 0:
-            return (0, max_gap_so_far, ()) if start == request_count else None
-        if request_count - start < groups_left:
+        if remaining_group_count == 0:
+            if suffix_start == request_count:
+                return (0, current_max_group_gap_frames, ())
+            return None
+        if request_count - suffix_start < remaining_group_count:
             return None
 
         best_plan: tuple[int, int, tuple[int, ...]] | None = None
-        minimum_length = ordered[start].total_mel_frames
-        last_end = request_count - groups_left + 1
-        for end in range(start + 1, last_end + 1):
-            maximum_length = ordered[end - 1].total_mel_frames
-            group_gap = maximum_length - minimum_length
-            if group_gap > merge_max_gap_frames:
+        shortest_frames = ordered[suffix_start].total_mel_frames
+        last_group_end = request_count - remaining_group_count + 1
+        for group_end in range(suffix_start + 1, last_group_end + 1):
+            longest_frames = ordered[group_end - 1].total_mel_frames
+            group_gap_frames = longest_frames - shortest_frames
+            if group_gap_frames > merge_max_gap_frames:
                 break
-            suffix = best(
-                end,
-                groups_left - 1,
-                max(max_gap_so_far, group_gap),
+            suffix_plan = optimal_suffix_partition(
+                suffix_start=group_end,
+                remaining_group_count=remaining_group_count - 1,
+                current_max_group_gap_frames=max(
+                    current_max_group_gap_frames, group_gap_frames
+                ),
             )
-            if suffix is None:
+            if suffix_plan is None:
                 continue
             candidate = (
-                (end - start) * maximum_length + suffix[0],
-                suffix[1],
-                (end,) + suffix[2],
+                (group_end - suffix_start) * longest_frames + suffix_plan[0],
+                suffix_plan[1],
+                (group_end,) + suffix_plan[2],
             )
             if best_plan is None or candidate < best_plan:
                 best_plan = candidate
         return best_plan
 
     for group_count in range(1, request_count + 1):
-        plan = best(0, group_count, 0)
+        plan = optimal_suffix_partition(
+            suffix_start=0,
+            remaining_group_count=group_count,
+            current_max_group_gap_frames=0,
+        )
         if (
             plan is not None
             and (plan[0] / baseline_work - 1) * 100 <= merge_pad_budget_percent + 1e-9
