@@ -103,20 +103,21 @@ def _inputs(
     frames: int,
     *,
     channels: int = 4,
-    dtype: torch.dtype = torch.bfloat16,
+    solver_dtype: torch.dtype = torch.float32,
+    speaker_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, ...]:
     x = (
         torch.arange(batch_size * channels * frames, dtype=torch.float32)
         .reshape(batch_size, channels, frames)
-        .to(dtype)
+        .to(solver_dtype)
     )
-    t_span = torch.linspace(0, 1, 11, dtype=dtype)
+    t_span = torch.linspace(0, 1, 11, dtype=solver_dtype)
     mu = torch.full_like(x, 2)
-    mask = torch.ones(batch_size, 1, frames, dtype=dtype)
+    mask = torch.ones(batch_size, 1, frames, dtype=solver_dtype)
     spks = (
         torch.arange(batch_size * 5, dtype=torch.float32)
         .reshape(batch_size, 5)
-        .to(dtype)
+        .to(speaker_dtype)
     )
     cond = torch.full_like(x, 3)
     return x, t_span, mu, mask, spks, cond
@@ -153,18 +154,27 @@ def _generation_case():
 
 
 @pytest.mark.parametrize(
-    ("compute_dtype", "runtime_dtype"),
-    [(torch.bfloat16, torch.bfloat16), (None, torch.float32)],
+    ("compute_dtype", "solver_dtype", "speaker_dtype"),
+    [
+        (torch.bfloat16, torch.float32, torch.bfloat16),
+        (None, torch.float32, torch.float32),
+    ],
     ids=["bf16-autocast", "fp32-no-autocast"],
 )
 def test_resident_replay_and_nonresident_fallback(
-    monkeypatch, compute_dtype, runtime_dtype
+    monkeypatch, compute_dtype, solver_dtype, speaker_dtype
 ) -> None:
     flow = _flow(channels=6)
     runner = _runner(flow, compute_dtype=compute_dtype)
     resident = _install_graph(runner, (2, 496))
 
-    inputs = _inputs(2, 489, channels=6, dtype=runtime_dtype)
+    inputs = _inputs(
+        2,
+        489,
+        channels=6,
+        solver_dtype=solver_dtype,
+        speaker_dtype=speaker_dtype,
+    )
     original_x, _, original_mu, _, _, original_cond = inputs
     output = runner.run(*inputs)
 
@@ -173,10 +183,23 @@ def test_resident_replay_and_nonresident_fallback(
     assert torch.equal(output, original_x + original_mu + original_cond)
     assert resident.replay_calls == 1
     captured_inputs = runner._graphs[(2, 496)].static_inputs
-    assert all(value.dtype == runtime_dtype for value in captured_inputs)
+    assert [value.dtype for value in captured_inputs] == [
+        solver_dtype,
+        solver_dtype,
+        solver_dtype,
+        solver_dtype,
+        speaker_dtype,
+        solver_dtype,
+    ]
     assert torch.count_nonzero(captured_inputs[0][..., 489:]) == 0
     assert torch.count_nonzero(captured_inputs[3][..., 489:]) == 0
-    miss_inputs = _inputs(2, 1, channels=6, dtype=runtime_dtype)
+    miss_inputs = _inputs(
+        2,
+        1,
+        channels=6,
+        solver_dtype=solver_dtype,
+        speaker_dtype=speaker_dtype,
+    )
     assert runner.run(*miss_inputs) is None
 
     fallback_flow, packed = _generation_case()

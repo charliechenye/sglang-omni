@@ -434,7 +434,7 @@ class _FlowCudaGraphRunner:
 
     def _capture_inputs(self, batch_size: int, frames: int) -> tuple[torch.Tensor, ...]:
         model_device, parameter_dtype = _flow_device_and_dtype(self._flow)
-        input_dtype = self._compute_dtype or parameter_dtype
+        speaker_dtype = self._compute_dtype or parameter_dtype
         decoder = self._flow.decoder
         noise = decoder.rand_noise
         channels = int(self._flow.output_size)
@@ -448,14 +448,16 @@ class _FlowCudaGraphRunner:
                 "Flow CUDA graph capture needs rand_noise with shape "
                 f"[1, {channels}, >= {frames}], got {tuple(noise.shape)}"
             )
-        x = noise[:, :, :frames].to(device=model_device, dtype=input_dtype)
+        x = noise[:, :, :frames].to(device=model_device, dtype=parameter_dtype)
         x = x.expand(batch_size, -1, -1).clone()
-        t_span = _flow_t_span(decoder, device=model_device, dtype=input_dtype)
+        t_span = _flow_t_span(decoder, device=model_device, dtype=parameter_dtype)
         mu = torch.zeros_like(x)
-        mask = torch.ones(batch_size, 1, frames, device=model_device, dtype=input_dtype)
+        mask = torch.ones(
+            batch_size, 1, frames, device=model_device, dtype=parameter_dtype
+        )
         speaker_dim = int(self._flow.spk_embed_affine_layer.out_features)
         spks = torch.zeros(
-            batch_size, speaker_dim, device=model_device, dtype=input_dtype
+            batch_size, speaker_dim, device=model_device, dtype=speaker_dtype
         )
         cond = torch.zeros_like(x)
         return x, t_span, mu, mask, spks, cond
