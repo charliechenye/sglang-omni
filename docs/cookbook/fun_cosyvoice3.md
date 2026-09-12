@@ -206,7 +206,7 @@ For complete buffered requests, scheduler admission uses exact mel frames (`flow
 
 ```text
 flow_merge_max_gap_frames = 384
-flow_merge_pad_budget_pct = 20
+flow_merge_pad_budget_percent = 20
 ```
 
 HiFT grouping is independent and applies its existing `hift_max_padding_waste` policy to the produced mels. Causal streaming uses a separate Flow + HiFT path.
