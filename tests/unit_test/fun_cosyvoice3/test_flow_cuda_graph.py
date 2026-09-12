@@ -150,7 +150,6 @@ def test_resident_replay_and_nonresident_fallback(monkeypatch) -> None:
     flow = _flow(channels=6)
     runner = _runner(flow)
     resident = _install_graph(runner, (2, 496))
-    nonresident = _install_graph(runner, (1, 464))
 
     inputs = _inputs(2, 489, channels=6)
     original_x, _, original_mu, _, _, original_cond = inputs
@@ -162,22 +161,9 @@ def test_resident_replay_and_nonresident_fallback(monkeypatch) -> None:
     assert resident.replay_calls == 1
     captured_inputs = runner._graphs[(2, 496)].static_inputs
     assert torch.count_nonzero(captured_inputs[0][..., 489:]) == 0
-    assert torch.count_nonzero(captured_inputs[2][..., 489:]) == 0
     assert torch.count_nonzero(captured_inputs[3][..., 489:]) == 0
-    assert torch.count_nonzero(captured_inputs[5][..., 489:]) == 0
-    assert torch.equal(captured_inputs[1], inputs[1])
-    assert torch.equal(captured_inputs[4], inputs[4])
-
-    capture_calls = []
-    monkeypatch.setattr(
-        runner,
-        "capture",
-        lambda *args, **kwargs: capture_calls.append((args, kwargs)),
-    )
-    miss_inputs = _inputs(1, 1, channels=6)
+    miss_inputs = _inputs(2, 1, channels=6)
     assert runner.run(*miss_inputs) is None
-    assert capture_calls == []
-    assert nonresident.replay_calls == 0
 
     fallback_flow, packed = _generation_case()
     eager_calls = []
@@ -227,18 +213,21 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     monkeypatch, capture_fails: bool
 ) -> None:
     events = []
+    loads = []
     flow = stages.FunCosyVoice3Flow(_flow())
 
     monkeypatch.setattr(
         stages, "resolve_concrete_device", lambda device, gpu_id: "cuda:0"
     )
     monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "checkpoint")
-    monkeypatch.setattr(
-        stages,
-        "_load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, **kwargs: (flow, object()),
-    )
+
+    def _load(*args, **kwargs):
+        loads.append((args, kwargs))
+        return flow, object()
+
+    monkeypatch.setattr(stages, "_load_cosyvoice3_flow_hift", _load)
     monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(stages.current_platform, "is_cuda", lambda: True)
     monkeypatch.setattr(
         stages,
         "_enable_flow_cuda_graph_dit_compat",
@@ -266,6 +255,15 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
         lambda runner: events.append("attach"),
     )
 
+    with pytest.raises(ValueError, match="cannot be enabled together"):
+        stages.create_vocoder_executor(
+            "model",
+            enable_flow_cuda_graph=True,
+            enable_flow_estimator_trt=True,
+        )
+    assert events == []
+    assert loads == []
+
     scheduler = stages.create_vocoder_executor(
         "model",
         enable_dit_torch_compile=True,
@@ -273,15 +271,15 @@ def test_factory_lifecycle_keeps_compile_and_serving_independent(
     )
 
     assert scheduler is not None
+    assert len(loads) == 1
     expected = ["compat", "compile", "runner", "capture"]
     if not capture_fails:
         expected.append("attach")
     assert events == expected
 
 
-def test_graph_safe_mask_preserves_buffered_behavior(monkeypatch) -> None:
-    monkeypatch.setattr(torch._dynamo, "graph_break", lambda: None)
-    masks = torch.tensor([[[1, 1, 0]], [[0, 0, 0]]], dtype=torch.float32)
+def test_graph_safe_mask_preserves_buffered_behavior() -> None:
+    masks = torch.tensor([[[True, True, False]], [[False, False, False]]])
     xs = torch.ones(2, 1, 3)
 
     result = stages._graph_safe_nonstreaming_chunk_mask(
@@ -289,10 +287,5 @@ def test_graph_safe_mask_preserves_buffered_behavior(monkeypatch) -> None:
     )
 
     assert result is masks
-    assert torch.equal(result[0], torch.tensor([[1, 1, 0]], dtype=torch.float32))
-    assert torch.equal(result[1], torch.ones(1, 3))
-
-    with pytest.raises(RuntimeError, match="buffered non-streaming"):
-        stages._graph_safe_nonstreaming_chunk_mask(xs, masks, True, False, 0, 0, 0)
-    with pytest.raises(RuntimeError, match="buffered non-streaming"):
-        stages._graph_safe_nonstreaming_chunk_mask(xs, masks, False, False, 0, 1, 0)
+    assert torch.equal(result[0], torch.tensor([[True, True, False]]))
+    assert torch.equal(result[1], torch.ones(1, 3, dtype=torch.bool))

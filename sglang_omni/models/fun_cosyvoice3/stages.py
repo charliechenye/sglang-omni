@@ -368,7 +368,6 @@ def _graph_safe_nonstreaming_chunk_mask(
             "CUDA graph mask workaround only supports buffered non-streaming Flow"
         )
     empty_rows = masks.sum(dim=-1, keepdim=True) == 0
-    torch._dynamo.graph_break()
     masks.masked_fill_(empty_rows, True)
     return masks
 
@@ -1547,6 +1546,11 @@ def create_vocoder_executor(
     token_max_hop_len: int = TOKEN_MAX_HOP_LEN,
     disable_hop_growth: bool = False,
 ) -> Any:
+    if enable_flow_cuda_graph and enable_flow_estimator_trt:
+        raise ValueError(
+            "enable_flow_cuda_graph and enable_flow_estimator_trt cannot be enabled together"
+        )
+
     from sglang_omni.models.fun_cosyvoice3.streaming_vocoder import (
         FunCosyVoice3StreamingVocoderScheduler,
     )
@@ -1576,6 +1580,7 @@ def create_vocoder_executor(
     device_obj = torch.device(device)
     flow_cg_enabled = (
         enable_flow_cuda_graph
+        and current_platform.is_cuda()
         and device_obj.type == "cuda"
         and torch.cuda.is_available()
         and compute_dtype == torch.bfloat16
