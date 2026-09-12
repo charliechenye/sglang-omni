@@ -16,10 +16,7 @@ from cosyvoice.flow.DiT import dit as cosyvoice_dit
 from cosyvoice.utils.mask import add_optional_chunk_mask as cosyvoice_chunk_mask
 from torch.nn.utils.parametrize import is_parametrized, remove_parametrizations
 
-from sglang_omni.models.fun_cosyvoice3.config import (
-    FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
-    reject_conflicting_dit_accelerators,
-)
+from sglang_omni.models.fun_cosyvoice3.config import reject_conflicting_dit_accelerators
 from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     execute_flow_estimator,
     is_flow_estimator_trt,
@@ -311,12 +308,10 @@ FLOW_CUDA_GRAPH_FRAME_BUCKET = 16
 
 
 def verify_flow_cuda_graph_capture_shapes(
-    capture_shapes: Sequence[Sequence[int]] | None,
+    capture_shapes: Sequence[Sequence[int]],
     *,
     max_batch_size: int,
 ) -> tuple[tuple[int, int], ...]:
-    if capture_shapes is None:
-        capture_shapes = FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
     if isinstance(capture_shapes, (str, bytes)) or not isinstance(
         capture_shapes, Sequence
     ):
@@ -1513,10 +1508,6 @@ def create_vocoder_executor(
 
     if flow_batch_admission_frames <= 0:
         raise ValueError("flow_batch_admission_frames must be greater than zero")
-    capture_shapes = verify_flow_cuda_graph_capture_shapes(
-        flow_cuda_graph_capture_shapes,
-        max_batch_size=max_batch_size,
-    )
 
     reject_conflicting_dit_accelerators(
         enable_dit_torch_compile=enable_dit_torch_compile,
@@ -1550,6 +1541,10 @@ def create_vocoder_executor(
         _compile_dit_backbone(flow, compute_dtype=compute_dtype)
 
     if enable_flow_cuda_graph:
+        capture_shapes = verify_flow_cuda_graph_capture_shapes(
+            flow_cuda_graph_capture_shapes,
+            max_batch_size=max_batch_size,
+        )
         runner = FlowCudaGraphRunner(
             flow,
             device=device_obj,

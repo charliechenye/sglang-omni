@@ -9,9 +9,6 @@ import pytest
 import torch
 
 import sglang_omni.models.fun_cosyvoice3.stages as stages
-from sglang_omni.models.fun_cosyvoice3.config import (
-    FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
-)
 
 
 @pytest.fixture(autouse=True)
@@ -106,11 +103,7 @@ def _packed_tokens(length: int = 17) -> SimpleNamespace:
     )
 
 
-def test_verify_capture_shapes_uses_defaults_and_rejects_bad_entries() -> None:
-    assert (
-        stages.verify_flow_cuda_graph_capture_shapes(None, max_batch_size=16)
-        == FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES
-    )
+def test_verify_capture_shapes_rejects_bad_entries() -> None:
     with pytest.raises(ValueError, match="max_batch_size"):
         stages.verify_flow_cuda_graph_capture_shapes([[32, 576]], max_batch_size=16)
     with pytest.raises(ValueError, match="multiples"):
