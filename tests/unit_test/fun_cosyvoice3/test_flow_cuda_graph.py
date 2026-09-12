@@ -150,11 +150,3 @@ def test_generate_flow_does_not_retry_eager_after_replay_failure(monkeypatch) ->
             cuda_graph_runner=_FailingRunner(),
         )
     assert eager_calls == []
-
-
-def test_graph_safe_mask_fills_empty_rows() -> None:
-    masks = torch.tensor([[[True, True, False]], [[False, False, False]]])
-    result = stages.graph_safe_nonstreaming_chunk_mask(
-        torch.ones(2, 1, 3), masks, False, False, 0, 0, 0
-    )
-    assert torch.equal(result[1], torch.ones(1, 3, dtype=torch.bool))

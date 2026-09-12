@@ -872,5 +872,9 @@ def test_vocoder_hift_defaults_to_float32(monkeypatch) -> None:
 
     # bfloat16 gave HiFT no speedup, so the default keeps full precision.
     assert vocoder.hift_compute_dtype is None
-    with vocoder.hift_autocast():
+    with torch.autocast(
+        device_type=stages.current_platform.device_type,
+        dtype=vocoder.hift_compute_dtype,
+        enabled=vocoder.hift_compute_dtype is not None,
+    ):
         assert not torch.is_autocast_enabled()
