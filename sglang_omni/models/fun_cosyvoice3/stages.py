@@ -532,70 +532,76 @@ def generate_flow(
         .contiguous()
     )
     batch_size, channels, max_mel_frame = token_condition.shape
+    decoder = flow.decoder
     if channels != flow.output_size:
         raise ValueError("Flow pre-lookahead output width does not match output_size")
-    if lookahead > 0:
-        total_mel_lengths_tensor = torch.tensor(
-            [
-                max(length - lookahead, 0) * flow.token_mel_ratio
-                for length in packed.combined_token_lengths
-            ],
-            dtype=torch.int64,
-            device=token_condition.device,
-        )
-    else:
-        total_mel_lengths_tensor = packed.total_mel_lengths_tensor
-    mel_mask = (
-        (
-            torch.arange(max_mel_frame, device=token_condition.device).unsqueeze(0)
-            < total_mel_lengths_tensor.unsqueeze(1)
-        )
-        .unsqueeze(1)
-        .to(token_condition.dtype)
-    )
-    prompt_mel = torch.zeros_like(token_condition)
-    for index, prompt_mel_frame in enumerate(packed.prompt_mel_lengths):
-        prompt_mel[index, :, :prompt_mel_frame] = packed.prompt_feat[
-            index, :prompt_mel_frame
-        ].transpose(0, 1)
-    decoder = flow.decoder
-    if max_mel_frame > decoder.rand_noise.shape[2]:
+    elif max_mel_frame > decoder.rand_noise.shape[2]:
         raise ValueError(
             f"decoder.rand_noise supports {decoder.rand_noise.shape[2]} frames, "
             f"but batch requires {max_mel_frame}"
         )
-    noisy_mel = (
-        decoder.rand_noise[:, :, :max_mel_frame]
-        .to(device=token_condition.device, dtype=token_condition.dtype)
-        .expand(batch_size, -1, -1)
-        .clone()
-    )
-    time_span = torch.linspace(
-        0, 1, 11, device=token_condition.device, dtype=token_condition.dtype
-    )
-    if decoder.t_scheduler == "cosine":
-        time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
-    if flow.cuda_graph_runner is not None:
-        generated = flow.cuda_graph_runner.run(
-            noisy_mel,
-            time_span,
-            token_condition,
-            mel_mask,
-            speaker_embedding,
-            prompt_mel,
+    else:
+        if lookahead > 0:
+            total_mel_lengths_tensor = torch.tensor(
+                [
+                    max(length - lookahead, 0) * flow.token_mel_ratio
+                    for length in packed.combined_token_lengths
+                ],
+                dtype=torch.int64,
+                device=token_condition.device,
+            )
+        else:
+            total_mel_lengths_tensor = packed.total_mel_lengths_tensor
+        mel_mask = (
+            (
+                torch.arange(max_mel_frame, device=token_condition.device).unsqueeze(0)
+                < total_mel_lengths_tensor.unsqueeze(1)
+            )
+            .unsqueeze(1)
+            .to(token_condition.dtype)
         )
+        prompt_mel = torch.zeros_like(token_condition)
+        for index, prompt_mel_frame in enumerate(packed.prompt_mel_lengths):
+            prompt_mel[index, :, :prompt_mel_frame] = packed.prompt_feat[
+                index, :prompt_mel_frame
+            ].transpose(0, 1)
+        noisy_mel = (
+            decoder.rand_noise[:, :, :max_mel_frame]
+            .to(device=token_condition.device, dtype=token_condition.dtype)
+            .expand(batch_size, -1, -1)
+            .clone()
+        )
+        unit_span = torch.linspace(
+            0, 1, 11, device=token_condition.device, dtype=token_condition.dtype
+        )
+        if decoder.t_scheduler == "cosine":
+            time_span = 1 - torch.cos(unit_span * 0.5 * torch.pi)
+        else:
+            time_span = unit_span
+        if flow.cuda_graph_runner is not None:
+            generated = flow.cuda_graph_runner.run(
+                noisy_mel,
+                time_span,
+                token_condition,
+                mel_mask,
+                speaker_embedding,
+                prompt_mel,
+            )
+        else:
+            generated = None
         if generated is not None:
             return generated
-    return solve_flow_euler(
-        decoder,
-        noisy_mel,
-        time_span,
-        token_condition,
-        mel_mask,
-        speaker_embedding,
-        prompt_mel,
-        streaming=streaming,
-    )
+        else:
+            return solve_flow_euler(
+                decoder,
+                noisy_mel,
+                time_span,
+                token_condition,
+                mel_mask,
+                speaker_embedding,
+                prompt_mel,
+                streaming=streaming,
+            )
 
 
 def split_generated_mels(
