@@ -429,50 +429,56 @@ class FlowCudaGraphRunner:
         captured = self.graphs.get((batch_size, bucket_mel_frame))
         if captured is None:
             return None
-
-        frame_inputs = (noisy_mel, token_condition, mel_mask, prompt_mel)
-        if any(
-            value.ndim == 0 or value.shape[-1] != actual_mel_frame
-            for value in frame_inputs
-        ):
-            return None
-        inputs = (
-            self.right_pad_mel_frames(noisy_mel, actual_mel_frame, bucket_mel_frame),
-            time_span,
-            self.right_pad_mel_frames(
-                token_condition, actual_mel_frame, bucket_mel_frame
-            ),
-            self.right_pad_mel_frames(mel_mask, actual_mel_frame, bucket_mel_frame),
-            speaker_embedding,
-            self.right_pad_mel_frames(prompt_mel, actual_mel_frame, bucket_mel_frame),
-        )
-        if not all(
-            static.shape == value.shape
-            and static.dtype == value.dtype
-            and static.device == value.device
-            for static, value in zip(captured.static_inputs, inputs, strict=True)
-        ):
-            return None
-        try:
-            with (
-                torch.cuda.device(self.device),
-                torch.autocast(
-                    device_type=self.device.type,
-                    dtype=self.autocast_dtype,
-                    enabled=self.autocast_dtype is not None,
-                ),
+        else:
+            frame_inputs = (noisy_mel, token_condition, mel_mask, prompt_mel)
+            if any(
+                value.ndim == 0 or value.shape[-1] != actual_mel_frame
+                for value in frame_inputs
             ):
-                for static, value in zip(captured.static_inputs, inputs, strict=True):
-                    static.copy_(value)
-                captured.graph.replay()
-                return captured.static_output[..., :actual_mel_frame].clone()
-        except Exception:
-            self.graphs.clear()
-            logger.exception(
-                f"Fun-CosyVoice3 Flow CUDA graph replay failed for batch={batch_size} "
-                f"mel_frame={bucket_mel_frame}; disabled all Flow CUDA graphs"
+                return None
+            inputs = (
+                self.right_pad_mel_frames(
+                    noisy_mel, actual_mel_frame, bucket_mel_frame
+                ),
+                time_span,
+                self.right_pad_mel_frames(
+                    token_condition, actual_mel_frame, bucket_mel_frame
+                ),
+                self.right_pad_mel_frames(mel_mask, actual_mel_frame, bucket_mel_frame),
+                speaker_embedding,
+                self.right_pad_mel_frames(
+                    prompt_mel, actual_mel_frame, bucket_mel_frame
+                ),
             )
-            raise
+            if not all(
+                static.shape == value.shape
+                and static.dtype == value.dtype
+                and static.device == value.device
+                for static, value in zip(captured.static_inputs, inputs, strict=True)
+            ):
+                return None
+            try:
+                with (
+                    torch.cuda.device(self.device),
+                    torch.autocast(
+                        device_type=self.device.type,
+                        dtype=self.autocast_dtype,
+                        enabled=self.autocast_dtype is not None,
+                    ),
+                ):
+                    for static, value in zip(
+                        captured.static_inputs, inputs, strict=True
+                    ):
+                        static.copy_(value)
+                    captured.graph.replay()
+                    return captured.static_output[..., :actual_mel_frame].clone()
+            except Exception:
+                self.graphs.clear()
+                logger.exception(
+                    f"Fun-CosyVoice3 Flow CUDA graph replay failed for batch={batch_size} "
+                    f"mel_frame={bucket_mel_frame}; disabled all Flow CUDA graphs"
+                )
+                raise
 
 
 @torch.inference_mode()
