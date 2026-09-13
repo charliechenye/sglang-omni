@@ -29,7 +29,6 @@ from sglang_omni.models.fun_cosyvoice3.request_builders import (
     preprocess_cosyvoice3_payload,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming import (
-    PRE_LOOKAHEAD_LEN,
     TOKEN_HOP_LEN,
     TOKEN_MAX_HOP_LEN,
     TOKEN_MEL_RATIO,
@@ -130,13 +129,8 @@ def pack_flow_inputs(
             raise ValueError(
                 f"input {index} embedding must have shape [1, speaker_dim]"
             )
-        expected_embedding_size = getattr(
-            flow.spk_embed_affine_layer, "in_features", None
-        )
-        if (
-            expected_embedding_size is not None
-            and item.embedding.shape[1] != expected_embedding_size
-        ):
+        expected_embedding_size = flow.spk_embed_affine_layer.in_features
+        if item.embedding.shape[1] != expected_embedding_size:
             raise ValueError(
                 f"input {index} embedding width must be {expected_embedding_size}"
             )
@@ -498,14 +492,7 @@ def generate_flow(
     if finalize:
         lookahead = 0
     else:
-        layer = getattr(flow, "pre_lookahead_layer", None)
-        layer_len = getattr(layer, "pre_lookahead_len", None)
-        if layer_len is not None:
-            lookahead = max(int(layer_len), 0)
-        else:
-            lookahead = max(
-                int(getattr(flow, "pre_lookahead_len", PRE_LOOKAHEAD_LEN)), 0
-            )
+        lookahead = flow.pre_lookahead_len
     if finalize or lookahead <= 0:
         token_hidden = flow.pre_lookahead_layer(token_embedding)
     else:
@@ -673,14 +660,7 @@ class FunCosyVoice3Flow:
         # keeps the chunk mask aligned with CosyVoice3Model hops.
         packed = pack_flow_inputs(self.flow, inputs)
         generated = generate_flow(self, packed, streaming=True, finalize=False)
-        layer = getattr(self.flow, "pre_lookahead_layer", None)
-        layer_len = getattr(layer, "pre_lookahead_len", None)
-        if layer_len is not None:
-            lookahead = max(int(layer_len), 0)
-        else:
-            lookahead = max(
-                int(getattr(self.flow, "pre_lookahead_len", PRE_LOOKAHEAD_LEN)), 0
-            )
+        lookahead = self.flow.pre_lookahead_len
         target_token_lengths = tuple(
             max(length - lookahead, 0) for length in packed.target_token_lengths
         )
@@ -797,7 +777,7 @@ def compile_dit_backbone(
     autocast_dtype: torch.dtype | None = None,
 ) -> bool:
 
-    estimator = getattr(getattr(flow, "decoder", None), "estimator", None)
+    estimator = flow.decoder.estimator
     if not isinstance(estimator, torch.nn.Module):
         logger.warning(
             "Fun-CosyVoice3 DiT estimator is not a PyTorch module (%s); "
@@ -810,10 +790,8 @@ def compile_dit_backbone(
 
     original_forward = estimator.forward
     torch._inductor.config.fx_graph_cache = True
-    if hasattr(torch._dynamo.config, "cache_size_limit"):
-        torch._dynamo.config.cache_size_limit = 1024
-    if hasattr(torch._dynamo.config, "accumulated_cache_size_limit"):
-        torch._dynamo.config.accumulated_cache_size_limit = 1024
+    torch._dynamo.config.cache_size_limit = 1024
+    torch._dynamo.config.accumulated_cache_size_limit = 1024
     # note (guozhihao-224): inductor NaN-compares subsequent_chunk_mask in
     # DiT.forward; keep the mask eager.
     global CHUNK_MASK_COMPILE_DISABLED
@@ -1187,7 +1165,7 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             raise RuntimeError(
                 "Fun-CosyVoice3 generation produced no usable speech tokens"
             )
-        native_flow = getattr(self.flow, "flow", self.flow)
+        native_flow = self.flow.flow
         device = next(native_flow.parameters()).device
         offset = max(int(token_offset), 0)
 
@@ -1310,19 +1288,8 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             wav, _ = self.hift.inference(speech_feat=padded, finalize=True)
         wav = wav.detach()
         if self.hift_samples_per_mel_frame is None:
-            rates = getattr(self.hift, "upsample_rates", None)
-            hop_len = (
-                getattr(self.hift, "istft_params", {}).get("hop_len")
-                if hasattr(self.hift, "istft_params")
-                else None
-            )
-            if not rates or not hop_len:
-                raise RuntimeError(
-                    "Fun-CosyVoice3 HiFT generator is missing upsample_rates / "
-                    "istft_params; refusing to guess the mel->wave stride"
-                )
-            stride = int(hop_len)
-            for rate in rates:
+            stride = int(self.hift.istft_params["hop_len"])
+            for rate in self.hift.upsample_rates:
                 stride *= int(rate)
             self.hift_samples_per_mel_frame = stride
         samples_per_frame = self.hift_samples_per_mel_frame

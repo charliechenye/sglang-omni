@@ -105,6 +105,8 @@ class _FakeHiFT(torch.nn.Module):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(1))
         self.calls: list[tuple] = []
+        self.upsample_rates = [8, 5, 3]
+        self.istft_params = {"n_fft": 16, "hop_len": 4}
 
     def inference(self, *, speech_feat, finalize):
         self.calls.append((speech_feat, finalize))
