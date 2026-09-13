@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.5" />
-    <meta name="docbuild:last-update" content="Sep 12, 2026"/>
+    <meta name="docbuild:last-update" content="Sep 13, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -807,7 +807,7 @@ flow_merge_pad_budget_percent = 25
 </section>
 <section id="vocoder-configuration">
 <h3>Vocoder Configuration<a class="headerlink" href="#vocoder-configuration" title="Link to this heading">#</a></h3>
-<p>Vocoder configuration controls batching, precision, and acceleration. The scheduler accepts <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> (16) and <code class="docutils literal notranslate"><span class="pre">max_batch_wait_ms</span></code> (30) to tune batch assembly. Flow uses <code class="docutils literal notranslate"><span class="pre">dtype</span></code> (bfloat16) for autocast, while HiFT uses <code class="docutils literal notranslate"><span class="pre">hift_dtype</span></code> (float32), independent of Flow; bfloat16 shows no speedup on H200 and reduces fidelity. Two mutually exclusive accelerators are available: <code class="docutils literal notranslate"><span class="pre">enable_dit_torch_compile</span></code> and <code class="docutils literal notranslate"><span class="pre">enable_flow_estimator_trt</span></code>.</p>
+<p>Vocoder configuration controls batching, precision, and acceleration. The scheduler accepts <code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code> (16) and <code class="docutils literal notranslate"><span class="pre">max_batch_wait_ms</span></code> (30) to tune batch assembly. Flow uses <code class="docutils literal notranslate"><span class="pre">dtype</span></code> (bfloat16) for autocast, while HiFT uses <code class="docutils literal notranslate"><span class="pre">hift_dtype</span></code> (float32), independent of Flow; bfloat16 shows no speedup on H200 and reduces fidelity. Buffered Flow CUDA Graphs are on by default. <code class="docutils literal notranslate"><span class="pre">enable_dit_torch_compile</span></code> and <code class="docutils literal notranslate"><span class="pre">enable_flow_estimator_trt</span></code> stay opt-in and mutually exclusive.</p>
 <p>The TTS engine stage accepts <code class="docutils literal notranslate"><span class="pre">onnx_intra_op_threads</span></code> (16) for the speech tokenizer and speaker encoder ONNX sessions. Preprocessing takes <code class="docutils literal notranslate"><span class="pre">max_concurrency</span></code> (8) to limit concurrent reference conditioning requests.</p>
 </section>
 <section id="torch-compile-for-the-dit-backbone">
@@ -1301,7 +1301,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Sep 12, 2026.
+  Last updated on Sep 13, 2026.
   <br/>
 </p>
   </div>
