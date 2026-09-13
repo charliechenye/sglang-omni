@@ -357,23 +357,22 @@ class FlowCudaGraphRunner:
 
     @torch.inference_mode()
     def capture(self, capture_shapes: tuple[tuple[int, int], ...]) -> None:
+        # Note (chenyang): Capture on a side stream so other
+        # kernels on default-stream are not recorded.
         graphs: dict[tuple[int, int], CapturedFlowCudaGraph] = {}
+        current_stream = torch.cuda.current_stream(self.device)
         stream = torch.cuda.Stream(device=self.device)
-        stream.wait_stream(torch.cuda.current_stream(self.device))
-        with torch.cuda.device(self.device):
+        stream.wait_stream(current_stream)
+        with torch.cuda.device(self.device), torch.cuda.stream(stream):
             self.pool = torch.cuda.graph_pool_handle()
             for batch_size, mel_frame in capture_shapes:
                 static_inputs = self.capture_inputs(batch_size, mel_frame)
-                with (
-                    torch.cuda.stream(stream),
-                    torch.autocast(
-                        device_type="cuda",
-                        dtype=self.autocast_dtype,
-                        enabled=self.autocast_dtype is not None,
-                    ),
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=self.autocast_dtype,
+                    enabled=self.autocast_dtype is not None,
                 ):
                     solve_flow_euler(self.flow.decoder, *static_inputs)
-                stream.synchronize()
                 graph = torch.cuda.CUDAGraph()
                 with (
                     torch.cuda.graph(
@@ -383,7 +382,7 @@ class FlowCudaGraphRunner:
                         capture_error_mode="thread_local",
                     ),
                     torch.autocast(
-                        device_type="cuda",
+                        device_type=self.device.type,
                         dtype=self.autocast_dtype,
                         enabled=self.autocast_dtype is not None,
                     ),
@@ -392,7 +391,7 @@ class FlowCudaGraphRunner:
                 graphs[(batch_size, mel_frame)] = CapturedFlowCudaGraph(
                     graph, static_inputs, static_output
                 )
-        stream.synchronize()
+        current_stream.wait_stream(stream)
         torch.cuda.empty_cache()
         self.graphs = graphs
 
@@ -454,7 +453,7 @@ class FlowCudaGraphRunner:
             with (
                 torch.cuda.device(self.device),
                 torch.autocast(
-                    device_type="cuda",
+                    device_type=self.device.type,
                     dtype=self.autocast_dtype,
                     enabled=self.autocast_dtype is not None,
                 ),
