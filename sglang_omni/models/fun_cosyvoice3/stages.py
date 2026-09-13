@@ -542,12 +542,16 @@ def generate_flow(
         )
     else:
         if lookahead > 0:
+
             total_mel_lengths_tensor = torch.tensor(
                 [
                     max(length - lookahead, 0) * flow.token_mel_ratio
                     for length in packed.combined_token_lengths
                 ],
                 dtype=torch.int64,
+                # Note (chenyang): int64 matches torch.arange's default and
+                # packed.total_mel_lengths_tensor so the comparison below
+                # does not mix integer dtypes.
                 device=token_condition.device,
             )
         else:
