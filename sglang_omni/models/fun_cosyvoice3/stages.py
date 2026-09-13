@@ -300,12 +300,12 @@ class FlowCudaGraphRunner:
         self.graphs: dict[tuple[int, int], CapturedFlowCudaGraph] = {}
         self.pool: tuple[int, int] | None = None
 
-    # Note (chenyang): CUDA Graph capture and replay must share the same
-    # tensor storage. This builds the static Euler inputs for one (B, T)
-    # capture shape; run() later copy_s the real batch into them.
     def capture_inputs(
         self, batch_size: int, mel_frame: int
     ) -> tuple[torch.Tensor, ...]:
+        # Note (chenyang): CUDA Graph capture and replay must share the same
+        # tensor storage. This function bulids the static Euler inputs for
+        # one (B, T) capture shape; run() later copies the real batch into them.
         parameter = next(self.flow.parameters())
         model_device, parameter_dtype = parameter.device, parameter.dtype
         speaker_dtype = self.autocast_dtype or parameter_dtype
