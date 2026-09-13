@@ -525,6 +525,7 @@ def generate_flow(
                 else:
                     pieces.append(hidden)
             token_hidden = torch.cat(pieces, dim=0)
+
     token_condition = (
         token_hidden.repeat_interleave(flow.token_mel_ratio, dim=1)
         .transpose(1, 2)
