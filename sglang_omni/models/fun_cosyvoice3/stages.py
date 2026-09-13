@@ -206,58 +206,76 @@ def pack_flow_inputs(
 
 def solve_flow_euler(
     decoder: ConditionalCFM,
-    x: torch.Tensor,
-    t_span: torch.Tensor,
-    mu: torch.Tensor,
-    mask: torch.Tensor,
-    spks: torch.Tensor,
-    cond: torch.Tensor,
+    noisy_mel: torch.Tensor,
+    time_span: torch.Tensor,
+    token_condition: torch.Tensor,
+    mel_mask: torch.Tensor,
+    speaker_embedding: torch.Tensor,
+    prompt_mel: torch.Tensor,
     *,
     streaming: bool = False,
 ) -> torch.Tensor:
-    batch_size, channels, frames = x.shape
-    dtype = spks.dtype
-    x_in = torch.zeros(2 * batch_size, channels, frames, device=x.device, dtype=dtype)
-    mask_in = torch.zeros(2 * batch_size, 1, frames, device=x.device, dtype=dtype)
-    mu_in = torch.zeros_like(x_in)
-    t_in = torch.zeros(1, device=x.device, dtype=dtype)
-    spks_in = torch.zeros(2 * batch_size, spks.shape[1], device=x.device, dtype=dtype)
-    cond_in = torch.zeros_like(x_in)
-    t, dt = t_span[0], t_span[1] - t_span[0]
-    for step in range(1, len(t_span)):
-        x_in[:batch_size] = x
-        x_in[batch_size:] = x
-        mask_in[:batch_size] = mask
-        mask_in[batch_size:] = mask
-        mu_in[:batch_size] = mu
-        t_in[:] = t
-        spks_in[:batch_size] = spks
-        cond_in[:batch_size] = cond
+    batch_size, channels, mel_frame = noisy_mel.shape
+    dtype = speaker_embedding.dtype
+    noisy_mel_cfg = torch.zeros(
+        2 * batch_size, channels, mel_frame, device=noisy_mel.device, dtype=dtype
+    )
+    mel_mask_cfg = torch.zeros(
+        2 * batch_size, 1, mel_frame, device=noisy_mel.device, dtype=dtype
+    )
+    token_condition_cfg = torch.zeros_like(noisy_mel_cfg)
+    flow_time = torch.zeros(1, device=noisy_mel.device, dtype=dtype)
+    speaker_embedding_cfg = torch.zeros(
+        2 * batch_size,
+        speaker_embedding.shape[1],
+        device=noisy_mel.device,
+        dtype=dtype,
+    )
+    prompt_mel_cfg = torch.zeros_like(noisy_mel_cfg)
+    t, dt = time_span[0], time_span[1] - time_span[0]
+    for step in range(1, len(time_span)):
+        noisy_mel_cfg[:batch_size] = noisy_mel
+        noisy_mel_cfg[batch_size:] = noisy_mel
+        mel_mask_cfg[:batch_size] = mel_mask
+        mel_mask_cfg[batch_size:] = mel_mask
+        token_condition_cfg[:batch_size] = token_condition
+        flow_time[:] = t
+        speaker_embedding_cfg[:batch_size] = speaker_embedding
+        prompt_mel_cfg[:batch_size] = prompt_mel
         estimator = decoder.estimator
         if isinstance(estimator, torch.nn.Module):
-            derivative = decoder.forward_estimator(
-                x_in,
-                mask_in,
-                mu_in,
-                t_in,
-                spks_in,
-                cond_in,
+            vector_field = decoder.forward_estimator(
+                noisy_mel_cfg,
+                mel_mask_cfg,
+                token_condition_cfg,
+                flow_time,
+                speaker_embedding_cfg,
+                prompt_mel_cfg,
                 streaming=streaming,
             )
         else:
             # Packed Flow is CFG=2N; CosyVoice TRT hardcodes (2, 80, T).
-            derivative = execute_flow_estimator(
-                estimator, x_in, mask_in, mu_in, t_in, spks_in, cond_in
+            vector_field = execute_flow_estimator(
+                estimator,
+                noisy_mel_cfg,
+                mel_mask_cfg,
+                token_condition_cfg,
+                flow_time,
+                speaker_embedding_cfg,
+                prompt_mel_cfg,
             )
-        conditional, unconditional = derivative[:batch_size], derivative[batch_size:]
-        x = x + dt * (
+        conditional, unconditional = (
+            vector_field[:batch_size],
+            vector_field[batch_size:],
+        )
+        noisy_mel = noisy_mel + dt * (
             (1.0 + decoder.inference_cfg_rate) * conditional
             - decoder.inference_cfg_rate * unconditional
         )
         t = t + dt
-        if step < len(t_span) - 1:
-            dt = t_span[step + 1] - t
-    return x.float()
+        if step < len(time_span) - 1:
+            dt = time_span[step + 1] - t
+    return noisy_mel.float()
 
 
 def verify_flow_cuda_graph_capture_shapes(
@@ -310,25 +328,32 @@ class FlowCudaGraphRunner:
         model_device, parameter_dtype = parameter.device, parameter.dtype
         speaker_dtype = self.autocast_dtype or parameter_dtype
         decoder = self.flow.decoder
-        x = (
+        noisy_mel = (
             decoder.rand_noise[:, :, :mel_frame]
             .to(device=model_device, dtype=parameter_dtype)
             .expand(batch_size, -1, -1)
             .clone()
         )
-        t_span = torch.linspace(0, 1, 11, device=model_device, dtype=parameter_dtype)
+        time_span = torch.linspace(0, 1, 11, device=model_device, dtype=parameter_dtype)
         if decoder.t_scheduler == "cosine":
-            t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
-        mu = torch.zeros_like(x)
-        mask = torch.ones(
+            time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
+        token_condition = torch.zeros_like(noisy_mel)
+        mel_mask = torch.ones(
             batch_size, 1, mel_frame, device=model_device, dtype=parameter_dtype
         )
         speaker_dim = int(self.flow.spk_embed_affine_layer.out_features)
-        spks = torch.zeros(
+        speaker_embedding = torch.zeros(
             batch_size, speaker_dim, device=model_device, dtype=speaker_dtype
         )
-        cond = torch.zeros_like(x)
-        return x, t_span, mu, mask, spks, cond
+        prompt_mel = torch.zeros_like(noisy_mel)
+        return (
+            noisy_mel,
+            time_span,
+            token_condition,
+            mel_mask,
+            speaker_embedding,
+            prompt_mel,
+        )
 
     @torch.inference_mode()
     def capture(self, capture_shapes: tuple[tuple[int, int], ...]) -> None:
@@ -383,16 +408,16 @@ class FlowCudaGraphRunner:
     @torch.inference_mode()
     def run(
         self,
-        x: torch.Tensor,
-        t_span: torch.Tensor,
-        mu: torch.Tensor,
-        mask: torch.Tensor,
-        spks: torch.Tensor,
-        cond: torch.Tensor,
+        noisy_mel: torch.Tensor,
+        time_span: torch.Tensor,
+        token_condition: torch.Tensor,
+        mel_mask: torch.Tensor,
+        speaker_embedding: torch.Tensor,
+        prompt_mel: torch.Tensor,
     ) -> torch.Tensor | None:
-        if x.ndim != 3:
+        if noisy_mel.ndim != 3:
             return None
-        batch_size, actual_mel_frame = int(x.shape[0]), int(x.shape[2])
+        batch_size, actual_mel_frame = int(noisy_mel.shape[0]), int(noisy_mel.shape[2])
         bucket_mel_frame = (
             (actual_mel_frame + FLOW_CUDA_GRAPH_FRAME_BUCKET - 1)
             // FLOW_CUDA_GRAPH_FRAME_BUCKET
@@ -402,19 +427,21 @@ class FlowCudaGraphRunner:
         if captured is None:
             return None
 
-        frame_inputs = (x, mu, mask, cond)
+        frame_inputs = (noisy_mel, token_condition, mel_mask, prompt_mel)
         if any(
             value.ndim == 0 or value.shape[-1] != actual_mel_frame
             for value in frame_inputs
         ):
             return None
         inputs = (
-            self.right_pad_mel_frames(x, actual_mel_frame, bucket_mel_frame),
-            t_span,
-            self.right_pad_mel_frames(mu, actual_mel_frame, bucket_mel_frame),
-            self.right_pad_mel_frames(mask, actual_mel_frame, bucket_mel_frame),
-            spks,
-            self.right_pad_mel_frames(cond, actual_mel_frame, bucket_mel_frame),
+            self.right_pad_mel_frames(noisy_mel, actual_mel_frame, bucket_mel_frame),
+            time_span,
+            self.right_pad_mel_frames(
+                token_condition, actual_mel_frame, bucket_mel_frame
+            ),
+            self.right_pad_mel_frames(mel_mask, actual_mel_frame, bucket_mel_frame),
+            speaker_embedding,
+            self.right_pad_mel_frames(prompt_mel, actual_mel_frame, bucket_mel_frame),
         )
         if not all(
             static.shape == value.shape
@@ -454,7 +481,9 @@ def generate_flow(
     finalize: bool = True,
     cuda_graph_runner: FlowCudaGraphRunner | None = None,
 ) -> torch.Tensor:
-    embedding = flow.spk_embed_affine_layer(F.normalize(packed.embedding, dim=1))
+    speaker_embedding = flow.spk_embed_affine_layer(
+        F.normalize(packed.embedding, dim=1)
+    )
     token_embedding = flow.input_embedding(torch.clamp(packed.token, min=0))
     token_embedding = token_embedding * packed.token_mask.to(token_embedding.dtype)
     if finalize:
@@ -469,12 +498,12 @@ def generate_flow(
                 int(getattr(flow, "pre_lookahead_len", PRE_LOOKAHEAD_LEN)), 0
             )
     if finalize or lookahead <= 0:
-        h = flow.pre_lookahead_layer(token_embedding)
+        token_hidden = flow.pre_lookahead_layer(token_embedding)
     else:
         layer = flow.pre_lookahead_layer
         lengths = packed.combined_token_lengths
         if len(set(int(length) for length in lengths)) <= 1:
-            h = layer(
+            token_hidden = layer(
                 token_embedding[:, :-lookahead],
                 context=token_embedding[:, -lookahead:],
             )
@@ -496,9 +525,13 @@ def generate_flow(
                 if hidden.shape[1] < max_body:
                     hidden = F.pad(hidden, (0, 0, 0, max_body - int(hidden.shape[1])))
                 pieces.append(hidden)
-            h = torch.cat(pieces, dim=0)
-    mu = h.repeat_interleave(flow.token_mel_ratio, dim=1).transpose(1, 2).contiguous()
-    batch_size, channels, max_mel = mu.shape
+            token_hidden = torch.cat(pieces, dim=0)
+    token_condition = (
+        token_hidden.repeat_interleave(flow.token_mel_ratio, dim=1)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    batch_size, channels, max_mel_frame = token_condition.shape
     if channels != flow.output_size:
         raise ValueError("Flow pre-lookahead output width does not match output_size")
     if lookahead > 0:
@@ -508,44 +541,60 @@ def generate_flow(
                 for length in packed.combined_token_lengths
             ],
             dtype=torch.int64,
-            device=mu.device,
+            device=token_condition.device,
         )
     else:
         total_mel_lengths_tensor = packed.total_mel_lengths_tensor
-    mask = (
+    mel_mask = (
         (
-            torch.arange(max_mel, device=mu.device).unsqueeze(0)
+            torch.arange(max_mel_frame, device=token_condition.device).unsqueeze(0)
             < total_mel_lengths_tensor.unsqueeze(1)
         )
         .unsqueeze(1)
-        .to(mu.dtype)
+        .to(token_condition.dtype)
     )
-    cond = torch.zeros_like(mu)
-    for index, prompt_frames in enumerate(packed.prompt_mel_lengths):
-        cond[index, :, :prompt_frames] = packed.prompt_feat[
-            index, :prompt_frames
+    prompt_mel = torch.zeros_like(token_condition)
+    for index, prompt_mel_frame in enumerate(packed.prompt_mel_lengths):
+        prompt_mel[index, :, :prompt_mel_frame] = packed.prompt_feat[
+            index, :prompt_mel_frame
         ].transpose(0, 1)
     decoder = flow.decoder
-    if max_mel > decoder.rand_noise.shape[2]:
+    if max_mel_frame > decoder.rand_noise.shape[2]:
         raise ValueError(
             f"decoder.rand_noise supports {decoder.rand_noise.shape[2]} frames, "
-            f"but batch requires {max_mel}"
+            f"but batch requires {max_mel_frame}"
         )
-    z = (
-        decoder.rand_noise[:, :, :max_mel]
-        .to(device=mu.device, dtype=mu.dtype)
+    noisy_mel = (
+        decoder.rand_noise[:, :, :max_mel_frame]
+        .to(device=token_condition.device, dtype=token_condition.dtype)
         .expand(batch_size, -1, -1)
         .clone()
     )
-    t_span = torch.linspace(0, 1, 11, device=mu.device, dtype=mu.dtype)
+    time_span = torch.linspace(
+        0, 1, 11, device=token_condition.device, dtype=token_condition.dtype
+    )
     if decoder.t_scheduler == "cosine":
-        t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
+        time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
     if cuda_graph_runner is not None:
-        generated = cuda_graph_runner.run(z, t_span, mu, mask, embedding, cond)
+        generated = cuda_graph_runner.run(
+            noisy_mel,
+            time_span,
+            token_condition,
+            mel_mask,
+            speaker_embedding,
+            prompt_mel,
+        )
         if generated is not None:
             return generated
     return solve_flow_euler(
-        decoder, z, t_span, mu, mask, embedding, cond, streaming=streaming
+        decoder,
+        noisy_mel,
+        time_span,
+        token_condition,
+        mel_mask,
+        speaker_embedding,
+        prompt_mel,
+        streaming=streaming,
     )
 
 
@@ -777,24 +826,36 @@ def compile_dit_backbone(
         estimator.forward = torch.compile(original_forward, dynamic=True)
         param = next(estimator.parameters())
         device, dtype = param.device, param.dtype
-        t = int(warmup_mel_frames)
+        mel_frame = int(warmup_mel_frames)
         with torch.inference_mode():
             for streaming in (False, True):
                 for _ in range(warmup_steps):
                     # CFG batch 2; mel dim 80 matches pinned checkpoint proj_out.
-                    x = torch.randn(2, 80, t, device=device, dtype=dtype)
-                    mask = torch.ones(2, 1, t, device=device, dtype=dtype)
-                    mu = torch.randn(2, 80, t, device=device, dtype=dtype)
-                    timestep = torch.zeros(1, device=device, dtype=dtype)
-                    spks = torch.randn(2, 80, device=device, dtype=dtype)
-                    cond = torch.randn(2, 80, t, device=device, dtype=dtype)
+                    noisy_mel = torch.randn(
+                        2, 80, mel_frame, device=device, dtype=dtype
+                    )
+                    mel_mask = torch.ones(2, 1, mel_frame, device=device, dtype=dtype)
+                    token_condition = torch.randn(
+                        2, 80, mel_frame, device=device, dtype=dtype
+                    )
+                    flow_time = torch.zeros(1, device=device, dtype=dtype)
+                    speaker_embedding = torch.randn(2, 80, device=device, dtype=dtype)
+                    prompt_mel = torch.randn(
+                        2, 80, mel_frame, device=device, dtype=dtype
+                    )
                     with torch.autocast(
                         device_type=current_platform.device_type,
                         dtype=autocast_dtype,
                         enabled=autocast_dtype is not None,
                     ):
                         estimator(
-                            x, mask, mu, timestep, spks, cond, streaming=streaming
+                            noisy_mel,
+                            mel_mask,
+                            token_condition,
+                            flow_time,
+                            speaker_embedding,
+                            prompt_mel,
+                            streaming=streaming,
                         )
     except Exception as exc:
         estimator.forward = original_forward

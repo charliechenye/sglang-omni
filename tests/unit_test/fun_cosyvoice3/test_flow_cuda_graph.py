@@ -78,16 +78,16 @@ def _install(
 
 
 def _solver_inputs(
-    batch_size: int, frames: int, channels: int = 4
+    batch_size: int, mel_frame: int, channels: int = 4
 ) -> tuple[torch.Tensor, ...]:
-    x = torch.ones(batch_size, channels, frames)
+    noisy_mel = torch.ones(batch_size, channels, mel_frame)
     return (
-        x,
+        noisy_mel,
         torch.linspace(0, 1, 11),
-        torch.full_like(x, 2),
-        torch.ones(batch_size, 1, frames),
+        torch.full_like(noisy_mel, 2),
+        torch.ones(batch_size, 1, mel_frame),
         torch.zeros(batch_size, 5),
-        torch.full_like(x, 3),
+        torch.full_like(noisy_mel, 3),
     )
 
 
@@ -111,12 +111,21 @@ def test_verify_capture_shapes_rejects_unaligned_frames() -> None:
 def test_resident_replay_crops_to_actual_frames() -> None:
     runner = _runner()
     _install(runner, (2, 496))
-    x, t_span, mu, mask, spks, cond = _solver_inputs(2, 489)
-    output = runner.run(x, t_span, mu, mask, spks, cond)
+    noisy_mel, time_span, token_condition, mel_mask, speaker_embedding, prompt_mel = (
+        _solver_inputs(2, 489)
+    )
+    output = runner.run(
+        noisy_mel,
+        time_span,
+        token_condition,
+        mel_mask,
+        speaker_embedding,
+        prompt_mel,
+    )
 
     assert output is not None
     assert output.shape == (2, 4, 489)
-    assert torch.equal(output, x + mu + cond)
+    assert torch.equal(output, noisy_mel + token_condition + prompt_mel)
 
 
 def test_nonresident_shape_returns_none() -> None:
