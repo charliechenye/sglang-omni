@@ -61,7 +61,7 @@ class _ReplayGraph:
 
 def _runner() -> stages.FlowCudaGraphRunner:
     return stages.FlowCudaGraphRunner(
-        _flow(), device=torch.device("cpu"), compute_dtype=None
+        _flow(), device=torch.device("cpu"), autocast_dtype=None
     )
 
 

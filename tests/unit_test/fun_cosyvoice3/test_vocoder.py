@@ -681,7 +681,7 @@ def _executor_compiles(monkeypatch, **kwargs) -> bool:
     monkeypatch.setattr(
         stages,
         "compile_dit_backbone",
-        lambda flow, compute_dtype: compiled.append(flow),
+        lambda flow, autocast_dtype: compiled.append(flow),
     )
     stages.create_vocoder_executor("model", device="cpu", **kwargs)
     return bool(compiled)
@@ -871,10 +871,10 @@ def test_vocoder_hift_defaults_to_float32(monkeypatch) -> None:
     vocoder = stages.CosyVoice3Vocoder(flow, _FakeHiFT())
 
     # bfloat16 gave HiFT no speedup, so the default keeps full precision.
-    assert vocoder.hift_compute_dtype is None
+    assert vocoder.hift_autocast_dtype is None
     with torch.autocast(
         device_type=stages.current_platform.device_type,
-        dtype=vocoder.hift_compute_dtype,
-        enabled=vocoder.hift_compute_dtype is not None,
+        dtype=vocoder.hift_autocast_dtype,
+        enabled=vocoder.hift_autocast_dtype is not None,
     ):
         assert not torch.is_autocast_enabled()
