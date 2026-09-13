@@ -141,10 +141,7 @@ def pack_flow_inputs(
                 f"input {index} embedding width must be {expected_embedding_size}"
             )
 
-    try:
-        parameter = next(flow.parameters())
-    except (AttributeError, StopIteration) as exc:
-        raise ValueError("Flow must expose at least one parameter") from exc
+    parameter = next(flow.parameters())
     device, dtype = parameter.device, parameter.dtype
     prompt_lengths = tuple(int(item.prompt_token.shape[1]) for item in inputs)
     target_lengths = tuple(int(item.token.shape[1]) for item in inputs)
@@ -303,16 +300,18 @@ class FlowCudaGraphRunner:
         self.graphs: dict[tuple[int, int], CapturedFlowCudaGraph] = {}
         self.pool: tuple[int, int] | None = None
 
-    def capture_inputs(self, batch_size: int, frames: int) -> tuple[torch.Tensor, ...]:
-        try:
-            parameter = next(self.flow.parameters())
-        except (AttributeError, StopIteration) as exc:
-            raise ValueError("Flow must expose at least one parameter") from exc
+    # Note (chenyang): CUDA Graph capture and replay must share the same
+    # tensor storage. This builds the static Euler inputs for one (B, T)
+    # capture shape; run() later copy_s the real batch into them.
+    def capture_inputs(
+        self, batch_size: int, mel_frame: int
+    ) -> tuple[torch.Tensor, ...]:
+        parameter = next(self.flow.parameters())
         model_device, parameter_dtype = parameter.device, parameter.dtype
         speaker_dtype = self.autocast_dtype or parameter_dtype
         decoder = self.flow.decoder
         x = (
-            decoder.rand_noise[:, :, :frames]
+            decoder.rand_noise[:, :, :mel_frame]
             .to(device=model_device, dtype=parameter_dtype)
             .expand(batch_size, -1, -1)
             .clone()
@@ -322,7 +321,7 @@ class FlowCudaGraphRunner:
             t_span = 1 - torch.cos(t_span * 0.5 * torch.pi)
         mu = torch.zeros_like(x)
         mask = torch.ones(
-            batch_size, 1, frames, device=model_device, dtype=parameter_dtype
+            batch_size, 1, mel_frame, device=model_device, dtype=parameter_dtype
         )
         speaker_dim = int(self.flow.spk_embed_affine_layer.out_features)
         spks = torch.zeros(
@@ -338,8 +337,8 @@ class FlowCudaGraphRunner:
         stream.wait_stream(torch.cuda.current_stream(self.device))
         with torch.cuda.device(self.device):
             self.pool = torch.cuda.graph_pool_handle()
-            for batch_size, frames in capture_shapes:
-                static_inputs = self.capture_inputs(batch_size, frames)
+            for batch_size, mel_frame in capture_shapes:
+                static_inputs = self.capture_inputs(batch_size, mel_frame)
                 with (
                     torch.cuda.stream(stream),
                     torch.autocast(
@@ -365,7 +364,7 @@ class FlowCudaGraphRunner:
                     ),
                 ):
                     static_output = solve_flow_euler(self.flow.decoder, *static_inputs)
-                graphs[(batch_size, frames)] = CapturedFlowCudaGraph(
+                graphs[(batch_size, mel_frame)] = CapturedFlowCudaGraph(
                     graph, static_inputs, static_output
                 )
         stream.synchronize()
@@ -373,10 +372,10 @@ class FlowCudaGraphRunner:
         self.graphs = graphs
 
     @staticmethod
-    def right_pad_frames(
-        value: torch.Tensor, actual_frames: int, bucket_frames: int
+    def right_pad_mel_frames(
+        value: torch.Tensor, actual_mel_frame: int, bucket_mel_frame: int
     ) -> torch.Tensor:
-        padding = bucket_frames - actual_frames
+        padding = bucket_mel_frame - actual_mel_frame
         if padding == 0:
             return value
         return F.pad(value, (0, padding), mode="constant", value=0)
@@ -393,29 +392,29 @@ class FlowCudaGraphRunner:
     ) -> torch.Tensor | None:
         if x.ndim != 3:
             return None
-        batch_size, actual_frames = int(x.shape[0]), int(x.shape[2])
-        bucket_frames = (
-            (actual_frames + FLOW_CUDA_GRAPH_FRAME_BUCKET - 1)
+        batch_size, actual_mel_frame = int(x.shape[0]), int(x.shape[2])
+        bucket_mel_frame = (
+            (actual_mel_frame + FLOW_CUDA_GRAPH_FRAME_BUCKET - 1)
             // FLOW_CUDA_GRAPH_FRAME_BUCKET
             * FLOW_CUDA_GRAPH_FRAME_BUCKET
         )
-        captured = self.graphs.get((batch_size, bucket_frames))
+        captured = self.graphs.get((batch_size, bucket_mel_frame))
         if captured is None:
             return None
 
         frame_inputs = (x, mu, mask, cond)
         if any(
-            value.ndim == 0 or value.shape[-1] != actual_frames
+            value.ndim == 0 or value.shape[-1] != actual_mel_frame
             for value in frame_inputs
         ):
             return None
         inputs = (
-            self.right_pad_frames(x, actual_frames, bucket_frames),
+            self.right_pad_mel_frames(x, actual_mel_frame, bucket_mel_frame),
             t_span,
-            self.right_pad_frames(mu, actual_frames, bucket_frames),
-            self.right_pad_frames(mask, actual_frames, bucket_frames),
+            self.right_pad_mel_frames(mu, actual_mel_frame, bucket_mel_frame),
+            self.right_pad_mel_frames(mask, actual_mel_frame, bucket_mel_frame),
             spks,
-            self.right_pad_frames(cond, actual_frames, bucket_frames),
+            self.right_pad_mel_frames(cond, actual_mel_frame, bucket_mel_frame),
         )
         if not all(
             static.shape == value.shape
@@ -436,12 +435,12 @@ class FlowCudaGraphRunner:
                 for static, value in zip(captured.static_inputs, inputs, strict=True):
                     static.copy_(value)
                 captured.graph.replay()
-                return captured.static_output[..., :actual_frames].clone()
+                return captured.static_output[..., :actual_mel_frame].clone()
         except Exception:
             self.graphs.clear()
             logger.exception(
                 f"Fun-CosyVoice3 Flow CUDA graph replay failed for batch={batch_size} "
-                f"frames={bucket_frames}; disabled all Flow CUDA graphs"
+                f"mel_frame={bucket_mel_frame}; disabled all Flow CUDA graphs"
             )
             raise
 
