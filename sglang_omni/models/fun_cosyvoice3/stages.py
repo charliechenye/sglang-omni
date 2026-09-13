@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -20,6 +21,11 @@ if TYPE_CHECKING:
     from cosyvoice.flow.flow import CausalMaskedDiffWithDiT
     from cosyvoice.flow.flow_matching import ConditionalCFM
 
+from sglang_omni.models.fun_cosyvoice3.attribution import (
+    CosyVoice3AttributionRecorder,
+    CosyVoice3FlowGroupTrace,
+    CosyVoice3HiFTGroupTrace,
+)
 from sglang_omni.models.fun_cosyvoice3.config import reject_conflicting_dit_accelerators
 from sglang_omni.models.fun_cosyvoice3.flow_estimator_trt import (
     execute_flow_estimator,
@@ -1193,6 +1199,7 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         self.hift_autocast_dtype = AUTOCAST_DTYPES[hift_dtype]
         self.hift_max_padding_waste = hift_max_padding_waste
         self.hift_samples_per_mel_frame: int | None = None
+        self._attribution = CosyVoice3AttributionRecorder.from_env()
 
     def prepare_item(
         self, payload: StagePayload
@@ -1210,71 +1217,143 @@ class CosyVoice3Vocoder(BatchVocoderBase):
     async def decode_batch(
         self, items: list[tuple[FunCosyVoice3State, torch.Tensor]]
     ) -> list[tuple[Any, int]]:
-        prepared: list[PreparedFlowRequest] = []
-        for index, (state, codes) in enumerate(items):
-            flow_input = self.make_flow_input(state, codes)
-            prepared.append(
-                PreparedFlowRequest(
-                    index=index,
-                    sample_rate=state.sample_rate,
-                    flow_input=flow_input,
-                    total_mel_frames=(
-                        flow_input.prompt_token.shape[1] + flow_input.token.shape[1]
-                    )
-                    * self.flow.token_mel_ratio,
-                )
-            )
-
-        results: list[tuple[Any, int] | None] = [None] * len(items)
-        flow_groups = adaptive_flow_requests_grouping(
-            prepared,
-            flow_merge_max_gap_frames=self.flow_merge_max_gap_frames,
-            flow_merge_pad_budget_percent=self.flow_merge_pad_budget_percent,
+        attribution = self._attribution
+        outer_trace = (
+            attribution.begin_outer_batch(len(items))
+            if attribution is not None
+            else None
         )
-        flow_device = next(self.flow.parameters()).device
-        for flow_group in flow_groups:
-            with torch.autocast(
-                device_type=flow_device.type,
-                dtype=self.autocast_dtype,
-                enabled=self.autocast_dtype is not None,
-            ):
-                mel_list = self.flow.inference(
-                    [request.flow_input for request in flow_group]
+        try:
+            prepared: list[PreparedFlowRequest] = []
+            for index, (state, codes) in enumerate(items):
+                flow_input = self.make_flow_input(state, codes)
+                prepared.append(
+                    PreparedFlowRequest(
+                        index=index,
+                        sample_rate=state.sample_rate,
+                        flow_input=flow_input,
+                        total_mel_frames=(
+                            flow_input.prompt_token.shape[1] + flow_input.token.shape[1]
+                        )
+                        * self.flow.token_mel_ratio,
+                    )
                 )
-            ordered = sorted(
-                zip(flow_group, mel_list, strict=True),
-                key=lambda pair: int(pair[1].shape[-1]),
-            )
-            group: list[tuple[Any, torch.Tensor]] = []
-            total = 0
-            longest = 0
-            max_waste = self.hift_max_padding_waste
-            hift_groups: list[list[tuple[Any, torch.Tensor]]] = []
-            for pair in ordered:
-                length = int(pair[1].shape[-1])
-                candidate_longest = max(longest, length)
-                candidate_total = total + length
-                if (
-                    group
-                    and candidate_longest * (len(group) + 1)
-                    > max_waste * candidate_total
-                ):
-                    hift_groups.append(group)
-                    group, total, longest = [], 0, 0
-                    candidate_longest = length
-                    candidate_total = length
-                group.append(pair)
-                total, longest = candidate_total, candidate_longest
-            if group:
-                hift_groups.append(group)
-            for group in hift_groups:
-                wavs = self.mel2wav_batch([mel for _, mel in group])
-                for (request, _), wav in zip(group, wavs, strict=True):
-                    results[request.index] = (wav, request.sample_rate)
 
-        if any(result is None for result in results):
-            raise RuntimeError("Fun-CosyVoice3 vocoder did not decode every request")
-        return [cast(tuple[Any, int], result) for result in results]
+            results: list[tuple[Any, int] | None] = [None] * len(items)
+            flow_groups = adaptive_flow_requests_grouping(
+                prepared,
+                flow_merge_max_gap_frames=self.flow_merge_max_gap_frames,
+                flow_merge_pad_budget_percent=self.flow_merge_pad_budget_percent,
+            )
+            flow_device = next(self.flow.parameters()).device
+            for flow_group_index, flow_group in enumerate(flow_groups):
+                flow_trace: CosyVoice3FlowGroupTrace | None = None
+                if outer_trace is not None:
+                    effective_t = max(
+                        request.total_mel_frames for request in flow_group
+                    )
+                    q16_padded_t = (
+                        (effective_t + FLOW_CUDA_GRAPH_FRAME_BUCKET - 1)
+                        // FLOW_CUDA_GRAPH_FRAME_BUCKET
+                        * FLOW_CUDA_GRAPH_FRAME_BUCKET
+                    )
+                    graph_runner = self.flow.cuda_graph_runner
+                    cuda_graph_key: list[int] | None = None
+                    cuda_graph_resident: bool | None = None
+                    if graph_runner is not None:
+                        graph_key = (len(flow_group), q16_padded_t)
+                        cuda_graph_key = list(graph_key)
+                        # Read the resident key set only; the current runner
+                        # does not expose whether this invocation replayed it.
+                        resident_graphs = getattr(graph_runner, "graphs", None)
+                        if isinstance(resident_graphs, Mapping):
+                            cuda_graph_resident = graph_key in resident_graphs
+                    flow_trace = outer_trace.begin_flow_group(
+                        index=flow_group_index,
+                        request_indices=[request.index for request in flow_group],
+                        total_mel_frames=[
+                            request.total_mel_frames for request in flow_group
+                        ],
+                        effective_shape=[
+                            len(flow_group),
+                            int(self.flow.output_size),
+                            effective_t,
+                        ],
+                        q16_padded_t=q16_padded_t,
+                        cuda_graph_key=cuda_graph_key,
+                        cuda_graph_resident=cuda_graph_resident,
+                        device=flow_device,
+                    )
+                try:
+                    with torch.autocast(
+                        device_type=flow_device.type,
+                        dtype=self.autocast_dtype,
+                        enabled=self.autocast_dtype is not None,
+                    ):
+                        mel_list = self.flow.inference(
+                            [request.flow_input for request in flow_group]
+                        )
+                finally:
+                    if flow_trace is not None:
+                        flow_trace.finish()
+                ordered = sorted(
+                    zip(flow_group, mel_list, strict=True),
+                    key=lambda pair: int(pair[1].shape[-1]),
+                )
+                group: list[tuple[Any, torch.Tensor]] = []
+                total = 0
+                longest = 0
+                max_waste = self.hift_max_padding_waste
+                hift_groups: list[list[tuple[Any, torch.Tensor]]] = []
+                for pair in ordered:
+                    length = int(pair[1].shape[-1])
+                    candidate_longest = max(longest, length)
+                    candidate_total = total + length
+                    if (
+                        group
+                        and candidate_longest * (len(group) + 1)
+                        > max_waste * candidate_total
+                    ):
+                        hift_groups.append(group)
+                        group, total, longest = [], 0, 0
+                        candidate_longest = length
+                        candidate_total = length
+                    group.append(pair)
+                    total, longest = candidate_total, candidate_longest
+                if group:
+                    hift_groups.append(group)
+                for hift_group_index, group in enumerate(hift_groups):
+                    hift_trace: CosyVoice3HiFTGroupTrace | None = None
+                    if flow_trace is not None:
+                        hift_trace = flow_trace.begin_hift_group(
+                            index=hift_group_index,
+                            mel_lengths=[int(mel.shape[-1]) for _, mel in group],
+                            device=flow_device,
+                        )
+                    if hift_trace is None:
+                        wavs = self.mel2wav_batch([mel for _, mel in group])
+                    else:
+                        wavs = self.mel2wav_batch(
+                            [mel for _, mel in group], attribution=hift_trace
+                        )
+                        # The existing .cpu() in mel2wav_batch is the natural
+                        # synchronization boundary at which Flow events may be
+                        # read. This observer adds no device-wide CUDA wait.
+                        flow_trace.resolve_cuda_elapsed()
+                    for (request, _), wav in zip(group, wavs, strict=True):
+                        results[request.index] = (wav, request.sample_rate)
+
+            if any(result is None for result in results):
+                raise RuntimeError(
+                    "Fun-CosyVoice3 vocoder did not decode every request"
+                )
+            decoded = [cast(tuple[Any, int], result) for result in results]
+            if outer_trace is not None:
+                outer_trace.complete(time.perf_counter_ns())
+            return decoded
+        finally:
+            if outer_trace is not None:
+                outer_trace.close_nvtx()
 
     async def decode_payload(self, payload: StagePayload) -> StagePayload:
         results = await self.decode_payloads([payload])
@@ -1420,7 +1499,12 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             flow_input.prompt_token.shape[1] + flow_input.token.shape[1]
         ) * self.flow.token_mel_ratio
 
-    def mel2wav_batch(self, mels: list[torch.Tensor]) -> list[torch.Tensor]:
+    def mel2wav_batch(
+        self,
+        mels: list[torch.Tensor],
+        *,
+        attribution: CosyVoice3HiFTGroupTrace | None = None,
+    ) -> list[torch.Tensor]:
         if not mels:
             return []
         hift_autocast = torch.autocast(
@@ -1429,8 +1513,27 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             enabled=self.hift_autocast_dtype is not None,
         )
         if len(mels) == 1:
-            with hift_autocast:
-                tts_speech, _ = self.hift.inference(speech_feat=mels[0], finalize=True)
+            if attribution is None:
+                with hift_autocast:
+                    tts_speech, _ = self.hift.inference(
+                        speech_feat=mels[0], finalize=True
+                    )
+            else:
+                attribution.begin_gpu()
+                try:
+                    with hift_autocast:
+                        tts_speech, _ = self.hift.inference(
+                            speech_feat=mels[0], finalize=True
+                        )
+                finally:
+                    attribution.finish_gpu()
+                attribution.begin_cpu_materialization()
+                try:
+                    wav = tts_speech.detach().cpu()
+                finally:
+                    attribution.finish_cpu_materialization()
+                attribution.resolve_cuda_elapsed()
+                return [wav]
             return [tts_speech.detach().cpu()]
         lengths = [int(mel.shape[2]) for mel in mels]
         longest = max(lengths)
@@ -1444,8 +1547,16 @@ class CosyVoice3Vocoder(BatchVocoderBase):
                 ],
                 dim=0,
             )
-        with hift_autocast:
-            wav, _ = self.hift.inference(speech_feat=padded, finalize=True)
+        if attribution is None:
+            with hift_autocast:
+                wav, _ = self.hift.inference(speech_feat=padded, finalize=True)
+        else:
+            attribution.begin_gpu()
+            try:
+                with hift_autocast:
+                    wav, _ = self.hift.inference(speech_feat=padded, finalize=True)
+            finally:
+                attribution.finish_gpu()
         wav = wav.detach()
         if self.hift_samples_per_mel_frame is None:
             stride = int(self.hift.istft_params["hop_len"])
@@ -1453,6 +1564,17 @@ class CosyVoice3Vocoder(BatchVocoderBase):
                 stride *= int(rate)
             self.hift_samples_per_mel_frame = stride
         samples_per_frame = self.hift_samples_per_mel_frame
+        if attribution is not None:
+            attribution.begin_cpu_materialization()
+            try:
+                wavs = [
+                    wav[index : index + 1, : length * samples_per_frame].cpu()
+                    for index, length in enumerate(lengths)
+                ]
+            finally:
+                attribution.finish_cpu_materialization()
+            attribution.resolve_cuda_elapsed()
+            return wavs
         return [
             wav[index : index + 1, : length * samples_per_frame].cpu()
             for index, length in enumerate(lengths)
