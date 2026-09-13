@@ -405,7 +405,8 @@ class FlowCudaGraphRunner:
         padding = bucket_mel_frame - actual_mel_frame
         if padding == 0:
             return value
-        return F.pad(value, (0, padding), mode="constant", value=0)
+        else:
+            return F.pad(value, (0, padding), mode="constant", value=0)
 
     @torch.inference_mode()
     def run(
