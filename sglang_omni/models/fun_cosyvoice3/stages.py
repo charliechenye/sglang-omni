@@ -484,12 +484,11 @@ class FlowCudaGraphRunner:
 
 @torch.inference_mode()
 def generate_flow(
-    flow: CausalMaskedDiffWithDiT,
+    flow: FunCosyVoice3Flow,
     packed: PackedFlowBatch,
     *,
     streaming: bool = False,
     finalize: bool = True,
-    cuda_graph_runner: FlowCudaGraphRunner | None = None,
 ) -> torch.Tensor:
     speaker_embedding = flow.spk_embed_affine_layer(
         F.normalize(packed.embedding, dim=1)
@@ -585,8 +584,8 @@ def generate_flow(
     )
     if decoder.t_scheduler == "cosine":
         time_span = 1 - torch.cos(time_span * 0.5 * torch.pi)
-    if cuda_graph_runner is not None:
-        generated = cuda_graph_runner.run(
+    if flow.cuda_graph_runner is not None:
+        generated = flow.cuda_graph_runner.run(
             noisy_mel,
             time_span,
             token_condition,
@@ -657,11 +656,7 @@ class FunCosyVoice3Flow:
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
         packed = pack_flow_inputs(self.flow, inputs)
-        generated = generate_flow(
-            self.flow,
-            packed,
-            cuda_graph_runner=self.cuda_graph_runner,
-        )
+        generated = generate_flow(self, packed)
         return split_generated_mels(
             self.flow,
             packed,
@@ -677,7 +672,7 @@ class FunCosyVoice3Flow:
         # mixed prompt lengths can share one DiT call. streaming=True
         # keeps the chunk mask aligned with CosyVoice3Model hops.
         packed = pack_flow_inputs(self.flow, inputs)
-        generated = generate_flow(self.flow, packed, streaming=True, finalize=False)
+        generated = generate_flow(self, packed, streaming=True, finalize=False)
         layer = getattr(self.flow, "pre_lookahead_layer", None)
         layer_len = getattr(layer, "pre_lookahead_len", None)
         if layer_len is not None:

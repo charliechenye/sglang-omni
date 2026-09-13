@@ -36,6 +36,7 @@ def _flow(*, channels: int = 4, max_frames: int = 512) -> SimpleNamespace:
         spk_embed_affine_layer=torch.nn.Linear(3, 5),
         input_embedding=lambda token: torch.ones(*token.shape, channels),
         pre_lookahead_layer=lambda x, context=None: x,
+        cuda_graph_runner=None,
     )
 
 
@@ -137,10 +138,8 @@ def test_generate_flow_does_not_retry_eager_after_replay_failure(monkeypatch) ->
         def run(self, *args, **kwargs):
             raise RuntimeError("replay failed")
 
+    flow = _flow(max_frames=64)
+    flow.cuda_graph_runner = _FailingRunner()
     with pytest.raises(RuntimeError, match="replay failed"):
-        stages.generate_flow(
-            _flow(max_frames=64),
-            _packed_tokens(),
-            cuda_graph_runner=_FailingRunner(),
-        )
+        stages.generate_flow(flow, _packed_tokens())
     assert eager_calls == []
