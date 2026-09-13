@@ -418,24 +418,27 @@ class FlowCudaGraphRunner:
         speaker_embedding: torch.Tensor,
         prompt_mel: torch.Tensor,
     ) -> torch.Tensor | None:
+        frame_inputs = (noisy_mel, token_condition, mel_mask, prompt_mel)
         if noisy_mel.ndim != 3:
             return None
-        batch_size, actual_mel_frame = int(noisy_mel.shape[0]), int(noisy_mel.shape[2])
-        bucket_mel_frame = (
-            (actual_mel_frame + FLOW_CUDA_GRAPH_FRAME_BUCKET - 1)
-            // FLOW_CUDA_GRAPH_FRAME_BUCKET
-            * FLOW_CUDA_GRAPH_FRAME_BUCKET
-        )
-        captured = self.graphs.get((batch_size, bucket_mel_frame))
-        if captured is None:
+        elif any(
+            value.ndim == 0 or value.shape[-1] != int(noisy_mel.shape[2])
+            for value in frame_inputs
+        ):
             return None
         else:
-            frame_inputs = (noisy_mel, token_condition, mel_mask, prompt_mel)
-            if any(
-                value.ndim == 0 or value.shape[-1] != actual_mel_frame
-                for value in frame_inputs
-            ):
-                return None
+            batch_size, actual_mel_frame = (
+                int(noisy_mel.shape[0]),
+                int(noisy_mel.shape[2]),
+            )
+            bucket_mel_frame = (
+                (actual_mel_frame + FLOW_CUDA_GRAPH_FRAME_BUCKET - 1)
+                // FLOW_CUDA_GRAPH_FRAME_BUCKET
+                * FLOW_CUDA_GRAPH_FRAME_BUCKET
+            )
+            captured = self.graphs.get((batch_size, bucket_mel_frame))
+            if captured is None:
+                inputs = None
             else:
                 inputs = (
                     self.right_pad_mel_frames(
@@ -453,30 +456,30 @@ class FlowCudaGraphRunner:
                         prompt_mel, actual_mel_frame, bucket_mel_frame
                     ),
                 )
-                if not all(
-                    static.shape == value.shape
-                    and static.dtype == value.dtype
-                    and static.device == value.device
+            if captured is None or inputs is None:
+                return None
+            elif not all(
+                static.shape == value.shape
+                and static.dtype == value.dtype
+                and static.device == value.device
+                for static, value in zip(captured.static_inputs, inputs, strict=True)
+            ):
+                return None
+            else:
+                with (
+                    torch.cuda.device(self.device),
+                    torch.autocast(
+                        device_type=self.device.type,
+                        dtype=self.autocast_dtype,
+                        enabled=self.autocast_dtype is not None,
+                    ),
+                ):
                     for static, value in zip(
                         captured.static_inputs, inputs, strict=True
-                    )
-                ):
-                    return None
-                else:
-                    with (
-                        torch.cuda.device(self.device),
-                        torch.autocast(
-                            device_type=self.device.type,
-                            dtype=self.autocast_dtype,
-                            enabled=self.autocast_dtype is not None,
-                        ),
                     ):
-                        for static, value in zip(
-                            captured.static_inputs, inputs, strict=True
-                        ):
-                            static.copy_(value)
-                        captured.graph.replay()
-                        return captured.static_output[..., :actual_mel_frame].clone()
+                        static.copy_(value)
+                    captured.graph.replay()
+                    return captured.static_output[..., :actual_mel_frame].clone()
 
 
 @torch.inference_mode()
