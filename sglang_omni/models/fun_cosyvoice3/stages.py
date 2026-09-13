@@ -519,8 +519,11 @@ def generate_flow(
                     ],
                 )
                 if hidden.shape[1] < max_body:
-                    hidden = F.pad(hidden, (0, 0, 0, max_body - int(hidden.shape[1])))
-                pieces.append(hidden)
+                    pieces.append(
+                        F.pad(hidden, (0, 0, 0, max_body - int(hidden.shape[1])))
+                    )
+                else:
+                    pieces.append(hidden)
             token_hidden = torch.cat(pieces, dim=0)
     token_condition = (
         token_hidden.repeat_interleave(flow.token_mel_ratio, dim=1)
