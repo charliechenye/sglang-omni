@@ -376,7 +376,7 @@ class FlowCudaGraphRunner:
                 graph = torch.cuda.CUDAGraph()
                 with (
                     torch.cuda.graph(
-                        graph,
+                        graph=graph,
                         pool=self.pool,
                         stream=stream,
                         capture_error_mode="thread_local",
@@ -388,12 +388,15 @@ class FlowCudaGraphRunner:
                     ),
                 ):
                     static_output = solve_flow_euler(self.flow.decoder, *static_inputs)
-                graphs[(batch_size, mel_frame)] = CapturedFlowCudaGraph(
-                    graph, static_inputs, static_output
+                graphs[(batch_size, mel_frame)] = CaptureedFlowCudaGraph(
+                    graph=graph,
+                    static_inputs=static_inputs,
+                    static_outputs=static_output,
                 )
         current_stream.wait_stream(stream)
         torch.cuda.empty_cache()
         self.graphs = graphs
+        return
 
     @staticmethod
     def right_pad_mel_frames(
