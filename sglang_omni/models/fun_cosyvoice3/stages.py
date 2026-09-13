@@ -578,24 +578,13 @@ def generate_flow(
         unit_span = torch.linspace(
             0, 1, 11, device=token_condition.device, dtype=token_condition.dtype
         )
+
         if decoder.t_scheduler == "cosine":
             time_span = 1 - torch.cos(unit_span * 0.5 * torch.pi)
         else:
             time_span = unit_span
-        if flow.cuda_graph_runner is not None:
-            generated = flow.cuda_graph_runner.run(
-                noisy_mel,
-                time_span,
-                token_condition,
-                mel_mask,
-                speaker_embedding,
-                prompt_mel,
-            )
-        else:
-            generated = None
-        if generated is not None:
-            return generated
-        else:
+
+        if flow.cuda_graph_runner is None:
             return solve_flow_euler(
                 decoder,
                 noisy_mel,
@@ -606,6 +595,28 @@ def generate_flow(
                 prompt_mel,
                 streaming=streaming,
             )
+        else:
+            generated = flow.cuda_graph_runner.run(
+                noisy_mel,
+                time_span,
+                token_condition,
+                mel_mask,
+                speaker_embedding,
+                prompt_mel,
+            )
+            if generated is not None:
+                return generated
+            else:
+                return solve_flow_euler(
+                    decoder,
+                    noisy_mel,
+                    time_span,
+                    token_condition,
+                    mel_mask,
+                    speaker_embedding,
+                    prompt_mel,
+                    streaming=streaming,
+                )
 
 
 def split_generated_mels(
