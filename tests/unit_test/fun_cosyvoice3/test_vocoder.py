@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from types import SimpleNamespace
 from typing import ClassVar
@@ -534,6 +535,133 @@ def test_decode_batch_merges_flow_preserving_hift_groups_and_order(
     # Mel lengths 48/50 vs 100/102 exceed default HiFT waste=1.5, so HiFT
     # keeps the same cut Flow already made. Result order is still original.
     assert hift_memberships == [(1, 2), (3, 4)]
+
+
+def test_cosyvoice3_attribution_is_disabled_by_default(monkeypatch, tmp_path) -> None:
+    monkeypatch.delenv("SGLANG_COSYVOICE3_ATTRIBUTION", raising=False)
+    monkeypatch.delenv("SGLANG_COSYVOICE3_ATTRIBUTION_PATH", raising=False)
+    monkeypatch.setattr(
+        torch.cuda,
+        "Event",
+        lambda *args, **kwargs: pytest.fail(
+            "disabled attribution must not create CUDA events"
+        ),
+    )
+    flow_calls: list[list] = []
+    _install_fake_batch_adapter(monkeypatch, flow_calls)
+    vocoder = stages.CosyVoice3Vocoder(_BatchCapableFakeFlow(), _FakeHiFT())
+
+    results = asyncio.run(vocoder.decode_batch([(_state(), _codes(2))]))
+
+    assert vocoder._attribution is None
+    assert len(results) == 1
+    assert flow_calls
+    assert not (tmp_path / "cosyvoice3.jsonl").exists()
+
+
+def test_cosyvoice3_attribution_records_buffered_groups_and_d2h(
+    monkeypatch, tmp_path
+) -> None:
+    trace_path = tmp_path / "cosyvoice3.jsonl"
+    monkeypatch.setenv("SGLANG_COSYVOICE3_ATTRIBUTION", "1")
+    monkeypatch.setenv("SGLANG_COSYVOICE3_ATTRIBUTION_PATH", str(trace_path))
+    monkeypatch.setattr(
+        torch.cuda,
+        "synchronize",
+        lambda *args, **kwargs: pytest.fail(
+            "attribution must not add an explicit CUDA wait"
+        ),
+    )
+
+    flow = _BatchCapableFakeFlow()
+    hift = _FakeHiFT()
+    flow_calls: list[list] = []
+    _install_fake_batch_adapter(monkeypatch, flow_calls)
+    vocoder = stages.CosyVoice3Vocoder(
+        flow,
+        hift,
+        flow_merge_max_gap_frames=4,
+        flow_merge_pad_budget_percent=25,
+    )
+    vocoder.flow.cuda_graph_runner = SimpleNamespace(graphs={(2, 64): object()})
+
+    items = [
+        (_state(sample_rate=16003, prompt_tokens=0), _codes(50, 3)),
+        (_state(sample_rate=16001, prompt_tokens=0), _codes(24, 1)),
+        (_state(sample_rate=16004, prompt_tokens=0), _codes(51, 4)),
+        (_state(sample_rate=16002, prompt_tokens=0), _codes(25, 2)),
+    ]
+    results = asyncio.run(vocoder.decode_batch(items))
+
+    assert len(results) == 4
+    records = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert len(records) == 1
+    record = records[0]
+    assert record["schema"] == "cosyvoice3-post2141-attribution-v1"
+    assert record["kind"] == "outer_batch"
+    assert record["request_count"] == 4
+    assert record["host_start_ns"] <= record["host_end_ns"]
+
+    flow_groups = record["flow_groups"]
+    assert [group["flow_group_index"] for group in flow_groups] == [0, 1]
+    assert all(
+        group["outer_batch_id"] == record["outer_batch_id"] for group in flow_groups
+    )
+    assert [group["request_indices"] for group in flow_groups] == [
+        [1, 3],
+        [0, 2],
+    ]
+    assert [group["total_mel_frames"] for group in flow_groups] == [
+        [48, 50],
+        [100, 102],
+    ]
+    assert [group["effective_shape"] for group in flow_groups] == [
+        [2, 80, 50],
+        [2, 80, 102],
+    ]
+    assert [group["cuda_graph_key"] for group in flow_groups] == [
+        [2, 64],
+        [2, 112],
+    ]
+    assert [group["cuda_graph_resident"] for group in flow_groups] == [
+        True,
+        False,
+    ]
+    assert [
+        hift["mel_lengths"] for group in flow_groups for hift in group["hift_groups"]
+    ] == [[48, 50], [100, 102]]
+    assert [
+        (hift["outer_batch_id"], hift["flow_group_index"], hift["hift_group_index"])
+        for group in flow_groups
+        for hift in group["hift_groups"]
+    ] == [
+        (record["outer_batch_id"], 0, 0),
+        (record["outer_batch_id"], 1, 0),
+    ]
+    assert all(
+        hift["host_start_ns"] <= hift["host_end_ns"]
+        and hift["cpu_materialization_start_ns"] <= hift["cpu_materialization_end_ns"]
+        and hift["cpu_materialization_ms"] >= 0
+        and hift["cuda_elapsed_ms"] is None
+        for group in flow_groups
+        for hift in group["hift_groups"]
+    )
+
+
+def test_cosyvoice3_attribution_requires_explicit_output_path(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("SGLANG_COSYVOICE3_ATTRIBUTION", "1")
+    monkeypatch.delenv("SGLANG_COSYVOICE3_ATTRIBUTION_PATH", raising=False)
+    with pytest.raises(ValueError, match="SGLANG_COSYVOICE3_ATTRIBUTION_PATH"):
+        stages.CosyVoice3Vocoder(_BatchCapableFakeFlow(), _FakeHiFT())
+
+    monkeypatch.setenv(
+        "SGLANG_COSYVOICE3_ATTRIBUTION_PATH",
+        str(tmp_path / "missing" / "cosyvoice3.jsonl"),
+    )
+    with pytest.raises(ValueError, match="parent directory does not exist"):
+        stages.CosyVoice3Vocoder(_BatchCapableFakeFlow(), _FakeHiFT())
 
 
 @pytest.mark.parametrize(
