@@ -301,7 +301,7 @@ class FlowCudaGraphRunner:
         self.device = torch.device(device)
         self.autocast_dtype = autocast_dtype
         self.graphs: dict[tuple[int, int], CapturedFlowCudaGraph] = {}
-        self.pool: Any | None = None
+        self.pool: tuple[int, int] | None = None
 
     def capture_inputs(self, batch_size: int, frames: int) -> tuple[torch.Tensor, ...]:
         try:
