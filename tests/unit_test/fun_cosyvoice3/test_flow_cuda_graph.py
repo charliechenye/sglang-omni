@@ -44,16 +44,11 @@ class _ReplayGraph:
         self,
         static_inputs: tuple[torch.Tensor, ...],
         static_output: torch.Tensor,
-        *,
-        fail: bool = False,
     ) -> None:
         self._static_inputs = static_inputs
         self._static_output = static_output
-        self._fail = fail
 
     def replay(self) -> None:
-        if self._fail:
-            raise RuntimeError("replay failed")
         self._static_output.copy_(
             self._static_inputs[0] + self._static_inputs[2] + self._static_inputs[5]
         )
@@ -65,13 +60,11 @@ def _runner() -> stages.FlowCudaGraphRunner:
     )
 
 
-def _install(
-    runner: stages.FlowCudaGraphRunner, key: tuple[int, int], *, fail: bool = False
-) -> None:
+def _install(runner: stages.FlowCudaGraphRunner, key: tuple[int, int]) -> None:
     static_inputs = runner.capture_inputs(*key)
     static_output = torch.empty_like(static_inputs[0])
     runner.graphs[key] = stages.CapturedFlowCudaGraph(
-        _ReplayGraph(static_inputs, static_output, fail=fail),
+        _ReplayGraph(static_inputs, static_output),
         static_inputs,
         static_output,
     )
@@ -132,14 +125,6 @@ def test_nonresident_shape_returns_none() -> None:
     runner = _runner()
     _install(runner, (2, 496))
     assert runner.run(*_solver_inputs(2, 1)) is None
-
-
-def test_replay_failure_clears_resident_graphs() -> None:
-    runner = _runner()
-    _install(runner, (1, 464), fail=True)
-    with pytest.raises(RuntimeError, match="replay failed"):
-        runner.run(*_solver_inputs(1, 449))
-    assert runner.graphs == {}
 
 
 def test_generate_flow_does_not_retry_eager_after_replay_failure(monkeypatch) -> None:

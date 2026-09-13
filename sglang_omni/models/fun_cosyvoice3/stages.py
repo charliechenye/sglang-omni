@@ -463,30 +463,20 @@ class FlowCudaGraphRunner:
                 ):
                     return None
                 else:
-                    try:
-                        with (
-                            torch.cuda.device(self.device),
-                            torch.autocast(
-                                device_type=self.device.type,
-                                dtype=self.autocast_dtype,
-                                enabled=self.autocast_dtype is not None,
-                            ),
+                    with (
+                        torch.cuda.device(self.device),
+                        torch.autocast(
+                            device_type=self.device.type,
+                            dtype=self.autocast_dtype,
+                            enabled=self.autocast_dtype is not None,
+                        ),
+                    ):
+                        for static, value in zip(
+                            captured.static_inputs, inputs, strict=True
                         ):
-                            for static, value in zip(
-                                captured.static_inputs, inputs, strict=True
-                            ):
-                                static.copy_(value)
-                            captured.graph.replay()
-                            return captured.static_output[
-                                ..., :actual_mel_frame
-                            ].clone()
-                    except Exception:
-                        self.graphs.clear()
-                        logger.exception(
-                            f"Fun-CosyVoice3 Flow CUDA graph replay failed for batch={batch_size} "
-                            f"mel_frame={bucket_mel_frame}; disabled all Flow CUDA graphs"
-                        )
-                        raise
+                            static.copy_(value)
+                        captured.graph.replay()
+                        return captured.static_output[..., :actual_mel_frame].clone()
 
 
 @torch.inference_mode()
