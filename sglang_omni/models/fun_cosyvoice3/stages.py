@@ -7,8 +7,10 @@ import importlib
 import logging
 import os
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import lru_cache
+from threading import Lock
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
@@ -1193,6 +1195,77 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         self.hift_autocast_dtype = AUTOCAST_DTYPES[hift_dtype]
         self.hift_max_padding_waste = hift_max_padding_waste
         self.hift_samples_per_mel_frame: int | None = None
+        self._hift_executor: ThreadPoolExecutor | None = None
+        self._hift_lane_lock = Lock()
+        self._hift_stream: torch.cuda.Stream | None = None
+        self._hift_stream_device: torch.device | None = None
+
+    def _submit_hift_batch(
+        self,
+        *,
+        flow_ready_event: torch.cuda.Event,
+        mels: list[torch.Tensor],
+    ) -> Future[list[torch.Tensor]]:
+        """Submit buffered HiFT work to the private serialized HiFT lane."""
+        mel_inputs = list(mels)
+        if not mel_inputs:
+            raise ValueError("HiFT batch must contain at least one mel")
+
+        with self._hift_lane_lock:
+            if self._hift_executor is None:
+                self._hift_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="cosyvoice3-hift",
+                )
+            return self._hift_executor.submit(
+                self._run_hift_worker,
+                flow_ready_event,
+                mel_inputs,
+                grad_enabled=torch.is_grad_enabled(),
+                inference_mode_enabled=torch.is_inference_mode_enabled(),
+            )
+
+    def _run_hift_worker(
+        self,
+        flow_ready_event: torch.cuda.Event,
+        mels: list[torch.Tensor],
+        *,
+        grad_enabled: bool,
+        inference_mode_enabled: bool,
+    ) -> list[torch.Tensor]:
+        device = mels[0].device
+        with torch.cuda.device(device):
+            if self._hift_stream is None:
+                self._hift_stream = torch.cuda.Stream(device=device)
+                self._hift_stream_device = device
+            elif self._hift_stream_device != device:
+                raise RuntimeError(
+                    "Fun-CosyVoice3 HiFT lane received tensors on multiple devices"
+                )
+            stream = self._hift_stream
+            assert stream is not None
+
+            stream.wait_event(flow_ready_event)
+            execution_mode = (
+                torch.inference_mode()
+                if inference_mode_enabled
+                else torch.set_grad_enabled(grad_enabled)
+            )
+            with torch.cuda.stream(stream), execution_mode:
+                device_waveforms = self._mel2wav_batch_device(mels)
+            stream.synchronize()
+            return self._materialize_waveforms(device_waveforms)
+
+    def _shutdown_hift_lane(self) -> None:
+        """Stop the private HiFT executor after all submitted work completes."""
+        with self._hift_lane_lock:
+            executor = self._hift_executor
+            if executor is None:
+                return
+            executor.shutdown(wait=True)
+            self._hift_executor = None
+            self._hift_stream = None
+            self._hift_stream_device = None
 
     def prepare_item(
         self, payload: StagePayload
@@ -1423,6 +1496,12 @@ class CosyVoice3Vocoder(BatchVocoderBase):
     def mel2wav_batch(self, mels: list[torch.Tensor]) -> list[torch.Tensor]:
         if not mels:
             return []
+        return self._materialize_waveforms(self._mel2wav_batch_device(mels))
+
+    def _mel2wav_batch_device(self, mels: list[torch.Tensor]) -> list[torch.Tensor]:
+        """Run HiFT and return detached waveform tensors without CPU materialization."""
+        if not mels:
+            return []
         hift_autocast = torch.autocast(
             device_type=current_platform.device_type,
             dtype=self.hift_autocast_dtype,
@@ -1431,7 +1510,7 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         if len(mels) == 1:
             with hift_autocast:
                 tts_speech, _ = self.hift.inference(speech_feat=mels[0], finalize=True)
-            return [tts_speech.detach().cpu()]
+            return [tts_speech.detach()]
         lengths = [int(mel.shape[2]) for mel in mels]
         longest = max(lengths)
         if min(lengths) == longest:
@@ -1454,9 +1533,14 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             self.hift_samples_per_mel_frame = stride
         samples_per_frame = self.hift_samples_per_mel_frame
         return [
-            wav[index : index + 1, : length * samples_per_frame].cpu()
+            wav[index : index + 1, : length * samples_per_frame]
             for index, length in enumerate(lengths)
         ]
+
+    def _materialize_waveforms(
+        self, waveforms: list[torch.Tensor]
+    ) -> list[torch.Tensor]:
+        return [waveform.cpu() for waveform in waveforms]
 
     def store_result(
         self,

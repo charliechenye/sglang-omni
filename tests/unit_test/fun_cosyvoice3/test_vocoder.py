@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import sys
+import threading
+import weakref
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -473,6 +477,263 @@ def _install_fake_batch_adapter(monkeypatch, calls: list[list]) -> None:
     monkeypatch.setattr(stages.FunCosyVoice3Flow, "inference", fake_infer)
 
 
+def _install_fake_hift_cuda_lane(monkeypatch):
+    trace = []
+    streams = []
+
+    class _FakeStream:
+        def __init__(self, device) -> None:
+            self.device = device
+            self.waited_events = []
+
+        def wait_event(self, event) -> None:
+            self.waited_events.append(event)
+            trace.append(("wait_event", event))
+
+        def synchronize(self) -> None:
+            trace.append(("synchronize", self))
+
+    def fake_device(device):
+        trace.append(("device", device))
+        return nullcontext()
+
+    def fake_stream(stream):
+        trace.append(("stream", stream))
+        return nullcontext()
+
+    def fake_new_stream(*, device):
+        stream = _FakeStream(device)
+        streams.append(stream)
+        trace.append(("new_stream", stream))
+        return stream
+
+    monkeypatch.setattr(torch.cuda, "device", fake_device)
+    monkeypatch.setattr(torch.cuda, "stream", fake_stream)
+    monkeypatch.setattr(torch.cuda, "Stream", fake_new_stream)
+
+    return trace, streams
+
+
+def _new_hift_lane_vocoder() -> stages.CosyVoice3Vocoder:
+    return stages.CosyVoice3Vocoder(_BatchCapableFakeFlow(), _FakeHiFT())
+
+
+def test_mel2wav_batch_keeps_existing_materialized_output() -> None:
+    vocoder = _new_hift_lane_vocoder()
+    mel = torch.ones(1, 80, 2)
+
+    device_waveforms = vocoder._mel2wav_batch_device([mel])
+    waveforms = vocoder.mel2wav_batch([mel])
+
+    assert torch.equal(waveforms[0], device_waveforms[0])
+    assert waveforms[0].device.type == "cpu"
+
+
+@pytest.mark.parametrize("lengths", [[2], [2, 3]])
+def test_mel2wav_batch_device_preserves_slicing_without_cpu_materialization(
+    monkeypatch, lengths: list[int]
+) -> None:
+    vocoder = _new_hift_lane_vocoder()
+    mels = [torch.ones(1, 80, length) for length in lengths]
+
+    def fail_cpu(_tensor):
+        raise AssertionError("device HiFT computation must not call .cpu()")
+
+    monkeypatch.setattr(torch.Tensor, "cpu", fail_cpu)
+    waveforms = vocoder._mel2wav_batch_device(mels)
+
+    assert [waveform.shape[-1] for waveform in waveforms] == [
+        length * 480 for length in lengths
+    ]
+    if len(lengths) > 1:
+        speech_feat, _ = vocoder.hift.calls[-1]
+        assert speech_feat.shape == (len(lengths), 80, max(lengths))
+        for index, length in enumerate(lengths):
+            assert torch.count_nonzero(speech_feat[index, :, length:]) == 0
+
+
+def test_hift_lane_is_lazy_single_worker_and_waits_for_flow_event(monkeypatch) -> None:
+    trace, streams = _install_fake_hift_cuda_lane(monkeypatch)
+    vocoder = _new_hift_lane_vocoder()
+    observed = []
+
+    def fake_device_compute(mels):
+        observed.append((threading.current_thread().name, mels))
+        trace.append(("compute",))
+        return [mels[0]]
+
+    monkeypatch.setattr(vocoder, "_mel2wav_batch_device", fake_device_compute)
+    event = object()
+    mel = torch.ones(1, 80, 1)
+
+    assert vocoder._hift_executor is None
+    future = vocoder._submit_hift_batch(flow_ready_event=event, mels=[mel])
+    try:
+        result = future.result(timeout=5)
+        assert len(result) == 1
+        assert torch.equal(result[0], mel)
+        assert vocoder._hift_executor is not None
+        assert vocoder._hift_executor._max_workers == 1
+        assert len(streams) == 1
+        assert observed[0][0].startswith("cosyvoice3-hift_")
+        assert streams[0].waited_events == [event]
+        assert trace.index(("wait_event", event)) < trace.index(("compute",))
+        assert trace.index(("compute",)) < next(
+            index for index, item in enumerate(trace) if item[0] == "synchronize"
+        )
+    finally:
+        vocoder._shutdown_hift_lane()
+
+
+def test_hift_lane_submissions_are_fifo_and_serial(monkeypatch) -> None:
+    trace, streams = _install_fake_hift_cuda_lane(monkeypatch)
+    vocoder = _new_hift_lane_vocoder()
+    first_started = threading.Event()
+    release_first = threading.Event()
+    state_lock = threading.Lock()
+    starts = []
+    active = 0
+    max_active = 0
+
+    def fake_device_compute(mels):
+        nonlocal active, max_active
+        value = int(mels[0].item())
+        with state_lock:
+            active += 1
+            max_active = max(max_active, active)
+            starts.append(value)
+        try:
+            if value == 1:
+                first_started.set()
+                assert release_first.wait(timeout=5)
+            return [mels[0]]
+        finally:
+            with state_lock:
+                active -= 1
+
+    monkeypatch.setattr(vocoder, "_mel2wav_batch_device", fake_device_compute)
+    first = None
+    second = None
+    try:
+        first = vocoder._submit_hift_batch(
+            flow_ready_event=object(),
+            mels=[torch.ones(1, 1, 1)],
+        )
+        assert first_started.wait(timeout=5)
+        second = vocoder._submit_hift_batch(
+            flow_ready_event=object(),
+            mels=[torch.full((1, 1, 1), 2.0)],
+        )
+        assert starts == [1]
+        release_first.set()
+        assert first is not None
+        assert second is not None
+        first_result = first.result(timeout=5)
+        second_result = second.result(timeout=5)
+        assert torch.equal(first_result[0], torch.ones(1, 1, 1))
+        assert torch.equal(second_result[0], torch.full((1, 1, 1), 2.0))
+        assert starts == [1, 2]
+        assert max_active == 1
+        assert len(streams) == 1
+    finally:
+        release_first.set()
+        vocoder._shutdown_hift_lane()
+
+
+def test_hift_future_retains_mels_until_worker_completion(monkeypatch) -> None:
+    _install_fake_hift_cuda_lane(monkeypatch)
+    vocoder = _new_hift_lane_vocoder()
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def fake_device_compute(mels):
+        worker_started.set()
+        assert release_worker.wait(timeout=5)
+        return [torch.zeros_like(mels[0])]
+
+    monkeypatch.setattr(vocoder, "_mel2wav_batch_device", fake_device_compute)
+    mel = torch.ones(1, 80, 1)
+    mel_ref = weakref.ref(mel)
+    future = vocoder._submit_hift_batch(flow_ready_event=object(), mels=[mel])
+    try:
+        assert worker_started.wait(timeout=5)
+        del mel
+        gc.collect()
+        assert mel_ref() is not None
+        release_worker.set()
+        future.result(timeout=5)
+        gc.collect()
+        assert mel_ref() is None
+    finally:
+        release_worker.set()
+        vocoder._shutdown_hift_lane()
+
+
+def test_hift_worker_exception_propagates_through_future(monkeypatch) -> None:
+    _install_fake_hift_cuda_lane(monkeypatch)
+    vocoder = _new_hift_lane_vocoder()
+
+    def fail_device_compute(_mels):
+        raise RuntimeError("HiFT worker failed")
+
+    monkeypatch.setattr(vocoder, "_mel2wav_batch_device", fail_device_compute)
+    future = vocoder._submit_hift_batch(
+        flow_ready_event=object(), mels=[torch.ones(1, 80, 1)]
+    )
+    try:
+        with pytest.raises(RuntimeError, match="HiFT worker failed"):
+            future.result(timeout=5)
+    finally:
+        vocoder._shutdown_hift_lane()
+
+
+def test_hift_lane_preserves_caller_execution_mode(monkeypatch) -> None:
+    _install_fake_hift_cuda_lane(monkeypatch)
+    vocoder = _new_hift_lane_vocoder()
+    observed = []
+
+    def record_execution_mode(mels):
+        observed.append((torch.is_grad_enabled(), torch.is_inference_mode_enabled()))
+        return [mels[0]]
+
+    monkeypatch.setattr(vocoder, "_mel2wav_batch_device", record_execution_mode)
+    mel = torch.ones(1, 80, 1)
+    try:
+        with torch.no_grad():
+            vocoder._submit_hift_batch(flow_ready_event=object(), mels=[mel]).result(
+                timeout=5
+            )
+        with torch.enable_grad():
+            vocoder._submit_hift_batch(flow_ready_event=object(), mels=[mel]).result(
+                timeout=5
+            )
+        with torch.inference_mode():
+            vocoder._submit_hift_batch(flow_ready_event=object(), mels=[mel]).result(
+                timeout=5
+            )
+        assert observed == [(False, False), (True, False), (False, True)]
+    finally:
+        vocoder._shutdown_hift_lane()
+
+
+def test_hift_lane_cleanup_shuts_down_executor(monkeypatch) -> None:
+    _install_fake_hift_cuda_lane(monkeypatch)
+    vocoder = _new_hift_lane_vocoder()
+    future = vocoder._submit_hift_batch(
+        flow_ready_event=object(), mels=[torch.ones(1, 80, 1)]
+    )
+    executor = vocoder._hift_executor
+    assert executor is not None
+    future.result(timeout=5)
+
+    vocoder._shutdown_hift_lane()
+
+    assert executor._shutdown is True
+    assert vocoder._hift_executor is None
+    assert vocoder._hift_stream is None
+    vocoder._shutdown_hift_lane()
+
+
 def test_decode_batch_size_one_uses_batch_adapter(monkeypatch) -> None:
     flow = _BatchCapableFakeFlow()
     hift = _FakeHiFT()
@@ -485,6 +746,7 @@ def test_decode_batch_size_one_uses_batch_adapter(monkeypatch) -> None:
     assert len(results) == 1
     assert [len(call) for call in batch_calls] == [1]
     assert len(hift.calls) == 1
+    assert vocoder._hift_executor is None
 
 
 def test_decode_payload_size_one_uses_batch_adapter(monkeypatch) -> None:
