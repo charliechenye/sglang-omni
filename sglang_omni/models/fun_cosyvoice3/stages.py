@@ -1210,6 +1210,13 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         mel_inputs = list(mels)
         if not mel_inputs:
             raise ValueError("HiFT batch must contain at least one mel")
+        device = mel_inputs[0].device
+        if any(mel.device != device for mel in mel_inputs[1:]):
+            devices = ", ".join(str(mel.device) for mel in mel_inputs)
+            raise ValueError(
+                "Fun-CosyVoice3 HiFT batch requires all mel tensors to be on the "
+                f"same device; got [{devices}]"
+            )
 
         with self._hift_lane_lock:
             if self._hift_executor is None:
@@ -1253,8 +1260,9 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             )
             with torch.cuda.stream(stream), execution_mode:
                 device_waveforms = self._mel2wav_batch_device(mels)
+                host_waveforms = self._materialize_waveforms(device_waveforms)
             stream.synchronize()
-            return self._materialize_waveforms(device_waveforms)
+            return host_waveforms
 
     def _shutdown_hift_lane(self) -> None:
         """Stop the private HiFT executor after all submitted work completes."""
