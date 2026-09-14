@@ -52,6 +52,7 @@ def test_fun_cosyvoice3_config_and_registry_contract() -> None:
         "flow_merge_pad_budget_percent": 25.0,
         "flow_cuda_graph_capture_shapes": FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
         "enable_flow_cuda_graph": True,
+        "enable_hift_decode_torch_compile": False,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
@@ -78,6 +79,7 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
                 [5, 544],
                 [7, 576],
             ],
+            "vocoder.factory.enable_hift_decode_torch_compile": True,
         }
     )
     vocoder = next(stage for stage in merged.stages if stage.name == "vocoder")
@@ -88,6 +90,7 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
         "flow_merge_pad_budget_percent": 3,
         "flow_cuda_graph_capture_shapes": [[1, 496], [5, 544], [7, 576]],
         "enable_flow_cuda_graph": True,
+        "enable_hift_decode_torch_compile": True,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
@@ -102,6 +105,7 @@ def test_fun_cosyvoice3_flow_factory_overrides_use_typed_path() -> None:
         [5, 544],
         [7, 576],
     ]
+    assert args["enable_hift_decode_torch_compile"] is True
 
 
 def test_fun_cosyvoice3_state_round_trip_preserves_wire_contract() -> None:

@@ -1015,6 +1015,13 @@ def compile_dit_backbone(
     return True
 
 
+def _compile_hift_decode(hift: torch.nn.Module) -> None:
+    hift_callable = cast(Any, hift)
+    original_decode = hift_callable.decode
+    hift_callable.decode = torch.compile(original_decode, dynamic=True)
+    logger.info("Enabled torch.compile(dynamic=True) for Fun-CosyVoice3 HiFT decode")
+
+
 def create_preprocessing_executor(
     model_path: str,
     max_concurrency: int = 8,
@@ -1779,6 +1786,7 @@ def create_vocoder_executor(
     flow_merge_max_gap_frames: int = 384,
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = False,
+    enable_hift_decode_torch_compile: bool = False,
     enable_flow_cuda_graph: bool = True,
     flow_cuda_graph_capture_shapes: tuple[tuple[int, int], ...] | None = None,
     enable_flow_estimator_trt: bool = False,
@@ -1820,6 +1828,11 @@ def create_vocoder_executor(
             raise ValueError(
                 "enable_dit_torch_compile is unavailable on the native MLX vocoder"
             )
+        if enable_hift_decode_torch_compile:
+            raise ValueError(
+                "enable_hift_decode_torch_compile is unavailable on the native "
+                "MLX vocoder"
+            )
         vocoder = _CosyVoice3MlxVocoderAdapter(
             _load_cosyvoice3_mlx_vocoder(
                 mlx_model_path, revision=mlx_model_revision, expected_dtype=dtype
@@ -1852,6 +1865,8 @@ def create_vocoder_executor(
         fp16=(dtype == "float16"),
         enable_flow_estimator_trt=enable_flow_estimator_trt,
     )
+    if enable_hift_decode_torch_compile:
+        _compile_hift_decode(hift)
 
     device_obj = torch.device(device)
     if enable_flow_cuda_graph and (

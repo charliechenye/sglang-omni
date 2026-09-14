@@ -172,6 +172,7 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
                 flow_cuda_graph_capture_shapes=FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
                 # note (guozhihao-224, chenyang):
                 # Follow SGLang, CUDA Graph is on by default. torch.compile and TensorRT stay opt-in.
+                enable_hift_decode_torch_compile=False,
                 enable_flow_estimator_trt=False,
                 token_hop_len=25,
                 token_max_hop_len=100,

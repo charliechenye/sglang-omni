@@ -35,6 +35,12 @@ class _FakeHiFT(torch.nn.Module):
         super().__init__()
         self.anchor = torch.nn.Parameter(torch.zeros(1))
         self.calls = []
+        self.f0_predictor = object()
+        self.m_source = object()
+
+    def decode(self, x, s, finalize=True):
+        del s, finalize
+        return x
 
     def inference(self, *, speech_feat, finalize):
         self.calls.append((speech_feat, finalize))
@@ -850,6 +856,73 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
     assert captured == {
         "enable_flow_estimator_trt": True,
     }
+
+
+def test_create_vocoder_executor_compiles_only_hift_decode(monkeypatch) -> None:
+    monkeypatch.setattr(
+        stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
+    )
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    fake_flow = _BatchCapableFakeFlow()
+    fake_hift = _FakeHiFT()
+    monkeypatch.setattr(
+        stages,
+        "load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, device, fp16, **kwargs: (fake_flow, fake_hift),
+    )
+
+    original_decode = fake_hift.decode
+    original_inference = fake_hift.inference
+    original_f0_predictor = fake_hift.f0_predictor
+    original_m_source = fake_hift.m_source
+    compiled_decode = object()
+    compile_calls = []
+
+    def fake_compile(target, *, dynamic):
+        compile_calls.append((target, dynamic))
+        return compiled_decode
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+
+    stages.create_vocoder_executor(
+        "model",
+        device="cpu",
+        enable_hift_decode_torch_compile=True,
+    )
+
+    assert compile_calls == [(original_decode, True)]
+    assert fake_hift.decode is compiled_decode
+    assert fake_hift.inference == original_inference
+    assert fake_hift.f0_predictor is original_f0_predictor
+    assert fake_hift.m_source is original_m_source
+
+
+def test_create_vocoder_executor_does_not_compile_hift_decode_by_default(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
+    )
+    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
+    fake_hift = _FakeHiFT()
+    monkeypatch.setattr(
+        stages,
+        "load_cosyvoice3_flow_hift",
+        lambda checkpoint_dir, device, fp16, **kwargs: (
+            _BatchCapableFakeFlow(),
+            fake_hift,
+        ),
+    )
+    original_decode = fake_hift.decode
+
+    def fail_compile(*args, **kwargs):
+        raise AssertionError("torch.compile must not run when disabled")
+
+    monkeypatch.setattr(torch, "compile", fail_compile)
+
+    stages.create_vocoder_executor("model", device="cpu")
+
+    assert fake_hift.decode == original_decode
 
 
 def _executor_compiles(monkeypatch, **kwargs) -> bool:
