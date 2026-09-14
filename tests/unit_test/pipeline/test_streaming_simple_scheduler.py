@@ -7,6 +7,7 @@ import pytest
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
 from sglang_omni.proto import OmniRequest, StagePayload
+from sglang_omni.scheduling import streaming_simple_scheduler as scheduler_module
 from sglang_omni.scheduling.messages import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.streaming_simple_scheduler import StreamingSimpleScheduler
 
@@ -82,6 +83,141 @@ def _drain_results(scheduler: StreamingSimpleScheduler) -> list[OutgoingMessage]
             messages.append(scheduler.outbox.get_nowait())
         except queue.Empty:
             return messages
+
+
+def test_streaming_simple_scheduler_enqueue_timestamps_message(monkeypatch) -> None:
+    scheduler = _TestStreamingScheduler(max_batch_wait_ms=30)
+    message = IncomingMessage("req", "new_request", _payload("req"))
+    assert message.enqueue_monotonic_s is None
+
+    monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 12.5)
+    scheduler.enqueue(message)
+
+    assert message.enqueue_monotonic_s == 12.5
+    assert scheduler.inbox.get_nowait() is message
+
+    existing = IncomingMessage(
+        "existing",
+        "new_request",
+        _payload("existing"),
+        enqueue_monotonic_s=7.5,
+    )
+    scheduler.enqueue(existing)
+
+    assert existing.enqueue_monotonic_s == 7.5
+    assert scheduler.inbox.get_nowait() is existing
+
+
+def test_fresh_first_request_keeps_full_batch_wait(monkeypatch) -> None:
+    scheduler = _TestStreamingScheduler(max_batch_wait_ms=30)
+    first = IncomingMessage(
+        "a", "new_request", _payload("a"), enqueue_monotonic_s=10.0
+    )
+    get_timeouts: list[float] = []
+
+    def get_batch_message(*, timeout: float = 0.0) -> IncomingMessage:
+        get_timeouts.append(timeout)
+        raise queue.Empty
+
+    monkeypatch.setattr(scheduler, "_get_batch_message", get_batch_message)
+    monotonic_values = iter([10.0, 10.0])
+    monkeypatch.setattr(
+        scheduler_module.time, "monotonic", lambda: next(monotonic_values)
+    )
+
+    assert scheduler._collect_new_request_batch(first) == [first]
+    assert get_timeouts == [0.0, pytest.approx(0.03)]
+
+
+def test_aged_first_request_does_not_wait_again(monkeypatch) -> None:
+    scheduler = _TestStreamingScheduler(max_batch_wait_ms=30)
+    first = IncomingMessage(
+        "a", "new_request", _payload("a"), enqueue_monotonic_s=0.0
+    )
+    get_timeouts: list[float] = []
+
+    def get_batch_message(*, timeout: float = 0.0) -> IncomingMessage:
+        get_timeouts.append(timeout)
+        raise queue.Empty
+
+    monkeypatch.setattr(scheduler, "_get_batch_message", get_batch_message)
+    monotonic_values = iter([0.04, 0.04])
+    monkeypatch.setattr(
+        scheduler_module.time, "monotonic", lambda: next(monotonic_values)
+    )
+
+    assert scheduler._collect_new_request_batch(first) == [first]
+    assert get_timeouts == [0.0]
+
+
+def test_expired_first_request_still_drains_ready_requests(monkeypatch) -> None:
+    scheduler = _TestStreamingScheduler(max_batch_size=3, max_batch_wait_ms=30)
+    first = IncomingMessage(
+        "a", "new_request", _payload("a"), enqueue_monotonic_s=0.0
+    )
+    second = IncomingMessage("b", "new_request", _payload("b"))
+    third = IncomingMessage("c", "new_request", _payload("c"))
+    scheduler.inbox.put(second)
+    scheduler.inbox.put(third)
+    monotonic_values = iter([0.04, 0.04])
+    monkeypatch.setattr(
+        scheduler_module.time, "monotonic", lambda: next(monotonic_values)
+    )
+
+    batch = scheduler._collect_new_request_batch(first)
+
+    assert [msg.request_id for msg in batch] == ["a", "b", "c"]
+
+
+def test_deferred_request_preserves_original_batch_wait_age(monkeypatch) -> None:
+    scheduler = _TestStreamingScheduler(max_batch_size=3, max_batch_wait_ms=30)
+    scheduler._request_cost_fn = lambda payload: payload.data["cost"]
+    scheduler._max_batch_cost = 3
+    first_payload = _payload("a")
+    first_payload.data["cost"] = 2
+    deferred_payload = _payload("b")
+    deferred_payload.data["cost"] = 2
+    first = IncomingMessage(
+        "a", "new_request", first_payload, enqueue_monotonic_s=0.0
+    )
+    deferred = IncomingMessage(
+        "b", "new_request", deferred_payload, enqueue_monotonic_s=0.0
+    )
+    scheduler.inbox.put(deferred)
+    monotonic_values = iter([0.01, 0.04, 0.04])
+    monkeypatch.setattr(
+        scheduler_module.time, "monotonic", lambda: next(monotonic_values)
+    )
+
+    assert scheduler._collect_new_request_batch(first) == [first]
+    assert list(scheduler._pending_messages) == [deferred]
+
+    next_first = scheduler._next_message()
+    assert next_first is deferred
+    assert next_first.enqueue_monotonic_s == 0.0
+    assert scheduler._collect_new_request_batch(next_first) == [deferred]
+
+
+def test_direct_inbox_message_keeps_legacy_wait_start(monkeypatch) -> None:
+    scheduler = _TestStreamingScheduler(max_batch_wait_ms=30)
+    first = IncomingMessage("a", "new_request", _payload("a"))
+    scheduler.inbox.put(first)
+    first = scheduler._next_message()
+    get_timeouts: list[float] = []
+
+    def get_batch_message(*, timeout: float = 0.0) -> IncomingMessage:
+        get_timeouts.append(timeout)
+        raise queue.Empty
+
+    monkeypatch.setattr(scheduler, "_get_batch_message", get_batch_message)
+    monotonic_values = iter([5.0, 5.0])
+    monkeypatch.setattr(
+        scheduler_module.time, "monotonic", lambda: next(monotonic_values)
+    )
+
+    assert first.enqueue_monotonic_s is None
+    assert scheduler._collect_new_request_batch(first) == [first]
+    assert get_timeouts == [0.0, pytest.approx(0.03)]
 
 
 def test_streaming_simple_scheduler_batches_non_streaming_requests() -> None:

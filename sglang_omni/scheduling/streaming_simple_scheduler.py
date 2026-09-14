@@ -77,6 +77,11 @@ class StreamingSimpleScheduler:
         self._state_lock = threading.RLock()
         self._abort_lock = threading.Lock()
 
+    def enqueue(self, msg: IncomingMessage) -> None:
+        if msg.enqueue_monotonic_s is None:
+            msg.enqueue_monotonic_s = time.monotonic()
+        self.inbox.put(msg)
+
     # ------------------------------------------------------------------
     # Hooks for subclasses
     # ------------------------------------------------------------------
@@ -291,7 +296,13 @@ class StreamingSimpleScheduler:
 
         deferred: list[IncomingMessage] = []
         batch_cost = self._message_cost(first_msg)
-        deadline = time.monotonic() + self._max_batch_wait_s
+        now = time.monotonic()
+        wait_start = (
+            first_msg.enqueue_monotonic_s
+            if first_msg.enqueue_monotonic_s is not None
+            else now
+        )
+        deadline = wait_start + self._max_batch_wait_s
         while len(batch) < self._max_batch_size:
             try:
                 msg = self._get_batch_message()

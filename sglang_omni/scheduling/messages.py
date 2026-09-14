@@ -12,6 +12,7 @@ class IncomingMessage:
     request_id: str
     type: Literal["new_request", "stream_chunk", "stream_done"]
     data: Any = None
+    enqueue_monotonic_s: float | None = None
 
 
 @dataclass
