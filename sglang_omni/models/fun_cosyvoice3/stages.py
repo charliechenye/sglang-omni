@@ -139,18 +139,6 @@ class PackedFlowBatch:
     embedding: torch.Tensor
 
 
-def _tensor_list_numel(value: Any) -> int:
-    if value is None:
-        return 0
-    numel = 1
-    while isinstance(value, list):
-        if not value:
-            return 0
-        numel *= len(value)
-        value = value[0]
-    return numel
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -1431,10 +1419,21 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             raise RuntimeError(
                 "Fun-CosyVoice3 vocoder requires audio_codes from tts_engine"
             )
-        prompt_tokens = payload.data.get("flow_prompt_speech_token")
-        return (
-            _tensor_list_numel(prompt_tokens) + _tensor_list_numel(audio_codes)
-        ) * self.flow.token_mel_ratio
+        else:
+            prompt_tokens = payload.data.get("flow_prompt_speech_token")
+            token_count = 0
+            for value in (prompt_tokens, audio_codes):
+                if value is None:
+                    continue
+                numel = 1
+                while isinstance(value, list):
+                    if not value:
+                        numel = 0
+                        break
+                    numel *= len(value)
+                    value = value[0]
+                token_count += numel
+            return token_count * self.flow.token_mel_ratio
 
     def mel2wav_batch(self, mels: list[torch.Tensor]) -> list[torch.Tensor]:
         if not mels:
