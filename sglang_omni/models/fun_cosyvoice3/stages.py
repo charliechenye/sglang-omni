@@ -6,7 +6,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
@@ -1248,6 +1248,9 @@ class PreparedFlowRequest:
     total_mel_frames: int
 
 
+FlowGroupCompleteCallback = Callable[[list[tuple[int, Any, int]]], None]
+
+
 def adaptive_flow_requests_grouping(
     requests: Sequence[PreparedFlowRequest],
     *,
@@ -1384,7 +1387,10 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         return state, codes
 
     async def decode_batch(
-        self, items: list[tuple[FunCosyVoice3State, torch.Tensor]]
+        self,
+        items: list[tuple[FunCosyVoice3State, torch.Tensor]],
+        *,
+        on_group_complete: FlowGroupCompleteCallback | None = None,
     ) -> list[tuple[Any, int]]:
         prepared: list[PreparedFlowRequest] = []
         for index, (state, codes) in enumerate(items):
@@ -1443,10 +1449,21 @@ class CosyVoice3Vocoder(BatchVocoderBase):
                 total, longest = candidate_total, candidate_longest
             if group:
                 hift_groups.append(group)
+            completed_group: list[tuple[PreparedFlowRequest, Any]] = []
             for group in hift_groups:
                 wavs = self.mel2wav_batch([mel for _, mel in group])
                 for (request, _), wav in zip(group, wavs, strict=True):
                     results[request.index] = (wav, request.sample_rate)
+                    completed_group.append((request, wav))
+            if on_group_complete is not None:
+                on_group_complete(
+                    [
+                        (request.index, wav, request.sample_rate)
+                        for request, wav in sorted(
+                            completed_group, key=lambda pair: pair[0].index
+                        )
+                    ]
+                )
 
         if any(result is None for result in results):
             raise RuntimeError("Fun-CosyVoice3 vocoder did not decode every request")
