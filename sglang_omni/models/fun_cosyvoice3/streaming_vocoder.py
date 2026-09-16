@@ -11,6 +11,7 @@ the next step (or the stream-done flush) is when they become audio.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Callable
@@ -33,7 +34,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     pad_flow_prompt_to_hop,
 )
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.message import OutgoingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
 from sglang_omni.utils.audio_payload import audio_waveform_payload
@@ -129,6 +130,121 @@ class FunCosyVoice3StreamingVocoderScheduler(
 
     async def vocode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
         return await self.vocoder.decode_payloads(payloads)
+
+    async def vocode_payloads_incrementally(
+        self,
+        payloads: list[StagePayload],
+        on_group_complete: Callable[[list[tuple[str, StagePayload]]], None],
+    ) -> None:
+        """Decode buffered requests and hand off each completed Flow group.
+
+        The callback runs only after Flow and every HiFT subgroup for one
+        adaptive Flow group has completed. Request storage and emission stay in
+        this scheduler so aborts can suppress results before they become
+        terminal.
+        """
+        items = [self.vocoder.prepare_item(payload) for payload in payloads]
+
+        def _on_group_complete(
+            group_results: list[tuple[int, Any, int]],
+        ) -> None:
+            stored: list[tuple[str, StagePayload]] = []
+            for index, wav, sample_rate in group_results:
+                payload = payloads[index]
+                if self.is_aborted(payload.request_id):
+                    continue
+                state, _ = items[index]
+                stored.append(
+                    (
+                        payload.request_id,
+                        self.vocoder.store_result(payload, state, wav, sample_rate),
+                    )
+                )
+            if stored:
+                on_group_complete(stored)
+
+        await self.vocoder.decode_batch(
+            items,
+            on_group_complete=_on_group_complete,
+        )
+
+    def run_non_streaming_batch(
+        self,
+        batch: list[IncomingMessage],
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        """Release buffered CosyVoice3 results as each Flow group finishes."""
+        active = [msg for msg in batch if not self.is_aborted(msg.request_id)]
+        if self.batch_fn is None or len(active) <= 1:
+            super().run_non_streaming_batch(batch, loop)
+            return
+
+        with self.state_lock:
+            for msg in active:
+                self.pending_done.discard(msg.request_id)
+
+        valid: list[IncomingMessage] = []
+        for msg in active:
+            try:
+                self.validate_non_streaming_payload(msg.data)
+            except Exception as exc:
+                if not self.is_aborted(msg.request_id):
+                    self.emit_error(msg.request_id, exc)
+                    self.record_completed_non_streaming_request_id(msg.request_id)
+                continue
+            valid.append(msg)
+        if not valid:
+            return
+
+        completed_request_ids: set[str] = set()
+
+        def emit_group_results(
+            results: list[tuple[str, StagePayload]],
+        ) -> None:
+            for request_id, result in results:
+                if (
+                    request_id in completed_request_ids
+                    or self.is_aborted(request_id)
+                ):
+                    continue
+                self.emit_result(request_id, result)
+                completed_request_ids.add(request_id)
+                self.record_completed_non_streaming_request_id(request_id)
+
+        try:
+            result = self.vocode_payloads_incrementally(
+                [msg.data for msg in valid],
+                emit_group_results,
+            )
+            if asyncio.iscoroutine(result):
+                loop.run_until_complete(result)
+        except Exception as exc:
+            for msg in valid:
+                request_id = msg.request_id
+                if (
+                    request_id not in completed_request_ids
+                    and not self.is_aborted(request_id)
+                ):
+                    self.emit_error(request_id, exc)
+                    self.record_completed_non_streaming_request_id(request_id)
+            return
+
+        # decode_batch normally guarantees this invariant. Keep the scheduler
+        # from silently leaving a request non-terminal if that contract breaks.
+        missing = [
+            msg.request_id
+            for msg in valid
+            if msg.request_id not in completed_request_ids
+            and not self.is_aborted(msg.request_id)
+        ]
+        if missing:
+            exc = RuntimeError(
+                "Fun-CosyVoice3 vocoder did not emit every buffered request: "
+                + ", ".join(missing)
+            )
+            for request_id in missing:
+                self.emit_error(request_id, exc)
+                self.record_completed_non_streaming_request_id(request_id)
 
     def create_stream_state(self, request_id: str) -> CosyVoice3StreamState:
         return CosyVoice3StreamState(hop_len=self.token_hop_len)
