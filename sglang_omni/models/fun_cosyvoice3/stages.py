@@ -1408,13 +1408,14 @@ class CosyVoice3Vocoder(BatchVocoderBase):
             )
 
         results: list[tuple[Any, int] | None] = [None] * len(items)
-        flow_groups = adaptive_flow_requests_grouping(
-            prepared,
-            flow_merge_max_gap_frames=self.flow_merge_max_gap_frames,
-            flow_merge_pad_budget_percent=self.flow_merge_pad_budget_percent,
-        )
+        pending = list(prepared)
         flow_device = next(self.flow.parameters()).device
-        for flow_group in flow_groups:
+        while pending:
+            flow_group = adaptive_flow_requests_grouping(
+                pending,
+                flow_merge_max_gap_frames=self.flow_merge_max_gap_frames,
+                flow_merge_pad_budget_percent=self.flow_merge_pad_budget_percent,
+            )[0]
             with torch.autocast(
                 device_type=flow_device.type,
                 dtype=self.autocast_dtype,
@@ -1464,6 +1465,10 @@ class CosyVoice3Vocoder(BatchVocoderBase):
                         )
                     ]
                 )
+            completed_indices = {request.index for request in flow_group}
+            pending = [
+                request for request in pending if request.index not in completed_indices
+            ]
 
         if any(result is None for result in results):
             raise RuntimeError("Fun-CosyVoice3 vocoder did not decode every request")
