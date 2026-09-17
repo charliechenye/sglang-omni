@@ -812,6 +812,60 @@ def test_buffered_vocoder_releases_first_flow_group_before_later_group(
     ]
 
 
+def test_buffered_vocoder_replans_flow_groups_after_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    flow = _BatchCapableFakeFlow()
+    flow_calls: list[list] = []
+    _install_fake_batch_adapter(monkeypatch, flow_calls)
+    vocoder = stages.CosyVoice3Vocoder(
+        flow,
+        _FakeHiFT(),
+        flow_merge_max_gap_frames=0,
+        flow_merge_pad_budget_percent=0,
+    )
+    timeline: list[tuple[str, list[int]]] = []
+    original_grouping = stages.adaptive_flow_requests_grouping
+
+    def spy_grouping(
+        requests: list[stages.PreparedFlowRequest],
+        *,
+        flow_merge_max_gap_frames: int,
+        flow_merge_pad_budget_percent: float,
+    ) -> list[list[stages.PreparedFlowRequest]]:
+        timeline.append(("plan", [request.index for request in requests]))
+        return original_grouping(
+            requests,
+            flow_merge_max_gap_frames=flow_merge_max_gap_frames,
+            flow_merge_pad_budget_percent=flow_merge_pad_budget_percent,
+        )
+
+    monkeypatch.setattr(stages, "adaptive_flow_requests_grouping", spy_grouping)
+    items = [
+        (_state(sample_rate=16001, prompt_tokens=0), _codes(2, 1)),
+        (_state(sample_rate=16002, prompt_tokens=0), _codes(2, 2)),
+        (_state(sample_rate=16003, prompt_tokens=0), _codes(3, 3)),
+    ]
+
+    def on_group_complete(
+        group_results: list[tuple[int, torch.Tensor, int]],
+    ) -> None:
+        timeline.append(("complete", [index for index, _, _ in group_results]))
+
+    results = asyncio.run(
+        vocoder.decode_batch(items, on_group_complete=on_group_complete)
+    )
+
+    assert timeline == [
+        ("plan", [0, 1, 2]),
+        ("complete", [0, 1]),
+        ("plan", [2]),
+        ("complete", [2]),
+    ]
+    assert [len(call) for call in flow_calls] == [2, 1]
+    assert [sample_rate for _, sample_rate in results] == [16001, 16002, 16003]
+
+
 def test_buffered_vocoder_maps_results_after_adaptive_reordering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
