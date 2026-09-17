@@ -6,7 +6,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
@@ -1248,9 +1248,6 @@ class PreparedFlowRequest:
     total_mel_frames: int
 
 
-FlowGroupCompleteCallback = Callable[[list[tuple[int, Any, int]]], None]
-
-
 def adaptive_flow_requests_grouping(
     requests: Sequence[PreparedFlowRequest],
     *,
@@ -1386,89 +1383,87 @@ class CosyVoice3Vocoder(BatchVocoderBase):
         codes = torch.as_tensor(state.audio_codes, dtype=torch.long).reshape(-1)
         return state, codes
 
-    async def decode_batch(
+    def prepare_flow_request(
         self,
-        items: list[tuple[FunCosyVoice3State, torch.Tensor]],
-        *,
-        on_group_complete: FlowGroupCompleteCallback | None = None,
-    ) -> list[tuple[Any, int]]:
-        prepared: list[PreparedFlowRequest] = []
-        for index, (state, codes) in enumerate(items):
-            flow_input = self.make_flow_input(state, codes)
-            prepared.append(
-                PreparedFlowRequest(
-                    index=index,
-                    sample_rate=state.sample_rate,
-                    flow_input=flow_input,
-                    total_mel_frames=(
-                        flow_input.prompt_token.shape[1] + flow_input.token.shape[1]
-                    )
-                    * self.flow.token_mel_ratio,
-                )
+        index: int,
+        state: FunCosyVoice3State,
+        codes: torch.Tensor,
+    ) -> PreparedFlowRequest:
+        flow_input = self.make_flow_input(state, codes)
+        return PreparedFlowRequest(
+            index=index,
+            sample_rate=state.sample_rate,
+            flow_input=flow_input,
+            total_mel_frames=(
+                flow_input.prompt_token.shape[1] + flow_input.token.shape[1]
             )
+            * self.flow.token_mel_ratio,
+        )
 
-        results: list[tuple[Any, int] | None] = [None] * len(items)
-        pending = list(prepared)
+    def decode_flow_group(
+        self, flow_group: list[PreparedFlowRequest]
+    ) -> list[tuple[PreparedFlowRequest, torch.Tensor, int]]:
         flow_device = next(self.flow.parameters()).device
-        while pending:
-            flow_group = adaptive_flow_requests_grouping(
-                pending,
-                flow_merge_max_gap_frames=self.flow_merge_max_gap_frames,
-                flow_merge_pad_budget_percent=self.flow_merge_pad_budget_percent,
-            )[0]
-            with torch.autocast(
-                device_type=flow_device.type,
-                dtype=self.autocast_dtype,
-                enabled=self.autocast_dtype is not None,
-            ):
-                mel_list = self.flow.inference(
-                    [request.flow_input for request in flow_group]
-                )
-            ordered = sorted(
-                zip(flow_group, mel_list, strict=True),
-                key=lambda pair: int(pair[1].shape[-1]),
+        with torch.autocast(
+            device_type=flow_device.type,
+            dtype=self.autocast_dtype,
+            enabled=self.autocast_dtype is not None,
+        ):
+            mel_list = self.flow.inference(
+                [request.flow_input for request in flow_group]
             )
-            group: list[tuple[Any, torch.Tensor]] = []
-            total = 0
-            longest = 0
-            max_waste = self.hift_max_padding_waste
-            hift_groups: list[list[tuple[Any, torch.Tensor]]] = []
-            for pair in ordered:
-                length = int(pair[1].shape[-1])
-                candidate_longest = max(longest, length)
-                candidate_total = total + length
-                if (
-                    group
-                    and candidate_longest * (len(group) + 1)
-                    > max_waste * candidate_total
-                ):
-                    hift_groups.append(group)
-                    group, total, longest = [], 0, 0
-                    candidate_longest = length
-                    candidate_total = length
-                group.append(pair)
-                total, longest = candidate_total, candidate_longest
-            if group:
+        ordered = sorted(
+            zip(flow_group, mel_list, strict=True),
+            key=lambda pair: int(pair[1].shape[-1]),
+        )
+        group: list[tuple[PreparedFlowRequest, torch.Tensor]] = []
+        total = 0
+        longest = 0
+        max_waste = self.hift_max_padding_waste
+        hift_groups: list[list[tuple[PreparedFlowRequest, torch.Tensor]]] = []
+        for pair in ordered:
+            length = int(pair[1].shape[-1])
+            candidate_longest = max(longest, length)
+            candidate_total = total + length
+            if (
+                group
+                and candidate_longest * (len(group) + 1) > max_waste * candidate_total
+            ):
                 hift_groups.append(group)
-            completed_group: list[tuple[PreparedFlowRequest, Any]] = []
-            for group in hift_groups:
-                wavs = self.mel2wav_batch([mel for _, mel in group])
-                for (request, _), wav in zip(group, wavs, strict=True):
-                    results[request.index] = (wav, request.sample_rate)
-                    completed_group.append((request, wav))
-            if on_group_complete is not None:
-                on_group_complete(
-                    [
-                        (request.index, wav, request.sample_rate)
-                        for request, wav in sorted(
-                            completed_group, key=lambda pair: pair[0].index
-                        )
-                    ]
-                )
-            completed_indices = {request.index for request in flow_group}
-            pending = [
-                request for request in pending if request.index not in completed_indices
-            ]
+                group, total, longest = [], 0, 0
+                candidate_longest = length
+                candidate_total = length
+            group.append(pair)
+            total, longest = candidate_total, candidate_longest
+        if group:
+            hift_groups.append(group)
+
+        completed_group: list[tuple[PreparedFlowRequest, torch.Tensor]] = []
+        for group in hift_groups:
+            wavs = self.mel2wav_batch([mel for _, mel in group])
+            for (request, _), wav in zip(group, wavs, strict=True):
+                completed_group.append((request, wav))
+        return [
+            (request, wav, request.sample_rate)
+            for request, wav in sorted(completed_group, key=lambda pair: pair[0].index)
+        ]
+
+    async def decode_batch(
+        self, items: list[tuple[FunCosyVoice3State, torch.Tensor]]
+    ) -> list[tuple[Any, int]]:
+        prepared = [
+            self.prepare_flow_request(index, state, codes)
+            for index, (state, codes) in enumerate(items)
+        ]
+        results: list[tuple[Any, int] | None] = [None] * len(items)
+        flow_groups = adaptive_flow_requests_grouping(
+            prepared,
+            flow_merge_max_gap_frames=self.flow_merge_max_gap_frames,
+            flow_merge_pad_budget_percent=self.flow_merge_pad_budget_percent,
+        )
+        for flow_group in flow_groups:
+            for request, wav, sample_rate in self.decode_flow_group(flow_group):
+                results[request.index] = (wav, sample_rate)
 
         if any(result is None for result in results):
             raise RuntimeError("Fun-CosyVoice3 vocoder did not decode every request")

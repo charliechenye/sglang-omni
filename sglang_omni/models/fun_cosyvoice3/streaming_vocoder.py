@@ -21,7 +21,11 @@ from typing import Any, Literal, Mapping
 import torch
 
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
-from sglang_omni.models.fun_cosyvoice3.stages import CosyVoice3Vocoder, FlowBatchInput
+from sglang_omni.models.fun_cosyvoice3.stages import (
+    CosyVoice3Vocoder,
+    FlowBatchInput,
+    adaptive_flow_requests_grouping,
+)
 from sglang_omni.models.fun_cosyvoice3.streaming import (
     PRE_LOOKAHEAD_LEN,
     TOKEN_HOP_LEN,
@@ -73,6 +77,13 @@ class CosyVoice3StreamState:
             return "wait"
 
 
+@dataclass
+class CosyVoice3BufferedState:
+    payload: StagePayload
+    pipeline_state: FunCosyVoice3State
+    codes: torch.Tensor
+
+
 class FunCosyVoice3StreamingVocoderScheduler(
     StreamingVocoderBase[CosyVoice3StreamState, NextDecode]
 ):
@@ -119,6 +130,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             request_cost_fn=request_cost_fn,
             max_batch_cost=max_batch_cost,
         )
+        self.buffered_pending: dict[str, CosyVoice3BufferedState] = {}
 
     async def vocode_payload(self, payload: StagePayload) -> StagePayload:
         results = await self.vocoder.decode_payloads([payload])
@@ -127,120 +139,44 @@ class FunCosyVoice3StreamingVocoderScheduler(
     async def vocode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
         return await self.vocoder.decode_payloads(payloads)
 
-    async def vocode_payloads_incrementally(
-        self,
-        payloads: list[StagePayload],
-        on_group_complete: Callable[[list[tuple[str, StagePayload]]], None],
-    ) -> None:
-        """Decode buffered requests and hand off each completed Flow group.
-
-        The callback runs only after Flow and every HiFT subgroup for one
-        adaptive Flow group has completed. Request storage and emission stay in
-        this scheduler so aborts can suppress results before they become
-        terminal.
-        """
-        items = [self.vocoder.prepare_item(payload) for payload in payloads]
-
-        def _on_group_complete(
-            group_results: list[tuple[int, Any, int]],
-        ) -> None:
-            stored: list[tuple[str, StagePayload]] = []
-            for index, wav, sample_rate in group_results:
-                payload = payloads[index]
-                if self.is_aborted(payload.request_id):
-                    continue
-                state, _ = items[index]
-                stored.append(
-                    (
-                        payload.request_id,
-                        self.vocoder.store_result(payload, state, wav, sample_rate),
-                    )
-                )
-            if stored:
-                on_group_complete(stored)
-
-        await self.vocoder.decode_batch(
-            items,
-            on_group_complete=_on_group_complete,
-        )
-
     def run_non_streaming_batch(
         self,
         batch: list[IncomingMessage],
         loop: asyncio.AbstractEventLoop,
     ) -> None:
-        """Release buffered CosyVoice3 results as each Flow group finishes."""
+        """Prepare and register non-streaming requests for a later decode step."""
         active = [msg for msg in batch if not self.is_aborted(msg.request_id)]
-        if self.batch_fn is None or len(active) <= 1:
-            super().run_non_streaming_batch(batch, loop)
+        if not active:
             return
 
         with self.state_lock:
             for msg in active:
                 self.pending_done.discard(msg.request_id)
 
-        valid: list[IncomingMessage] = []
         for msg in active:
             try:
                 self.validate_non_streaming_payload(msg.data)
+                pipeline_state, codes = self.vocoder.prepare_item(msg.data)
             except Exception as exc:
                 if not self.is_aborted(msg.request_id):
                     self.emit_error(msg.request_id, exc)
                     self.record_completed_non_streaming_request_id(msg.request_id)
                 continue
-            valid.append(msg)
-        if not valid:
-            return
+            if self.is_aborted(msg.request_id):
+                continue
+            with self.state_lock:
+                self.buffered_pending[msg.request_id] = CosyVoice3BufferedState(
+                    payload=msg.data,
+                    pipeline_state=pipeline_state,
+                    codes=codes,
+                )
 
-        completed_request_ids: set[str] = set()
-
-        def emit_group_results(
-            results: list[tuple[str, StagePayload]],
-        ) -> None:
-            for request_id, result in results:
-                if (
-                    request_id in completed_request_ids
-                    or self.is_aborted(request_id)
-                ):
-                    continue
-                self.emit_result(request_id, result)
-                completed_request_ids.add(request_id)
-                self.record_completed_non_streaming_request_id(request_id)
-
-        try:
-            result = self.vocode_payloads_incrementally(
-                [msg.data for msg in valid],
-                emit_group_results,
-            )
-            if asyncio.iscoroutine(result):
-                loop.run_until_complete(result)
-        except Exception as exc:
-            for msg in valid:
-                request_id = msg.request_id
-                if (
-                    request_id not in completed_request_ids
-                    and not self.is_aborted(request_id)
-                ):
-                    self.emit_error(request_id, exc)
-                    self.record_completed_non_streaming_request_id(request_id)
-            return
-
-        # decode_batch normally guarantees this invariant. Keep the scheduler
-        # from silently leaving a request non-terminal if that contract breaks.
-        missing = [
-            msg.request_id
-            for msg in valid
-            if msg.request_id not in completed_request_ids
-            and not self.is_aborted(msg.request_id)
-        ]
-        if missing:
-            exc = RuntimeError(
-                "Fun-CosyVoice3 vocoder did not emit every buffered request: "
-                + ", ".join(missing)
-            )
-            for request_id in missing:
-                self.emit_error(request_id, exc)
-                self.record_completed_non_streaming_request_id(request_id)
+    def clear_request_state(
+        self, request_id: str, *, keep_aborted: bool = False
+    ) -> None:
+        with self.state_lock:
+            self.buffered_pending.pop(request_id, None)
+            super().clear_request_state(request_id, keep_aborted=keep_aborted)
 
     def create_stream_state(self, request_id: str) -> CosyVoice3StreamState:
         return CosyVoice3StreamState(hop_len=self.token_hop_len)
@@ -408,10 +344,98 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 state.next_decode() != "wait" and not self.is_aborted(request_id)
                 for request_id, state in self.stream_state_items()
             )
-            if ready:
-                return True
+            return ready or bool(self.buffered_pending)
+
+    def run_ready_step(self) -> None:
+        with self.state_lock:
+            streaming_ready = any(
+                state.next_decode() != "wait" and not self.is_aborted(request_id)
+                for request_id, state in self.stream_state_items()
+            )
+            if streaming_ready:
+                failed = self._pump_one_step() or []
+                candidates: list[tuple[str, CosyVoice3BufferedState]] = []
             else:
-                return False
+                failed = []
+                candidates = []
+                candidate_cost = 0
+                for request_id, buffered in list(self.buffered_pending.items()):
+                    if self.is_aborted(request_id):
+                        self.buffered_pending.pop(request_id, None)
+                        continue
+                    if len(candidates) >= self.max_batch_size:
+                        break
+                    request_cost = (
+                        max(int(self.request_cost_fn(buffered.payload)), 0)
+                        if self.request_cost_fn is not None
+                        else 0
+                    )
+                    if (
+                        self.max_batch_cost is not None
+                        and candidates
+                        and candidate_cost + request_cost > self.max_batch_cost
+                    ):
+                        break
+                    candidates.append((request_id, buffered))
+                    candidate_cost += request_cost
+
+        if streaming_ready:
+            for request_id in failed:
+                self.cleanup_aborted_request(request_id)
+            return
+        if not candidates:
+            return
+
+        prepared = [
+            self.vocoder.prepare_flow_request(
+                index, buffered.pipeline_state, buffered.codes
+            )
+            for index, (_, buffered) in enumerate(candidates)
+        ]
+        flow_group = adaptive_flow_requests_grouping(
+            prepared,
+            flow_merge_max_gap_frames=self.vocoder.flow_merge_max_gap_frames,
+            flow_merge_pad_budget_percent=self.vocoder.flow_merge_pad_budget_percent,
+        )[0]
+        try:
+            completed = self.vocoder.decode_flow_group(flow_group)
+        except Exception as exc:
+            for request in flow_group:
+                request_id = candidates[request.index][0]
+                with self.state_lock:
+                    self.buffered_pending.pop(request_id, None)
+                    self.pending_done.discard(request_id)
+                if not self.is_aborted(request_id):
+                    self.emit_error(request_id, exc)
+                    self.record_completed_non_streaming_request_id(request_id)
+            return
+
+        for request, wav, sample_rate in completed:
+            request_id, buffered = candidates[request.index]
+            if self.is_aborted(request_id):
+                with self.state_lock:
+                    self.buffered_pending.pop(request_id, None)
+                    self.pending_done.discard(request_id)
+                continue
+            try:
+                result = self.vocoder.store_result(
+                    buffered.payload,
+                    buffered.pipeline_state,
+                    wav,
+                    sample_rate,
+                )
+            except Exception as exc:
+                if not self.is_aborted(request_id):
+                    self.emit_error(request_id, exc)
+                    self.record_completed_non_streaming_request_id(request_id)
+            else:
+                if not self.is_aborted(request_id):
+                    self.emit_result(request_id, result)
+                    self.record_completed_non_streaming_request_id(request_id)
+            finally:
+                with self.state_lock:
+                    self.buffered_pending.pop(request_id, None)
+                    self.pending_done.discard(request_id)
 
     def select_step_participants(
         self,
