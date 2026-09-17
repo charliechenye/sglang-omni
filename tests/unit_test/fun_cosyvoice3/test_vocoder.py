@@ -736,6 +736,15 @@ def _drain_buffered_results(
             return results
 
 
+def _run_buffered_batch(
+    scheduler: FunCosyVoice3StreamingVocoderScheduler,
+    messages: list[IncomingMessage],
+) -> None:
+    scheduler.handle_new_request_batch(messages)
+    while scheduler.has_ready_work():
+        scheduler.run_ready_step()
+
+
 def _audio_value(message) -> float:
     payload = message.data
     return float(np.frombuffer(payload.data["audio_waveform"], dtype=np.float32)[0])
@@ -763,18 +772,18 @@ def _buffered_scheduler(
 def test_buffered_vocoder_releases_first_flow_group_before_later_group(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    flow, _, scheduler = _buffered_scheduler(monkeypatch)
-    second_group_started = threading.Event()
-    release_second_group = threading.Event()
+    _, _, scheduler = _buffered_scheduler(monkeypatch)
+    first_group_started = threading.Event()
+    release_first_group = threading.Event()
     call_count = 0
 
     def fake_inference(flow, inputs):
         nonlocal call_count
         del flow
         call_count += 1
-        if call_count == 2:
-            second_group_started.set()
-            assert release_second_group.wait(timeout=5)
+        if call_count == 1:
+            first_group_started.set()
+            assert release_first_group.wait(timeout=5)
         return [
             torch.full(
                 (1, 80, item.token.shape[1] * 2),
@@ -789,81 +798,113 @@ def test_buffered_vocoder_releases_first_flow_group_before_later_group(
         IncomingMessage("b", "new_request", _buffered_payload("b", 2, 20)),
         IncomingMessage("c", "new_request", _buffered_payload("c", 3, 30)),
     ]
-    worker = threading.Thread(
-        target=scheduler.handle_new_request_batch,
-        args=(messages,),
-    )
+    scheduler.handle_new_request_batch(messages)
+    worker = threading.Thread(target=scheduler.run_ready_step)
     worker.start()
     try:
-        assert second_group_started.wait(timeout=5)
-        first = [scheduler.outbox.get(timeout=5), scheduler.outbox.get(timeout=5)]
-        assert [message.request_id for message in first] == ["a", "b"]
-        assert all(message.type == "result" for message in first)
+        assert first_group_started.wait(timeout=5)
         with pytest.raises(queue.Empty):
             scheduler.outbox.get_nowait()
+        release_first_group.set()
+        worker.join(timeout=5)
     finally:
-        release_second_group.set()
+        release_first_group.set()
         worker.join(timeout=5)
 
     assert not worker.is_alive()
+    first = _drain_buffered_results(scheduler)
+    assert [(message.request_id, message.type) for message in first] == [
+        ("a", "result"),
+        ("b", "result"),
+    ]
+    assert list(scheduler.buffered_pending) == ["c"]
+
+    scheduler.run_ready_step()
     later = _drain_buffered_results(scheduler)
     assert [(message.request_id, message.type) for message in later] == [
         ("c", "result")
     ]
 
 
-def test_buffered_vocoder_replans_flow_groups_after_completion(
+def test_buffered_vocoder_rolls_pending_flow_groups_across_arrivals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    flow = _BatchCapableFakeFlow()
-    flow_calls: list[list] = []
-    _install_fake_batch_adapter(monkeypatch, flow_calls)
-    vocoder = stages.CosyVoice3Vocoder(
-        flow,
-        _FakeHiFT(),
-        flow_merge_max_gap_frames=0,
-        flow_merge_pad_budget_percent=0,
-    )
-    timeline: list[tuple[str, list[int]]] = []
-    original_grouping = stages.adaptive_flow_requests_grouping
+    _, _, scheduler = _buffered_scheduler(monkeypatch)
+    flow_calls: list[list[int]] = []
+    first_flow_started = threading.Event()
+    release_first_flow = threading.Event()
+    second_flow_started = threading.Event()
+    release_second_flow = threading.Event()
+    call_count = 0
 
-    def spy_grouping(
-        requests: list[stages.PreparedFlowRequest],
-        *,
-        flow_merge_max_gap_frames: int,
-        flow_merge_pad_budget_percent: float,
-    ) -> list[list[stages.PreparedFlowRequest]]:
-        timeline.append(("plan", [request.index for request in requests]))
-        return original_grouping(
-            requests,
-            flow_merge_max_gap_frames=flow_merge_max_gap_frames,
-            flow_merge_pad_budget_percent=flow_merge_pad_budget_percent,
+    def block_between_flow_groups(flow, inputs):
+        nonlocal call_count
+        del flow
+        call_count += 1
+        members = [int(item.token[0, 0]) for item in inputs]
+        flow_calls.append(members)
+        if call_count == 1:
+            first_flow_started.set()
+            assert release_first_flow.wait(timeout=5)
+        elif call_count == 2:
+            second_flow_started.set()
+            assert release_second_flow.wait(timeout=5)
+        return [
+            torch.full(
+                (1, 80, item.token.shape[1] * 2),
+                float(item.token[0, 0]),
+            )
+            for item in inputs
+        ]
+
+    monkeypatch.setattr(
+        stages.FunCosyVoice3Flow, "inference", block_between_flow_groups
+    )
+    initial = [
+        IncomingMessage("a", "new_request", _buffered_payload("a", 2, 10)),
+        IncomingMessage("b", "new_request", _buffered_payload("b", 2, 20)),
+        IncomingMessage("c", "new_request", _buffered_payload("c", 3, 30)),
+    ]
+    for message in initial:
+        scheduler.inbox.put(message)
+    worker = threading.Thread(target=scheduler.start)
+    worker.start()
+    try:
+        assert first_flow_started.wait(timeout=5)
+        scheduler.inbox.put(
+            IncomingMessage("d", "new_request", _buffered_payload("d", 3, 40))
         )
+        scheduler.inbox.put(
+            IncomingMessage("e", "new_request", _buffered_payload("e", 3, 50))
+        )
+        release_first_flow.set()
 
-    monkeypatch.setattr(stages, "adaptive_flow_requests_grouping", spy_grouping)
-    items = [
-        (_state(sample_rate=16001, prompt_tokens=0), _codes(2, 1)),
-        (_state(sample_rate=16002, prompt_tokens=0), _codes(2, 2)),
-        (_state(sample_rate=16003, prompt_tokens=0), _codes(3, 3)),
-    ]
+        assert second_flow_started.wait(timeout=5)
+        assert flow_calls == [[10, 20], [30, 40, 50]]
+        first_results = [
+            scheduler.outbox.get(timeout=5),
+            scheduler.outbox.get(timeout=5),
+        ]
+        assert [message.request_id for message in first_results] == ["a", "b"]
+        assert all(message.type == "result" for message in first_results)
+        with pytest.raises(queue.Empty):
+            scheduler.outbox.get_nowait()
 
-    def on_group_complete(
-        group_results: list[tuple[int, torch.Tensor, int]],
-    ) -> None:
-        timeline.append(("complete", [index for index, _, _ in group_results]))
+        release_second_flow.set()
+        remaining_results = [scheduler.outbox.get(timeout=5) for _ in range(3)]
+        assert [message.request_id for message in remaining_results] == [
+            "c",
+            "d",
+            "e",
+        ]
+        assert all(message.type == "result" for message in remaining_results)
+    finally:
+        release_first_flow.set()
+        release_second_flow.set()
+        scheduler.stop()
+        worker.join(timeout=5)
 
-    results = asyncio.run(
-        vocoder.decode_batch(items, on_group_complete=on_group_complete)
-    )
-
-    assert timeline == [
-        ("plan", [0, 1, 2]),
-        ("complete", [0, 1]),
-        ("plan", [2]),
-        ("complete", [2]),
-    ]
-    assert [len(call) for call in flow_calls] == [2, 1]
-    assert [sample_rate for _, sample_rate in results] == [16001, 16002, 16003]
+    assert not worker.is_alive()
 
 
 def test_buffered_vocoder_maps_results_after_adaptive_reordering(
@@ -883,7 +924,7 @@ def test_buffered_vocoder_maps_results_after_adaptive_reordering(
         IncomingMessage("b", "new_request", _buffered_payload("b", 2, 20)),
         IncomingMessage("c", "new_request", _buffered_payload("c", 2, 30)),
     ]
-    scheduler.handle_new_request_batch(messages)
+    _run_buffered_batch(scheduler, messages)
 
     results = _drain_buffered_results(scheduler)
     assert [message.request_id for message in results] == ["b", "c", "a"]
@@ -902,7 +943,7 @@ def test_buffered_vocoder_emits_each_successful_request_once(
         IncomingMessage("c", "new_request", _buffered_payload("c", 2, 30)),
     ]
 
-    scheduler.handle_new_request_batch(messages)
+    _run_buffered_batch(scheduler, messages)
 
     results = _drain_buffered_results(scheduler)
     assert [message.type for message in results] == ["result", "result", "result"]
@@ -932,7 +973,8 @@ def test_buffered_vocoder_later_group_failure_does_not_retroactively_fail(
     monkeypatch.setattr(
         stages.FunCosyVoice3Flow, "inference", fail_second_group
     )
-    scheduler.handle_new_request_batch(
+    _run_buffered_batch(
+        scheduler,
         [
             IncomingMessage("a", "new_request", _buffered_payload("a", 2, 10)),
             IncomingMessage("b", "new_request", _buffered_payload("b", 2, 20)),
@@ -983,10 +1025,8 @@ def test_buffered_vocoder_waits_for_all_hift_subgroups_before_emitting(
         IncomingMessage("b", "new_request", _buffered_payload("b", 2, 20)),
         IncomingMessage("c", "new_request", _buffered_payload("c", 5, 30)),
     ]
-    worker = threading.Thread(
-        target=scheduler.handle_new_request_batch,
-        args=(messages,),
-    )
+    scheduler.handle_new_request_batch(messages)
+    worker = threading.Thread(target=scheduler.run_ready_step)
     worker.start()
     try:
         assert first_hift_finished.wait(timeout=5)
@@ -1036,10 +1076,8 @@ def test_buffered_vocoder_aborted_request_before_own_group_emits_nothing(
         IncomingMessage("b", "new_request", _buffered_payload("b", 2, 20)),
         IncomingMessage("c", "new_request", _buffered_payload("c", 3, 30)),
     ]
-    worker = threading.Thread(
-        target=scheduler.handle_new_request_batch,
-        args=(messages,),
-    )
+    scheduler.handle_new_request_batch(messages)
+    worker = threading.Thread(target=scheduler.run_ready_step)
     worker.start()
     try:
         assert first_group_started.wait(timeout=5)
