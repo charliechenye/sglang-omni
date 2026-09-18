@@ -49,10 +49,15 @@ class _RecordingPackedEstimator:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
 
-    def prepare_plan(
-        self, rows: PackedRows, *, streaming: bool, dtype: torch.dtype
+    def prepare_full_context_plan(
+        self, rows: PackedRows, *, dtype: torch.dtype
     ) -> SimpleNamespace:
-        return SimpleNamespace(rows=rows, streaming=streaming, dtype=dtype)
+        return SimpleNamespace(rows=rows, streaming=False, dtype=dtype)
+
+    def prepare_chunk_causal_plan(
+        self, rows: PackedRows, *, dtype: torch.dtype
+    ) -> SimpleNamespace:
+        return SimpleNamespace(rows=rows, streaming=True, dtype=dtype)
 
     def forward(
         self,

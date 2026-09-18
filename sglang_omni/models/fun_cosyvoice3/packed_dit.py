@@ -219,11 +219,20 @@ class PackedDiT:
     def chunk_size(self) -> int:
         return int(self.dit.static_chunk_size)
 
-    def prepare_plan(
-        self, rows: PackedRows, *, streaming: bool, dtype: torch.dtype
+    def prepare_full_context_plan(
+        self, rows: PackedRows, *, dtype: torch.dtype
+    ) -> PreparedPackedPlan:
+        return self._prepare_plan(rows, chunk_size=None, dtype=dtype)
+
+    def prepare_chunk_causal_plan(
+        self, rows: PackedRows, *, dtype: torch.dtype
+    ) -> PreparedPackedPlan:
+        return self._prepare_plan(rows, chunk_size=self.chunk_size, dtype=dtype)
+
+    def _prepare_plan(
+        self, rows: PackedRows, *, chunk_size: int | None, dtype: torch.dtype
     ) -> PreparedPackedPlan:
         attention_module = self.dit.transformer_blocks[0].attn
-        chunk_size = self.chunk_size if streaming else None
         if self.is_ragged and dtype in FA3_DTYPES:
             attention = RaggedRowAttention(
                 rows,
@@ -310,7 +319,10 @@ def solve_flow_euler_packed(
     conditional rows and their unconditional twins share one DiT call."""
     total = noise.shape[1]
     twin_rows = pack_rows(rows.lengths * 2, noise.device)
-    plan = estimator.prepare_plan(twin_rows, streaming=streaming, dtype=spks.dtype)
+    if streaming:
+        plan = estimator.prepare_chunk_causal_plan(twin_rows, dtype=spks.dtype)
+    else:
+        plan = estimator.prepare_full_context_plan(twin_rows, dtype=spks.dtype)
     mu_cfg = torch.cat((mu, torch.zeros_like(mu)), dim=1)
     cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=1)
     spks_cfg = torch.cat((spks, torch.zeros_like(spks)), dim=0)

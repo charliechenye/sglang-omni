@@ -158,9 +158,14 @@ def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
             padded["cond"],
             streaming=streaming,
         )
-        plan = estimator.prepare_plan(
-            packed["rows"], streaming=streaming, dtype=packed["x"].dtype
-        )
+        if streaming:
+            plan = estimator.prepare_chunk_causal_plan(
+                packed["rows"], dtype=packed["x"].dtype
+            )
+        else:
+            plan = estimator.prepare_full_context_plan(
+                packed["rows"], dtype=packed["x"].dtype
+            )
         out = estimator.forward(
             packed["x"],
             packed["mu"],
@@ -226,8 +231,8 @@ def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
     estimator = PackedDiT(dit, device=CPU)
 
     with torch.inference_mode():
-        together_plan = estimator.prepare_plan(
-            packed["rows"], streaming=True, dtype=packed["x"].dtype
+        together_plan = estimator.prepare_chunk_causal_plan(
+            packed["rows"], dtype=packed["x"].dtype
         )
         together = estimator.forward(
             packed["x"],
@@ -239,7 +244,7 @@ def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
         )
         for index, length in enumerate(LENGTHS):
             rows = pack_rows((length,), CPU)
-            plan = estimator.prepare_plan(rows, streaming=True, dtype=packed["x"].dtype)
+            plan = estimator.prepare_chunk_causal_plan(rows, dtype=packed["x"].dtype)
             alone = estimator.forward(
                 padded["x"][index : index + 1, :, :length].transpose(1, 2),
                 padded["mu"][index : index + 1, :, :length].transpose(1, 2),
@@ -254,24 +259,31 @@ def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
             )
 
 
+@pytest.mark.parametrize("streaming", [True, False])
 def test_packed_solve_prepares_one_plan_for_all_euler_steps(
     monkeypatch: pytest.MonkeyPatch,
+    streaming: bool,
 ) -> None:
     dit = _tiny_dit()
     padded = _padded_inputs()
     packed = _packed_inputs(padded)
     estimator = PackedDiT(dit, device=CPU)
     prepare_calls = 0
-    original_prepare_plan = estimator.prepare_plan
+    if streaming:
+        original_prepare_plan = estimator.prepare_chunk_causal_plan
+        prepare_method_name = "prepare_chunk_causal_plan"
+    else:
+        original_prepare_plan = estimator.prepare_full_context_plan
+        prepare_method_name = "prepare_full_context_plan"
 
     def counted_prepare_plan(
-        rows: PackedRows, *, streaming: bool, dtype: torch.dtype
+        rows: PackedRows, *, dtype: torch.dtype
     ) -> PreparedPackedPlan:
         nonlocal prepare_calls
         prepare_calls += 1
-        return original_prepare_plan(rows, streaming=streaming, dtype=dtype)
+        return original_prepare_plan(rows, dtype=dtype)
 
-    monkeypatch.setattr(estimator, "prepare_plan", counted_prepare_plan)
+    monkeypatch.setattr(estimator, prepare_method_name, counted_prepare_plan)
     noise = torch.randn(1, CHANNELS, 19, dtype=torch.float64).expand(
         len(LENGTHS), -1, -1
     )
@@ -287,7 +299,7 @@ def test_packed_solve_prepares_one_plan_for_all_euler_steps(
             packed["cond"],
             packed["rows"],
             cfg_rate=0.7,
-            streaming=True,
+            streaming=streaming,
         )
 
     assert prepare_calls == 1
