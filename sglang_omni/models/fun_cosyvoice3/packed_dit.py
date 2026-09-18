@@ -262,24 +262,25 @@ class PackedDiT:
         mu: torch.Tensor,
         spks: torch.Tensor,
         cond: torch.Tensor,
-        t: torch.Tensor,
+        time_embedding: torch.Tensor,
         plan: PreparedPackedPlan,
     ) -> torch.Tensor:
-        """x, mu, cond, spks: (1, total, channels); t: (1,). Returns
-        (1, total, out_channels)."""
+        """x, mu, cond, spks: (1, total, channels); time_embedding: (1, dim).
+        Returns (1, total, out_channels)."""
         dit = self.dit
-        t = dit.time_embed(t)
         h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
         h = self._conv_pos_embed(h, plan.rows) + h
         residual = h
         for block in dit.transformer_blocks:
-            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(h, emb=t)
+            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(
+                h, emb=time_embedding
+            )
             h = h + gate_msa.unsqueeze(1) * self._attend(block.attn, norm, plan)
             ff_norm = block.ff_norm(h) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
             h = h + gate_mlp.unsqueeze(1) * block.ff(ff_norm)
         if dit.long_skip_connection is not None:
             h = dit.long_skip_connection(torch.cat((h, residual), dim=-1))
-        h = dit.norm_out(h, t)
+        h = dit.norm_out(h, time_embedding)
         return dit.proj_out(h)
 
     def _conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
@@ -327,17 +328,17 @@ def solve_flow_euler_packed(
     cond_cfg = torch.cat((cond, torch.zeros_like(cond)), dim=1)
     spks_cfg = torch.cat((spks, torch.zeros_like(spks)), dim=0)
     spks_cfg = spks_cfg[twin_rows.row_ids].unsqueeze(0)
-    flow_time = torch.zeros(1, device=noise.device, dtype=spks.dtype)
+    time_embeddings = estimator.dit.time_embed(time_span[:-1])
     x = noise
     t, dt = time_span[0], time_span[1] - time_span[0]
     for step in range(1, len(time_span)):
-        flow_time[:] = t
+        time_embedding = time_embeddings[step - 1 : step]
         vector_field = estimator.forward(
             torch.cat((x, x), dim=1),
             mu_cfg,
             spks_cfg,
             cond_cfg,
-            flow_time,
+            time_embedding,
             plan,
         )
         conditional = vector_field[:, :total]

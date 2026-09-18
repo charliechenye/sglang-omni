@@ -141,6 +141,21 @@ def test_row_attention_matches_dense_attention_per_row(chunk_size: int | None) -
         )
 
 
+def test_batched_time_embeddings_match_scalar_steps() -> None:
+    dit = _tiny_dit()
+    unit_span = torch.linspace(0, 1, 11, dtype=torch.float64)
+    time_span = 1 - torch.cos(unit_span * 0.5 * torch.pi)
+
+    with torch.inference_mode():
+        batched = dit.time_embed(time_span[:-1])
+        scalar = torch.cat(
+            [dit.time_embed(time[None]) for time in time_span[:-1]], dim=0
+        )
+
+    assert batched.shape == scalar.shape
+    torch.testing.assert_close(batched, scalar, rtol=1e-9, atol=1e-9)
+
+
 @pytest.mark.parametrize("streaming", [True, False])
 def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
     dit = _tiny_dit()
@@ -166,12 +181,13 @@ def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
             plan = estimator.prepare_full_context_plan(
                 packed["rows"], dtype=packed["x"].dtype
             )
+        time_embedding = dit.time_embed(packed["t"])
         out = estimator.forward(
             packed["x"],
             packed["mu"],
             packed["spks"],
             packed["cond"],
-            packed["t"],
+            time_embedding,
             plan,
         )
     out = scatter_rows(out, packed["rows"], 19).transpose(1, 2)
@@ -234,12 +250,13 @@ def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
         together_plan = estimator.prepare_chunk_causal_plan(
             packed["rows"], dtype=packed["x"].dtype
         )
+        time_embedding = dit.time_embed(packed["t"])
         together = estimator.forward(
             packed["x"],
             packed["mu"],
             packed["spks"],
             packed["cond"],
-            packed["t"],
+            time_embedding,
             together_plan,
         )
         for index, length in enumerate(LENGTHS):
@@ -250,7 +267,7 @@ def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
                 padded["mu"][index : index + 1, :, :length].transpose(1, 2),
                 padded["spks"][index : index + 1].expand(length, -1).unsqueeze(0),
                 padded["cond"][index : index + 1, :, :length].transpose(1, 2),
-                padded["t"],
+                time_embedding,
                 plan,
             )
             start = int(packed["rows"].starts_host[index])
@@ -303,6 +320,45 @@ def test_packed_solve_prepares_one_plan_for_all_euler_steps(
         )
 
     assert prepare_calls == 1
+
+
+@pytest.mark.parametrize("streaming", [True, False])
+def test_packed_solve_embeds_timestep_schedule_once(
+    monkeypatch: pytest.MonkeyPatch,
+    streaming: bool,
+) -> None:
+    dit = _tiny_dit()
+    padded = _padded_inputs()
+    packed = _packed_inputs(padded)
+    estimator = PackedDiT(dit, device=CPU)
+    time_embed_calls = 0
+    original_time_embed = dit.time_embed.forward
+
+    def counted_time_embed(timestep: torch.Tensor) -> torch.Tensor:
+        nonlocal time_embed_calls
+        time_embed_calls += 1
+        return original_time_embed(timestep)
+
+    monkeypatch.setattr(dit.time_embed, "forward", counted_time_embed)
+    noise = torch.randn(1, CHANNELS, 19, dtype=torch.float64).expand(
+        len(LENGTHS), -1, -1
+    )
+    time_span = torch.linspace(0, 1, 11, dtype=torch.float64)
+
+    with torch.inference_mode():
+        solve_flow_euler_packed(
+            estimator,
+            gather_rows(noise.transpose(1, 2), packed["rows"]),
+            time_span,
+            packed["mu"],
+            padded["spks"],
+            packed["cond"],
+            packed["rows"],
+            cfg_rate=0.7,
+            streaming=streaming,
+        )
+
+    assert time_embed_calls == 1
 
 
 @pytest.mark.accelerator
