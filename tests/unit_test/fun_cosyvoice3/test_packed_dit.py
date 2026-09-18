@@ -9,6 +9,8 @@ import torch
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     PackedDiT,
+    PackedRows,
+    PreparedPackedPlan,
     RaggedRowAttention,
     RowAttention,
     chunk_causal_mask,
@@ -156,7 +158,7 @@ def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
             padded["cond"],
             streaming=streaming,
         )
-        attention = estimator.row_attention(
+        plan = estimator.prepare_plan(
             packed["rows"], streaming=streaming, dtype=packed["x"].dtype
         )
         out = estimator.forward(
@@ -165,8 +167,7 @@ def test_packed_forward_matches_the_padded_dit_per_row(streaming: bool) -> None:
             packed["spks"],
             packed["cond"],
             packed["t"],
-            packed["rows"],
-            attention,
+            plan,
         )
     out = scatter_rows(out, packed["rows"], 19).transpose(1, 2)
 
@@ -225,32 +226,71 @@ def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
     estimator = PackedDiT(dit, device=CPU)
 
     with torch.inference_mode():
+        together_plan = estimator.prepare_plan(
+            packed["rows"], streaming=True, dtype=packed["x"].dtype
+        )
         together = estimator.forward(
             packed["x"],
             packed["mu"],
             packed["spks"],
             packed["cond"],
             packed["t"],
-            packed["rows"],
-            estimator.row_attention(
-                packed["rows"], streaming=True, dtype=packed["x"].dtype
-            ),
+            together_plan,
         )
         for index, length in enumerate(LENGTHS):
             rows = pack_rows((length,), CPU)
+            plan = estimator.prepare_plan(rows, streaming=True, dtype=packed["x"].dtype)
             alone = estimator.forward(
                 padded["x"][index : index + 1, :, :length].transpose(1, 2),
                 padded["mu"][index : index + 1, :, :length].transpose(1, 2),
                 padded["spks"][index : index + 1].expand(length, -1).unsqueeze(0),
                 padded["cond"][index : index + 1, :, :length].transpose(1, 2),
                 padded["t"],
-                rows,
-                estimator.row_attention(rows, streaming=True, dtype=packed["x"].dtype),
+                plan,
             )
             start = int(packed["rows"].starts_host[index])
             torch.testing.assert_close(
                 together[:, start : start + length], alone, rtol=1e-9, atol=1e-9
             )
+
+
+def test_packed_solve_prepares_one_plan_for_all_euler_steps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dit = _tiny_dit()
+    padded = _padded_inputs()
+    packed = _packed_inputs(padded)
+    estimator = PackedDiT(dit, device=CPU)
+    prepare_calls = 0
+    original_prepare_plan = estimator.prepare_plan
+
+    def counted_prepare_plan(
+        rows: PackedRows, *, streaming: bool, dtype: torch.dtype
+    ) -> PreparedPackedPlan:
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return original_prepare_plan(rows, streaming=streaming, dtype=dtype)
+
+    monkeypatch.setattr(estimator, "prepare_plan", counted_prepare_plan)
+    noise = torch.randn(1, CHANNELS, 19, dtype=torch.float64).expand(
+        len(LENGTHS), -1, -1
+    )
+    time_span = torch.linspace(0, 1, 11, dtype=torch.float64)
+
+    with torch.inference_mode():
+        solve_flow_euler_packed(
+            estimator,
+            gather_rows(noise.transpose(1, 2), packed["rows"]),
+            time_span,
+            packed["mu"],
+            padded["spks"],
+            packed["cond"],
+            packed["rows"],
+            cfg_rate=0.7,
+            streaming=True,
+        )
+
+    assert prepare_calls == 1
 
 
 @pytest.mark.accelerator
