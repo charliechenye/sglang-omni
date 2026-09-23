@@ -24,6 +24,7 @@ from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.stages import (
     CosyVoice3Vocoder,
     FlowBatchInput,
+    PreparedFlowRequest,
     adaptive_flow_requests_grouping,
 )
 from sglang_omni.models.fun_cosyvoice3.streaming import (
@@ -81,7 +82,8 @@ class CosyVoice3StreamState:
 class CosyVoice3BufferedState:
     payload: StagePayload
     pipeline_state: FunCosyVoice3State
-    codes: torch.Tensor
+    prepared: PreparedFlowRequest
+    admission_cost: int
 
 
 class FunCosyVoice3StreamingVocoderScheduler(
@@ -131,6 +133,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             max_batch_cost=max_batch_cost,
         )
         self.buffered_pending: dict[str, CosyVoice3BufferedState] = {}
+        self.next_buffered_request_index = 0
 
     def pump_one_step(self) -> list[str] | None:
         with self.vocoder.stream_context:
@@ -161,6 +164,17 @@ class FunCosyVoice3StreamingVocoderScheduler(
             try:
                 self.validate_non_streaming_payload(msg.data)
                 pipeline_state, codes = self.vocoder.prepare_item(msg.data)
+                with self.state_lock:
+                    request_index = self.next_buffered_request_index
+                    self.next_buffered_request_index += 1
+                prepared = self.vocoder.prepare_flow_request(
+                    request_index, pipeline_state, codes
+                )
+                admission_cost = (
+                    max(int(self.request_cost_fn(msg.data)), 0)
+                    if self.request_cost_fn is not None
+                    else prepared.total_mel_frames
+                )
             except Exception as exc:
                 if not self.is_aborted(msg.request_id):
                     self.emit_error(msg.request_id, exc)
@@ -172,7 +186,8 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 self.buffered_pending[msg.request_id] = CosyVoice3BufferedState(
                     payload=msg.data,
                     pipeline_state=pipeline_state,
-                    codes=codes,
+                    prepared=prepared,
+                    admission_cost=admission_cost,
                 )
 
     def clear_request_state(
@@ -373,11 +388,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                         continue
                     if len(candidates) >= self.max_batch_size:
                         break
-                    request_cost = (
-                        max(int(self.request_cost_fn(buffered.payload)), 0)
-                        if self.request_cost_fn is not None
-                        else 0
-                    )
+                    request_cost = buffered.admission_cost
                     if (
                         self.max_batch_cost is not None
                         and candidates
@@ -394,11 +405,12 @@ class FunCosyVoice3StreamingVocoderScheduler(
         if not candidates:
             return
 
+        candidates_by_index = {
+            buffered.prepared.index: (request_id, buffered)
+            for request_id, buffered in candidates
+        }
         prepared = [
-            self.vocoder.prepare_flow_request(
-                index, buffered.pipeline_state, buffered.codes
-            )
-            for index, (_, buffered) in enumerate(candidates)
+            buffered.prepared for _, buffered in candidates
         ]
         flow_group = adaptive_flow_requests_grouping(
             prepared,
@@ -409,7 +421,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             completed = self.vocoder.decode_flow_group(flow_group)
         except Exception as exc:
             for request in flow_group:
-                request_id = candidates[request.index][0]
+                request_id = candidates_by_index[request.index][0]
                 with self.state_lock:
                     self.buffered_pending.pop(request_id, None)
                     self.pending_done.discard(request_id)
@@ -419,7 +431,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             return
 
         for request, wav, sample_rate in completed:
-            request_id, buffered = candidates[request.index]
+            request_id, buffered = candidates_by_index[request.index]
             if self.is_aborted(request_id):
                 with self.state_lock:
                     self.buffered_pending.pop(request_id, None)

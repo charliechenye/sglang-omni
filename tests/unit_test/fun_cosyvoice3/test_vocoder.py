@@ -829,7 +829,15 @@ def test_buffered_vocoder_releases_first_flow_group_before_later_group(
 def test_buffered_vocoder_rolls_pending_flow_groups_across_arrivals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _, _, scheduler = _buffered_scheduler(monkeypatch)
+    _, vocoder, scheduler = _buffered_scheduler(monkeypatch)
+    prepare_calls: list[int] = []
+    original_make_flow_input = vocoder.make_flow_input
+
+    def record_make_flow_input(state, codes):
+        prepare_calls.append(int(codes[0]))
+        return original_make_flow_input(state, codes)
+
+    monkeypatch.setattr(vocoder, "make_flow_input", record_make_flow_input)
     flow_calls: list[list[int]] = []
     first_flow_started = threading.Event()
     release_first_flow = threading.Event()
@@ -905,6 +913,7 @@ def test_buffered_vocoder_rolls_pending_flow_groups_across_arrivals(
         worker.join(timeout=5)
 
     assert not worker.is_alive()
+    assert prepare_calls == [10, 20, 30, 40, 50]
 
 
 def test_buffered_vocoder_maps_results_after_adaptive_reordering(
