@@ -134,6 +134,9 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
         self.buffered_pending: dict[str, CosyVoice3BufferedState] = {}
         self.next_buffered_request_index = 0
+        self.buffered_plan: list[tuple[str, ...]] = []
+        self.buffered_plan_dirty = True
+        self.buffered_active_group_ids: set[str] = set()
 
     def pump_one_step(self) -> list[str] | None:
         with self.vocoder.stream_context:
@@ -145,6 +148,13 @@ class FunCosyVoice3StreamingVocoderScheduler(
 
     async def vocode_payloads(self, payloads: list[StagePayload]) -> list[StagePayload]:
         return await self.vocoder.decode_payloads(payloads)
+
+    def new_request_batch_wait_s(self, first_msg: IncomingMessage) -> float:
+        del first_msg
+        with self.state_lock:
+            if self.buffered_pending:
+                return 0.0
+        return self.max_batch_wait_s
 
     def run_non_streaming_batch(
         self,
@@ -189,12 +199,15 @@ class FunCosyVoice3StreamingVocoderScheduler(
                     prepared=prepared,
                     admission_cost=admission_cost,
                 )
+                self.buffered_plan_dirty = True
 
     def clear_request_state(
         self, request_id: str, *, keep_aborted: bool = False
     ) -> None:
         with self.state_lock:
-            self.buffered_pending.pop(request_id, None)
+            if self.buffered_pending.pop(request_id, None) is not None:
+                if request_id not in self.buffered_active_group_ids:
+                    self.buffered_plan_dirty = True
             super().clear_request_state(request_id, keep_aborted=keep_aborted)
 
     def create_stream_state(self, request_id: str) -> CosyVoice3StreamState:
@@ -369,7 +382,25 @@ class FunCosyVoice3StreamingVocoderScheduler(
             )
             return ready or bool(self.buffered_pending)
 
+    def remove_buffered_group_locked(
+        self, group_ids: tuple[str, ...]
+    ) -> dict[str, CosyVoice3BufferedState]:
+        if self.buffered_plan and self.buffered_plan[0] == group_ids:
+            self.buffered_plan.pop(0)
+        group: dict[str, CosyVoice3BufferedState] = {}
+        for request_id in group_ids:
+            buffered = self.buffered_pending.pop(request_id, None)
+            if buffered is not None:
+                group[request_id] = buffered
+        for request_id in group_ids:
+            self.pending_done.discard(request_id)
+        self.buffered_active_group_ids.difference_update(group_ids)
+        return group
+
     def run_ready_step(self) -> None:
+        flow_group: list[PreparedFlowRequest] | None = None
+        group_ids: tuple[str, ...] = ()
+        requests_by_index: dict[int, tuple[str, CosyVoice3BufferedState]] = {}
         with self.state_lock:
             streaming_ready = any(
                 state.next_decode() != "wait" and not self.is_aborted(request_id)
@@ -377,66 +408,106 @@ class FunCosyVoice3StreamingVocoderScheduler(
             )
             if streaming_ready:
                 failed = self._pump_one_step() or []
-                candidates: list[tuple[str, CosyVoice3BufferedState]] = []
             else:
                 failed = []
-                candidates = []
-                candidate_cost = 0
-                for request_id, buffered in list(self.buffered_pending.items()):
-                    if self.is_aborted(request_id):
-                        self.buffered_pending.pop(request_id, None)
-                        continue
-                    if len(candidates) >= self.max_batch_size:
-                        break
-                    request_cost = buffered.admission_cost
-                    if (
-                        self.max_batch_cost is not None
-                        and candidates
-                        and candidate_cost + request_cost > self.max_batch_cost
+                if self.buffered_plan_dirty or not self.buffered_plan:
+                    candidates: list[tuple[str, CosyVoice3BufferedState]] = []
+                    candidate_cost = 0
+                    for request_id, buffered in list(self.buffered_pending.items()):
+                        if self.is_aborted(request_id):
+                            self.buffered_pending.pop(request_id, None)
+                            self.buffered_plan_dirty = True
+                            continue
+                        if len(candidates) >= self.max_batch_size:
+                            break
+                        request_cost = buffered.admission_cost
+                        if (
+                            self.max_batch_cost is not None
+                            and candidates
+                            and candidate_cost + request_cost > self.max_batch_cost
+                        ):
+                            break
+                        candidates.append((request_id, buffered))
+                        candidate_cost += request_cost
+
+                    if candidates:
+                        request_ids_by_index = {
+                            buffered.prepared.index: request_id
+                            for request_id, buffered in candidates
+                        }
+                        groups = adaptive_flow_requests_grouping(
+                            [buffered.prepared for _, buffered in candidates],
+                            flow_merge_max_gap_frames=self.vocoder.flow_merge_max_gap_frames,
+                            flow_merge_pad_budget_percent=self.vocoder.flow_merge_pad_budget_percent,
+                        )
+                        groups.sort(key=len, reverse=True)
+                        self.buffered_plan = [
+                            tuple(
+                                request_ids_by_index[request.index] for request in group
+                            )
+                            for group in groups
+                        ]
+                    else:
+                        self.buffered_plan = []
+                    self.buffered_plan_dirty = False
+
+                if self.buffered_plan:
+                    group_ids = self.buffered_plan[0]
+                    group = [
+                        (request_id, self.buffered_pending.get(request_id))
+                        for request_id in group_ids
+                    ]
+                    if all(
+                        buffered is not None and not self.is_aborted(request_id)
+                        for request_id, buffered in group
                     ):
-                        break
-                    candidates.append((request_id, buffered))
-                    candidate_cost += request_cost
+                        requests_by_index = {
+                            buffered.prepared.index: (request_id, buffered)
+                            for request_id, buffered in group
+                            if buffered is not None
+                        }
+                        flow_group = [
+                            buffered.prepared
+                            for _, buffered in group
+                            if buffered is not None
+                        ]
+                        self.buffered_active_group_ids = set(group_ids)
+                    else:
+                        self.buffered_plan_dirty = True
 
         if streaming_ready:
             for request_id in failed:
                 self.cleanup_aborted_request(request_id)
             return
-        if not candidates:
+        if flow_group is None:
             return
 
-        candidates_by_index = {
-            buffered.prepared.index: (request_id, buffered)
-            for request_id, buffered in candidates
-        }
-        prepared = [
-            buffered.prepared for _, buffered in candidates
-        ]
-        flow_group = adaptive_flow_requests_grouping(
-            prepared,
-            flow_merge_max_gap_frames=self.vocoder.flow_merge_max_gap_frames,
-            flow_merge_pad_budget_percent=self.vocoder.flow_merge_pad_budget_percent,
-        )[0]
         try:
             completed = self.vocoder.decode_flow_group(flow_group)
+            completed_by_index = {
+                request.index: (request, wav, sample_rate)
+                for request, wav, sample_rate in completed
+            }
+            if set(completed_by_index) != set(requests_by_index):
+                raise RuntimeError(
+                    "Fun-CosyVoice3 vocoder did not decode every request in the "
+                    "Flow group"
+                )
         except Exception as exc:
-            for request in flow_group:
-                request_id = candidates_by_index[request.index][0]
-                with self.state_lock:
-                    self.buffered_pending.pop(request_id, None)
-                    self.pending_done.discard(request_id)
+            with self.state_lock:
+                self.remove_buffered_group_locked(group_ids)
+            for request_id in group_ids:
                 if not self.is_aborted(request_id):
                     self.emit_error(request_id, exc)
                     self.record_completed_non_streaming_request_id(request_id)
             return
 
-        for request, wav, sample_rate in completed:
-            request_id, buffered = candidates_by_index[request.index]
-            if self.is_aborted(request_id):
-                with self.state_lock:
-                    self.buffered_pending.pop(request_id, None)
-                    self.pending_done.discard(request_id)
+        with self.state_lock:
+            buffered_group = self.remove_buffered_group_locked(group_ids)
+        for request_index, (request_id, buffered) in requests_by_index.items():
+            if request_id not in buffered_group or self.is_aborted(request_id):
                 continue
+            _, wav, sample_rate = completed_by_index[request_index]
             try:
                 result = self.vocoder.store_result(
                     buffered.payload,
@@ -452,10 +523,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 if not self.is_aborted(request_id):
                     self.emit_result(request_id, result)
                     self.record_completed_non_streaming_request_id(request_id)
-            finally:
-                with self.state_lock:
-                    self.buffered_pending.pop(request_id, None)
-                    self.pending_done.discard(request_id)
 
     def select_step_participants(
         self,
