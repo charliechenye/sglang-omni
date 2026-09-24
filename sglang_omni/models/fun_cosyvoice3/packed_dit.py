@@ -22,6 +22,83 @@ FA3_PAGE_SIZE = 1
 FA3_DTYPES = (torch.float16, torch.bfloat16)
 
 
+@torch.library.custom_op(
+    "sglang_omni::cosyvoice3_native_mish",
+    mutates_args=(),
+    device_types="cuda",
+)
+def cosyvoice3_native_mish(x: torch.Tensor) -> torch.Tensor:
+    return F.mish(x)
+
+
+@cosyvoice3_native_mish.register_fake
+def _fake_cosyvoice3_native_mish(x: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@torch.library.custom_op(
+    "sglang_omni::cosyvoice3_native_layer_norm",
+    mutates_args=(),
+    device_types="cuda",
+)
+def cosyvoice3_native_layer_norm(
+    x: torch.Tensor,
+    normalized_size: int,
+    eps: float,
+) -> torch.Tensor:
+    return F.layer_norm(x.float(), (normalized_size,), None, None, eps)
+
+
+@cosyvoice3_native_layer_norm.register_fake
+def _fake_cosyvoice3_native_layer_norm(
+    x: torch.Tensor,
+    normalized_size: int,
+    eps: float,
+) -> torch.Tensor:
+    del normalized_size, eps
+    return torch.empty_like(x, dtype=torch.float32)
+
+
+@torch.library.custom_op(
+    "sglang_omni::cosyvoice3_ragged_attention",
+    mutates_args=(),
+    device_types="cuda",
+)
+def cosyvoice3_ragged_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+) -> torch.Tensor:
+    return flash_attn_with_kvcache(
+        q=q,
+        k_cache=k_cache,
+        v_cache=v_cache,
+        cache_seqlens=cache_seqlens,
+        page_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
+        causal=False,
+    )
+
+
+@cosyvoice3_ragged_attention.register_fake
+def _fake_cosyvoice3_ragged_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    max_seqlen_q: int,
+) -> torch.Tensor:
+    del k_cache, v_cache, cache_seqlens, page_table, cu_seqlens_q, max_seqlen_q
+    return torch.empty_like(q)
+
+
 @dataclass(frozen=True)
 class PackedRows:
     lengths: tuple[int, ...]
@@ -69,9 +146,10 @@ def scatter_rows(packed: torch.Tensor, rows: PackedRows, width: int) -> torch.Te
     """(1, total, channels) -> (rows, width, channels), zero past each row's
     length."""
     channels = packed.shape[2]
-    flat = packed.new_zeros(len(rows.lengths) * width, channels)
+    row_count = rows.starts_host.shape[0] - 1
+    flat = packed.new_zeros(row_count * width, channels)
     flat[rows.row_ids * width + rows.positions] = packed[0]
-    return flat.view(len(rows.lengths), width, channels)
+    return flat.view(row_count, width, channels)
 
 
 def chunk_causal_mask(
@@ -152,6 +230,7 @@ class RaggedRowAttention:
     ) -> None:
         self.heads = heads
         self.head_dim = head_dim
+        self.chunk_size = chunk_size
         device = rows.row_ids.device
         segment_rows, segment_ends, offsets = chunk_segments(rows.lengths, chunk_size)
         self.cache_seqlens = torch.tensor(
@@ -187,6 +266,51 @@ class RaggedRowAttention:
         return out.reshape(1, -1, self.heads * self.head_dim)
 
 
+def mark_compile_dynamic(rows: PackedRows, attention: RaggedRowAttention) -> None:
+    torch._dynamo.mark_dynamic(attention.page_table, (0, 1))
+    torch._dynamo.mark_dynamic(attention.cu_seqlens_q, 0)
+    torch._dynamo.mark_dynamic(attention.cache_seqlens, 0)
+    torch._dynamo.mark_dynamic(rows.starts_host, 0)
+    torch._dynamo.mark_dynamic(rows.row_ids, 0)
+    torch._dynamo.mark_dynamic(rows.positions, 0)
+
+
+def layer_norm_eager_numerics(
+    layer_norm: torch.nn.LayerNorm,
+    x: torch.Tensor,
+) -> torch.Tensor:
+    return cosyvoice3_native_layer_norm(
+        x,
+        int(layer_norm.normalized_shape[0]),
+        float(layer_norm.eps),
+    )
+
+
+def attn_norm_eager_numerics(
+    block: torch.nn.Module,
+    h: torch.Tensor,
+    time_embedding: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    modulation = block.attn_norm.linear(block.attn_norm.silu(time_embedding))
+    shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = torch.chunk(
+        modulation, 6, dim=1
+    )
+    normalized = layer_norm_eager_numerics(block.attn_norm.norm, h)
+    normalized = normalized * (1 + scale_msa[:, None]) + shift_msa[:, None]
+    return normalized, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+def final_norm_eager_numerics(
+    norm_out: torch.nn.Module,
+    h: torch.Tensor,
+    time_embedding: torch.Tensor,
+) -> torch.Tensor:
+    modulation = norm_out.linear(norm_out.silu(time_embedding))
+    scale, shift = torch.chunk(modulation, 2, dim=1)
+    normalized = layer_norm_eager_numerics(norm_out.norm, h)
+    return normalized * (1 + scale)[:, None, :] + shift[:, None, :]
+
+
 PackedRowAttention = RowAttention | RaggedRowAttention
 
 
@@ -200,6 +324,7 @@ class PackedDiT:
         self.dit = dit
         device = torch.device(device)
         self.is_ragged = device.type == "cuda" and _is_fa3_supported()
+        self.compiled_causal_forward = None
         logger.info(
             "Fun-CosyVoice3 Flow row attention on %s: %s",
             device,
@@ -216,12 +341,15 @@ class PackedDiT:
         attention = self.dit.transformer_blocks[0].attn
         chunk_size = self.chunk_size if streaming else None
         if self.is_ragged and dtype in FA3_DTYPES:
-            return RaggedRowAttention(
+            ragged = RaggedRowAttention(
                 rows,
                 chunk_size=chunk_size,
                 heads=attention.heads,
                 head_dim=attention.inner_dim // attention.heads,
             )
+            if streaming and self.compiled_causal_forward is not None:
+                mark_compile_dynamic(rows, ragged)
+            return ragged
         else:
             pass
         return RowAttention(rows, chunk_size=chunk_size, heads=attention.heads)
@@ -238,6 +366,26 @@ class PackedDiT:
     ) -> torch.Tensor:
         """x, mu, cond, spks: (1, total, channels); t: (1,). Returns
         (1, total, out_channels)."""
+        if (
+            self.compiled_causal_forward is not None
+            and isinstance(attention, RaggedRowAttention)
+            and attention.chunk_size is not None
+        ):
+            return self.compiled_causal_forward(
+                x, mu, spks, cond, t, rows, attention
+            )
+        return self.forward_eager(x, mu, spks, cond, t, rows, attention)
+
+    def forward_eager(
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+        t: torch.Tensor,
+        rows: PackedRows,
+        attention: PackedRowAttention,
+    ) -> torch.Tensor:
         dit = self.dit
         t = dit.time_embed(t)
         h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
@@ -257,6 +405,107 @@ class PackedDiT:
             pass
         h = dit.norm_out(h, t)
         return dit.proj_out(h)
+
+    def enable_causal_torch_compile(self) -> None:
+        if not self.is_ragged:
+            raise RuntimeError("PackedDiT causal torch.compile requires ragged FA3")
+        self.compiled_causal_forward = torch.compile(
+            self.forward_ragged_causal,
+            backend="inductor",
+            dynamic=True,
+            fullgraph=True,
+            options={"emulate_precision_casts": True},
+        )
+
+    def disable_causal_torch_compile(self) -> None:
+        self.compiled_causal_forward = None
+
+    def forward_ragged_causal(
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+        t: torch.Tensor,
+        rows: PackedRows,
+        attention: RaggedRowAttention,
+    ) -> torch.Tensor:
+        dit = self.dit
+        time_embedding = dit.time_embed(t)
+        h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
+        width = attention.page_table.shape[1]
+        h = self.conv_pos_embed_ragged_compiled(h, rows, width) + h
+        rope = self.rope_ragged_compiled(rows, width)
+        residual = h
+        for block in dit.transformer_blocks:
+            norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                attn_norm_eager_numerics(block, h, time_embedding)
+            )
+            h = h + gate_msa.unsqueeze(1) * self.attend_ragged_compiled(
+                block.attn, norm, rope, attention
+            )
+            ff_norm = layer_norm_eager_numerics(block.ff_norm, h)
+            ff_norm = ff_norm * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+            h = h + gate_mlp.unsqueeze(1) * block.ff(ff_norm)
+        if dit.long_skip_connection is not None:
+            h = dit.long_skip_connection(torch.cat((h, residual), dim=-1))
+        else:
+            pass
+        h = final_norm_eager_numerics(dit.norm_out, h, time_embedding)
+        return dit.proj_out(h)
+
+    def conv_pos_embed_ragged_compiled(
+        self,
+        h: torch.Tensor,
+        rows: PackedRows,
+        width: int,
+    ) -> torch.Tensor:
+        row_count = rows.starts_host.shape[0] - 1
+        padded = scatter_rows(h, rows, width)
+        module = self.dit.input_embed.conv_pos_embed
+        embedded = padded.permute(0, 2, 1)
+        embedded = F.pad(embedded, (module.kernel_size - 1, 0, 0, 0))
+        embedded = cosyvoice3_native_mish(module.conv1[0](embedded))
+        embedded = F.pad(embedded, (module.kernel_size - 1, 0, 0, 0))
+        embedded = cosyvoice3_native_mish(module.conv2[0](embedded))
+        embedded = embedded.permute(0, 2, 1)
+        assert embedded.shape[0] == row_count
+        return gather_rows(embedded, rows)
+
+    def rope_ragged_compiled(
+        self,
+        rows: PackedRows,
+        width: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        freqs, scale = self.dit.rotary_embed.forward_from_seq_len(width)
+        assert not isinstance(scale, torch.Tensor), "the DiT's RoPE has no xpos scale"
+        freqs = freqs[:, rows.positions]
+        return freqs.cos(), freqs.sin()
+
+    @staticmethod
+    def attend_ragged_compiled(
+        attn: torch.nn.Module,
+        x: torch.Tensor,
+        rope: tuple[torch.Tensor, torch.Tensor],
+        attention: RaggedRowAttention,
+    ) -> torch.Tensor:
+        x = x.to(attn.to_q.weight.dtype)
+        query = attn.to_q(x)
+        key = attn.to_k(x)
+        value = attn.to_v(x)
+        rotate_in_place(query, *rope)
+        rotate_in_place(key, *rope)
+        page_shape = (-1, FA3_PAGE_SIZE, attention.heads, attention.head_dim)
+        out = cosyvoice3_ragged_attention(
+            query[0].reshape(-1, attention.heads, attention.head_dim),
+            key[0].reshape(page_shape),
+            value[0].reshape(page_shape),
+            attention.cache_seqlens,
+            attention.page_table,
+            attention.cu_seqlens_q,
+            attention.max_seqlen_q,
+        ).reshape(1, -1, attention.heads * attention.head_dim)
+        return attn.to_out[1](attn.to_out[0](out.to(query.dtype)))
 
     def conv_pos_embed(self, h: torch.Tensor, rows: PackedRows) -> torch.Tensor:
         padded = scatter_rows(h, rows, rows.width)
