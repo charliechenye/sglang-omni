@@ -180,11 +180,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                 prepared = self.vocoder.prepare_flow_request(
                     request_index, pipeline_state, codes
                 )
-                admission_cost = (
-                    max(int(self.request_cost_fn(msg.data)), 0)
-                    if self.request_cost_fn is not None
-                    else prepared.total_mel_frames
-                )
+                admission_cost = prepared.total_mel_frames
             except Exception as exc:
                 if not self.is_aborted(msg.request_id):
                     self.emit_error(msg.request_id, exc)

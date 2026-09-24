@@ -1201,6 +1201,78 @@ def test_buffered_vocoder_aborted_request_before_own_group_emits_nothing(
     assert all(message.type == "result" for message in results)
 
 
+def test_buffered_vocoder_active_group_abort_does_not_replan(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, _, scheduler = _buffered_scheduler(monkeypatch, max_batch_size=4)
+    plan_calls: list[list[int]] = []
+    original_grouping = streaming_vocoder_module.adaptive_flow_requests_grouping
+
+    def spy_grouping(requests, **kwargs):
+        plan_calls.append([request.index for request in requests])
+        return original_grouping(requests, **kwargs)
+
+    monkeypatch.setattr(
+        streaming_vocoder_module, "adaptive_flow_requests_grouping", spy_grouping
+    )
+    first_group_started = threading.Event()
+    release_first_group = threading.Event()
+    flow_calls: list[list[int]] = []
+    call_count = 0
+
+    def block_first_group(flow, inputs):
+        nonlocal call_count
+        del flow
+        call_count += 1
+        flow_calls.append([int(item.token[0, 0]) for item in inputs])
+        if call_count == 1:
+            first_group_started.set()
+            assert release_first_group.wait(timeout=5)
+        return [
+            torch.full(
+                (1, 80, item.token.shape[1] * 2),
+                float(item.token[0, 0]),
+            )
+            for item in inputs
+        ]
+
+    monkeypatch.setattr(stages.FunCosyVoice3Flow, "inference", block_first_group)
+    scheduler.handle_new_request_batch(
+        [
+            IncomingMessage("a", "new_request", _buffered_payload("a", 2, 10)),
+            IncomingMessage("b", "new_request", _buffered_payload("b", 2, 20)),
+            IncomingMessage("c", "new_request", _buffered_payload("c", 3, 30)),
+            IncomingMessage("d", "new_request", _buffered_payload("d", 3, 40)),
+        ]
+    )
+    worker = threading.Thread(target=scheduler.run_ready_step)
+    worker.start()
+    try:
+        assert first_group_started.wait(timeout=5)
+        with pytest.raises(queue.Empty):
+            scheduler.outbox.get_nowait()
+        scheduler.abort("b")
+        release_first_group.set()
+        worker.join(timeout=5)
+    finally:
+        release_first_group.set()
+        worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    scheduler.run_ready_step()
+    results = _drain_buffered_results(scheduler)
+    by_request = {
+        request_id: [message for message in results if message.request_id == request_id]
+        for request_id in {message.request_id for message in results}
+    }
+    assert [message.type for message in by_request["a"]] == ["result"]
+    assert "b" not in by_request
+    assert [message.type for message in by_request["c"]] == ["result"]
+    assert [message.type for message in by_request["d"]] == ["result"]
+    assert flow_calls == [[10, 20], [30, 40]]
+    assert plan_calls == [[0, 1, 2, 3]]
+
+
 def test_buffered_vocoder_replans_after_abort_invalidates_remaining_plan(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
