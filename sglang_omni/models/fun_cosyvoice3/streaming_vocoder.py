@@ -436,7 +436,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
                             flow_merge_max_gap_frames=self.vocoder.flow_merge_max_gap_frames,
                             flow_merge_pad_budget_percent=self.vocoder.flow_merge_pad_budget_percent,
                         )
-                        groups.sort(key=len, reverse=True)
                         self.buffered_plan = [
                             tuple(
                                 request_ids_by_index[request.index] for request in group
