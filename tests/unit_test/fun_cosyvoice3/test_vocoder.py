@@ -1104,7 +1104,7 @@ def test_create_vocoder_executor_skips_dit_compile_by_default(monkeypatch) -> No
     assert scheduler.enable_packed_dit_torch_compile is False
 
 
-def test_create_vocoder_executor_defers_native_graph_and_packed_setup(
+def test_create_vocoder_executor_captures_graph_before_deferred_compile(
     monkeypatch,
 ) -> None:
     from sglang_omni.models.fun_cosyvoice3 import engine_builder
@@ -1159,25 +1159,30 @@ def test_create_vocoder_executor_defers_native_graph_and_packed_setup(
     )
 
     assert scheduler.enable_packed_dit_torch_compile is True
-    assert events == ["runner_create", "scheduler_warmup"]
+    assert events == [
+        "runner_create",
+        "graph_capture",
+        "attach",
+        "scheduler_warmup",
+    ]
 
     engine_builder.run_vocoder_before_memory_pool_setup()
     assert events == [
         "runner_create",
-        "scheduler_warmup",
-        "native_compile",
         "graph_capture",
         "attach",
+        "scheduler_warmup",
+        "native_compile",
         "packed_warmup",
     ]
 
     engine_builder.run_vocoder_before_memory_pool_setup()
     assert events == [
         "runner_create",
-        "scheduler_warmup",
-        "native_compile",
         "graph_capture",
         "attach",
+        "scheduler_warmup",
+        "native_compile",
         "packed_warmup",
     ]
 
@@ -1272,7 +1277,7 @@ def test_deferred_native_compile_false_skips_packed_warmup(monkeypatch) -> None:
     assert events == ["scheduler_warmup", "native_compile"]
 
 
-def test_create_vocoder_executor_defers_graph_without_native_compile(
+def test_create_vocoder_executor_captures_graph_without_native_compile(
     monkeypatch,
 ) -> None:
     from sglang_omni.models.fun_cosyvoice3 import engine_builder
@@ -1324,14 +1329,19 @@ def test_create_vocoder_executor_defers_graph_without_native_compile(
         enable_dit_torch_compile=False,
         enable_flow_cuda_graph=True,
     )
-    assert events == ["runner_create", "scheduler_warmup"]
+    assert events == [
+        "runner_create",
+        "graph_capture",
+        "attach",
+        "scheduler_warmup",
+    ]
 
     engine_builder.run_vocoder_before_memory_pool_setup()
     assert events == [
         "runner_create",
-        "scheduler_warmup",
         "graph_capture",
         "attach",
+        "scheduler_warmup",
     ]
 
 

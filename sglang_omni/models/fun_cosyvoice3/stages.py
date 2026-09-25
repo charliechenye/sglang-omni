@@ -2260,8 +2260,6 @@ def create_vocoder_executor(
     else:
         pass
 
-    capture_shapes: tuple[tuple[int, int], ...] | None = None
-    runner: FlowCudaGraphRunner | None = None
     if enable_flow_cuda_graph:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
             flow_cuda_graph_capture_shapes,
@@ -2271,6 +2269,8 @@ def create_vocoder_executor(
             device=device_obj,
             autocast_dtype=autocast_dtype,
         )
+        runner.capture(capture_shapes)
+        flow.attach_cuda_graph_runner(runner)
     else:
         pass
 
@@ -2305,12 +2305,6 @@ def create_vocoder_executor(
             )
         else:
             pass
-        if runner is not None:
-            assert capture_shapes is not None
-            runner.capture(capture_shapes)
-            flow.attach_cuda_graph_runner(runner)
-        else:
-            pass
         if dit_compile_enabled:
             scheduler.warmup_packed_dit_compile()
         else:
@@ -2321,7 +2315,7 @@ def create_vocoder_executor(
         set_vocoder_before_memory_pool_setup,
     )
 
-    if enable_dit_torch_compile or enable_flow_cuda_graph:
+    if enable_dit_torch_compile:
         set_vocoder_before_memory_pool_setup(deferred_vocoder_setup)
     else:
         set_vocoder_before_memory_pool_setup(None)
