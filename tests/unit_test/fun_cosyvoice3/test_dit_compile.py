@@ -23,9 +23,6 @@ class FakeFlow(torch.nn.Module):
         super().__init__()
         self.decoder = torch.nn.Module()
         self.decoder.estimator = estimator
-        self.decoder.inference_cfg_rate = 0.7
-        self.output_size = 8
-        self.spk_embed_affine_layer = torch.nn.Linear(3, self.output_size)
 
 
 class NonModuleEstimator:
@@ -33,17 +30,12 @@ class NonModuleEstimator:
 
 
 class _RecordingPackedDiT(PackedDiT):
-    def __init__(self, compile_result: bool = False) -> None:
+    def __init__(self) -> None:
         self.dtypes: list[torch.dtype | None] = []
-        self.compile_result = compile_result
-        self.disabled = False
 
     def compile(self, dtype: torch.dtype | None) -> bool:
         self.dtypes.append(dtype)
-        return self.compile_result
-
-    def disable_compile(self) -> None:
-        self.disabled = True
+        return False
 
 
 def test_compile_dit_backbone_compiles_estimator_forward_dynamic(monkeypatch) -> None:
@@ -126,66 +118,6 @@ def test_compile_dit_backbone_checks_packed_dit_eligibility(monkeypatch) -> None
 
     assert stages.compile_dit_backbone(flow, warmup_mel_frames=16) is True
     assert packed_estimator.dtypes == [None]
-
-
-def test_compile_dit_backbone_probes_both_packed_contracts(monkeypatch) -> None:
-    estimator = _FakeDiTEstimator()
-    flow = _FakeFlow(estimator)
-    packed_estimator = _RecordingPackedDiT(compile_result=True)
-    flow.packed_estimator = packed_estimator
-    probe_streaming: list[bool] = []
-
-    def _fake_compile(fn, dynamic=None):
-        del dynamic
-        return fn
-
-    def _fake_solve(
-        estimator,
-        noise,
-        time_span,
-        mu,
-        spks,
-        cond,
-        rows,
-        *,
-        cfg_rate,
-        streaming,
-    ):
-        del estimator, mu, spks, cond, rows, cfg_rate
-        assert time_span.shape == (2,)
-        probe_streaming.append(streaming)
-        return noise
-
-    monkeypatch.setattr(torch, "compile", _fake_compile)
-    monkeypatch.setattr(stages, "solve_flow_euler_packed", _fake_solve)
-
-    assert stages.compile_dit_backbone(flow, warmup_mel_frames=16) is True
-    assert probe_streaming == [True, False]
-    assert not packed_estimator.disabled
-
-
-def test_compile_dit_backbone_disables_packed_contracts_on_probe_failure(
-    monkeypatch,
-) -> None:
-    estimator = _FakeDiTEstimator()
-    flow = _FakeFlow(estimator)
-    packed_estimator = _RecordingPackedDiT(compile_result=True)
-    flow.packed_estimator = packed_estimator
-    original_forward = estimator.forward
-
-    def _fake_compile(fn, dynamic=None):
-        del dynamic
-        return fn
-
-    def _fail_solve(*args, **kwargs):
-        raise RuntimeError("synthetic packed compile failure")
-
-    monkeypatch.setattr(torch, "compile", _fake_compile)
-    monkeypatch.setattr(stages, "solve_flow_euler_packed", _fail_solve)
-
-    assert stages.compile_dit_backbone(flow, warmup_mel_frames=16) is False
-    assert estimator.forward == original_forward
-    assert packed_estimator.disabled
 
 
 def test_compile_dit_backbone_falls_back_to_eager_on_compile_failure(

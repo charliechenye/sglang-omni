@@ -899,7 +899,7 @@ def executor_compiles(monkeypatch, **kwargs) -> bool:
     monkeypatch.setattr(
         stages,
         "compile_dit_backbone",
-        lambda flow, **kwargs: compiled.append(flow),
+        lambda flow, autocast_dtype: compiled.append(flow),
     )
     stages.create_vocoder_executor("model", device="cpu", **kwargs)
     return bool(compiled)
