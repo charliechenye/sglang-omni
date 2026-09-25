@@ -26,6 +26,7 @@ from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.tp_control import TPFollowerControlPlane, TPLeaderFanout
 from sglang_omni.platforms import current_platform, get_platform_spec
+from sglang_omni.scheduling.lifecycle import StartupFinalizable
 from sglang_omni.utils.gpu_compat import (
     apply_gpu_compat_env_defaults,
     get_gpu_compat_env_defaults,
@@ -563,6 +564,12 @@ def run_process(
                 )
             )
         local_dispatcher.register_many(stages)
+        for stage in stages:
+            scheduler = stage.scheduler
+            if isinstance(scheduler, StartupFinalizable):
+                scheduler.finalize_startup()
+            else:
+                pass
         asyncio.run(_start_and_run())
     except BaseException:
         cleanup_constructed_stages(
