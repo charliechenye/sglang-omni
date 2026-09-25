@@ -93,6 +93,70 @@ def test_compile_dit_backbone_warmup_matches_serving_grad_mode(monkeypatch) -> N
     assert modes == [(True, True)] * 4
 
 
+def test_compile_dit_backbone_warmup_uses_autocast_dtype(monkeypatch) -> None:
+    estimator = _FakeDiTEstimator()
+    flow = _FakeFlow(estimator)
+    argument_dtypes: list[tuple[torch.dtype, ...]] = []
+
+    def _fake_compile(fn, dynamic=None):
+        del dynamic
+
+        def _wrapped(x, mask, mu, t, spks, cond, streaming):
+            argument_dtypes.append(
+                (x.dtype, mask.dtype, mu.dtype, t.dtype, spks.dtype, cond.dtype)
+            )
+            return fn(x, mask, mu, t, spks, cond, streaming)
+
+        return _wrapped
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    assert (
+        stages.compile_dit_backbone(
+            flow,
+            autocast_dtype=torch.bfloat16,
+            warmup_steps=1,
+            warmup_mel_frames=16,
+        )
+        is True
+    )
+
+    assert argument_dtypes == [(torch.bfloat16,) * 6] * 2
+
+
+def test_compile_dit_backbone_warmup_uses_parameter_dtype_without_autocast(
+    monkeypatch,
+) -> None:
+    estimator = _FakeDiTEstimator().double()
+    flow = _FakeFlow(estimator)
+    argument_dtypes: list[tuple[torch.dtype, ...]] = []
+
+    def _fake_compile(fn, dynamic=None):
+        del dynamic
+
+        def _wrapped(x, mask, mu, t, spks, cond, streaming):
+            argument_dtypes.append(
+                (x.dtype, mask.dtype, mu.dtype, t.dtype, spks.dtype, cond.dtype)
+            )
+            return fn(x, mask, mu, t, spks, cond, streaming)
+
+        return _wrapped
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    assert (
+        stages.compile_dit_backbone(
+            flow,
+            autocast_dtype=None,
+            warmup_steps=1,
+            warmup_mel_frames=16,
+        )
+        is True
+    )
+
+    assert argument_dtypes == [(torch.float64,) * 6] * 2
+
+
 def test_compile_dit_backbone_skips_non_module_estimator(monkeypatch) -> None:
     flow = FakeFlow(NonModuleEstimator())
 

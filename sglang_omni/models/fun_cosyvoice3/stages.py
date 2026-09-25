@@ -1210,26 +1210,32 @@ def compile_dit_backbone(
         pass
     try:
         estimator.forward = torch.compile(original_forward, dynamic=True)
-        # note(ratish): serving feeds the Flow's dtype; the DiT's weights may
-        # already be in the autocast dtype.
+        # note(chenye): synthetic inputs must use the dtype serving presents to
+        # the estimator, including the effective autocast dtype.
         param = next(flow.parameters())
-        device, dtype = param.device, param.dtype
+        device = param.device
+        parameter_dtype = param.dtype
+        warmup_dtype = autocast_dtype or parameter_dtype
         mel_frame = int(warmup_mel_frames)
         with torch.inference_mode():
             for streaming in (False, True):
                 for _ in range(warmup_steps):
                     # CFG batch 2; mel dim 80 matches pinned checkpoint proj_out.
                     noisy_mel = torch.randn(
-                        2, 80, mel_frame, device=device, dtype=dtype
+                        2, 80, mel_frame, device=device, dtype=warmup_dtype
                     )
-                    mel_mask = torch.ones(2, 1, mel_frame, device=device, dtype=dtype)
+                    mel_mask = torch.ones(
+                        2, 1, mel_frame, device=device, dtype=warmup_dtype
+                    )
                     token_condition = torch.randn(
-                        2, 80, mel_frame, device=device, dtype=dtype
+                        2, 80, mel_frame, device=device, dtype=warmup_dtype
                     )
-                    flow_time = torch.zeros(1, device=device, dtype=dtype)
-                    speaker_embedding = torch.randn(2, 80, device=device, dtype=dtype)
+                    flow_time = torch.zeros(1, device=device, dtype=warmup_dtype)
+                    speaker_embedding = torch.randn(
+                        2, 80, device=device, dtype=warmup_dtype
+                    )
                     prompt_mel = torch.randn(
-                        2, 80, mel_frame, device=device, dtype=dtype
+                        2, 80, mel_frame, device=device, dtype=warmup_dtype
                     )
                     with torch.autocast(
                         device_type=current_platform.device_type,
