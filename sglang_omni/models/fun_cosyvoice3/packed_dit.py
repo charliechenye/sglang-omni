@@ -378,15 +378,15 @@ class PackedDiT:
         if not isinstance(attention, RaggedRowAttention):
             return self.forward
         else:
-            pass
-        if self.compiled_causal_forward is None:
-            assert self.compiled_full_forward is None
-        else:
-            assert self.compiled_full_forward is not None
-        compiled = (
-            self.compiled_causal_forward if streaming else self.compiled_full_forward
-        )
-        return self.forward if compiled is None else compiled
+            assert (self.compiled_causal_forward is None) == (
+                self.compiled_full_forward is None
+            )
+            compiled = (
+                self.compiled_causal_forward
+                if streaming
+                else self.compiled_full_forward
+            )
+            return self.forward if compiled is None else compiled
 
     def forward_causal(
         self,
