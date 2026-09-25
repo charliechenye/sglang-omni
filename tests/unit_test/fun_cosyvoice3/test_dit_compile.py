@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 import sglang_omni.models.fun_cosyvoice3.stages as stages
@@ -60,7 +61,7 @@ def test_compile_dit_backbone_compiles_estimator_forward_dynamic(monkeypatch) ->
 
     monkeypatch.setattr(torch, "compile", fake_compile)
 
-    assert stages.compile_dit_backbone(flow, warmup_mel_frames=16) is True
+    stages.compile_dit_backbone(flow, warmup_mel_frames=16)
 
     assert [call["dynamic"] for call in compile_calls] == [True]
     assert compile_calls[0]["fn"] == original_forward
@@ -94,8 +95,8 @@ def test_compile_dit_backbone_warmup_matches_serving_grad_mode(monkeypatch) -> N
 
 
 def test_compile_dit_backbone_warmup_uses_autocast_dtype(monkeypatch) -> None:
-    estimator = _FakeDiTEstimator()
-    flow = _FakeFlow(estimator)
+    estimator = FakeDiTEstimator()
+    flow = FakeFlow(estimator)
     argument_dtypes: list[tuple[torch.dtype, ...]] = []
 
     def _fake_compile(fn, dynamic=None):
@@ -111,14 +112,11 @@ def test_compile_dit_backbone_warmup_uses_autocast_dtype(monkeypatch) -> None:
 
     monkeypatch.setattr(torch, "compile", _fake_compile)
 
-    assert (
-        stages.compile_dit_backbone(
-            flow,
-            autocast_dtype=torch.bfloat16,
-            warmup_steps=1,
-            warmup_mel_frames=16,
-        )
-        is True
+    stages.compile_dit_backbone(
+        flow,
+        autocast_dtype=torch.bfloat16,
+        warmup_steps=1,
+        warmup_mel_frames=16,
     )
 
     assert argument_dtypes == [(torch.bfloat16,) * 6] * 2
@@ -127,8 +125,8 @@ def test_compile_dit_backbone_warmup_uses_autocast_dtype(monkeypatch) -> None:
 def test_compile_dit_backbone_warmup_uses_parameter_dtype_without_autocast(
     monkeypatch,
 ) -> None:
-    estimator = _FakeDiTEstimator().double()
-    flow = _FakeFlow(estimator)
+    estimator = FakeDiTEstimator().double()
+    flow = FakeFlow(estimator)
     argument_dtypes: list[tuple[torch.dtype, ...]] = []
 
     def _fake_compile(fn, dynamic=None):
@@ -144,20 +142,17 @@ def test_compile_dit_backbone_warmup_uses_parameter_dtype_without_autocast(
 
     monkeypatch.setattr(torch, "compile", _fake_compile)
 
-    assert (
-        stages.compile_dit_backbone(
-            flow,
-            autocast_dtype=None,
-            warmup_steps=1,
-            warmup_mel_frames=16,
-        )
-        is True
+    stages.compile_dit_backbone(
+        flow,
+        autocast_dtype=None,
+        warmup_steps=1,
+        warmup_mel_frames=16,
     )
 
     assert argument_dtypes == [(torch.float64,) * 6] * 2
 
 
-def test_compile_dit_backbone_skips_non_module_estimator(monkeypatch) -> None:
+def test_compile_dit_backbone_rejects_non_module_estimator(monkeypatch) -> None:
     flow = FakeFlow(NonModuleEstimator())
 
     def fail_compile(fn, dynamic=None):
@@ -165,12 +160,16 @@ def test_compile_dit_backbone_skips_non_module_estimator(monkeypatch) -> None:
 
     monkeypatch.setattr(torch, "compile", fail_compile)
 
-    assert stages.compile_dit_backbone(flow) is False
+    with pytest.raises(
+        RuntimeError,
+        match="requires a PyTorch estimator",
+    ):
+        stages.compile_dit_backbone(flow)
 
 
 def test_compile_dit_backbone_does_not_compile_packed_dit(monkeypatch) -> None:
-    estimator = _FakeDiTEstimator()
-    flow = _FakeFlow(estimator)
+    estimator = FakeDiTEstimator()
+    flow = FakeFlow(estimator)
     packed_estimator = _RecordingPackedDiT()
     flow.packed_estimator = packed_estimator
 
@@ -180,11 +179,11 @@ def test_compile_dit_backbone_does_not_compile_packed_dit(monkeypatch) -> None:
 
     monkeypatch.setattr(torch, "compile", _fake_compile)
 
-    assert stages.compile_dit_backbone(flow, warmup_mel_frames=16) is True
+    stages.compile_dit_backbone(flow, warmup_mel_frames=16)
     assert packed_estimator.dtypes == []
 
 
-def test_compile_dit_backbone_falls_back_to_eager_on_compile_failure(
+def test_compile_dit_backbone_raises_and_restores_eager_on_compile_failure(
     monkeypatch,
 ) -> None:
     # torch.compile is lazy: a failure surfaces on the first warmup call and
@@ -201,7 +200,12 @@ def test_compile_dit_backbone_falls_back_to_eager_on_compile_failure(
 
     monkeypatch.setattr(torch, "compile", fail_compile)
 
-    assert stages.compile_dit_backbone(flow, warmup_mel_frames=16) is False
+    with pytest.raises(
+        RuntimeError,
+        match="startup warmup failed",
+    ) as exc_info:
+        stages.compile_dit_backbone(flow, warmup_mel_frames=16)
+    assert str(exc_info.value.__cause__) == "synthetic compile failure"
     assert estimator.forward == original_forward
     # The restored eager forward still runs.
     x = torch.ones(2, 80, 16)

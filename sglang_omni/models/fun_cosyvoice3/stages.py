@@ -1170,16 +1170,14 @@ def compile_dit_backbone(
     warmup_mel_frames: int = 128,
     warmup_steps: int = 3,
     autocast_dtype: torch.dtype | None = None,
-) -> bool:
+) -> None:
 
     estimator = flow.decoder.estimator
     if not isinstance(estimator, torch.nn.Module):
-        logger.warning(
-            "Fun-CosyVoice3 DiT estimator is not a PyTorch module (%s); "
-            "skipping torch.compile",
-            type(estimator).__name__,
+        raise RuntimeError(
+            "Fun-CosyVoice3 DiT torch.compile requires a PyTorch estimator, "
+            f"got {type(estimator).__name__}"
         )
-        return False
     else:
         pass
     if warmup_mel_frames < 2:
@@ -1253,13 +1251,9 @@ def compile_dit_backbone(
                         )
     except Exception as exc:
         estimator.forward = original_forward
-        logger.warning(
-            "torch.compile for the Fun-CosyVoice3 DiT backbone failed "
-            "(%s: %s); the flow decoder will run eager",
-            type(exc).__name__,
-            exc,
-        )
-        return False
+        raise RuntimeError(
+            "Fun-CosyVoice3 native DiT torch.compile startup warmup failed"
+        ) from exc
     logger.info(
         "Compiled Fun-CosyVoice3 DiT backbone (dynamic=True, autocast_dtype=%s, "
         "warmup_mel_frames=%d, warmup_steps=%d, streaming=False/True)",
@@ -1267,7 +1261,6 @@ def compile_dit_backbone(
         warmup_mel_frames,
         warmup_steps,
     )
-    return True
 
 
 def create_preprocessing_executor(
@@ -2293,23 +2286,12 @@ def create_vocoder_executor(
         token_hop_len=token_hop_len,
         token_max_hop_len=token_max_hop_len,
         disable_hop_growth=disable_hop_growth,
-        enable_packed_dit_torch_compile=enable_dit_torch_compile,
     )
     scheduler.warmup_now()
 
     def deferred_torch_compile_setup() -> None:
-        dit_compile_enabled = False
-        if enable_dit_torch_compile:
-            dit_compile_enabled = compile_dit_backbone(
-                flow, autocast_dtype=autocast_dtype
-            )
-        else:
-            pass
-        if dit_compile_enabled:
-            scheduler.warmup_packed_dit_compile()
-        else:
-            pass
-        scheduler.enable_packed_dit_torch_compile = dit_compile_enabled
+        compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
+        scheduler.warmup_packed_dit_compile()
 
     from sglang_omni.models.fun_cosyvoice3.engine_builder import (
         set_vocoder_torch_compile_setup,

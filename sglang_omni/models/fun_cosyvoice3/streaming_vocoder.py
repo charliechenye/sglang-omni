@@ -93,7 +93,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
         token_hop_len: int = TOKEN_HOP_LEN,
         token_max_hop_len: int = TOKEN_MAX_HOP_LEN,
         disable_hop_growth: bool = False,
-        enable_packed_dit_torch_compile: bool = False,
     ) -> None:
         hop = int(token_hop_len)
         max_hop = int(token_max_hop_len)
@@ -109,7 +108,6 @@ class FunCosyVoice3StreamingVocoderScheduler(
             self.token_max_hop_len = max_hop
             self.disable_hop_growth = bool(disable_hop_growth)
             self.vocoder = vocoder
-            self.enable_packed_dit_torch_compile = enable_packed_dit_torch_compile
             self.clock: Callable[[], float] = time.monotonic
         super().__init__(
             self.vocode_payload,
@@ -158,33 +156,31 @@ class FunCosyVoice3StreamingVocoderScheduler(
 
     def warmup_packed_dit_compile(self) -> None:
         """Materialize PackedDiT contracts during the SGLang engine compile phase."""
-        if not self.enable_packed_dit_torch_compile or not isinstance(
-            self.vocoder.flow.packed_estimator, PackedDiT
-        ):
+        packed_estimator = self.vocoder.flow.packed_estimator
+        if not isinstance(packed_estimator, PackedDiT):
+            raise RuntimeError(
+                "Fun-CosyVoice3 PackedDiT compile warmup requires a PackedDiT estimator"
+            )
+        else:
+            pass
+        if not packed_estimator.compile(self.vocoder.autocast_dtype):
             return
         else:
-            try:
-                if not self.vocoder.flow.packed_estimator.compile(
-                    self.vocoder.autocast_dtype
-                ):
-                    return
-                else:
-                    item = self.make_warmup_flow_input()
-                    started = time.monotonic()
-                    with self.vocoder.stream_context:
-                        self.vocoder.hop_batch([item])
-                        self.vocoder.leftover_batch([item])
-                    logger.info(
-                        f"Fun-CosyVoice3 PackedDiT causal/full compile warmup completed "
-                        f"during SGLang engine compile with torch_num_threads="
-                        f"{torch.get_num_threads()} ({time.monotonic() - started:.1f} s)"
-                    )
-            except Exception as exc:
-                self.vocoder.flow.packed_estimator.disable_compile()
-                logger.warning(
-                    f"Fun-CosyVoice3 PackedDiT causal/full compile warmup failed "
-                    f"({type(exc).__name__}: {exc}); falling back to eager PackedDiT"
-                )
+            pass
+        item = self.make_warmup_flow_input()
+        started = time.monotonic()
+        try:
+            with self.vocoder.stream_context:
+                self.vocoder.hop_batch([item])
+                self.vocoder.leftover_batch([item])
+        except Exception:
+            packed_estimator.disable_compile()
+            raise
+        logger.info(
+            f"Fun-CosyVoice3 PackedDiT causal/full compile warmup completed "
+            f"during SGLang engine compile with torch_num_threads="
+            f"{torch.get_num_threads()} ({time.monotonic() - started:.1f} s)"
+        )
 
     def make_warmup_flow_input(self) -> FlowBatchInput:
         flow = self.vocoder.flow
