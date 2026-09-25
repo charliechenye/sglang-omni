@@ -1170,6 +1170,7 @@ def compile_dit_backbone(
     warmup_mel_frames: int = 128,
     warmup_steps: int = 3,
     autocast_dtype: torch.dtype | None = None,
+    stream_context: contextlib.AbstractContextManager[None] | None = None,
 ) -> bool:
 
     estimator = flow.decoder.estimator
@@ -1190,8 +1191,9 @@ def compile_dit_backbone(
     original_forward = estimator.forward
     packed_estimator = getattr(flow, "packed_estimator", None)
     packed_compile_enabled = False
-    # The streaming scheduler warmup executes one causal and one full packed
-    # call after this factory setup, so both callables can stay lazy here.
+    packed_stream_context = (
+        contextlib.nullcontext() if stream_context is None else stream_context
+    )
     torch._inductor.config.fx_graph_cache = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.accumulated_cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
@@ -1223,7 +1225,12 @@ def compile_dit_backbone(
         param = next(flow.parameters())
         device, dtype = param.device, param.dtype
         mel_frame = int(warmup_mel_frames)
-        with torch.inference_mode():
+        warmup_stream: torch.cuda.Stream | None = None
+        with packed_stream_context, torch.inference_mode():
+            if stream_context is not None and device.type == "cuda":
+                warmup_stream = torch.cuda.current_stream(device)
+            else:
+                pass
             for streaming in (False, True):
                 for _ in range(warmup_steps):
                     # CFG batch 2; mel dim 80 matches pinned checkpoint proj_out.
@@ -1253,6 +1260,48 @@ def compile_dit_backbone(
                             prompt_mel,
                             streaming=streaming,
                         )
+            if packed_compile_enabled:
+                assert isinstance(packed_estimator, PackedDiT)
+                packed_dtype = autocast_dtype or dtype
+                packed_rows = pack_rows((mel_frame, mel_frame), device)
+                packed_shape = (1, packed_rows.total, flow.output_size)
+                packed_noise = torch.zeros(
+                    packed_shape, device=device, dtype=packed_dtype
+                )
+                packed_mu = torch.zeros_like(packed_noise)
+                packed_condition = torch.zeros_like(packed_noise)
+                packed_speaker_embedding = torch.zeros(
+                    len(packed_rows.lengths),
+                    flow.spk_embed_affine_layer.out_features,
+                    device=device,
+                    dtype=packed_dtype,
+                )
+                packed_time_span = torch.tensor(
+                    (0, 1), device=device, dtype=packed_dtype
+                )
+                with torch.autocast(
+                    device_type=current_platform.device_type,
+                    dtype=autocast_dtype,
+                    enabled=autocast_dtype is not None,
+                ):
+                    for streaming in (True, False):
+                        solve_flow_euler_packed(
+                            packed_estimator,
+                            packed_noise,
+                            packed_time_span,
+                            packed_mu,
+                            packed_speaker_embedding,
+                            packed_condition,
+                            packed_rows,
+                            cfg_rate=flow.decoder.inference_cfg_rate,
+                            streaming=streaming,
+                        )
+            else:
+                pass
+        if warmup_stream is not None:
+            torch.cuda.current_stream(device).wait_stream(warmup_stream)
+        else:
+            pass
     except Exception as exc:
         estimator.forward = original_forward
         if packed_compile_enabled:
@@ -2268,8 +2317,22 @@ def create_vocoder_executor(
     else:
         pass
 
+    vocoder = CosyVoice3Vocoder(
+        flow,
+        hift,
+        autocast_dtype=autocast_dtype,
+        flow_merge_max_gap_frames=flow_merge_max_gap_frames,
+        flow_merge_pad_budget_percent=flow_merge_pad_budget_percent,
+        hift_dtype=hift_dtype,
+        hift_max_padding_waste=hift_max_padding_waste,
+    )
+
     if enable_dit_torch_compile:
-        compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
+        compile_dit_backbone(
+            flow,
+            autocast_dtype=autocast_dtype,
+            stream_context=vocoder.stream_context,
+        )
     else:
         pass
 
@@ -2286,16 +2349,6 @@ def create_vocoder_executor(
         flow.attach_cuda_graph_runner(runner)
     else:
         pass
-
-    vocoder = CosyVoice3Vocoder(
-        flow,
-        hift,
-        autocast_dtype=autocast_dtype,
-        flow_merge_max_gap_frames=flow_merge_max_gap_frames,
-        flow_merge_pad_budget_percent=flow_merge_pad_budget_percent,
-        hift_dtype=hift_dtype,
-        hift_max_padding_waste=hift_max_padding_waste,
-    )
 
     scheduler = FunCosyVoice3StreamingVocoderScheduler(
         vocoder,
