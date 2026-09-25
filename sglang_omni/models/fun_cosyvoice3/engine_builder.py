@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib
 import logging
 import os
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -22,6 +23,23 @@ from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 logger = logging.getLogger(__name__)
+
+_VOCODER_BEFORE_MEMORY_POOL_WARMUP: Callable[[], None] | None = None
+
+
+def set_vocoder_before_memory_pool_warmup(
+    warmup: Callable[[], None] | None,
+) -> None:
+    global _VOCODER_BEFORE_MEMORY_POOL_WARMUP
+    _VOCODER_BEFORE_MEMORY_POOL_WARMUP = warmup
+
+
+def _run_vocoder_before_memory_pool_warmup() -> None:
+    global _VOCODER_BEFORE_MEMORY_POOL_WARMUP
+    warmup = _VOCODER_BEFORE_MEMORY_POOL_WARMUP
+    _VOCODER_BEFORE_MEMORY_POOL_WARMUP = None
+    if warmup is not None:
+        warmup()
 
 
 class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
@@ -188,6 +206,10 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
             use_mlx=use_mlx(),
             model_revision=root,
         )
+        # SGLang ModelRunner has already completed load-time process-global
+        # setup (including torch.set_num_threads) here, while alloc_memory_pool()
+        # and generation CUDA Graph capture have not run yet.
+        _run_vocoder_before_memory_pool_warmup()
 
     def setup_model(
         self,

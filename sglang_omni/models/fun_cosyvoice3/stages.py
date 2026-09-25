@@ -1188,8 +1188,6 @@ def compile_dit_backbone(
         pass
 
     original_forward = estimator.forward
-    packed_estimator = getattr(flow, "packed_estimator", None)
-    packed_compile_enabled = False
     torch._inductor.config.fx_graph_cache = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.accumulated_cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
@@ -1212,10 +1210,6 @@ def compile_dit_backbone(
         pass
     try:
         estimator.forward = torch.compile(original_forward, dynamic=True)
-        if isinstance(packed_estimator, PackedDiT):
-            packed_compile_enabled = packed_estimator.compile(autocast_dtype)
-        else:
-            pass
         # note(ratish): serving feeds the Flow's dtype; the DiT's weights may
         # already be in the autocast dtype.
         param = next(flow.parameters())
@@ -1253,10 +1247,6 @@ def compile_dit_backbone(
                         )
     except Exception as exc:
         estimator.forward = original_forward
-        if packed_compile_enabled:
-            packed_estimator.disable_compile()
-        else:
-            pass
         logger.warning(
             "torch.compile for the Fun-CosyVoice3 DiT backbone failed "
             "(%s: %s); the flow decoder will run eager",
@@ -1266,12 +1256,10 @@ def compile_dit_backbone(
         return False
     logger.info(
         "Compiled Fun-CosyVoice3 DiT backbone (dynamic=True, autocast_dtype=%s, "
-        "warmup_mel_frames=%d, warmup_steps=%d, streaming=False/True, "
-        "packed_causal/full=%s)",
+        "warmup_mel_frames=%d, warmup_steps=%d, streaming=False/True)",
         autocast_dtype,
         warmup_mel_frames,
         warmup_steps,
-        packed_compile_enabled,
     )
     return True
 
@@ -2266,8 +2254,9 @@ def create_vocoder_executor(
     else:
         pass
 
+    dit_compile_enabled = False
     if enable_dit_torch_compile:
-        compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
+        dit_compile_enabled = compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
     else:
         pass
 
@@ -2304,6 +2293,14 @@ def create_vocoder_executor(
         token_hop_len=token_hop_len,
         token_max_hop_len=token_max_hop_len,
         disable_hop_growth=disable_hop_growth,
+        enable_packed_dit_torch_compile=dit_compile_enabled,
     )
     scheduler.warmup_now()
+    from sglang_omni.models.fun_cosyvoice3.engine_builder import (
+        set_vocoder_before_memory_pool_warmup,
+    )
+
+    set_vocoder_before_memory_pool_warmup(
+        scheduler.warmup_packed_dit_compile if dit_compile_enabled else None
+    )
     return scheduler

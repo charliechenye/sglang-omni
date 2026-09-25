@@ -104,7 +104,7 @@ def test_compile_dit_backbone_skips_non_module_estimator(monkeypatch) -> None:
     assert stages.compile_dit_backbone(flow) is False
 
 
-def test_compile_dit_backbone_checks_packed_dit_eligibility(monkeypatch) -> None:
+def test_compile_dit_backbone_does_not_compile_packed_dit(monkeypatch) -> None:
     estimator = _FakeDiTEstimator()
     flow = _FakeFlow(estimator)
     packed_estimator = _RecordingPackedDiT()
@@ -117,7 +117,7 @@ def test_compile_dit_backbone_checks_packed_dit_eligibility(monkeypatch) -> None
     monkeypatch.setattr(torch, "compile", _fake_compile)
 
     assert stages.compile_dit_backbone(flow, warmup_mel_frames=16) is True
-    assert packed_estimator.dtypes == [None]
+    assert packed_estimator.dtypes == []
 
 
 def test_compile_dit_backbone_falls_back_to_eager_on_compile_failure(

@@ -19,6 +19,7 @@ from typing import Any, Literal, Mapping
 
 import torch
 
+from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.fun_cosyvoice3.stages import CosyVoice3Vocoder, FlowBatchInput
 from sglang_omni.models.fun_cosyvoice3.streaming import (
@@ -92,6 +93,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         token_hop_len: int = TOKEN_HOP_LEN,
         token_max_hop_len: int = TOKEN_MAX_HOP_LEN,
         disable_hop_growth: bool = False,
+        enable_packed_dit_torch_compile: bool = False,
     ) -> None:
         hop = int(token_hop_len)
         max_hop = int(token_max_hop_len)
@@ -107,6 +109,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             self.token_max_hop_len = max_hop
             self.disable_hop_growth = bool(disable_hop_growth)
             self.vocoder = vocoder
+            self.enable_packed_dit_torch_compile = enable_packed_dit_torch_compile
             self.clock: Callable[[], float] = time.monotonic
         super().__init__(
             self.vocode_payload,
@@ -137,17 +140,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         # note(ratish): one hop and one final through Flow and HiFT before the
         # stage publishes readiness, so the first request pays neither the
         # attention kernel load nor the f0 cast.
-        flow = self.vocoder.flow
-        item = FlowBatchInput(
-            token=torch.zeros(
-                1, self.token_hop_len + PRE_LOOKAHEAD_LEN, dtype=torch.int32
-            ),
-            prompt_token=torch.zeros(1, self.token_hop_len, dtype=torch.int32),
-            prompt_feat=torch.zeros(
-                1, self.token_hop_len * TOKEN_MEL_RATIO, flow.output_size
-            ),
-            embedding=torch.zeros(1, flow.spk_embed_affine_layer.in_features),
-        )
+        item = self._make_warmup_flow_input()
         # note(ratish): under the vocoder's stream, so the warmup and not the
         # first request builds that stream's memory pool and cuBLAS workspaces,
         # which PyTorch keeps per stream.
@@ -161,6 +154,54 @@ class FunCosyVoice3StreamingVocoderScheduler(
         final_s = time.monotonic() - started - hop_s
         logger.info(
             f"Fun-CosyVoice3 vocoder warmup: hop {hop_s:.1f} s, final {final_s:.1f} s"
+        )
+
+    def warmup_packed_dit_compile(self) -> None:
+        """Materialize PackedDiT after SGLang initialization and before KV sizing."""
+        if not self.enable_packed_dit_torch_compile:
+            return
+        else:
+            pass
+        packed_estimator = self.vocoder.flow.packed_estimator
+        if not isinstance(packed_estimator, PackedDiT):
+            return
+        else:
+            pass
+        try:
+            if not packed_estimator.compile(self.vocoder.autocast_dtype):
+                return
+            else:
+                pass
+            item = self._make_warmup_flow_input()
+            started = time.monotonic()
+            with self.vocoder.stream_context:
+                self.vocoder.hop_batch([item])
+                self.vocoder.leftover_batch([item])
+            logger.info(
+                f"Fun-CosyVoice3 PackedDiT causal/full compile warmup completed "
+                f"before SGLang KV sizing with torch_num_threads="
+                f"{torch.get_num_threads()} ({time.monotonic() - started:.1f} s)"
+            )
+        except Exception as exc:
+            packed_estimator.disable_compile()
+            logger.warning(
+                f"Fun-CosyVoice3 PackedDiT causal/full compile warmup failed "
+                f"({type(exc).__name__}: {exc}); falling back to eager PackedDiT"
+            )
+
+    def _make_warmup_flow_input(  # noqa: leading-underscore
+        self,
+    ) -> FlowBatchInput:
+        flow = self.vocoder.flow
+        return FlowBatchInput(
+            token=torch.zeros(
+                1, self.token_hop_len + PRE_LOOKAHEAD_LEN, dtype=torch.int32
+            ),
+            prompt_token=torch.zeros(1, self.token_hop_len, dtype=torch.int32),
+            prompt_feat=torch.zeros(
+                1, self.token_hop_len * TOKEN_MEL_RATIO, flow.output_size
+            ),
+            embedding=torch.zeros(1, flow.spk_embed_affine_layer.in_features),
         )
 
     def latch_stream_contract(
