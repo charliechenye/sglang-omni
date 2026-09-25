@@ -292,7 +292,6 @@ class PackedDiT:
         self.dit = dit
         device = torch.device(device)
         self.is_ragged = device.type == "cuda" and _is_fa3_supported()
-        self.compile_enabled = False
         self.compiled_causal_forward: Callable[..., torch.Tensor] | None = None
         self.compiled_full_forward: Callable[..., torch.Tensor] | None = None
         logger.info(
@@ -317,10 +316,11 @@ class PackedDiT:
                 heads=attention.heads,
                 head_dim=attention.inner_dim // attention.heads,
             )
-            if self.compile_enabled:
+            if self.compiled_causal_forward is not None:
+                assert self.compiled_full_forward is not None
                 mark_packed_compile_metadata(rows, attention)
             else:
-                pass
+                assert self.compiled_full_forward is None
             return attention
         else:
             pass
@@ -337,15 +337,12 @@ class PackedDiT:
             return False
         else:
             pass
-        if (
-            self.compiled_causal_forward is not None
-            and self.compiled_full_forward is not None
-        ):
+        if self.compiled_causal_forward is not None:
+            assert self.compiled_full_forward is not None
             return True
         else:
-            pass
+            assert self.compiled_full_forward is None
 
-        self.compile_enabled = True
         try:
             self.compiled_causal_forward = torch.compile(
                 self.forward_causal,
@@ -372,7 +369,6 @@ class PackedDiT:
         return True
 
     def disable_compile(self) -> None:
-        self.compile_enabled = False
         self.compiled_causal_forward = None
         self.compiled_full_forward = None
 
@@ -383,6 +379,10 @@ class PackedDiT:
             return self.forward
         else:
             pass
+        if self.compiled_causal_forward is None:
+            assert self.compiled_full_forward is None
+        else:
+            assert self.compiled_full_forward is not None
         compiled = (
             self.compiled_causal_forward if streaming else self.compiled_full_forward
         )
@@ -398,8 +398,16 @@ class PackedDiT:
         rows: PackedRows,
         attention: RaggedRowAttention,
     ) -> torch.Tensor:
-        return self.forward_compiled_core(
-            x, mu, spks, cond, t, rows, attention, attention.max_seqlen_q
+        return forward_packed_tensor_geometry(
+            self,
+            x,
+            mu,
+            spks,
+            cond,
+            t,
+            rows,
+            attention,
+            max_seqlen_q=attention.max_seqlen_q,
         )
 
     def forward_full(
@@ -412,28 +420,6 @@ class PackedDiT:
         rows: PackedRows,
         attention: RaggedRowAttention,
     ) -> torch.Tensor:
-        return self.forward_compiled_core(
-            x,
-            mu,
-            spks,
-            cond,
-            t,
-            rows,
-            attention,
-            attention.page_table.shape[1],
-        )
-
-    def forward_compiled_core(
-        self,
-        x: torch.Tensor,
-        mu: torch.Tensor,
-        spks: torch.Tensor,
-        cond: torch.Tensor,
-        t: torch.Tensor,
-        rows: PackedRows,
-        attention: RaggedRowAttention,
-        max_seqlen_q: int,
-    ) -> torch.Tensor:
         return forward_packed_tensor_geometry(
             self,
             x,
@@ -443,7 +429,7 @@ class PackedDiT:
             t,
             rows,
             attention,
-            max_seqlen_q=max_seqlen_q,
+            max_seqlen_q=attention.page_table.shape[1],
         )
 
     def forward(
