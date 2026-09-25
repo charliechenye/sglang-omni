@@ -21,7 +21,11 @@ import torch
 
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
-from sglang_omni.models.fun_cosyvoice3.stages import CosyVoice3Vocoder, FlowBatchInput
+from sglang_omni.models.fun_cosyvoice3.stages import (
+    CosyVoice3Vocoder,
+    FlowBatchInput,
+    compile_dit_backbone,
+)
 from sglang_omni.models.fun_cosyvoice3.streaming import (
     PRE_LOOKAHEAD_LEN,
     TOKEN_HOP_LEN,
@@ -34,6 +38,7 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     pad_flow_prompt_to_hop,
 )
 from sglang_omni.proto import StagePayload
+from sglang_omni.scheduling.lifecycle import StartupFinalizable
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
@@ -74,7 +79,7 @@ class CosyVoice3StreamState:
 
 
 class FunCosyVoice3StreamingVocoderScheduler(
-    StreamingVocoderBase[CosyVoice3StreamState, NextDecode]
+    StreamingVocoderBase[CosyVoice3StreamState, NextDecode], StartupFinalizable
 ):
     """Decode CosyVoice3 speech tokens incrementally through Flow + HiFT."""
 
@@ -93,6 +98,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         token_hop_len: int = TOKEN_HOP_LEN,
         token_max_hop_len: int = TOKEN_MAX_HOP_LEN,
         disable_hop_growth: bool = False,
+        enable_dit_torch_compile: bool = False,
     ) -> None:
         hop = int(token_hop_len)
         max_hop = int(token_max_hop_len)
@@ -107,6 +113,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             self.token_hop_len = hop
             self.token_max_hop_len = max_hop
             self.disable_hop_growth = bool(disable_hop_growth)
+            self.enable_dit_torch_compile = bool(enable_dit_torch_compile)
             self.vocoder = vocoder
             self.clock: Callable[[], float] = time.monotonic
         super().__init__(
@@ -154,8 +161,19 @@ class FunCosyVoice3StreamingVocoderScheduler(
             f"Fun-CosyVoice3 vocoder warmup: hop {hop_s:.1f} s, final {final_s:.1f} s"
         )
 
+    def finalize_startup(self) -> None:
+        if not self.enable_dit_torch_compile:
+            return
+        else:
+            pass
+        compile_dit_backbone(
+            self.vocoder.flow,
+            autocast_dtype=self.vocoder.autocast_dtype,
+        )
+        self.warmup_packed_dit_compile()
+
     def warmup_packed_dit_compile(self) -> None:
-        """Materialize PackedDiT contracts during the SGLang engine compile phase."""
+        """Materialize PackedDiT contracts during process startup finalization."""
         packed_estimator = self.vocoder.flow.packed_estimator
         if not isinstance(packed_estimator, PackedDiT):
             raise RuntimeError(
@@ -178,7 +196,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
             raise
         logger.info(
             f"Fun-CosyVoice3 PackedDiT causal/full compile warmup completed "
-            f"during SGLang engine compile with torch_num_threads="
+            f"during process startup with torch_num_threads="
             f"{torch.get_num_threads()} ({time.monotonic() - started:.1f} s)"
         )
 

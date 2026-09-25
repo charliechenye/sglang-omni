@@ -6,7 +6,6 @@ from __future__ import annotations
 import importlib
 import logging
 import os
-from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -23,25 +22,6 @@ from sglang_omni.scheduling.engine_factory import TtsEngineBuilder
 from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoint
 
 logger = logging.getLogger(__name__)
-
-VOCODER_TORCH_COMPILE_SETUP: Callable[[], None] | None = None
-
-
-def set_vocoder_torch_compile_setup(
-    setup: Callable[[], None] | None,
-) -> None:
-    global VOCODER_TORCH_COMPILE_SETUP
-    VOCODER_TORCH_COMPILE_SETUP = setup
-
-
-def run_vocoder_torch_compile_setup() -> None:
-    global VOCODER_TORCH_COMPILE_SETUP
-    setup = VOCODER_TORCH_COMPILE_SETUP
-    VOCODER_TORCH_COMPILE_SETUP = None
-    if setup is not None:
-        setup()
-    else:
-        pass
 
 
 class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
@@ -219,10 +199,6 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
         server_args: Any,
     ) -> None:
         del model_worker, checkpoint_dir, device, gpu_id, server_args
-
-    def compile_model(self, model: Any, server_args: Any) -> None:
-        del model, server_args
-        run_vocoder_torch_compile_setup()
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         from sglang.srt.hardware_backend.mlx.runtime import use_mlx

@@ -2286,19 +2286,7 @@ def create_vocoder_executor(
         token_hop_len=token_hop_len,
         token_max_hop_len=token_max_hop_len,
         disable_hop_growth=disable_hop_growth,
+        enable_dit_torch_compile=enable_dit_torch_compile,
     )
     scheduler.warmup_now()
-
-    def deferred_torch_compile_setup() -> None:
-        compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
-        scheduler.warmup_packed_dit_compile()
-
-    from sglang_omni.models.fun_cosyvoice3.engine_builder import (
-        set_vocoder_torch_compile_setup,
-    )
-
-    if enable_dit_torch_compile:
-        set_vocoder_torch_compile_setup(deferred_torch_compile_setup)
-    else:
-        set_vocoder_torch_compile_setup(None)
     return scheduler

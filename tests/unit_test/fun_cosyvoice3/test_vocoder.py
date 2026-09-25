@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from sglang_omni.client.client import Client
-from sglang_omni.models.fun_cosyvoice3 import stages
+from sglang_omni.models.fun_cosyvoice3 import stages, streaming_vocoder
 from sglang_omni.models.fun_cosyvoice3.config import (
     FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
     FunCosyVoice3PipelineConfig,
@@ -154,10 +154,11 @@ def test_packed_dit_compile_warmup_materializes_serving_variants() -> None:
     assert hop_items[0][0] is leftover_items[0][0]
 
 
-def test_packed_dit_compile_warmup_skips_non_packed_estimator() -> None:
+def test_packed_dit_compile_warmup_rejects_non_packed_estimator() -> None:
     scheduler, hop_items, leftover_items = _packed_compile_scheduler(None)
 
-    scheduler.warmup_packed_dit_compile()
+    with pytest.raises(RuntimeError, match="requires a PackedDiT estimator"):
+        scheduler.warmup_packed_dit_compile()
 
     assert hop_items == leftover_items == []
 
@@ -1064,31 +1065,36 @@ def _executor_compiles(
         del autocast_dtype
         compiled.append(flow)
 
-    monkeypatch.setattr(stages, "compile_dit_backbone", fake_compile)
+    monkeypatch.setattr(streaming_vocoder, "compile_dit_backbone", fake_compile)
     scheduler = stages.create_vocoder_executor("model", device="cpu", **kwargs)
     return compiled, scheduler
 
 
-def test_create_vocoder_executor_defers_dit_compile(monkeypatch) -> None:
-    from sglang_omni.models.fun_cosyvoice3 import engine_builder
-
-    compiled, _scheduler = _executor_compiles(monkeypatch)
+def test_create_vocoder_executor_finalizes_dit_compile_at_startup(
+    monkeypatch,
+) -> None:
+    compiled, scheduler = _executor_compiles(monkeypatch)
+    assert compiled == []
+    scheduler.finalize_startup()
     assert compiled == []
 
-    compiled, _scheduler = _executor_compiles(
+    monkeypatch.setattr(
+        FunCosyVoice3StreamingVocoderScheduler,
+        "warmup_packed_dit_compile",
+        lambda scheduler: None,
+    )
+    compiled, scheduler = _executor_compiles(
         monkeypatch,
         enable_dit_torch_compile=True,
     )
     assert compiled == []
-    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
+    scheduler.finalize_startup()
     assert len(compiled) == 1
 
 
-def test_create_vocoder_executor_captures_graph_before_deferred_compile(
+def test_create_vocoder_executor_captures_graph_before_startup_finalization(
     monkeypatch,
 ) -> None:
-    from sglang_omni.models.fun_cosyvoice3 import engine_builder
-
     events: list[str] = []
     fake_flow = _GraphRunnableFakeFlow(events)
     monkeypatch.setattr(
@@ -1107,7 +1113,7 @@ def test_create_vocoder_executor_captures_graph_before_deferred_compile(
         del flow, autocast_dtype
         events.append("native_compile")
 
-    monkeypatch.setattr(stages, "compile_dit_backbone", fake_compile)
+    monkeypatch.setattr(streaming_vocoder, "compile_dit_backbone", fake_compile)
 
     class _FakeFlowCudaGraphRunner:
         def __init__(self, flow, *, device, autocast_dtype):
@@ -1144,17 +1150,7 @@ def test_create_vocoder_executor_captures_graph_before_deferred_compile(
         "scheduler_warmup",
     ]
 
-    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
-    assert events == [
-        "runner_create",
-        "graph_capture",
-        "attach",
-        "scheduler_warmup",
-        "native_compile",
-        "packed_warmup",
-    ]
-
-    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
+    scheduler.finalize_startup()
     assert events == [
         "runner_create",
         "graph_capture",
@@ -1165,11 +1161,9 @@ def test_create_vocoder_executor_captures_graph_before_deferred_compile(
     ]
 
 
-def test_create_vocoder_executor_defers_native_compile_when_graph_disabled(
+def test_create_vocoder_executor_defers_native_compile_until_startup_finalization(
     monkeypatch,
 ) -> None:
-    from sglang_omni.models.fun_cosyvoice3 import engine_builder
-
     events: list[str] = []
     fake_flow = _GraphRunnableFakeFlow(events)
     monkeypatch.setattr(
@@ -1183,7 +1177,7 @@ def test_create_vocoder_executor_defers_native_compile_when_graph_disabled(
         lambda checkpoint_dir, device, fp16, **kwargs: (fake_flow, _FakeHiFT()),
     )
     monkeypatch.setattr(
-        stages,
+        streaming_vocoder,
         "compile_dit_backbone",
         lambda flow, autocast_dtype: events.append("native_compile"),
     )
@@ -1198,7 +1192,7 @@ def test_create_vocoder_executor_defers_native_compile_when_graph_disabled(
         lambda scheduler: events.append("packed_warmup"),
     )
 
-    stages.create_vocoder_executor(
+    scheduler = stages.create_vocoder_executor(
         "model",
         device="cpu",
         enable_dit_torch_compile=True,
@@ -1206,7 +1200,7 @@ def test_create_vocoder_executor_defers_native_compile_when_graph_disabled(
     )
 
     assert events == ["scheduler_warmup"]
-    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
+    scheduler.finalize_startup()
     assert events == ["scheduler_warmup", "native_compile", "packed_warmup"]
     assert fake_flow.attached_runner is None
 
@@ -1214,8 +1208,6 @@ def test_create_vocoder_executor_defers_native_compile_when_graph_disabled(
 def test_create_vocoder_executor_captures_graph_without_native_compile(
     monkeypatch,
 ) -> None:
-    from sglang_omni.models.fun_cosyvoice3 import engine_builder
-
     events: list[str] = []
     fake_flow = _GraphRunnableFakeFlow(events)
     monkeypatch.setattr(
@@ -1234,7 +1226,7 @@ def test_create_vocoder_executor_captures_graph_without_native_compile(
         del flow, autocast_dtype
         raise AssertionError("native compile must stay disabled")
 
-    monkeypatch.setattr(stages, "compile_dit_backbone", fail_compile)
+    monkeypatch.setattr(streaming_vocoder, "compile_dit_backbone", fail_compile)
 
     class _FakeFlowCudaGraphRunner:
         def __init__(self, flow, *, device, autocast_dtype):
@@ -1257,7 +1249,7 @@ def test_create_vocoder_executor_captures_graph_without_native_compile(
         lambda scheduler: events.append("packed_warmup"),
     )
 
-    stages.create_vocoder_executor(
+    scheduler = stages.create_vocoder_executor(
         "model",
         device="cuda",
         enable_dit_torch_compile=False,
@@ -1270,7 +1262,7 @@ def test_create_vocoder_executor_captures_graph_without_native_compile(
         "scheduler_warmup",
     ]
 
-    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
+    scheduler.finalize_startup()
     assert events == [
         "runner_create",
         "graph_capture",
@@ -1374,52 +1366,6 @@ def test_preprocessing_executor_threads_max_concurrency() -> None:
 def test_preprocessing_executor_rejects_non_positive_concurrency() -> None:
     with pytest.raises(ValueError, match="max_concurrency"):
         stages.create_preprocessing_executor("model", max_concurrency=0)
-
-
-def test_engine_builder_consumes_vocoder_compile_at_compile_model(
-    monkeypatch,
-) -> None:
-    from sglang_omni.models.fun_cosyvoice3 import engine_builder, request_builders
-
-    events: list[str] = []
-    engine_builder.set_vocoder_torch_compile_setup(
-        lambda: events.append("vocoder_compile")
-    )
-
-    class _StubModel:
-        def load_weights(self, weights) -> None:
-            del weights
-
-    monkeypatch.setattr(engine_builder, "SpeechTokenizerV3", lambda *a, **k: object())
-    monkeypatch.setattr(engine_builder, "SpeakerEncoder", lambda *a, **k: object())
-    monkeypatch.setattr(engine_builder, "CosyVoice3Tokenizer", lambda path: object())
-    monkeypatch.setattr(engine_builder.torch, "load", lambda *a, **k: {})
-    monkeypatch.setattr(
-        request_builders,
-        "set_cosyvoice3_preprocessing_context",
-        lambda **kwargs: events.append("context"),
-    )
-
-    builder = engine_builder.FunCosyVoice3EngineBuilder()
-    builder.checkpoint_root = "/tmp"
-    builder.before_memory_pool(
-        model_worker=SimpleNamespace(
-            model_runner=SimpleNamespace(
-                model=_StubModel(),
-                model_config=SimpleNamespace(vocab_size=0),
-            )
-        ),
-        checkpoint_dir="/tmp",
-        device="cpu",
-        gpu_id=0,
-        server_args=object(),
-    )
-
-    assert events == ["context"]
-    builder.compile_model(None, None)
-    assert events == ["context", "vocoder_compile"]
-    builder.compile_model(None, None)
-    assert events == ["context", "vocoder_compile"]
 
 
 def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
