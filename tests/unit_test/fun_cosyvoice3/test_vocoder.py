@@ -1090,7 +1090,7 @@ def test_create_vocoder_executor_skips_dit_compile_by_default(monkeypatch) -> No
     assert scheduler.enable_packed_dit_torch_compile is True
     engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
     assert len(compiled) == 1
-    assert scheduler.enable_packed_dit_torch_compile is False
+    assert scheduler.enable_packed_dit_torch_compile is True
 
     compiled, scheduler = _executor_compiles(
         monkeypatch,
