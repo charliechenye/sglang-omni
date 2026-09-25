@@ -1188,6 +1188,10 @@ def compile_dit_backbone(
         pass
 
     original_forward = estimator.forward
+    packed_estimator = getattr(flow, "packed_estimator", None)
+    packed_compile_enabled = False
+    # The streaming scheduler warmup executes one causal and one full packed
+    # call after this factory setup, so both callables can stay lazy here.
     torch._inductor.config.fx_graph_cache = True  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
     torch._dynamo.config.accumulated_cache_size_limit = 1024  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
@@ -1210,6 +1214,10 @@ def compile_dit_backbone(
         pass
     try:
         estimator.forward = torch.compile(original_forward, dynamic=True)
+        if isinstance(packed_estimator, PackedDiT):
+            packed_compile_enabled = packed_estimator.compile(autocast_dtype)
+        else:
+            pass
         # note(ratish): serving feeds the Flow's dtype; the DiT's weights may
         # already be in the autocast dtype.
         param = next(flow.parameters())
@@ -1247,6 +1255,10 @@ def compile_dit_backbone(
                         )
     except Exception as exc:
         estimator.forward = original_forward
+        if packed_compile_enabled:
+            packed_estimator.disable_compile()
+        else:
+            pass
         logger.warning(
             "torch.compile for the Fun-CosyVoice3 DiT backbone failed "
             "(%s: %s); the flow decoder will run eager",
@@ -1256,10 +1268,12 @@ def compile_dit_backbone(
         return False
     logger.info(
         "Compiled Fun-CosyVoice3 DiT backbone (dynamic=True, autocast_dtype=%s, "
-        "warmup_mel_frames=%d, warmup_steps=%d, streaming=False/True)",
+        "warmup_mel_frames=%d, warmup_steps=%d, streaming=False/True, "
+        "packed_causal/full=%s)",
         autocast_dtype,
         warmup_mel_frames,
         warmup_steps,
+        packed_compile_enabled,
     )
     return True
 

@@ -271,7 +271,7 @@ The TTS engine stage accepts `onnx_intra_op_threads` (16) for the speech tokeniz
 
 ### torch.compile for the DiT backbone
 
-`torch.compile` is off by default. Enable it when you want the lowest DiT kernel-launch overhead. The first startup with an empty Inductor cache takes about 100 s and builds one symbolic (`dynamic=True`) graph for every utterance length; later starts reuse that cache. Keep the cache so you do not pay the compile cost again (`~/.cache/torch/inductor`, or `TORCHINDUCTOR_CACHE_DIR`).
+`torch.compile` is off by default. Enable it when you want lower DiT kernel-launch overhead. `enable_dit_torch_compile=true` covers the native padded DiT and, on eligible CUDA ragged FA3 Flow inputs in float16 or bfloat16, one dynamic (`dynamic=True`) PackedDiT graph for causal hops plus one for full-context leftovers. Non-CUDA and non-ragged PackedDiT execution remains eager, and buffered Flow CUDA Graph routing is unchanged. The first startup with an empty Inductor cache takes about 100 s; keep the cache so you do not pay the compile cost again (`~/.cache/torch/inductor`, or `TORCHINDUCTOR_CACHE_DIR`).
 
 ```bash
 sgl-omni serve \

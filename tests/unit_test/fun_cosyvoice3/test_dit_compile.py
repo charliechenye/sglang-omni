@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 import sglang_omni.models.fun_cosyvoice3.stages as stages
+from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedDiT
 
 
 class FakeDiTEstimator(torch.nn.Module):
@@ -26,6 +27,15 @@ class FakeFlow(torch.nn.Module):
 
 class NonModuleEstimator:
     pass
+
+
+class _RecordingPackedDiT(PackedDiT):
+    def __init__(self) -> None:
+        self.dtypes: list[torch.dtype | None] = []
+
+    def compile(self, dtype: torch.dtype | None) -> bool:
+        self.dtypes.append(dtype)
+        return False
 
 
 def test_compile_dit_backbone_compiles_estimator_forward_dynamic(monkeypatch) -> None:
@@ -92,6 +102,22 @@ def test_compile_dit_backbone_skips_non_module_estimator(monkeypatch) -> None:
     monkeypatch.setattr(torch, "compile", fail_compile)
 
     assert stages.compile_dit_backbone(flow) is False
+
+
+def test_compile_dit_backbone_checks_packed_dit_eligibility(monkeypatch) -> None:
+    estimator = _FakeDiTEstimator()
+    flow = _FakeFlow(estimator)
+    packed_estimator = _RecordingPackedDiT()
+    flow.packed_estimator = packed_estimator
+
+    def _fake_compile(fn, dynamic=None):
+        del dynamic
+        return fn
+
+    monkeypatch.setattr(torch, "compile", _fake_compile)
+
+    assert stages.compile_dit_backbone(flow, warmup_mel_frames=16) is True
+    assert packed_estimator.dtypes == [None]
 
 
 def test_compile_dit_backbone_falls_back_to_eager_on_compile_failure(
