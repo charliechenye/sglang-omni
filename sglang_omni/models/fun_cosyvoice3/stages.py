@@ -2260,12 +2260,8 @@ def create_vocoder_executor(
     else:
         pass
 
-    dit_compile_enabled = False
-    if enable_dit_torch_compile:
-        dit_compile_enabled = compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
-    else:
-        pass
-
+    capture_shapes: tuple[tuple[int, int], ...] | None = None
+    runner: FlowCudaGraphRunner | None = None
     if enable_flow_cuda_graph:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
             flow_cuda_graph_capture_shapes,
@@ -2275,8 +2271,6 @@ def create_vocoder_executor(
             device=device_obj,
             autocast_dtype=autocast_dtype,
         )
-        runner.capture(capture_shapes)
-        flow.attach_cuda_graph_runner(runner)
     else:
         pass
 
@@ -2299,14 +2293,36 @@ def create_vocoder_executor(
         token_hop_len=token_hop_len,
         token_max_hop_len=token_max_hop_len,
         disable_hop_growth=disable_hop_growth,
-        enable_packed_dit_torch_compile=dit_compile_enabled,
+        enable_packed_dit_torch_compile=enable_dit_torch_compile,
     )
     scheduler.warmup_now()
+
+    def deferred_vocoder_setup() -> None:
+        dit_compile_enabled = False
+        if enable_dit_torch_compile:
+            dit_compile_enabled = compile_dit_backbone(
+                flow, autocast_dtype=autocast_dtype
+            )
+        else:
+            pass
+        if runner is not None:
+            assert capture_shapes is not None
+            runner.capture(capture_shapes)
+            flow.attach_cuda_graph_runner(runner)
+        else:
+            pass
+        if dit_compile_enabled:
+            scheduler.warmup_packed_dit_compile()
+        else:
+            pass
+        scheduler.enable_packed_dit_torch_compile = dit_compile_enabled
+
     from sglang_omni.models.fun_cosyvoice3.engine_builder import (
-        set_vocoder_before_memory_pool_warmup,
+        set_vocoder_before_memory_pool_setup,
     )
 
-    set_vocoder_before_memory_pool_warmup(
-        scheduler.warmup_packed_dit_compile if dit_compile_enabled else None
-    )
+    if enable_dit_torch_compile or enable_flow_cuda_graph:
+        set_vocoder_before_memory_pool_setup(deferred_vocoder_setup)
+    else:
+        set_vocoder_before_memory_pool_setup(None)
     return scheduler

@@ -24,22 +24,24 @@ from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoi
 
 logger = logging.getLogger(__name__)
 
-VOCODER_BEFORE_MEMORY_POOL_WARMUP: Callable[[], None] | None = None
+VOCODER_BEFORE_MEMORY_POOL_SETUP: Callable[[], None] | None = None
 
 
-def set_vocoder_before_memory_pool_warmup(
-    warmup: Callable[[], None] | None,
+def set_vocoder_before_memory_pool_setup(
+    setup: Callable[[], None] | None,
 ) -> None:
-    global VOCODER_BEFORE_MEMORY_POOL_WARMUP
-    VOCODER_BEFORE_MEMORY_POOL_WARMUP = warmup
+    global VOCODER_BEFORE_MEMORY_POOL_SETUP
+    VOCODER_BEFORE_MEMORY_POOL_SETUP = setup
 
 
-def run_vocoder_before_memory_pool_warmup() -> None:
-    global VOCODER_BEFORE_MEMORY_POOL_WARMUP
-    warmup = VOCODER_BEFORE_MEMORY_POOL_WARMUP
-    VOCODER_BEFORE_MEMORY_POOL_WARMUP = None
-    if warmup is not None:
-        warmup()
+def run_vocoder_before_memory_pool_setup() -> None:
+    global VOCODER_BEFORE_MEMORY_POOL_SETUP
+    setup = VOCODER_BEFORE_MEMORY_POOL_SETUP
+    VOCODER_BEFORE_MEMORY_POOL_SETUP = None
+    if setup is not None:
+        setup()
+    else:
+        pass
 
 
 class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
@@ -209,7 +211,7 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
         # note(chenye): SGLang ModelRunner has already completed load time
         # process-global setup (including torch.set_num_threads) here, while
         # alloc_memory_pool() and generation CUDA Graph capture have not run yet.
-        run_vocoder_before_memory_pool_warmup()
+        run_vocoder_before_memory_pool_setup()
 
     def setup_model(
         self,
