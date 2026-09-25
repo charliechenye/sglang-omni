@@ -140,7 +140,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         # note(ratish): one hop and one final through Flow and HiFT before the
         # stage publishes readiness, so the first request pays neither the
         # attention kernel load nor the f0 cast.
-        item = self._make_warmup_flow_input()
+        item = self.make_warmup_flow_input()
         # note(ratish): under the vocoder's stream, so the warmup and not the
         # first request builds that stream's memory pool and cuBLAS workspaces,
         # which PyTorch keeps per stream.
@@ -158,40 +158,35 @@ class FunCosyVoice3StreamingVocoderScheduler(
 
     def warmup_packed_dit_compile(self) -> None:
         """Materialize PackedDiT after SGLang initialization and before KV sizing."""
-        if not self.enable_packed_dit_torch_compile:
+        if not self.enable_packed_dit_torch_compile or not isinstance(
+            self.vocoder.flow.packed_estimator, PackedDiT
+        ):
             return
         else:
-            pass
-        packed_estimator = self.vocoder.flow.packed_estimator
-        if not isinstance(packed_estimator, PackedDiT):
-            return
-        else:
-            pass
-        try:
-            if not packed_estimator.compile(self.vocoder.autocast_dtype):
-                return
-            else:
-                pass
-            item = self._make_warmup_flow_input()
-            started = time.monotonic()
-            with self.vocoder.stream_context:
-                self.vocoder.hop_batch([item])
-                self.vocoder.leftover_batch([item])
-            logger.info(
-                f"Fun-CosyVoice3 PackedDiT causal/full compile warmup completed "
-                f"before SGLang KV sizing with torch_num_threads="
-                f"{torch.get_num_threads()} ({time.monotonic() - started:.1f} s)"
-            )
-        except Exception as exc:
-            packed_estimator.disable_compile()
-            logger.warning(
-                f"Fun-CosyVoice3 PackedDiT causal/full compile warmup failed "
-                f"({type(exc).__name__}: {exc}); falling back to eager PackedDiT"
-            )
+            try:
+                if not self.vocoder.flow.packed_estimator.compile(
+                    self.vocoder.autocast_dtype
+                ):
+                    return
+                else:
+                    item = self.make_warmup_flow_input()
+                    started = time.monotonic()
+                    with self.vocoder.stream_context:
+                        self.vocoder.hop_batch([item])
+                        self.vocoder.leftover_batch([item])
+                    logger.info(
+                        f"Fun-CosyVoice3 PackedDiT causal/full compile warmup completed "
+                        f"before SGLang KV sizing with torch_num_threads="
+                        f"{torch.get_num_threads()} ({time.monotonic() - started:.1f} s)"
+                    )
+            except Exception as exc:
+                self.vocoder.flow.packed_estimator.disable_compile()
+                logger.warning(
+                    f"Fun-CosyVoice3 PackedDiT causal/full compile warmup failed "
+                    f"({type(exc).__name__}: {exc}); falling back to eager PackedDiT"
+                )
 
-    def _make_warmup_flow_input(  # noqa: leading-underscore
-        self,
-    ) -> FlowBatchInput:
+    def make_warmup_flow_input(self) -> FlowBatchInput:
         flow = self.vocoder.flow
         return FlowBatchInput(
             token=torch.zeros(
