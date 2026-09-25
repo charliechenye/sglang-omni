@@ -2297,7 +2297,7 @@ def create_vocoder_executor(
     )
     scheduler.warmup_now()
 
-    def deferred_vocoder_setup() -> None:
+    def deferred_torch_compile_setup() -> None:
         dit_compile_enabled = False
         if enable_dit_torch_compile:
             dit_compile_enabled = compile_dit_backbone(
@@ -2312,11 +2312,11 @@ def create_vocoder_executor(
         scheduler.enable_packed_dit_torch_compile = dit_compile_enabled
 
     from sglang_omni.models.fun_cosyvoice3.engine_builder import (
-        set_vocoder_before_memory_pool_setup,
+        set_vocoder_torch_compile_setup,
     )
 
     if enable_dit_torch_compile:
-        set_vocoder_before_memory_pool_setup(deferred_vocoder_setup)
+        set_vocoder_torch_compile_setup(deferred_torch_compile_setup)
     else:
-        set_vocoder_before_memory_pool_setup(None)
+        set_vocoder_torch_compile_setup(None)
     return scheduler

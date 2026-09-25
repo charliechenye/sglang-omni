@@ -24,20 +24,20 @@ from sglang_omni.utils.checkpoint import resolve_checkpoint as _resolve_checkpoi
 
 logger = logging.getLogger(__name__)
 
-VOCODER_BEFORE_MEMORY_POOL_SETUP: Callable[[], None] | None = None
+VOCODER_TORCH_COMPILE_SETUP: Callable[[], None] | None = None
 
 
-def set_vocoder_before_memory_pool_setup(
+def set_vocoder_torch_compile_setup(
     setup: Callable[[], None] | None,
 ) -> None:
-    global VOCODER_BEFORE_MEMORY_POOL_SETUP
-    VOCODER_BEFORE_MEMORY_POOL_SETUP = setup
+    global VOCODER_TORCH_COMPILE_SETUP
+    VOCODER_TORCH_COMPILE_SETUP = setup
 
 
-def run_vocoder_before_memory_pool_setup() -> None:
-    global VOCODER_BEFORE_MEMORY_POOL_SETUP
-    setup = VOCODER_BEFORE_MEMORY_POOL_SETUP
-    VOCODER_BEFORE_MEMORY_POOL_SETUP = None
+def run_vocoder_torch_compile_setup() -> None:
+    global VOCODER_TORCH_COMPILE_SETUP
+    setup = VOCODER_TORCH_COMPILE_SETUP
+    VOCODER_TORCH_COMPILE_SETUP = None
     if setup is not None:
         setup()
     else:
@@ -208,10 +208,6 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
             use_mlx=use_mlx(),
             model_revision=root,
         )
-        # note(chenye): SGLang ModelRunner has already completed load time
-        # process-global setup (including torch.set_num_threads) here, while
-        # alloc_memory_pool() and generation CUDA Graph capture have not run yet.
-        run_vocoder_before_memory_pool_setup()
 
     def setup_model(
         self,
@@ -223,6 +219,10 @@ class FunCosyVoice3EngineBuilder(TtsEngineBuilder):
         server_args: Any,
     ) -> None:
         del model_worker, checkpoint_dir, device, gpu_id, server_args
+
+    def compile_model(self, model: Any, server_args: Any) -> None:
+        del model, server_args
+        run_vocoder_torch_compile_setup()
 
     def make_model_runner(self, model_worker: Any, output_proc: Any) -> Any:
         from sglang.srt.hardware_backend.mlx.runtime import use_mlx

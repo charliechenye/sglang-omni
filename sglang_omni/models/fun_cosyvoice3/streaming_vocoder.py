@@ -157,7 +157,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         )
 
     def warmup_packed_dit_compile(self) -> None:
-        """Materialize PackedDiT after SGLang initialization and before KV sizing."""
+        """Materialize PackedDiT contracts during the SGLang engine compile phase."""
         if not self.enable_packed_dit_torch_compile or not isinstance(
             self.vocoder.flow.packed_estimator, PackedDiT
         ):
@@ -176,7 +176,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
                         self.vocoder.leftover_batch([item])
                     logger.info(
                         f"Fun-CosyVoice3 PackedDiT causal/full compile warmup completed "
-                        f"before SGLang KV sizing with torch_num_threads="
+                        f"during SGLang engine compile with torch_num_threads="
                         f"{torch.get_num_threads()} ({time.monotonic() - started:.1f} s)"
                     )
             except Exception as exc:

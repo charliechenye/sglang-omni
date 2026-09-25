@@ -145,7 +145,7 @@ def _packed_compile_scheduler(
     return scheduler, hop_items, leftover_items
 
 
-def test_before_memory_pool_warmup_materializes_packed_dit_serving_variants() -> None:
+def test_packed_dit_compile_warmup_materializes_serving_variants() -> None:
     packed_estimator = _RecordingPackedDiT()
     scheduler, hop_items, leftover_items = _packed_compile_scheduler(packed_estimator)
 
@@ -156,7 +156,7 @@ def test_before_memory_pool_warmup_materializes_packed_dit_serving_variants() ->
     assert hop_items[0][0] is leftover_items[0][0]
 
 
-def test_before_memory_pool_warmup_skips_packed_dit_when_disabled() -> None:
+def test_packed_dit_compile_warmup_skips_when_disabled() -> None:
     packed_estimator = _RecordingPackedDiT()
     scheduler, hop_items, leftover_items = _packed_compile_scheduler(
         packed_estimator,
@@ -169,7 +169,7 @@ def test_before_memory_pool_warmup_skips_packed_dit_when_disabled() -> None:
     assert hop_items == leftover_items == []
 
 
-def test_before_memory_pool_warmup_skips_materialization_when_compile_returns_false() -> (
+def test_packed_dit_compile_warmup_skips_materialization_when_compile_returns_false() -> (
     None
 ):
     packed_estimator = _RecordingPackedDiT(compile_result=False)
@@ -182,7 +182,7 @@ def test_before_memory_pool_warmup_skips_materialization_when_compile_returns_fa
 
 
 @pytest.mark.parametrize("failure", ["compile", "hop", "leftover"])
-def test_before_memory_pool_warmup_falls_back_to_eager_on_packed_failure(
+def test_packed_dit_compile_warmup_falls_back_to_eager_on_failure(
     failure: str,
 ) -> None:
     packed_estimator = _RecordingPackedDiT(failure=failure)
@@ -1088,7 +1088,7 @@ def test_create_vocoder_executor_skips_dit_compile_by_default(monkeypatch) -> No
     )
     assert compiled == []
     assert scheduler.enable_packed_dit_torch_compile is True
-    engine_builder.run_vocoder_before_memory_pool_setup()
+    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
     assert len(compiled) == 1
     assert scheduler.enable_packed_dit_torch_compile is False
 
@@ -1099,7 +1099,7 @@ def test_create_vocoder_executor_skips_dit_compile_by_default(monkeypatch) -> No
     )
     assert compiled == []
     assert scheduler.enable_packed_dit_torch_compile is True
-    engine_builder.run_vocoder_before_memory_pool_setup()
+    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
     assert len(compiled) == 1
     assert scheduler.enable_packed_dit_torch_compile is False
 
@@ -1166,7 +1166,7 @@ def test_create_vocoder_executor_captures_graph_before_deferred_compile(
         "scheduler_warmup",
     ]
 
-    engine_builder.run_vocoder_before_memory_pool_setup()
+    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
     assert events == [
         "runner_create",
         "graph_capture",
@@ -1176,7 +1176,7 @@ def test_create_vocoder_executor_captures_graph_before_deferred_compile(
         "packed_warmup",
     ]
 
-    engine_builder.run_vocoder_before_memory_pool_setup()
+    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
     assert events == [
         "runner_create",
         "graph_capture",
@@ -1228,7 +1228,7 @@ def test_create_vocoder_executor_defers_native_compile_when_graph_disabled(
     )
 
     assert events == ["scheduler_warmup"]
-    engine_builder.run_vocoder_before_memory_pool_setup()
+    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
     assert events == ["scheduler_warmup", "native_compile", "packed_warmup"]
     assert fake_flow.attached_runner is None
 
@@ -1272,7 +1272,7 @@ def test_deferred_native_compile_false_skips_packed_warmup(monkeypatch) -> None:
         enable_dit_torch_compile=True,
         enable_flow_cuda_graph=False,
     )
-    engine_builder.run_vocoder_before_memory_pool_setup()
+    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
 
     assert events == ["scheduler_warmup", "native_compile"]
 
@@ -1336,7 +1336,7 @@ def test_create_vocoder_executor_captures_graph_without_native_compile(
         "scheduler_warmup",
     ]
 
-    engine_builder.run_vocoder_before_memory_pool_setup()
+    engine_builder.FunCosyVoice3EngineBuilder().compile_model(None, None)
     assert events == [
         "runner_create",
         "graph_capture",
@@ -1443,12 +1443,14 @@ def test_preprocessing_executor_rejects_non_positive_concurrency() -> None:
         stages.create_preprocessing_executor("model", max_concurrency=0)
 
 
-def test_engine_builder_runs_vocoder_warmup_before_memory_pool(monkeypatch) -> None:
+def test_engine_builder_consumes_vocoder_compile_at_compile_model(
+    monkeypatch,
+) -> None:
     from sglang_omni.models.fun_cosyvoice3 import engine_builder, request_builders
 
     events: list[str] = []
-    engine_builder.set_vocoder_before_memory_pool_setup(
-        lambda: events.append("vocoder_warmup")
+    engine_builder.set_vocoder_torch_compile_setup(
+        lambda: events.append("vocoder_compile")
     )
 
     class _StubModel:
@@ -1480,9 +1482,11 @@ def test_engine_builder_runs_vocoder_warmup_before_memory_pool(monkeypatch) -> N
         server_args=object(),
     )
 
-    assert events == ["context", "vocoder_warmup"]
-    engine_builder.run_vocoder_before_memory_pool_setup()
-    assert events == ["context", "vocoder_warmup"]
+    assert events == ["context"]
+    builder.compile_model(None, None)
+    assert events == ["context", "vocoder_compile"]
+    builder.compile_model(None, None)
+    assert events == ["context", "vocoder_compile"]
 
 
 def test_onnx_intra_op_threads_reaches_both_encoders(monkeypatch) -> None:
