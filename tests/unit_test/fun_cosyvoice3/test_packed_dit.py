@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang_omni.models.fun_cosyvoice3.packed_dit as packed_dit
 from sglang_omni.models.fun_cosyvoice3.packed_dit import (
     PackedDiT,
     RaggedRowAttention,
@@ -216,6 +217,70 @@ def test_packed_solve_matches_the_padded_solve_per_row(streaming: bool) -> None:
 
     for actual, reference in zip(valid(out), valid(expected), strict=True):
         torch.testing.assert_close(actual, reference, rtol=1e-9, atol=1e-9)
+
+
+def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
+    estimator = PackedDiT(_tiny_dit(), device=CPU)
+    compile_calls: list[dict[str, object]] = []
+
+    def fake_compile(fn, **kwargs):
+        compile_calls.append(kwargs)
+        return fn
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    assert not estimator.compile(torch.float32)
+
+    estimator.is_ragged = True
+    assert not estimator.compile(torch.float32)
+    assert estimator.compile(torch.bfloat16)
+    assert len(compile_calls) == 2
+    assert all(
+        call
+        == {
+            "backend": "inductor",
+            "dynamic": True,
+            "fullgraph": True,
+            "options": {"emulate_precision_casts": True},
+        }
+        for call in compile_calls
+    )
+
+    marked: list[tuple[torch.Size, int | tuple[int, ...]]] = []
+    monkeypatch.setattr(
+        packed_dit.dynamo,
+        "mark_dynamic",
+        lambda tensor, dims: marked.append((tensor.shape, dims)),
+    )
+    estimator.row_attention(
+        pack_rows(LENGTHS, CPU), streaming=True, dtype=torch.bfloat16
+    )
+    assert [dims for _, dims in marked] == [
+        (0, 1),
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
+
+
+@pytest.mark.parametrize(("streaming", "contract"), [(True, "causal"), (False, "full")])
+def test_packed_forward_for_mode_selects_the_compiled_contract(
+    streaming: bool, contract: str
+) -> None:
+    estimator = PackedDiT(_tiny_dit(), device=CPU)
+    eager = estimator.forward
+    causal = object()
+    full = object()
+
+    estimator.compiled_causal_forward = causal
+    estimator.compiled_full_forward = full
+    ragged = object.__new__(RaggedRowAttention)
+    padded = object.__new__(RowAttention)
+
+    selected = estimator.forward_for_mode(streaming, attention=ragged)
+    assert selected is (causal if contract == "causal" else full)
+    assert estimator.forward_for_mode(streaming, attention=padded) == eager
 
 
 def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
