@@ -30,7 +30,7 @@ class NonModuleEstimator:
     pass
 
 
-class _RecordingPackedDiT(PackedDiT):
+class RecordingPackedDiT(PackedDiT):
     def __init__(self) -> None:
         self.dtypes: list[torch.dtype | None] = []
 
@@ -170,7 +170,7 @@ def test_compile_dit_backbone_rejects_non_module_estimator(monkeypatch) -> None:
 def test_compile_dit_backbone_does_not_compile_packed_dit(monkeypatch) -> None:
     estimator = FakeDiTEstimator()
     flow = FakeFlow(estimator)
-    packed_estimator = _RecordingPackedDiT()
+    packed_estimator = RecordingPackedDiT()
     flow.packed_estimator = packed_estimator
 
     def _fake_compile(fn, dynamic=None):

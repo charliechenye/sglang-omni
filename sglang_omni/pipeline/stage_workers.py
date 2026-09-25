@@ -22,11 +22,10 @@ from sglang_omni.config.runtime import (
 from sglang_omni.pipeline.control_plane import StageControlPlane
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher
 from sglang_omni.pipeline.stage.input import AggregatedInput, DirectInput
-from sglang_omni.pipeline.stage.runtime import Stage
+from sglang_omni.pipeline.stage.runtime import Stage, StartupFinalizableScheduler
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.tp_control import TPFollowerControlPlane, TPLeaderFanout
 from sglang_omni.platforms import current_platform, get_platform_spec
-from sglang_omni.scheduling.lifecycle import StartupFinalizable
 from sglang_omni.utils.gpu_compat import (
     apply_gpu_compat_env_defaults,
     get_gpu_compat_env_defaults,
@@ -566,7 +565,7 @@ def run_process(
         local_dispatcher.register_many(stages)
         for stage in stages:
             scheduler = stage.scheduler
-            if isinstance(scheduler, StartupFinalizable):
+            if isinstance(scheduler, StartupFinalizableScheduler):
                 scheduler.finalize_startup()
             else:
                 pass

@@ -7,11 +7,11 @@ import logging
 import pytest
 
 from sglang_omni.pipeline import stage_workers
+from sglang_omni.pipeline.stage.runtime import StartupFinalizableScheduler
 from sglang_omni.pipeline.stage_workers import StageLaunchConfig, StageWorkerProcessSpec
-from sglang_omni.scheduling.lifecycle import StartupFinalizable
 
 
-class _ReadyEvent:
+class ReadyEvent:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
@@ -19,34 +19,36 @@ class _ReadyEvent:
         self.events.append("ready")
 
 
-class _FinalizableScheduler(StartupFinalizable):
-    def __init__(self, stage_name: str, events: list[str]) -> None:
-        self.stage_name = stage_name
+class FinalizableScheduler(StartupFinalizableScheduler):
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        name: str = "scheduler",
+        fail: bool = False,
+    ) -> None:
         self.events = events
+        self.name = name
+        self.fail = fail
 
     def finalize_startup(self) -> None:
-        self.events.append(f"finalize:{self.stage_name}")
+        self.events.append(f"finalize:{self.name}")
+        if self.fail:
+            raise RuntimeError("startup finalization failed")
+        else:
+            pass
 
 
-class _CoincidentalScheduler:
-    def __init__(self, stage_name: str, events: list[str]) -> None:
-        self.stage_name = stage_name
-        self.events = events
-
+class CoincidentalScheduler:
     def finalize_startup(self) -> None:
-        raise AssertionError(f"unexpected finalization: {self.stage_name}")
+        raise AssertionError("non-participating scheduler must not be finalized")
 
 
-class _FailingScheduler(StartupFinalizable):
-    def finalize_startup(self) -> None:
-        raise RuntimeError("startup finalization failed")
-
-
-class _FakeStage:
+class FakeStage:
     def __init__(
         self,
         stage_name: str,
-        scheduler: StartupFinalizable | _CoincidentalScheduler,
+        scheduler: StartupFinalizableScheduler | CoincidentalScheduler,
         events: list[str],
     ) -> None:
         self.name = stage_name
@@ -67,55 +69,65 @@ class _FakeStage:
         self.running = False
 
 
-class _RecordingDispatcher:
+class RecordingDispatcher:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
-    def register_many(self, stages: list[_FakeStage]) -> None:
+    def register_many(self, stages: list[FakeStage]) -> None:
         del stages
         self.events.append("register")
 
 
-def test_run_process_finalizes_only_explicit_schedulers_before_start(
+def run_worker(
     monkeypatch: pytest.MonkeyPatch,
+    stage_schedulers: dict[str, StartupFinalizableScheduler | CoincidentalScheduler],
+    events: list[str],
+    stage_names: list[str],
 ) -> None:
-    events: list[str] = []
-    schedulers = {
-        "first": _FinalizableScheduler("first", events),
-        "second": _CoincidentalScheduler("second", events),
-    }
-
     def fake_construct_stage(
         stage_spec: StageLaunchConfig,
         log: logging.Logger,
         *,
-        local_dispatcher: _RecordingDispatcher,
-    ) -> _FakeStage:
+        local_dispatcher: RecordingDispatcher,
+    ) -> FakeStage:
         del log, local_dispatcher
         events.append(f"construct:{stage_spec.stage_name}")
-        return _FakeStage(
+        return FakeStage(
             stage_spec.stage_name,
-            schedulers[stage_spec.stage_name],
+            stage_schedulers[stage_spec.stage_name],
             events,
         )
 
     monkeypatch.setattr(
         stage_workers,
         "LocalStageDispatcher",
-        lambda: _RecordingDispatcher(events),
+        lambda: RecordingDispatcher(events),
     )
     monkeypatch.setattr(stage_workers, "construct_stage", fake_construct_stage)
 
     stage_workers.run_process(
         StageWorkerProcessSpec(
             process_name="worker",
-            stage_specs=[
-                StageLaunchConfig(stage_name="first"),
-                StageLaunchConfig(stage_name="second"),
-            ],
+            stage_specs=[StageLaunchConfig(stage_name=name) for name in stage_names],
         ),
-        _ReadyEvent(events),
+        ReadyEvent(events),
         logging.getLogger(__name__),
+    )
+
+
+def test_run_process_finalizes_explicit_schedulers_before_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    run_worker(
+        monkeypatch,
+        {
+            "first": FinalizableScheduler(events, name="first"),
+            "second": CoincidentalScheduler(),
+        },
+        events,
+        ["first", "second"],
     )
 
     assert events == [
@@ -131,36 +143,17 @@ def test_run_process_finalizes_only_explicit_schedulers_before_start(
     ]
 
 
-def test_run_process_propagates_finalizer_failure_before_start(
+def test_run_process_stops_startup_when_finalization_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     events: list[str] = []
 
-    def fake_construct_stage(
-        stage_spec: StageLaunchConfig,
-        log: logging.Logger,
-        *,
-        local_dispatcher: _RecordingDispatcher,
-    ) -> _FakeStage:
-        del log, local_dispatcher
-        events.append(f"construct:{stage_spec.stage_name}")
-        return _FakeStage(stage_spec.stage_name, _FailingScheduler(), events)
-
-    monkeypatch.setattr(
-        stage_workers,
-        "LocalStageDispatcher",
-        lambda: _RecordingDispatcher(events),
-    )
-    monkeypatch.setattr(stage_workers, "construct_stage", fake_construct_stage)
-
     with pytest.raises(RuntimeError, match="startup finalization failed"):
-        stage_workers.run_process(
-            StageWorkerProcessSpec(
-                process_name="worker",
-                stage_specs=[StageLaunchConfig(stage_name="first")],
-            ),
-            _ReadyEvent(events),
-            logging.getLogger(__name__),
+        run_worker(
+            monkeypatch,
+            {"first": FinalizableScheduler(events, fail=True)},
+            events,
+            ["first"],
         )
 
     assert events == ["construct:first", "register", "stop:first"]

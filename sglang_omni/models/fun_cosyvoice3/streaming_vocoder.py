@@ -37,8 +37,8 @@ from sglang_omni.models.fun_cosyvoice3.streaming import (
     next_stream_hop_len,
     pad_flow_prompt_to_hop,
 )
+from sglang_omni.pipeline.stage.runtime import StartupFinalizableScheduler
 from sglang_omni.proto import StagePayload
-from sglang_omni.scheduling.lifecycle import StartupFinalizable
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.pipeline_state import build_usage
 from sglang_omni.scheduling.streaming_vocoder import StreamingVocoderBase
@@ -79,7 +79,8 @@ class CosyVoice3StreamState:
 
 
 class FunCosyVoice3StreamingVocoderScheduler(
-    StreamingVocoderBase[CosyVoice3StreamState, NextDecode], StartupFinalizable
+    StreamingVocoderBase[CosyVoice3StreamState, NextDecode],
+    StartupFinalizableScheduler,
 ):
     """Decode CosyVoice3 speech tokens incrementally through Flow + HiFT."""
 

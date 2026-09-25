@@ -15,6 +15,7 @@ import logging
 import os
 import queue as _queue_mod
 import threading
+from abc import ABC, abstractmethod
 from contextlib import suppress
 from dataclasses import replace
 from typing import Any, Awaitable, Callable, Literal
@@ -67,6 +68,15 @@ GetStreamDoneTargetsFn = Callable[[str, Any], str | list[str] | None]
 
 def error_text(exc: BaseException) -> str:
     return str(exc) or type(exc).__name__
+
+
+class StartupFinalizableScheduler(ABC):
+    """Scheduler with synchronous startup work required before its process starts."""
+
+    @abstractmethod
+    def finalize_startup(self) -> None:
+        """Finish startup work after process construction and before Stage.start()."""
+        raise NotImplementedError
 
 
 class Stage:

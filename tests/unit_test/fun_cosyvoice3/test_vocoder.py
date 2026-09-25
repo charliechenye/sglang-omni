@@ -58,7 +58,7 @@ class RunnableFakeFlow(_PackedFlow):
         self.spk_embed_affine_layer = torch.nn.Linear(192, 80)
 
 
-class _GraphRunnableFakeFlow(_RunnableFakeFlow):
+class GraphRunnableFakeFlow(RunnableFakeFlow):
     def __init__(self, events: list[str] | None = None) -> None:
         super().__init__()
         self.events = events
@@ -72,7 +72,7 @@ class _GraphRunnableFakeFlow(_RunnableFakeFlow):
             pass
 
 
-class _RecordingPackedDiT(PackedDiT):
+class RecordingPackedDiT(PackedDiT):
     def __init__(
         self,
         *,
@@ -98,7 +98,7 @@ class _RecordingPackedDiT(PackedDiT):
         self.disable_calls += 1
 
 
-def _packed_compile_scheduler(
+def packed_compile_scheduler(
     packed_estimator: PackedDiT | None,
     *,
     failure: str | None = None,
@@ -144,8 +144,8 @@ def _packed_compile_scheduler(
 
 
 def test_packed_dit_compile_warmup_materializes_serving_variants() -> None:
-    packed_estimator = _RecordingPackedDiT()
-    scheduler, hop_items, leftover_items = _packed_compile_scheduler(packed_estimator)
+    packed_estimator = RecordingPackedDiT()
+    scheduler, hop_items, leftover_items = packed_compile_scheduler(packed_estimator)
 
     scheduler.warmup_packed_dit_compile()
 
@@ -155,7 +155,7 @@ def test_packed_dit_compile_warmup_materializes_serving_variants() -> None:
 
 
 def test_packed_dit_compile_warmup_rejects_non_packed_estimator() -> None:
-    scheduler, hop_items, leftover_items = _packed_compile_scheduler(None)
+    scheduler, hop_items, leftover_items = packed_compile_scheduler(None)
 
     with pytest.raises(RuntimeError, match="requires a PackedDiT estimator"):
         scheduler.warmup_packed_dit_compile()
@@ -166,8 +166,8 @@ def test_packed_dit_compile_warmup_rejects_non_packed_estimator() -> None:
 def test_packed_dit_compile_warmup_skips_materialization_when_compile_returns_false() -> (
     None
 ):
-    packed_estimator = _RecordingPackedDiT(compile_result=False)
-    scheduler, hop_items, leftover_items = _packed_compile_scheduler(packed_estimator)
+    packed_estimator = RecordingPackedDiT(compile_result=False)
+    scheduler, hop_items, leftover_items = packed_compile_scheduler(packed_estimator)
 
     scheduler.warmup_packed_dit_compile()
 
@@ -179,8 +179,8 @@ def test_packed_dit_compile_warmup_skips_materialization_when_compile_returns_fa
 def test_packed_dit_compile_warmup_raises_and_cleans_up_on_failure(
     failure: str,
 ) -> None:
-    packed_estimator = _RecordingPackedDiT(failure=failure)
-    scheduler, _, _ = _packed_compile_scheduler(
+    packed_estimator = RecordingPackedDiT(failure=failure)
+    scheduler, _, _ = packed_compile_scheduler(
         packed_estimator,
         failure=failure,
     )
@@ -1042,7 +1042,7 @@ def test_create_vocoder_executor_warms_up_before_return(monkeypatch) -> None:
     assert warmup_schedulers == [scheduler]
 
 
-def _executor_compiles(
+def executor_compiles(
     monkeypatch,
     **kwargs,
 ) -> tuple[list[torch.nn.Module], FunCosyVoice3StreamingVocoderScheduler]:
@@ -1073,7 +1073,7 @@ def _executor_compiles(
 def test_create_vocoder_executor_finalizes_dit_compile_at_startup(
     monkeypatch,
 ) -> None:
-    compiled, scheduler = _executor_compiles(monkeypatch)
+    compiled, scheduler = executor_compiles(monkeypatch)
     assert compiled == []
     scheduler.finalize_startup()
     assert compiled == []
@@ -1083,7 +1083,7 @@ def test_create_vocoder_executor_finalizes_dit_compile_at_startup(
         "warmup_packed_dit_compile",
         lambda scheduler: None,
     )
-    compiled, scheduler = _executor_compiles(
+    compiled, scheduler = executor_compiles(
         monkeypatch,
         enable_dit_torch_compile=True,
     )
@@ -1096,7 +1096,7 @@ def test_create_vocoder_executor_captures_graph_before_startup_finalization(
     monkeypatch,
 ) -> None:
     events: list[str] = []
-    fake_flow = _GraphRunnableFakeFlow(events)
+    fake_flow = GraphRunnableFakeFlow(events)
     monkeypatch.setattr(
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cuda")
     )
@@ -1106,7 +1106,7 @@ def test_create_vocoder_executor_captures_graph_before_startup_finalization(
     monkeypatch.setattr(
         stages,
         "load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, device, fp16, **kwargs: (fake_flow, _FakeHiFT()),
+        lambda checkpoint_dir, device, fp16, **kwargs: (fake_flow, FakeHiFT()),
     )
 
     def fake_compile(flow, autocast_dtype):
@@ -1165,7 +1165,7 @@ def test_create_vocoder_executor_defers_native_compile_until_startup_finalizatio
     monkeypatch,
 ) -> None:
     events: list[str] = []
-    fake_flow = _GraphRunnableFakeFlow(events)
+    fake_flow = GraphRunnableFakeFlow(events)
     monkeypatch.setattr(
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
     )
@@ -1174,7 +1174,7 @@ def test_create_vocoder_executor_defers_native_compile_until_startup_finalizatio
     monkeypatch.setattr(
         stages,
         "load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, device, fp16, **kwargs: (fake_flow, _FakeHiFT()),
+        lambda checkpoint_dir, device, fp16, **kwargs: (fake_flow, FakeHiFT()),
     )
     monkeypatch.setattr(
         streaming_vocoder,
@@ -1209,7 +1209,7 @@ def test_create_vocoder_executor_captures_graph_without_native_compile(
     monkeypatch,
 ) -> None:
     events: list[str] = []
-    fake_flow = _GraphRunnableFakeFlow(events)
+    fake_flow = GraphRunnableFakeFlow(events)
     monkeypatch.setattr(
         stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cuda")
     )
@@ -1219,7 +1219,7 @@ def test_create_vocoder_executor_captures_graph_without_native_compile(
     monkeypatch.setattr(
         stages,
         "load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, device, fp16, **kwargs: (fake_flow, _FakeHiFT()),
+        lambda checkpoint_dir, device, fp16, **kwargs: (fake_flow, FakeHiFT()),
     )
 
     def fail_compile(flow, autocast_dtype):
@@ -1274,7 +1274,7 @@ def test_create_vocoder_executor_captures_graph_without_native_compile(
 def test_create_vocoder_executor_trt_alone_skips_the_default_compile(
     monkeypatch,
 ) -> None:
-    compiled, _scheduler = _executor_compiles(
+    compiled, _scheduler = executor_compiles(
         monkeypatch,
         enable_flow_estimator_trt=True,
     )
