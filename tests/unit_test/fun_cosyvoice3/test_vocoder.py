@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from sglang_omni.client.client import Client
-from sglang_omni.models.fun_cosyvoice3 import stages, streaming_vocoder
+from sglang_omni.models.fun_cosyvoice3 import stages
 from sglang_omni.models.fun_cosyvoice3.config import (
     FUN_COSYVOICE3_DEFAULT_FLOW_CUDA_GRAPH_CAPTURE_SHAPES,
     FunCosyVoice3PipelineConfig,
@@ -1000,13 +1000,13 @@ def create_scheduler_recording_native_compile(
         assert autocast_dtype == torch.bfloat16
         compiled.append(flow)
 
-    monkeypatch.setattr(streaming_vocoder, "compile_dit_backbone", fake_compile)
+    monkeypatch.setattr(stages, "compile_dit_backbone", fake_compile)
     scheduler = stages.create_vocoder_executor("model", device="cpu", **kwargs)
     return compiled, scheduler
 
 
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
-def test_create_vocoder_executor_compile_flag_controls_startup_finalization(
+def test_create_vocoder_executor_compile_flag_controls_startup_materialization(
     monkeypatch,
     enable_dit_torch_compile: bool,
 ) -> None:
@@ -1017,13 +1017,10 @@ def test_create_vocoder_executor_compile_flag_controls_startup_finalization(
         lambda scheduler: packed_warmups.append(scheduler),
     )
 
-    compiled, scheduler = create_scheduler_recording_native_compile(
+    compiled, _scheduler = create_scheduler_recording_native_compile(
         monkeypatch,
         enable_dit_torch_compile=enable_dit_torch_compile,
     )
-    assert scheduler.enable_dit_torch_compile is enable_dit_torch_compile
-    assert compiled == []
-    scheduler.finalize_startup()
     assert len(compiled) == (1 if enable_dit_torch_compile else 0)
     assert len(packed_warmups) == (1 if enable_dit_torch_compile else 0)
 
@@ -1058,15 +1055,13 @@ def prepare_vocoder_startup(
 
     def record_native_compile(flow, autocast_dtype: torch.dtype | None) -> None:
         if allow_native_compile:
-            assert flow.flow is fake_flow
+            assert flow is fake_flow
             assert autocast_dtype == torch.bfloat16
             startup_events.append("native_compile")
         else:
             raise AssertionError("native compile must stay disabled")
 
-    monkeypatch.setattr(
-        streaming_vocoder, "compile_dit_backbone", record_native_compile
-    )
+    monkeypatch.setattr(stages, "compile_dit_backbone", record_native_compile)
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler,
         "warmup_now",
@@ -1098,7 +1093,7 @@ def prepare_vocoder_startup(
 
 
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
-def test_create_vocoder_executor_preserves_graph_before_startup_finalization(
+def test_create_vocoder_executor_compiles_before_flow_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
     enable_dit_torch_compile: bool,
 ) -> None:
@@ -1110,7 +1105,7 @@ def test_create_vocoder_executor_preserves_graph_before_startup_finalization(
         allow_native_compile=enable_dit_torch_compile,
     )
 
-    scheduler = stages.create_vocoder_executor(
+    _scheduler = stages.create_vocoder_executor(
         "model",
         device="cuda",
         enable_dit_torch_compile=enable_dit_torch_compile,
@@ -1118,37 +1113,31 @@ def test_create_vocoder_executor_preserves_graph_before_startup_finalization(
         flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
     )
 
-    assert startup_events.index("graph_capture") < startup_events.index("attach")
-    assert startup_events.index("attach") < startup_events.index("scheduler_warmup")
-    assert startup_events.count("graph_capture") == 1
-    assert "native_compile" not in startup_events
-    assert "packed_warmup" not in startup_events
-
-    scheduler.finalize_startup()
     assert startup_events.count("graph_capture") == 1
     if enable_dit_torch_compile:
-        assert startup_events.index("graph_capture") < startup_events.index(
-            "native_compile"
-        )
         assert startup_events.index("native_compile") < startup_events.index(
+            "graph_capture"
+        )
+        assert startup_events.index("graph_capture") < startup_events.index(
             "packed_warmup"
+        )
+        assert startup_events.index("packed_warmup") < startup_events.index(
+            "scheduler_warmup"
         )
     else:
         assert "native_compile" not in startup_events
         assert "packed_warmup" not in startup_events
+        assert "scheduler_warmup" in startup_events
 
 
 def test_create_vocoder_executor_trt_alone_skips_the_default_compile(
     monkeypatch,
 ) -> None:
-    compiled, scheduler = create_scheduler_recording_native_compile(
+    compiled, _scheduler = create_scheduler_recording_native_compile(
         monkeypatch,
         enable_dit_torch_compile=False,
         enable_flow_estimator_trt=True,
     )
-    assert scheduler.enable_dit_torch_compile is False
-    assert compiled == []
-    scheduler.finalize_startup()
     assert compiled == []
 
 
