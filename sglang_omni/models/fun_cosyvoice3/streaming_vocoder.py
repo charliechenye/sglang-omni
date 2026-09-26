@@ -99,7 +99,7 @@ class FunCosyVoice3StreamingVocoderScheduler(
         token_hop_len: int = TOKEN_HOP_LEN,
         token_max_hop_len: int = TOKEN_MAX_HOP_LEN,
         disable_hop_growth: bool = False,
-        enable_dit_torch_compile: bool = False,
+        enable_dit_torch_compile: bool = True,
     ) -> None:
         hop = int(token_hop_len)
         max_hop = int(token_max_hop_len)

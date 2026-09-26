@@ -1255,11 +1255,10 @@ def compile_dit_backbone(
             "Fun-CosyVoice3 native DiT torch.compile startup warmup failed"
         ) from exc
     logger.info(
-        "Compiled Fun-CosyVoice3 DiT backbone (dynamic=True, autocast_dtype=%s, "
-        "warmup_mel_frames=%d, warmup_steps=%d, streaming=False/True)",
-        autocast_dtype,
-        warmup_mel_frames,
-        warmup_steps,
+        "Compiled Fun-CosyVoice3 DiT backbone "
+        f"(dynamic=True, autocast_dtype={autocast_dtype}, "
+        f"warmup_mel_frames={warmup_mel_frames}, warmup_steps={warmup_steps}, "
+        "streaming=False/True)"
     )
 
 
@@ -2141,7 +2140,7 @@ def create_vocoder_executor(
     flow_batch_admission_frames: int = DEFAULT_FLOW_BATCH_ADMISSION_FRAMES,
     flow_merge_max_gap_frames: int = 384,
     flow_merge_pad_budget_percent: float = 25.0,
-    enable_dit_torch_compile: bool = False,
+    enable_dit_torch_compile: bool = True,
     enable_flow_cuda_graph: bool = True,
     flow_cuda_graph_capture_shapes: tuple[tuple[int, int], ...] | None = None,
     enable_flow_estimator_trt: bool = False,
@@ -2187,12 +2186,7 @@ def create_vocoder_executor(
             )
         else:
             pass
-        if enable_dit_torch_compile:
-            raise ValueError(
-                "enable_dit_torch_compile is unavailable on the native MLX vocoder"
-            )
-        else:
-            pass
+        # The CUDA DiT compile flag defaults on and does not apply here.
         vocoder = CosyVoice3MlxVocoderAdapter(
             load_cosyvoice3_mlx_vocoder(
                 mlx_model_path, revision=mlx_model_revision, expected_dtype=dtype

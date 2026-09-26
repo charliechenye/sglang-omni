@@ -5,10 +5,10 @@ along the sequence for every per token module, attention within each row."""
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from itertools import pairwise
-from typing import Any
+from typing import Protocol
 
 import torch
 import torch._dynamo as dynamo
@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 # note (ratish, chenyang): a row's chunks share a key prefix, so FA3 pages are one frame.
 FA3_PAGE_SIZE = 1
 FA3_DTYPES = (torch.float16, torch.bfloat16)
+PACKED_INDUCTOR_OPTIONS: dict[str, bool] = {"emulate_precision_casts": True}
 
 
 @torch.library.custom_op(
@@ -60,7 +61,6 @@ def fake_packed_fa3(
     cu_seqlens_q: torch.Tensor,
     max_seqlen_q: int,
 ) -> torch.Tensor:
-    del k_cache, v_cache, cache_seqlens, page_table, cu_seqlens_q, max_seqlen_q
     return torch.empty_like(q)
 
 
@@ -99,7 +99,6 @@ def fake_native_layer_norm(
     normalized_size: int,
     eps: float,
 ) -> torch.Tensor:
-    del normalized_size, eps
     return torch.empty_like(x, dtype=torch.float32)
 
 
@@ -271,6 +270,21 @@ class RaggedRowAttention:
 PackedRowAttention = RowAttention | RaggedRowAttention
 
 
+class CompiledPackedForward(Protocol):
+    """One compiled PackedDiT contract: causal or full-context."""
+
+    def __call__(
+        self,
+        x: torch.Tensor,
+        mu: torch.Tensor,
+        spks: torch.Tensor,
+        cond: torch.Tensor,
+        t: torch.Tensor,
+        rows: PackedRows,
+        attention: RaggedRowAttention,
+    ) -> torch.Tensor: ...
+
+
 def mark_packed_compile_metadata(
     rows: PackedRows, attention: RaggedRowAttention
 ) -> None:
@@ -292,8 +306,8 @@ class PackedDiT:
         self.dit = dit
         device = torch.device(device)
         self.is_ragged = device.type == "cuda" and _is_fa3_supported()
-        self.compiled_causal_forward: Callable[..., torch.Tensor] | None = None
-        self.compiled_full_forward: Callable[..., torch.Tensor] | None = None
+        self.compiled_causal_forward: CompiledPackedForward | None = None
+        self.compiled_full_forward: CompiledPackedForward | None = None
         logger.info(
             "Fun-CosyVoice3 Flow row attention on %s: %s",
             device,
@@ -330,9 +344,7 @@ class PackedDiT:
         """Install the two exact dynamic Inductor PackedDiT contracts."""
         if not self.is_ragged or dtype not in FA3_DTYPES:
             logger.debug(
-                "Skipping PackedDiT torch.compile (ragged=%s, dtype=%s)",
-                self.is_ragged,
-                dtype,
+                f"Skipping PackedDiT torch.compile (ragged={self.is_ragged}, dtype={dtype})"
             )
             return False
         else:
@@ -349,22 +361,21 @@ class PackedDiT:
                 backend="inductor",
                 dynamic=True,
                 fullgraph=True,
-                options={"emulate_precision_casts": True},
+                options=dict(PACKED_INDUCTOR_OPTIONS),
             )
             self.compiled_full_forward = torch.compile(
                 self.forward_full,
                 backend="inductor",
                 dynamic=True,
                 fullgraph=True,
-                options={"emulate_precision_casts": True},
+                options=dict(PACKED_INDUCTOR_OPTIONS),
             )
         except Exception:
             self.disable_compile()
             raise
         logger.info(
             "Compiled eligible Fun-CosyVoice3 PackedDiT causal/full contracts "
-            "(dynamic=True, fullgraph=True, emulate_precision_casts=True, dtype=%s)",
-            dtype,
+            f"(dynamic=True, fullgraph=True, emulate_precision_casts=True, dtype={dtype})"
         )
         return True
 
@@ -374,7 +385,7 @@ class PackedDiT:
 
     def forward_for_mode(
         self, streaming: bool, *, attention: PackedRowAttention
-    ) -> Callable[..., torch.Tensor]:
+    ) -> CompiledPackedForward:
         if not isinstance(attention, RaggedRowAttention):
             return self.forward
         else:
@@ -662,7 +673,7 @@ def rotate_in_place(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> No
 
 
 def solve_flow_euler_packed(
-    estimator: Any,
+    estimator: PackedDiT,
     noise: torch.Tensor,
     time_span: torch.Tensor,
     mu: torch.Tensor,
@@ -685,11 +696,7 @@ def solve_flow_euler_packed(
     spks_cfg = torch.cat((spks, torch.zeros_like(spks)), dim=0)
     spks_cfg = spks_cfg[twin_rows.row_ids].unsqueeze(0)
     flow_time = torch.zeros(1, device=noise.device, dtype=spks.dtype)
-    forward = (
-        estimator.forward_for_mode(streaming, attention=attention)
-        if isinstance(estimator, PackedDiT)
-        else estimator.forward
-    )
+    forward = estimator.forward_for_mode(streaming, attention=attention)
     x = noise
     t, dt = time_span[0], time_span[1] - time_span[0]
     for step in range(1, len(time_span)):
