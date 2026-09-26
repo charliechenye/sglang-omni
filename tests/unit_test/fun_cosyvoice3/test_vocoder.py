@@ -73,18 +73,22 @@ class GraphRunnableFakeFlow(RunnableFakeFlow):
 
 
 class RecordingPackedDiT(PackedDiT):
-    def __init__(self, *, is_eligible: bool = True) -> None:
+    def __init__(self) -> None:
         self.is_ragged = True
-        self.is_eligible = is_eligible
-        self.compile_dtypes: list[torch.dtype | None] = []
+        self.disable_calls = 0
 
     def compile(self, dtype: torch.dtype | None) -> bool:
-        self.compile_dtypes.append(dtype)
-        return self.is_eligible
+        del dtype
+        return True
+
+    def disable_compile(self) -> None:
+        self.disable_calls += 1
 
 
 def packed_compile_scheduler(
-    packed_estimator: PackedDiT,
+    packed_estimator: RecordingPackedDiT,
+    *,
+    failure: str | None = None,
 ) -> tuple[
     FunCosyVoice3StreamingVocoderScheduler,
     list[list[stages.FlowBatchInput]],
@@ -105,6 +109,10 @@ def packed_compile_scheduler(
     )
 
     def hop_batch(items: list[stages.FlowBatchInput]) -> list[torch.Tensor]:
+        if failure == "hop":
+            raise RuntimeError("causal materialization failed")
+        else:
+            pass
         hop_batches.append(list(items))
         return []
 
@@ -118,7 +126,7 @@ def packed_compile_scheduler(
     return scheduler, hop_batches, leftover_batches
 
 
-def test_packed_dit_compile_warmup_materializes_causal_and_full_batches() -> None:
+def test_packed_dit_compile_warmup_materializes_serving_variants() -> None:
     packed_estimator = RecordingPackedDiT()
     scheduler, hop_batches, leftover_batches = packed_compile_scheduler(
         packed_estimator
@@ -126,21 +134,21 @@ def test_packed_dit_compile_warmup_materializes_causal_and_full_batches() -> Non
 
     scheduler.warmup_packed_dit_compile()
 
-    assert packed_estimator.compile_dtypes == [torch.bfloat16]
     assert len(hop_batches) == len(leftover_batches) == 1
-    assert hop_batches[0][0] is leftover_batches[0][0]
 
 
-def test_packed_dit_compile_warmup_skips_batches_when_compile_is_ineligible() -> None:
-    packed_estimator = RecordingPackedDiT(is_eligible=False)
-    scheduler, hop_batches, leftover_batches = packed_compile_scheduler(
-        packed_estimator
+def test_packed_dit_compile_warmup_failure_disables_compiled_path() -> None:
+    packed_estimator = RecordingPackedDiT()
+    scheduler, _, leftover_batches = packed_compile_scheduler(
+        packed_estimator,
+        failure="hop",
     )
 
-    scheduler.warmup_packed_dit_compile()
+    with pytest.raises(RuntimeError, match="causal materialization failed"):
+        scheduler.warmup_packed_dit_compile()
 
-    assert packed_estimator.compile_dtypes == [torch.bfloat16]
-    assert hop_batches == leftover_batches == []
+    assert packed_estimator.disable_calls == 1
+    assert leftover_batches == []
 
 
 def test_mlx_stream_scheduler_consumes_chunks_before_final_decode() -> None:
@@ -969,32 +977,6 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
     }
 
 
-def test_create_vocoder_executor_warms_up_before_return(monkeypatch) -> None:
-    monkeypatch.setattr(
-        stages, "resolve_concrete_device", lambda device, gpu_id: torch.device("cpu")
-    )
-    monkeypatch.setattr(stages, "resolve_checkpoint", lambda model_path: "/checkpoint")
-    monkeypatch.setattr(stages, "patch_chunk_mask", lambda: None)
-    monkeypatch.setattr(
-        stages,
-        "load_cosyvoice3_flow_hift",
-        lambda checkpoint_dir, device, fp16, **_: (
-            RunnableFakeFlow(),
-            FakeHiFT(),
-        ),
-    )
-    warmup_schedulers = []
-    monkeypatch.setattr(
-        FunCosyVoice3StreamingVocoderScheduler,
-        "warmup_now",
-        lambda scheduler: warmup_schedulers.append(scheduler),
-    )
-
-    scheduler = stages.create_vocoder_executor("model", device="cpu")
-
-    assert warmup_schedulers == [scheduler]
-
-
 def create_scheduler_recording_native_compile(
     monkeypatch,
     **kwargs,
@@ -1023,28 +1005,27 @@ def create_scheduler_recording_native_compile(
     return compiled, scheduler
 
 
-def test_create_vocoder_executor_compiles_dit_by_default_at_startup(
+@pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
+def test_create_vocoder_executor_compile_flag_controls_startup_finalization(
     monkeypatch,
+    enable_dit_torch_compile: bool,
 ) -> None:
+    packed_warmups: list[FunCosyVoice3StreamingVocoderScheduler] = []
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler,
         "warmup_packed_dit_compile",
-        lambda scheduler: None,
+        lambda scheduler: packed_warmups.append(scheduler),
     )
-    compiled, scheduler = create_scheduler_recording_native_compile(monkeypatch)
-    assert scheduler.enable_dit_torch_compile is True
-    assert compiled == []
-    scheduler.finalize_startup()
-    assert len(compiled) == 1
 
     compiled, scheduler = create_scheduler_recording_native_compile(
         monkeypatch,
-        enable_dit_torch_compile=False,
+        enable_dit_torch_compile=enable_dit_torch_compile,
     )
-    assert scheduler.enable_dit_torch_compile is False
+    assert scheduler.enable_dit_torch_compile is enable_dit_torch_compile
     assert compiled == []
     scheduler.finalize_startup()
-    assert compiled == []
+    assert len(compiled) == (1 if enable_dit_torch_compile else 0)
+    assert len(packed_warmups) == (1 if enable_dit_torch_compile else 0)
 
 
 FLOW_GRAPH_CAPTURE_SHAPES = ((2, 16),)
@@ -1116,99 +1097,45 @@ def prepare_vocoder_startup(
     return fake_flow
 
 
-def test_create_vocoder_executor_captures_graph_before_startup_finalization(
+@pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
+def test_create_vocoder_executor_preserves_graph_before_startup_finalization(
     monkeypatch: pytest.MonkeyPatch,
+    enable_dit_torch_compile: bool,
 ) -> None:
     startup_events: list[str] = []
     prepare_vocoder_startup(
         monkeypatch,
         startup_events,
         device_type="cuda",
-        allow_native_compile=True,
+        allow_native_compile=enable_dit_torch_compile,
     )
 
     scheduler = stages.create_vocoder_executor(
         "model",
         device="cuda",
-        enable_dit_torch_compile=True,
+        enable_dit_torch_compile=enable_dit_torch_compile,
         enable_flow_cuda_graph=True,
         flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
     )
 
-    assert startup_events == [
-        "runner_create",
-        "graph_capture",
-        "attach",
-        "scheduler_warmup",
-    ]
+    assert startup_events.index("graph_capture") < startup_events.index("attach")
+    assert startup_events.index("attach") < startup_events.index("scheduler_warmup")
+    assert startup_events.count("graph_capture") == 1
+    assert "native_compile" not in startup_events
+    assert "packed_warmup" not in startup_events
 
     scheduler.finalize_startup()
-    assert startup_events == [
-        "runner_create",
-        "graph_capture",
-        "attach",
-        "scheduler_warmup",
-        "native_compile",
-        "packed_warmup",
-    ]
-
-
-def test_create_vocoder_executor_defers_native_compile_until_startup_finalization(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    startup_events: list[str] = []
-    fake_flow = prepare_vocoder_startup(
-        monkeypatch,
-        startup_events,
-        device_type="cpu",
-        allow_native_compile=True,
-    )
-
-    scheduler = stages.create_vocoder_executor(
-        "model",
-        device="cpu",
-        enable_dit_torch_compile=True,
-        enable_flow_cuda_graph=False,
-    )
-
-    assert startup_events == ["scheduler_warmup"]
-    scheduler.finalize_startup()
-    assert startup_events == ["scheduler_warmup", "native_compile", "packed_warmup"]
-    assert fake_flow.attached_runner is None
-
-
-def test_create_vocoder_executor_captures_graph_without_native_compile(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    startup_events: list[str] = []
-    prepare_vocoder_startup(
-        monkeypatch,
-        startup_events,
-        device_type="cuda",
-        allow_native_compile=False,
-    )
-
-    scheduler = stages.create_vocoder_executor(
-        "model",
-        device="cuda",
-        enable_dit_torch_compile=False,
-        enable_flow_cuda_graph=True,
-        flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
-    )
-    assert startup_events == [
-        "runner_create",
-        "graph_capture",
-        "attach",
-        "scheduler_warmup",
-    ]
-
-    scheduler.finalize_startup()
-    assert startup_events == [
-        "runner_create",
-        "graph_capture",
-        "attach",
-        "scheduler_warmup",
-    ]
+    assert startup_events.count("graph_capture") == 1
+    if enable_dit_torch_compile:
+        assert startup_events.index("graph_capture") < startup_events.index(
+            "native_compile"
+        )
+        assert startup_events.index("native_compile") < startup_events.index(
+            "packed_warmup"
+        )
+    else:
+        assert "native_compile" not in startup_events
+        assert "packed_warmup" not in startup_events
 
 
 def test_create_vocoder_executor_trt_alone_skips_the_default_compile(

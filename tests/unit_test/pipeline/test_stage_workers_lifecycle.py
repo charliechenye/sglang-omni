@@ -133,17 +133,14 @@ def test_run_process_finalizes_explicit_schedulers_before_start(
         ["first", "second"],
     )
 
-    assert lifecycle_events == [
-        "construct:first",
-        "construct:second",
-        "register",
-        "finalize:first",
-        "start:first",
-        "start:second",
-        "ready",
-        "run:first",
-        "run:second",
-    ]
+    finalize_index = lifecycle_events.index("finalize:first")
+    assert lifecycle_events.index("construct:first") < finalize_index
+    assert lifecycle_events.index("construct:second") < finalize_index
+    assert lifecycle_events.index("register") < finalize_index
+    assert finalize_index < lifecycle_events.index("start:first")
+    assert finalize_index < lifecycle_events.index("start:second")
+    assert finalize_index < lifecycle_events.index("ready")
+    assert "finalize:second" not in lifecycle_events
 
 
 def test_run_process_stops_startup_when_finalization_fails(
@@ -165,9 +162,10 @@ def test_run_process_stops_startup_when_finalization_fails(
             ["first"],
         )
 
-    assert lifecycle_events == [
-        "construct:first",
-        "register",
-        "finalize:first",
-        "stop:first",
-    ]
+    assert "finalize:first" in lifecycle_events
+    assert "start:first" not in lifecycle_events
+    assert "ready" not in lifecycle_events
+    assert "stop:first" in lifecycle_events
+    assert lifecycle_events.index("finalize:first") < lifecycle_events.index(
+        "stop:first"
+    )

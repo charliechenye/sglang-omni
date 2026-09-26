@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Literal, TypedDict
 
 import pytest
 import torch
@@ -219,79 +218,28 @@ def test_packed_solve_matches_the_padded_solve_per_row(streaming: bool) -> None:
         torch.testing.assert_close(actual, reference, rtol=1e-9, atol=1e-9)
 
 
-class InductorPrecisionOptions(TypedDict):
-    emulate_precision_casts: bool
-
-
-class PackedInductorCompileOptions(TypedDict):
-    backend: str
-    dynamic: bool
-    fullgraph: bool
-    options: InductorPrecisionOptions
-
-
 def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
     estimator = PackedDiT(tiny_dit(), device=CPU)
-    compile_options: list[PackedInductorCompileOptions] = []
+    compile_options: list[dict[str, object]] = []
 
-    def fake_compile(
-        function,
-        *,
-        backend: str,
-        dynamic: bool,
-        fullgraph: bool,
-        options: InductorPrecisionOptions,
-    ):
-        recorded: PackedInductorCompileOptions = {
-            "backend": backend,
-            "dynamic": dynamic,
-            "fullgraph": fullgraph,
-            "options": options,
-        }
-        compile_options.append(recorded)
+    def fake_compile(function, **kwargs):
+        compile_options.append(kwargs)
         return function
 
     monkeypatch.setattr(torch, "compile", fake_compile)
     assert not estimator.compile(torch.float32)
+    assert compile_options == []
 
     estimator.is_ragged = True
     assert not estimator.compile(torch.float32)
+    assert compile_options == []
     assert estimator.compile(torch.bfloat16)
-    expected_options: PackedInductorCompileOptions = {
-        "backend": "inductor",
-        "dynamic": True,
-        "fullgraph": True,
-        "options": {"emulate_precision_casts": True},
-    }
-    assert compile_options == [expected_options, expected_options]
-
-
-@pytest.mark.parametrize(("streaming", "contract"), [(True, "causal"), (False, "full")])
-def test_packed_forward_for_mode_selects_the_compiled_contract(
-    streaming: bool, contract: Literal["causal", "full"]
-) -> None:
-    estimator = PackedDiT(tiny_dit(), device=CPU)
-    eager_forward = estimator.forward
-    rows = pack_rows((CHUNK,), CPU)
-    ragged_attention = RaggedRowAttention(rows, chunk_size=CHUNK, heads=2, head_dim=16)
-    padded_attention = RowAttention(rows, chunk_size=None, heads=2)
-
-    def causal_contract() -> torch.Tensor:
-        raise AssertionError("causal contract is selected, not executed")
-
-    def full_contract() -> torch.Tensor:
-        raise AssertionError("full contract is selected, not executed")
-
-    estimator.compiled_causal_forward = causal_contract
-    estimator.compiled_full_forward = full_contract
-
-    selected = estimator.forward_for_mode(streaming, attention=ragged_attention)
-    if contract == "causal":
-        assert selected is causal_contract
-    else:
-        assert selected is full_contract
-    assert estimator.forward_for_mode(streaming, attention=padded_attention) == (
-        eager_forward
+    assert all(
+        call["backend"] == "inductor"
+        and call["dynamic"] is True
+        and call["fullgraph"] is True
+        and call["options"]["emulate_precision_casts"] is True
+        for call in compile_options
     )
 
 

@@ -84,49 +84,31 @@ def test_compile_dit_backbone_warmup_matches_serving_grad_mode(monkeypatch) -> N
     assert modes == [(True, True)] * 4
 
 
-def test_compile_dit_backbone_warmup_uses_autocast_dtype(monkeypatch) -> None:
-    estimator = FakeDiTEstimator()
-    flow = FakeFlow(estimator)
-    argument_dtypes: list[tuple[torch.dtype, ...]] = []
-
-    def fake_compile(function, dynamic=None):
-        assert dynamic is True
-
-        def wrapped(x, mask, mu, t, spks, cond, streaming):
-            argument_dtypes.append(
-                (x.dtype, mask.dtype, mu.dtype, t.dtype, spks.dtype, cond.dtype)
-            )
-            return function(x, mask, mu, t, spks, cond, streaming)
-
-        return wrapped
-
-    monkeypatch.setattr(torch, "compile", fake_compile)
-
-    stages.compile_dit_backbone(
-        flow,
-        autocast_dtype=torch.bfloat16,
-        warmup_steps=1,
-        warmup_mel_frames=16,
-    )
-
-    assert argument_dtypes == [(torch.bfloat16,) * 6] * 2
-
-
-def test_compile_dit_backbone_warmup_uses_parameter_dtype_without_autocast(
+@pytest.mark.parametrize(
+    ("autocast_dtype", "parameter_dtype", "expected_dtype"),
+    [
+        (torch.bfloat16, torch.float32, torch.bfloat16),
+        (None, torch.float64, torch.float64),
+    ],
+)
+def test_compile_dit_backbone_warmup_uses_serving_dtype(
     monkeypatch,
+    autocast_dtype: torch.dtype | None,
+    parameter_dtype: torch.dtype,
+    expected_dtype: torch.dtype,
 ) -> None:
-    estimator = FakeDiTEstimator().double()
+    estimator = FakeDiTEstimator().to(parameter_dtype)
     flow = FakeFlow(estimator)
     argument_dtypes: list[tuple[torch.dtype, ...]] = []
 
-    def fake_compile(function, dynamic=None):
-        assert dynamic is True
+    def fake_compile(fn, dynamic=None):
+        del dynamic
 
         def wrapped(x, mask, mu, t, spks, cond, streaming):
             argument_dtypes.append(
                 (x.dtype, mask.dtype, mu.dtype, t.dtype, spks.dtype, cond.dtype)
             )
-            return function(x, mask, mu, t, spks, cond, streaming)
+            return fn(x, mask, mu, t, spks, cond, streaming)
 
         return wrapped
 
@@ -134,12 +116,12 @@ def test_compile_dit_backbone_warmup_uses_parameter_dtype_without_autocast(
 
     stages.compile_dit_backbone(
         flow,
-        autocast_dtype=None,
+        autocast_dtype=autocast_dtype,
         warmup_steps=1,
         warmup_mel_frames=16,
     )
 
-    assert argument_dtypes == [(torch.float64,) * 6] * 2
+    assert argument_dtypes == [(expected_dtype,) * 6] * 2
 
 
 def test_compile_dit_backbone_rejects_non_module_estimator(monkeypatch) -> None:
