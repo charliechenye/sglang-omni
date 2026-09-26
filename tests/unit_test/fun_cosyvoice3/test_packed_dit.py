@@ -273,9 +273,7 @@ def test_packed_forward_for_mode_selects_the_compiled_contract(
     estimator = PackedDiT(tiny_dit(), device=CPU)
     eager_forward = estimator.forward
     rows = pack_rows((CHUNK,), CPU)
-    ragged_attention = RaggedRowAttention(
-        rows, chunk_size=CHUNK, heads=2, head_dim=16
-    )
+    ragged_attention = RaggedRowAttention(rows, chunk_size=CHUNK, heads=2, head_dim=16)
     padded_attention = RowAttention(rows, chunk_size=None, heads=2)
 
     def causal_contract() -> torch.Tensor:

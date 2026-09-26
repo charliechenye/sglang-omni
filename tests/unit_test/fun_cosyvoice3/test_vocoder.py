@@ -120,7 +120,9 @@ def packed_compile_scheduler(
 
 def test_packed_dit_compile_warmup_materializes_causal_and_full_batches() -> None:
     packed_estimator = RecordingPackedDiT()
-    scheduler, hop_batches, leftover_batches = packed_compile_scheduler(packed_estimator)
+    scheduler, hop_batches, leftover_batches = packed_compile_scheduler(
+        packed_estimator
+    )
 
     scheduler.warmup_packed_dit_compile()
 
@@ -131,7 +133,9 @@ def test_packed_dit_compile_warmup_materializes_causal_and_full_batches() -> Non
 
 def test_packed_dit_compile_warmup_skips_batches_when_compile_is_ineligible() -> None:
     packed_estimator = RecordingPackedDiT(is_eligible=False)
-    scheduler, hop_batches, leftover_batches = packed_compile_scheduler(packed_estimator)
+    scheduler, hop_batches, leftover_batches = packed_compile_scheduler(
+        packed_estimator
+    )
 
     scheduler.warmup_packed_dit_compile()
 
@@ -956,6 +960,7 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
         "model",
         device="cpu",
         max_batch_size=4,
+        enable_dit_torch_compile=False,
         enable_flow_estimator_trt=True,
     )
 
@@ -1018,26 +1023,28 @@ def create_scheduler_recording_native_compile(
     return compiled, scheduler
 
 
-def test_create_vocoder_executor_finalizes_dit_compile_at_startup(
+def test_create_vocoder_executor_compiles_dit_by_default_at_startup(
     monkeypatch,
 ) -> None:
-    compiled, scheduler = create_scheduler_recording_native_compile(monkeypatch)
-    assert compiled == []
-    scheduler.finalize_startup()
-    assert compiled == []
-
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler,
         "warmup_packed_dit_compile",
         lambda scheduler: None,
     )
-    compiled, scheduler = create_scheduler_recording_native_compile(
-        monkeypatch,
-        enable_dit_torch_compile=True,
-    )
+    compiled, scheduler = create_scheduler_recording_native_compile(monkeypatch)
+    assert scheduler.enable_dit_torch_compile is True
     assert compiled == []
     scheduler.finalize_startup()
     assert len(compiled) == 1
+
+    compiled, scheduler = create_scheduler_recording_native_compile(
+        monkeypatch,
+        enable_dit_torch_compile=False,
+    )
+    assert scheduler.enable_dit_torch_compile is False
+    assert compiled == []
+    scheduler.finalize_startup()
+    assert compiled == []
 
 
 FLOW_GRAPH_CAPTURE_SHAPES = ((2, 16),)
@@ -1209,8 +1216,10 @@ def test_create_vocoder_executor_trt_alone_skips_the_default_compile(
 ) -> None:
     compiled, scheduler = create_scheduler_recording_native_compile(
         monkeypatch,
+        enable_dit_torch_compile=False,
         enable_flow_estimator_trt=True,
     )
+    assert scheduler.enable_dit_torch_compile is False
     assert compiled == []
     scheduler.finalize_startup()
     assert compiled == []
@@ -1376,6 +1385,7 @@ def test_pipeline_config_sets_flow_batch_admission_by_default() -> None:
         "max_batch_size": 16,
         "max_batch_wait_ms": 30,
         "enable_flow_cuda_graph": True,
+        "enable_dit_torch_compile": True,
         "enable_flow_estimator_trt": False,
         "token_hop_len": 25,
         "token_max_hop_len": 100,
