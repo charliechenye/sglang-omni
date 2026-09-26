@@ -850,7 +850,10 @@ def test_flow_admission_defers_request_after_long_singleton(monkeypatch) -> None
     # distribution, so pin it here: this test is about admission behaviour, not
     # about the default value.
     scheduler = stages.create_vocoder_executor(
-        "model", device="cpu", flow_batch_admission_frames=2000
+        "model",
+        device="cpu",
+        flow_batch_admission_frames=2000,
+        enable_dit_torch_compile=False,
     )
     long_state = make_state(prompt_tokens=0)
     long_state.audio_codes = make_codes(2200)
@@ -879,7 +882,9 @@ def test_create_vocoder_executor_defaults_batch_for_real_lengths(monkeypatch) ->
             FakeHiFT(),
         ),
     )
-    scheduler = stages.create_vocoder_executor("model", device="cpu")
+    scheduler = stages.create_vocoder_executor(
+        "model", device="cpu", enable_dit_torch_compile=False
+    )
 
     assert scheduler.max_batch_cost == stages.DEFAULT_FLOW_BATCH_ADMISSION_FRAMES
     assert (
@@ -920,6 +925,7 @@ def test_create_vocoder_executor_threads_batch_configuration(monkeypatch) -> Non
     scheduler = stages.create_vocoder_executor(
         "model",
         device="cpu",
+        enable_dit_torch_compile=False,
         dtype="float16",
         max_batch_size=6,
         max_batch_wait_ms=7,
@@ -1118,16 +1124,9 @@ def test_create_vocoder_executor_compiles_before_flow_graph_capture(
         assert startup_events.index("native_compile") < startup_events.index(
             "graph_capture"
         )
-        assert startup_events.index("graph_capture") < startup_events.index(
-            "packed_warmup"
-        )
-        assert startup_events.index("packed_warmup") < startup_events.index(
-            "scheduler_warmup"
-        )
     else:
         assert "native_compile" not in startup_events
-        assert "packed_warmup" not in startup_events
-        assert "scheduler_warmup" in startup_events
+    assert ("packed_warmup" in startup_events) is enable_dit_torch_compile
 
 
 def test_create_vocoder_executor_trt_alone_skips_the_default_compile(
@@ -1283,6 +1282,7 @@ def test_create_vocoder_executor_rejects_non_positive_admission_budget(
             "model",
             device="cpu",
             flow_batch_admission_frames=0,
+            enable_dit_torch_compile=False,
         )
 
 

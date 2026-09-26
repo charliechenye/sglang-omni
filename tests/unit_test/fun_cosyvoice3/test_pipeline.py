@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 import torch
 
@@ -14,26 +16,59 @@ from sglang_omni.models.fun_cosyvoice3.config import (
 )
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
+from sglang_omni.pipeline.mp_runner import build_stage_groups
+from sglang_omni.pipeline.runtime_config import prepare_pipeline_runtime
+from sglang_omni.pipeline.stage_workers import patched_spawn_env
+from tests.unit_test.fixtures.pipeline_fakes import FakeMpContext
 from tests.unit_test.pipeline.helpers import build_compiled_process_topology
 
 
 @pytest.mark.parametrize(
-    ("env_defaults", "expected_engine_env", "expected_process_env"),
-    [({}, "1", None), ({"OMP_NUM_THREADS": "3"}, None, "3")],
+    ("env_defaults", "expected_omp_threads"),
+    [({}, "1"), ({"OMP_NUM_THREADS": "3"}, "3")],
 )
-def test_fun_cosyvoice3_config_resolves_startup_omp_default(
+def test_fun_cosyvoice3_engine_process_resolves_spawn_omp_default(
+    monkeypatch: pytest.MonkeyPatch,
     env_defaults: dict[str, str],
-    expected_engine_env: str | None,
-    expected_process_env: str | None,
+    expected_omp_threads: str,
 ) -> None:
+    monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
     config = FunCosyVoice3PipelineConfig(
         model_path="model",
         env_defaults=env_defaults,
     )
 
-    engine_stage = config.stage_named("tts_engine")
-    assert engine_stage.env.get("OMP_NUM_THREADS") == expected_engine_env
-    assert config.resolved_env_defaults().get("OMP_NUM_THREADS") == expected_process_env
+    prep = prepare_pipeline_runtime(config)
+    try:
+        groups = build_stage_groups(
+            config,
+            ctx=FakeMpContext(),
+            stages_cfg=prep.stages_cfg,
+            endpoints=prep.endpoints,
+            placement_plan=prep.placement_plan,
+            process_plan=prep.process_plan,
+            replica_topology=prep.replica_topology,
+        )
+        engine_stage_names = {
+            stage_cfg.name
+            for stage_cfg in prep.stages_cfg
+            if type(config).stage_config_cls(stage_cfg.name).engine_stage
+        }
+        engine_process_specs = [
+            process_spec
+            for group in groups
+            for process_spec in group.process_specs
+            if any(
+                stage_spec.stage_name in engine_stage_names
+                for stage_spec in process_spec.stage_specs
+            )
+        ]
+        assert len(engine_process_specs) == 1
+
+        with patched_spawn_env(engine_process_specs[0]):
+            assert os.environ["OMP_NUM_THREADS"] == expected_omp_threads
+    finally:
+        prep.runtime_dir.close()
 
 
 def test_fun_cosyvoice3_config_and_registry_contract() -> None:

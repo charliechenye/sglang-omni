@@ -234,6 +234,9 @@ def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
     assert not estimator.compile(torch.float32)
     assert compile_options == []
     assert estimator.compile(torch.bfloat16)
+    assert len(compile_options) == 2
+    assert estimator.compiled_causal_forward is not None
+    assert estimator.compiled_full_forward is not None
     assert all(
         call["backend"] == "inductor"
         and call["dynamic"] is True
