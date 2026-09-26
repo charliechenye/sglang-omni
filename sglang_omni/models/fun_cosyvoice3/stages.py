@@ -2247,6 +2247,11 @@ def create_vocoder_executor(
     else:
         pass
 
+    if enable_dit_torch_compile:
+        compile_dit_backbone(flow, autocast_dtype=autocast_dtype)
+    else:
+        pass
+
     if enable_flow_cuda_graph:
         capture_shapes = verify_flow_cuda_graph_capture_shapes(
             flow_cuda_graph_capture_shapes,
@@ -2280,7 +2285,10 @@ def create_vocoder_executor(
         token_hop_len=token_hop_len,
         token_max_hop_len=token_max_hop_len,
         disable_hop_growth=disable_hop_growth,
-        enable_dit_torch_compile=enable_dit_torch_compile,
     )
+    if enable_dit_torch_compile:
+        scheduler.warmup_packed_dit_compile()
+    else:
+        pass
     scheduler.warmup_now()
     return scheduler

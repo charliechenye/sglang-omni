@@ -22,7 +22,7 @@ from sglang_omni.config.runtime import (
 from sglang_omni.pipeline.control_plane import StageControlPlane
 from sglang_omni.pipeline.local_dispatch import LocalStageDispatcher
 from sglang_omni.pipeline.stage.input import AggregatedInput, DirectInput
-from sglang_omni.pipeline.stage.runtime import Stage, StartupFinalizableScheduler
+from sglang_omni.pipeline.stage.runtime import Stage
 from sglang_omni.pipeline.stage.stream_queue import StreamQueue
 from sglang_omni.pipeline.tp_control import TPFollowerControlPlane, TPLeaderFanout
 from sglang_omni.platforms import current_platform, get_platform_spec
@@ -563,12 +563,6 @@ def run_process(
                 )
             )
         local_dispatcher.register_many(stages)
-        for stage in stages:
-            scheduler = stage.scheduler
-            if isinstance(scheduler, StartupFinalizableScheduler):
-                scheduler.finalize_startup()
-            else:
-                pass
         asyncio.run(_start_and_run())
     except BaseException:
         cleanup_constructed_stages(
