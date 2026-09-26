@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import pytest
 import torch
 
 from sglang_omni.config.manager import ConfigManager
@@ -14,6 +15,25 @@ from sglang_omni.models.fun_cosyvoice3.config import (
 from sglang_omni.models.fun_cosyvoice3.payload_types import FunCosyVoice3State
 from sglang_omni.models.registry import PIPELINE_CONFIG_REGISTRY
 from tests.unit_test.pipeline.helpers import build_compiled_process_topology
+
+
+@pytest.mark.parametrize(
+    ("env_defaults", "expected_engine_env", "expected_process_env"),
+    [({}, "1", None), ({"OMP_NUM_THREADS": "3"}, None, "3")],
+)
+def test_fun_cosyvoice3_config_resolves_startup_omp_default(
+    env_defaults: dict[str, str],
+    expected_engine_env: str | None,
+    expected_process_env: str | None,
+) -> None:
+    config = FunCosyVoice3PipelineConfig(
+        model_path="model",
+        env_defaults=env_defaults,
+    )
+
+    engine_stage = config.stage_named("tts_engine")
+    assert engine_stage.env.get("OMP_NUM_THREADS") == expected_engine_env
+    assert config.resolved_env_defaults().get("OMP_NUM_THREADS") == expected_process_env
 
 
 def test_fun_cosyvoice3_config_and_registry_contract() -> None:

@@ -192,6 +192,17 @@ class FunCosyVoice3PipelineConfig(PipelineConfig):
         # TODO (chenyang): Indeed, TRT and Torch compile conflicts are pretty
         # common in this repo, so we should make this into config level, not in each model.
         super().model_post_init(__context)
+        if "OMP_NUM_THREADS" not in self.env_defaults:
+            config_cls = type(self)
+            for stage in self.stages:
+                if config_cls.stage_config_cls(stage.name).engine_stage:
+                    # note(chenye): SGLang pins Torch CPU threads to 1 for its GPU process.
+                    # Apply the same policy at spawn to every stage colocated with the engine.
+                    stage.env.setdefault("OMP_NUM_THREADS", "1")
+                else:
+                    pass
+        else:
+            pass
         vocoder = next(stage for stage in self.stages if stage.name == "vocoder")
         extras = vocoder.factory.model_extra
         reject_conflicting_dit_accelerators(
