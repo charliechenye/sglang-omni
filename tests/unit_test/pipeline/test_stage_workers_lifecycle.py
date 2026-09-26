@@ -22,18 +22,18 @@ class ReadyEvent:
 class FinalizableScheduler(StartupFinalizableScheduler):
     def __init__(
         self,
-        events: list[str],
+        lifecycle_events: list[str],
         *,
-        name: str = "scheduler",
-        fail: bool = False,
+        name: str,
+        should_fail: bool = False,
     ) -> None:
-        self.events = events
+        self.lifecycle_events = lifecycle_events
         self.name = name
-        self.fail = fail
+        self.should_fail = should_fail
 
     def finalize_startup(self) -> None:
-        self.events.append(f"finalize:{self.name}")
-        if self.fail:
+        self.lifecycle_events.append(f"finalize:{self.name}")
+        if self.should_fail:
             raise RuntimeError("startup finalization failed")
         else:
             pass
@@ -49,39 +49,41 @@ class FakeStage:
         self,
         stage_name: str,
         scheduler: StartupFinalizableScheduler | CoincidentalScheduler,
-        events: list[str],
+        lifecycle_events: list[str],
     ) -> None:
         self.name = stage_name
         self.scheduler = scheduler
-        self.events = events
+        self.lifecycle_events = lifecycle_events
         self.running = False
 
     async def start(self) -> None:
-        self.events.append(f"start:{self.name}")
+        self.lifecycle_events.append(f"start:{self.name}")
         self.running = True
 
     async def run(self) -> None:
-        self.events.append(f"run:{self.name}")
+        self.lifecycle_events.append(f"run:{self.name}")
         self.running = False
 
     async def stop(self) -> None:
-        self.events.append(f"stop:{self.name}")
+        self.lifecycle_events.append(f"stop:{self.name}")
         self.running = False
 
 
 class RecordingDispatcher:
-    def __init__(self, events: list[str]) -> None:
-        self.events = events
+    def __init__(self, lifecycle_events: list[str]) -> None:
+        self.lifecycle_events = lifecycle_events
 
     def register_many(self, stages: list[FakeStage]) -> None:
-        del stages
-        self.events.append("register")
+        if stages:
+            self.lifecycle_events.append("register")
+        else:
+            raise AssertionError("stage worker registered no stages")
 
 
-def run_worker(
+def run_stage_worker(
     monkeypatch: pytest.MonkeyPatch,
     stage_schedulers: dict[str, StartupFinalizableScheduler | CoincidentalScheduler],
-    events: list[str],
+    lifecycle_events: list[str],
     stage_names: list[str],
 ) -> None:
     def fake_construct_stage(
@@ -90,18 +92,19 @@ def run_worker(
         *,
         local_dispatcher: RecordingDispatcher,
     ) -> FakeStage:
-        del log, local_dispatcher
-        events.append(f"construct:{stage_spec.stage_name}")
+        assert log is not None
+        assert local_dispatcher is not None
+        lifecycle_events.append(f"construct:{stage_spec.stage_name}")
         return FakeStage(
             stage_spec.stage_name,
             stage_schedulers[stage_spec.stage_name],
-            events,
+            lifecycle_events,
         )
 
     monkeypatch.setattr(
         stage_workers,
         "LocalStageDispatcher",
-        lambda: RecordingDispatcher(events),
+        lambda: RecordingDispatcher(lifecycle_events),
     )
     monkeypatch.setattr(stage_workers, "construct_stage", fake_construct_stage)
 
@@ -110,7 +113,7 @@ def run_worker(
             process_name="worker",
             stage_specs=[StageLaunchConfig(stage_name=name) for name in stage_names],
         ),
-        ReadyEvent(events),
+        ReadyEvent(lifecycle_events),
         logging.getLogger(__name__),
     )
 
@@ -118,19 +121,19 @@ def run_worker(
 def test_run_process_finalizes_explicit_schedulers_before_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    events: list[str] = []
+    lifecycle_events: list[str] = []
 
-    run_worker(
+    run_stage_worker(
         monkeypatch,
         {
-            "first": FinalizableScheduler(events, name="first"),
+            "first": FinalizableScheduler(lifecycle_events, name="first"),
             "second": CoincidentalScheduler(),
         },
-        events,
+        lifecycle_events,
         ["first", "second"],
     )
 
-    assert events == [
+    assert lifecycle_events == [
         "construct:first",
         "construct:second",
         "register",
@@ -146,14 +149,25 @@ def test_run_process_finalizes_explicit_schedulers_before_start(
 def test_run_process_stops_startup_when_finalization_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    events: list[str] = []
+    lifecycle_events: list[str] = []
 
     with pytest.raises(RuntimeError, match="startup finalization failed"):
-        run_worker(
+        run_stage_worker(
             monkeypatch,
-            {"first": FinalizableScheduler(events, fail=True)},
-            events,
+            {
+                "first": FinalizableScheduler(
+                    lifecycle_events,
+                    name="first",
+                    should_fail=True,
+                )
+            },
+            lifecycle_events,
             ["first"],
         )
 
-    assert events == ["construct:first", "register", "stop:first"]
+    assert lifecycle_events == [
+        "construct:first",
+        "register",
+        "finalize:first",
+        "stop:first",
+    ]
