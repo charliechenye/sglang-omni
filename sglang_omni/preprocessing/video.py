@@ -9,6 +9,7 @@ import logging
 import tempfile
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -42,6 +43,153 @@ class VideoDiagnosticHook(Protocol):
         phase: str,
         metadata: Mapping[str, VideoDiagnosticValue],
     ) -> None: ...
+
+
+@dataclass(frozen=True, kw_only=True)
+class VideoResizeGeometry:
+    """Resolved frame geometry for the production video resize path."""
+
+    frame_count: int
+    source_height: int
+    source_width: int
+    resized_height: int
+    resized_width: int
+
+
+def decode_video_path(
+    path: str | Path,
+    fps: float | None = None,
+    max_frames: int | None = None,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+    total_pixels: int | None = None,
+    profile_hook: VideoDiagnosticHook | None = None,
+) -> tuple[torch.Tensor, float]:
+    """Decode a local video with the same backend fallback as serving."""
+    path = Path(path)
+    element: dict[str, str | int | float] = {"video": str(path)}
+    if fps is not None:
+        element["fps"] = float(fps)
+    else:
+        pass
+    if max_frames is not None:
+        element["max_frames"] = int(max_frames)
+    else:
+        pass
+    if min_pixels is not None:
+        element["min_pixels"] = int(min_pixels)
+    else:
+        pass
+    if max_pixels is not None:
+        element["max_pixels"] = int(max_pixels)
+    else:
+        pass
+    if total_pixels is not None:
+        element["total_pixels"] = int(total_pixels)
+    else:
+        pass
+
+    backend = qwen_vision.get_video_reader_backend()
+    backend_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
+    fallback_used = False
+    try:
+        video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS[backend](element)
+        selected_backend = backend
+    except Exception as backend_exc:
+        if backend == "torchvision":
+            raise VideoDecodeError(
+                f"Failed to decode video path={path}; torchvision failed with "
+                f"{type(backend_exc).__name__}: {backend_exc}"
+            ) from backend_exc
+        else:
+            pass
+        logger.warning(f"Video reader {backend} failed, falling back to torchvision")
+        fallback_used = True
+        try:
+            video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS["torchvision"](
+                element
+            )
+            selected_backend = "torchvision"
+        except Exception as fallback_exc:
+            raise VideoDecodeError(
+                f"Failed to decode video path={path}; {backend} failed with "
+                f"{type(backend_exc).__name__}: {backend_exc}; "
+                f"torchvision failed with {type(fallback_exc).__name__}: "
+                f"{fallback_exc}"
+            ) from fallback_exc
+    else:
+        pass
+
+    if profile_hook is not None:
+        backend_metadata: dict[str, VideoDiagnosticValue] = {
+            "backend": selected_backend,
+            "fallback_used": fallback_used,
+            "sampled_frame_count": int(video.shape[0]),
+            "source_height": int(video.shape[-2]),
+            "source_width": int(video.shape[-1]),
+            "duration_ms": (time.perf_counter_ns() - backend_started_ns) / 1_000_000.0,
+        }
+        if sample_fps is not None:
+            backend_metadata["sample_fps"] = float(sample_fps)
+        else:
+            pass
+        profile_hook("backend_decode", backend_metadata)
+    else:
+        pass
+    return video, sample_fps
+
+
+def compute_video_resize_geometry(
+    video: torch.Tensor,
+    *,
+    min_pixels: int | None = None,
+    max_pixels: int | None = None,
+    total_pixels: int | None = None,
+) -> VideoResizeGeometry:
+    """Resolve the serving resize dimensions without touching tensor values."""
+    frame_count, _, source_height, source_width = video.shape
+    effective_min_pixels = (
+        qwen_vision.VIDEO_MIN_PIXELS if min_pixels is None else min_pixels
+    )
+    effective_total_pixels = (
+        qwen_vision.VIDEO_TOTAL_PIXELS if total_pixels is None else total_pixels
+    )
+    computed_max_pixels = max(
+        min(
+            qwen_vision.VIDEO_MAX_PIXELS,
+            effective_total_pixels / frame_count * qwen_vision.FRAME_FACTOR,
+        ),
+        int(effective_min_pixels * 1.05),
+    )
+    effective_max_pixels = computed_max_pixels if max_pixels is None else max_pixels
+    effective_max_pixels = min(effective_max_pixels, computed_max_pixels)
+    resized_height, resized_width = qwen_vision.smart_resize(
+        source_height,
+        source_width,
+        factor=qwen_vision.IMAGE_FACTOR,
+        min_pixels=effective_min_pixels,
+        max_pixels=effective_max_pixels,
+    )
+    return VideoResizeGeometry(
+        frame_count=int(frame_count),
+        source_height=int(source_height),
+        source_width=int(source_width),
+        resized_height=int(resized_height),
+        resized_width=int(resized_width),
+    )
+
+
+def resize_video_tensor(
+    video: torch.Tensor,
+    geometry: VideoResizeGeometry,
+) -> torch.Tensor:
+    """Apply the production torchvision resize without dtype conversion."""
+    return tv_f.resize(
+        video,
+        [geometry.resized_height, geometry.resized_width],
+        interpolation=InterpolationMode.BICUBIC,
+        antialias=True,
+    )
 
 
 class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
@@ -381,119 +529,98 @@ def load_video_path(
     profile_hook: VideoDiagnosticHook | None = None,
 ) -> tuple[torch.Tensor, float]:
     """Load a local video into a torch tensor (T, C, H, W) on CPU."""
-    path = Path(path)
-    ele: dict[str, Any] = {"video": str(path)}
-    if fps is not None:
-        ele["fps"] = float(fps)
-    else:
-        pass
-    if max_frames is not None:
-        ele["max_frames"] = int(max_frames)
-    else:
-        pass
-    if min_pixels is not None:
-        ele["min_pixels"] = int(min_pixels)
-    else:
-        pass
-    if max_pixels is not None:
-        ele["max_pixels"] = int(max_pixels)
-    else:
-        pass
-    if total_pixels is not None:
-        ele["total_pixels"] = int(total_pixels)
-    else:
-        pass
-    backend = qwen_vision.get_video_reader_backend()
-    backend_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
-    fallback_used = False
-    try:
-        video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS[backend](ele)
-        selected_backend = backend
-    except Exception as backend_exc:
-        if backend == "torchvision":
-            raise VideoDecodeError(
-                f"Failed to decode video path={path}; torchvision failed with "
-                f"{type(backend_exc).__name__}: {backend_exc}"
-            ) from backend_exc
-        else:
-            pass
-        logger.warning(f"Video reader {backend} failed, falling back to torchvision")
-        fallback_used = True
-        try:
-            video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS["torchvision"](ele)
-            selected_backend = "torchvision"
-        except Exception as fallback_exc:
-            raise VideoDecodeError(
-                f"Failed to decode video path={path}; {backend} failed with "
-                f"{type(backend_exc).__name__}: {backend_exc}; "
-                f"torchvision failed with {type(fallback_exc).__name__}: "
-                f"{fallback_exc}"
-            ) from fallback_exc
-    else:
-        pass
-
-    if profile_hook is not None:
-        backend_metadata: dict[str, VideoDiagnosticValue] = {
-            "backend": selected_backend,
-            "fallback_used": fallback_used,
-            "sampled_frame_count": int(video.shape[0]),
-            "source_height": int(video.shape[-2]),
-            "source_width": int(video.shape[-1]),
-            "duration_ms": (time.perf_counter_ns() - backend_started_ns) / 1_000_000.0,
-        }
-        if sample_fps is not None:
-            backend_metadata["sample_fps"] = float(sample_fps)
-        else:
-            pass
-        profile_hook(
-            "backend_decode",
-            backend_metadata,
-        )
-    else:
-        pass
+    video, sample_fps = decode_video_path(
+        path,
+        fps=fps,
+        max_frames=max_frames,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        total_pixels=total_pixels,
+        profile_hook=profile_hook,
+    )
 
     resize_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
-    nframes, _, height, width = video.shape
-    min_pixels = ele.get("min_pixels", qwen_vision.VIDEO_MIN_PIXELS)
-    total_pixels = ele.get("total_pixels", qwen_vision.VIDEO_TOTAL_PIXELS)
-    max_pixels = max(
-        min(
-            qwen_vision.VIDEO_MAX_PIXELS,
-            total_pixels / nframes * qwen_vision.FRAME_FACTOR,
-        ),
-        int(min_pixels * 1.05),
+    geometry_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
+    geometry = compute_video_resize_geometry(
+        video,
+        min_pixels=min_pixels,
+        max_pixels=max_pixels,
+        total_pixels=total_pixels,
     )
-    max_pixels_supposed = ele.get("max_pixels", max_pixels)
-    max_pixels = min(max_pixels_supposed, max_pixels)
-    if "resized_height" in ele and "resized_width" in ele:
-        resized_height, resized_width = qwen_vision.smart_resize(
-            ele["resized_height"],
-            ele["resized_width"],
-            factor=qwen_vision.IMAGE_FACTOR,
+    geometry_duration_ms = (
+        (time.perf_counter_ns() - geometry_started_ns) / 1_000_000.0
+        if profile_hook is not None
+        else 0.0
+    )
+    if profile_hook is not None:
+        profile_hook(
+            "resize_geometry",
+            {
+                "frame_count": geometry.frame_count,
+                "source_height": geometry.source_height,
+                "source_width": geometry.source_width,
+                "resized_height": geometry.resized_height,
+                "resized_width": geometry.resized_width,
+                "duration_ms": geometry_duration_ms,
+            },
         )
     else:
-        resized_height, resized_width = qwen_vision.smart_resize(
-            height,
-            width,
-            factor=qwen_vision.IMAGE_FACTOR,
-            min_pixels=min_pixels,
-            max_pixels=max_pixels,
+        pass
+
+    input_dtype = str(video.dtype) if profile_hook is not None else ""
+    tensor_resize_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
+    resized_video = resize_video_tensor(video, geometry)
+    tensor_resize_duration_ms = (
+        (time.perf_counter_ns() - tensor_resize_started_ns) / 1_000_000.0
+        if profile_hook is not None
+        else 0.0
+    )
+    if profile_hook is not None:
+        profile_hook(
+            "tensor_resize",
+            {
+                "frame_count": geometry.frame_count,
+                "source_height": geometry.source_height,
+                "source_width": geometry.source_width,
+                "resized_height": geometry.resized_height,
+                "resized_width": geometry.resized_width,
+                "input_dtype": input_dtype,
+                "resize_output_dtype": str(resized_video.dtype),
+                "duration_ms": tensor_resize_duration_ms,
+            },
         )
-    video = tv_f.resize(
-        video,
-        [resized_height, resized_width],
-        interpolation=InterpolationMode.BICUBIC,
-        antialias=True,
-    ).float()
+    else:
+        pass
+
+    dtype_convert_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
+    video = resized_video.float()
+    dtype_convert_duration_ms = (
+        (time.perf_counter_ns() - dtype_convert_started_ns) / 1_000_000.0
+        if profile_hook is not None
+        else 0.0
+    )
+    if profile_hook is not None:
+        profile_hook(
+            "dtype_convert",
+            {
+                "input_dtype": str(resized_video.dtype),
+                "output_dtype": str(video.dtype),
+                "dtype_changed": resized_video.dtype != video.dtype,
+                "duration_ms": dtype_convert_duration_ms,
+            },
+        )
+    else:
+        pass
+
     if profile_hook is not None:
         profile_hook(
             "resize_convert",
             {
-                "frame_count": int(nframes),
-                "source_height": int(height),
-                "source_width": int(width),
-                "resized_height": int(resized_height),
-                "resized_width": int(resized_width),
+                "frame_count": geometry.frame_count,
+                "source_height": geometry.source_height,
+                "source_width": geometry.source_width,
+                "resized_height": geometry.resized_height,
+                "resized_width": geometry.resized_width,
                 "output_dtype": str(video.dtype),
                 "duration_ms": (time.perf_counter_ns() - resize_started_ns)
                 / 1_000_000.0,

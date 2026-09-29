@@ -90,6 +90,9 @@ MINICPMO_PREPROCESS_PHASE_NAMES = {
 MINICPMO_PREPROCESS_DIAGNOSTIC_EVENTS = {
     "minicpmo_preprocess_video_backend_decode": "video_backend_decode",
     "minicpmo_preprocess_video_resize_convert": "video_resize_convert",
+    "minicpmo_preprocess_video_resize_geometry": "video_resize_geometry",
+    "minicpmo_preprocess_video_tensor_resize": "video_tensor_resize",
+    "minicpmo_preprocess_video_dtype_convert": "video_dtype_convert",
     "minicpmo_preprocess_video_tensor_prepare": "video_tensor_prepare",
     "minicpmo_preprocess_video_pil_materialize": "video_pil_materialize",
 }
@@ -100,6 +103,9 @@ MINICPMO_PREPROCESS_PHASE_ORDER = (
     "video_decode",
     "video_backend_decode",
     "video_resize_convert",
+    "video_resize_geometry",
+    "video_tensor_resize",
+    "video_dtype_convert",
     "video_to_images",
     "video_tensor_prepare",
     "video_pil_materialize",

@@ -42,6 +42,9 @@ IMAGE_PLACEHOLDER = "<image>./</image>"
 AUDIO_PLACEHOLDER = "<audio>./</audio>"
 VIDEO_DIAGNOSTIC_EVENT_NAMES = {
     "backend_decode": "minicpmo_preprocess_video_backend_decode",
+    "resize_geometry": "minicpmo_preprocess_video_resize_geometry",
+    "tensor_resize": "minicpmo_preprocess_video_tensor_resize",
+    "dtype_convert": "minicpmo_preprocess_video_dtype_convert",
     "resize_convert": "minicpmo_preprocess_video_resize_convert",
     "tensor_prepare": "minicpmo_preprocess_video_tensor_prepare",
     "pil_materialize": "minicpmo_preprocess_video_pil_materialize",
