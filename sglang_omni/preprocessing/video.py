@@ -7,8 +7,10 @@ import asyncio
 import base64
 import logging
 import tempfile
+import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import av
 import librosa
@@ -27,6 +29,19 @@ logger = logging.getLogger(__name__)
 
 class VideoDecodeError(RuntimeError):
     """Raised when video decoding fails."""
+
+
+VideoDiagnosticValue = str | int | float | bool
+
+
+class VideoDiagnosticHook(Protocol):
+    """Receive completed, model-agnostic video preprocessing subphases."""
+
+    def __call__(
+        self,
+        phase: str,
+        metadata: Mapping[str, VideoDiagnosticValue],
+    ) -> None: ...
 
 
 class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
@@ -137,6 +152,7 @@ async def ensure_video_list_async(
     resource_connector: Any | None = None,
     extract_audio: bool = False,
     audio_target_sr: int = 16000,
+    profile_hook: VideoDiagnosticHook | None = None,
 ) -> tuple[list[Any], list[float] | None, list[Any] | None]:
     """Asynchronously normalize video inputs into a list.
 
@@ -152,6 +168,7 @@ async def ensure_video_list_async(
                         the global connector.
         extract_audio: If True, extract audio from videos and return as third element.
         audio_target_sr: Target sample rate for audio extraction (default: 16000).
+        profile_hook: Optional callback for completed local video subphase durations.
 
     Returns:
         Tuple of (normalized video list, sample_fps_list or None, extracted_audio_list or None).
@@ -179,10 +196,24 @@ async def ensure_video_list_async(
         pass
 
     async def _load_video_with_audio(
-        video_item: str | Path, is_url: bool
+        video_item: str | Path, is_url: bool, video_index: int
     ) -> tuple[Any, float, Any | None]:
         """Load video and optionally extract audio."""
         loop = asyncio.get_running_loop()
+        indexed_profile_hook: VideoDiagnosticHook | None = None
+        if profile_hook is not None:
+
+            def indexed_profile_hook(
+                phase: str,
+                metadata: Mapping[str, VideoDiagnosticValue],
+            ) -> None:
+                profile_hook(
+                    phase,
+                    {"video_index": video_index, **dict(metadata)},
+                )
+
+        else:
+            pass
 
         if is_url:
             # Use fetch_video_async for URL videos, similar to fetch_image_async
@@ -210,6 +241,7 @@ async def ensure_video_list_async(
                     min_pixels,
                     max_pixels,
                     total_pixels,
+                    indexed_profile_hook,
                 )
                 audio_task = loop.run_in_executor(
                     global_thread_pool,
@@ -231,6 +263,7 @@ async def ensure_video_list_async(
                     min_pixels,
                     max_pixels,
                     total_pixels,
+                    indexed_profile_hook,
                 )
                 return video, sample_fps, None
 
@@ -243,7 +276,7 @@ async def ensure_video_list_async(
         if isinstance(video_item, (str, Path)):
             if is_url(video_item):
                 # Create coroutine for async URL fetching with optional audio extraction
-                coro = _load_video_with_audio(video_item, is_url=True)
+                coro = _load_video_with_audio(video_item, is_url=True, video_index=idx)
                 task = asyncio.create_task(coro)
                 coroutines.append(task)
                 url_indices.append(idx)
@@ -255,7 +288,7 @@ async def ensure_video_list_async(
                     pass
             elif Path(video_item).exists():
                 # Load from local path with optional audio extraction
-                coro = _load_video_with_audio(video_item, is_url=False)
+                coro = _load_video_with_audio(video_item, is_url=False, video_index=idx)
                 task = asyncio.create_task(coro)
                 coroutines.append(task)
                 url_indices.append(idx)
@@ -345,6 +378,7 @@ def load_video_path(
     min_pixels: int | None = None,
     max_pixels: int | None = None,
     total_pixels: int | None = None,
+    profile_hook: VideoDiagnosticHook | None = None,
 ) -> tuple[torch.Tensor, float]:
     """Load a local video into a torch tensor (T, C, H, W) on CPU."""
     path = Path(path)
@@ -370,8 +404,11 @@ def load_video_path(
     else:
         pass
     backend = qwen_vision.get_video_reader_backend()
+    backend_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
+    fallback_used = False
     try:
         video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS[backend](ele)
+        selected_backend = backend
     except Exception as backend_exc:
         if backend == "torchvision":
             raise VideoDecodeError(
@@ -381,8 +418,10 @@ def load_video_path(
         else:
             pass
         logger.warning(f"Video reader {backend} failed, falling back to torchvision")
+        fallback_used = True
         try:
             video, sample_fps = qwen_vision.VIDEO_READER_BACKENDS["torchvision"](ele)
+            selected_backend = "torchvision"
         except Exception as fallback_exc:
             raise VideoDecodeError(
                 f"Failed to decode video path={path}; {backend} failed with "
@@ -390,6 +429,30 @@ def load_video_path(
                 f"torchvision failed with {type(fallback_exc).__name__}: "
                 f"{fallback_exc}"
             ) from fallback_exc
+    else:
+        pass
+
+    if profile_hook is not None:
+        backend_metadata: dict[str, VideoDiagnosticValue] = {
+            "backend": selected_backend,
+            "fallback_used": fallback_used,
+            "sampled_frame_count": int(video.shape[0]),
+            "source_height": int(video.shape[-2]),
+            "source_width": int(video.shape[-1]),
+            "duration_ms": (time.perf_counter_ns() - backend_started_ns) / 1_000_000.0,
+        }
+        if sample_fps is not None:
+            backend_metadata["sample_fps"] = float(sample_fps)
+        else:
+            pass
+        profile_hook(
+            "backend_decode",
+            backend_metadata,
+        )
+    else:
+        pass
+
+    resize_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
     nframes, _, height, width = video.shape
     min_pixels = ele.get("min_pixels", qwen_vision.VIDEO_MIN_PIXELS)
     total_pixels = ele.get("total_pixels", qwen_vision.VIDEO_TOTAL_PIXELS)
@@ -422,6 +485,22 @@ def load_video_path(
         interpolation=InterpolationMode.BICUBIC,
         antialias=True,
     ).float()
+    if profile_hook is not None:
+        profile_hook(
+            "resize_convert",
+            {
+                "frame_count": int(nframes),
+                "source_height": int(height),
+                "source_width": int(width),
+                "resized_height": int(resized_height),
+                "resized_width": int(resized_width),
+                "output_dtype": str(video.dtype),
+                "duration_ms": (time.perf_counter_ns() - resize_started_ns)
+                / 1_000_000.0,
+            },
+        )
+    else:
+        pass
     return video, sample_fps
 
 
