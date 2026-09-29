@@ -210,3 +210,148 @@ def test_minicpm_video_options_preserve_other_media(
     prompt_text = result.data["prompt"]["prompt_text"]
     assert prompt_text.count("<image>./</image>") == len(expected_images)
     assert prompt_text.count("<audio>./</audio>") == int(with_audio)
+
+
+def make_test_preprocessor(
+    fake_processor: FakeProcessor, monkeypatch: pytest.MonkeyPatch
+) -> MiniCPMOPreprocessor:
+    preprocessor = object.__new__(MiniCPMOPreprocessor)
+    preprocessor._processor = fake_processor  # noqa: leading-underscore
+    preprocessor.speech_enabled = False
+    monkeypatch.setattr(
+        preprocessor, "render_chat_template", lambda messages, **_: str(messages)
+    )
+    return preprocessor
+
+
+def test_minicpm_preprocessor_events_cover_video_request(monkeypatch) -> None:
+    fake_processor = FakeProcessor()
+    preprocessor = make_test_preprocessor(fake_processor, monkeypatch)
+    events = []
+    monkeypatch.setattr(
+        preprocessor_mod, "_emit_event", lambda **event: events.append(event)
+    )
+
+    image = Image.new("RGB", (2, 2), color="red")
+    frame = Image.new("RGB", (2, 2), color="blue")
+
+    async def images(raw_images):
+        return [image] if raw_images else []
+
+    async def videos(raw_videos, **kwargs):
+        return [[frame]], [1.0], None
+
+    async def audios(_audios, *, target_sr):
+        return []
+
+    monkeypatch.setattr(preprocessor_mod, "ensure_image_list_async", images)
+    monkeypatch.setattr(preprocessor_mod, "ensure_video_list_async", videos)
+    monkeypatch.setattr(preprocessor_mod, "ensure_audio_list_async", audios)
+    monkeypatch.setattr(
+        preprocessor_mod, "compute_image_cache_key", lambda _images: "image-cache"
+    )
+    monkeypatch.setattr(
+        preprocessor_mod,
+        "compute_video_cache_key",
+        lambda _videos, **_kwargs: "video-cache",
+    )
+    monkeypatch.setattr(
+        preprocessor_mod, "compute_audio_cache_key", lambda _audios: "audio-cache"
+    )
+
+    payload = make_payload(
+        {
+            "messages": [{"role": "user", "content": "Describe this."}],
+            "images": [image],
+            "videos": ["clip.mp4"],
+            "video_fps": 2,
+            "video_max_frames": 8,
+            "video_min_pixels": 128,
+            "video_max_pixels": 4096,
+            "video_total_pixels": 8192,
+        }
+    )
+    result = asyncio.run(preprocessor(payload))
+
+    assert result.request_id == "video-test"
+    assert [event["event_name"] for event in events] == [
+        "minicpmo_preprocess_cache_key_start",
+        "minicpmo_preprocess_cache_key_end",
+        "minicpmo_preprocess_image_load_start",
+        "minicpmo_preprocess_image_load_end",
+        "minicpmo_preprocess_video_decode_start",
+        "minicpmo_preprocess_video_decode_end",
+        "minicpmo_preprocess_video_to_images_start",
+        "minicpmo_preprocess_video_to_images_end",
+        "minicpmo_preprocess_audio_start",
+        "minicpmo_preprocess_audio_end",
+        "minicpmo_preprocess_prompt_start",
+        "minicpmo_preprocess_prompt_end",
+        "minicpmo_preprocess_processor_start",
+        "minicpmo_preprocess_processor_end",
+        "minicpmo_preprocess_payload_start",
+        "minicpmo_preprocess_payload_end",
+    ]
+    assert all(
+        event["request_id"] == "video-test" and event["stage"] is None
+        for event in events
+    )
+    assert events[0]["metadata"] == {"has_images": True, "has_videos": True}
+    assert events[4]["metadata"] == {
+        "video_count": 1,
+        "video_fps": 2,
+        "video_max_frames": 8,
+        "video_min_pixels": 128,
+        "video_max_pixels": 4096,
+        "video_total_pixels": 8192,
+    }
+    assert events[7]["metadata"] == {"decoded_frame_count": 1}
+    assert events[9]["metadata"] == {"num_audios": 0}
+    assert events[11]["metadata"] == {"num_images": 2, "num_audios": 0}
+    assert events[13]["metadata"] == {"num_images": 2}
+    assert events[15]["metadata"] == {
+        "input_token_count": 3,
+        "image_slice_count": 2,
+    }
+    for event in events:
+        assert all(
+            isinstance(value, (bool, float, int, str))
+            for value in event.get("metadata", {}).values()
+        )
+
+
+def test_minicpm_image_only_preprocessing_needs_no_profiler_setup(monkeypatch) -> None:
+    fake_processor = FakeProcessor()
+    preprocessor = make_test_preprocessor(fake_processor, monkeypatch)
+    image = Image.new("RGB", (2, 2), color="red")
+
+    async def images(raw_images):
+        return [image] if raw_images else []
+
+    async def audios(_audios, *, target_sr):
+        return []
+
+    monkeypatch.setattr(preprocessor_mod, "ensure_image_list_async", images)
+    monkeypatch.setattr(preprocessor_mod, "ensure_audio_list_async", audios)
+    monkeypatch.setattr(
+        preprocessor_mod, "compute_image_cache_key", lambda _images: "image-cache"
+    )
+    monkeypatch.setattr(
+        preprocessor_mod, "compute_audio_cache_key", lambda _audios: "audio-cache"
+    )
+
+    result = asyncio.run(
+        preprocessor(
+            make_payload(
+                {
+                    "messages": [{"role": "user", "content": "Describe this."}],
+                    "images": [image],
+                }
+            )
+        )
+    )
+
+    assert fake_processor.options == {}
+    assert len(fake_processor.images[0]) == 1
+    assert result.data["prompt"]["prompt_text"].count("<image>./</image>") == 1
+    assert result.request.inputs is None
