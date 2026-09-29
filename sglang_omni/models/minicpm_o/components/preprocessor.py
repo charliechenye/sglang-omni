@@ -287,7 +287,7 @@ class MiniCPMOPreprocessor:
         )
         _emit_event(
             request_id=payload.request_id,
-            stage=None,
+            stage="preprocessing",
             event_name="minicpmo_preprocess_cache_key_start",
             metadata={"has_images": has_images, "has_videos": has_videos},
         )
@@ -297,14 +297,14 @@ class MiniCPMOPreprocessor:
         )
         _emit_event(
             request_id=payload.request_id,
-            stage=None,
+            stage="preprocessing",
             event_name="minicpmo_preprocess_cache_key_end",
         )
 
         if has_images:
             _emit_event(
                 request_id=payload.request_id,
-                stage=None,
+                stage="preprocessing",
                 event_name="minicpmo_preprocess_image_load_start",
             )
         else:
@@ -313,7 +313,7 @@ class MiniCPMOPreprocessor:
         if has_images:
             _emit_event(
                 request_id=payload.request_id,
-                stage=None,
+                stage="preprocessing",
                 event_name="minicpmo_preprocess_image_load_end",
             )
         else:
@@ -328,7 +328,7 @@ class MiniCPMOPreprocessor:
                     pass
             _emit_event(
                 request_id=payload.request_id,
-                stage=None,
+                stage="preprocessing",
                 event_name="minicpmo_preprocess_video_decode_start",
                 metadata=video_metadata,
             )
@@ -340,7 +340,7 @@ class MiniCPMOPreprocessor:
             )
             _emit_event(
                 request_id=payload.request_id,
-                stage=None,
+                stage="preprocessing",
                 event_name="minicpmo_preprocess_video_decode_end",
                 metadata={"video_count": video_count},
             )
@@ -349,7 +349,7 @@ class MiniCPMOPreprocessor:
         if videos:
             _emit_event(
                 request_id=payload.request_id,
-                stage=None,
+                stage="preprocessing",
                 event_name="minicpmo_preprocess_video_to_images_start",
             )
             video_images = [
@@ -357,37 +357,50 @@ class MiniCPMOPreprocessor:
             ]
             _emit_event(
                 request_id=payload.request_id,
-                stage=None,
+                stage="preprocessing",
                 event_name="minicpmo_preprocess_video_to_images_end",
                 metadata={"decoded_frame_count": len(video_images)},
             )
         else:
             video_images = []
         images.extend(video_images)
-        _emit_event(
-            request_id=payload.request_id,
-            stage=None,
-            event_name="minicpmo_preprocess_audio_start",
+        has_raw_audios = raw_audios is not None and (
+            not isinstance(raw_audios, (list, tuple)) or len(raw_audios) > 0
         )
+        has_extracted_video_audio = video_audios is not None and any(
+            audio is not None for audio in video_audios
+        )
+        has_audio_work = has_raw_audios or has_extracted_video_audio
+        if has_audio_work:
+            _emit_event(
+                request_id=payload.request_id,
+                stage="preprocessing",
+                event_name="minicpmo_preprocess_audio_start",
+            )
+        else:
+            pass
         audios = await ensure_audio_list_async(raw_audios, target_sr=16000)
         if video_audios:
             audios.extend(audio for audio in video_audios if audio is not None)
         else:
             pass
         audio_cache_key = compute_audio_cache_key(audios)
-        _emit_event(
-            request_id=payload.request_id,
-            stage=None,
-            event_name="minicpmo_preprocess_audio_end",
-            metadata={"num_audios": len(audios)},
-        )
+        if has_audio_work:
+            _emit_event(
+                request_id=payload.request_id,
+                stage="preprocessing",
+                event_name="minicpmo_preprocess_audio_end",
+                metadata={"num_audios": len(audios)},
+            )
+        else:
+            pass
 
         cache_keys = [key for key in (image_cache_key, video_cache_key) if key]
         image_cache_key = "|".join(cache_keys) if cache_keys else None
 
         _emit_event(
             request_id=payload.request_id,
-            stage=None,
+            stage="preprocessing",
             event_name="minicpmo_preprocess_prompt_start",
         )
         if isinstance(messages, list) and not (
@@ -404,7 +417,7 @@ class MiniCPMOPreprocessor:
         )
         _emit_event(
             request_id=payload.request_id,
-            stage=None,
+            stage="preprocessing",
             event_name="minicpmo_preprocess_prompt_end",
             metadata={"num_images": len(images), "num_audios": len(audios)},
         )
@@ -415,7 +428,7 @@ class MiniCPMOPreprocessor:
         )
         _emit_event(
             request_id=payload.request_id,
-            stage=None,
+            stage="preprocessing",
             event_name="minicpmo_preprocess_processor_start",
         )
         processed = self.processor(
@@ -427,14 +440,14 @@ class MiniCPMOPreprocessor:
         )
         _emit_event(
             request_id=payload.request_id,
-            stage=None,
+            stage="preprocessing",
             event_name="minicpmo_preprocess_processor_end",
             metadata={"num_images": len(images)},
         )
 
         _emit_event(
             request_id=payload.request_id,
-            stage=None,
+            stage="preprocessing",
             event_name="minicpmo_preprocess_payload_start",
         )
         input_ids = processed["input_ids"][0].to(dtype=torch.long)
@@ -507,7 +520,7 @@ class MiniCPMOPreprocessor:
             pass
         _emit_event(
             request_id=payload.request_id,
-            stage=None,
+            stage="preprocessing",
             event_name="minicpmo_preprocess_payload_end",
             metadata=payload_metadata,
         )
