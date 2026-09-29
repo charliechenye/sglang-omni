@@ -27,6 +27,7 @@ from sglang_omni.models.minicpm_o.payload_types import MiniCPMOPipelineState
 from sglang_omni.models.minicpm_o.request_builders import build_encoder_request
 from sglang_omni.models.minicpm_o.routing import TALKER_STAGE, code2wav_reference_audio
 from sglang_omni.preprocessing.cache_key import hash_bytes, reference_path_cache_key
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 from sglang_omni.scheduling.generation_batch_policy import (
     build_generation_batch_overrides,
@@ -66,6 +67,10 @@ def create_encoder_executor(encoder: nn.Module, *, stage_name: str) -> SimpleSch
         max_bytes=ENCODER_CACHE_MAX_BYTES,
         cache_device="cpu",
     )
+    encoder_metadata = {
+        "modality": stage_name.removesuffix("_encoder"),
+        "batch_size": 1,
+    }
 
     def _encode_stage(payload: StagePayload) -> StagePayload:
         state = MiniCPMOPipelineState.from_dict(payload.data)
@@ -78,8 +83,22 @@ def create_encoder_executor(encoder: nn.Module, *, stage_name: str) -> SimpleSch
         elif cached is not None:
             encoder_out = cached
         else:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="encoder_start",
+                metadata=encoder_metadata,
+            )
             with torch.no_grad():
-                encoder_out = encoder(**request.model_inputs)
+                try:
+                    encoder_out = encoder(**request.model_inputs)
+                finally:
+                    _emit_event(
+                        request_id=payload.request_id,
+                        stage=None,
+                        event_name="encoder_end",
+                        metadata=encoder_metadata,
+                    )
             cache.put(request.cache_key, encoder_out)
         state.encoder_outs[stage_name] = encoder_out
         payload.data = state.to_dict()
