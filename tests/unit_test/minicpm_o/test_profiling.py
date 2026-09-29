@@ -10,13 +10,15 @@ from sglang_omni.models.minicpm_o.profiling import (
     summarize_preprocessing_intervals,
 )
 
+Event = dict[str, str | int | float | dict[str, str | int | float]]
+
 
 def make_event(
     request_id: str,
     stage: str,
     event_name: str,
     timestamp_ns: int,
-) -> dict[str, str | int | dict[str, str]]:
+) -> Event:
     return {
         "request_id": request_id,
         "stage": stage,
@@ -27,7 +29,7 @@ def make_event(
 
 
 def add_pair(
-    events: list[dict[str, str | int | dict[str, str]]],
+    events: list[Event],
     request_id: str,
     stage: str,
     opener: str,
@@ -45,7 +47,7 @@ def add_pair(
 
 def write_events(
     path: Path,
-    events: list[dict[str, str | int | dict[str, str]]],
+    events: list[Event],
 ) -> None:
     path.write_text(
         "".join(json.dumps(event) + "\n" for event in events),
@@ -53,10 +55,32 @@ def write_events(
     )
 
 
+def add_diagnostic_event(
+    events: list[Event],
+    request_id: str,
+    event_name: str,
+    timestamp_ns: int,
+    video_index: int,
+    duration_ms: float,
+) -> None:
+    events.append(
+        {
+            "request_id": request_id,
+            "stage": "preprocessing",
+            "event_name": event_name,
+            "timestamp_ns": timestamp_ns,
+            "metadata": {
+                "video_index": video_index,
+                "duration_ms": duration_ms,
+            },
+        }
+    )
+
+
 def test_summarize_preprocessing_intervals_preserves_request_and_stage_scope(
     tmp_path: Path,
 ) -> None:
-    events: list[dict[str, str | int | dict[str, str]]] = []
+    events: list[Event] = []
     add_pair(
         events,
         "r1",
@@ -200,7 +224,7 @@ def test_summarize_preprocessing_intervals_preserves_request_and_stage_scope(
 
 
 def test_summarize_omits_unobserved_media_phases(tmp_path: Path) -> None:
-    events: list[dict[str, str | int | dict[str, str]]] = []
+    events: list[Event] = []
     add_pair(
         events,
         "no-video",
@@ -224,7 +248,7 @@ def test_profiling_cli_defaults_to_table_and_supports_json(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    events: list[dict[str, str | int | dict[str, str]]] = []
+    events: list[Event] = []
     add_pair(
         events,
         "cli-test",
@@ -256,3 +280,99 @@ def test_profiling_cli_defaults_to_table_and_supports_json(
             "max_ms": 2.0,
         }
     ]
+
+
+def test_summarize_video_diagnostics_counts_completed_records_per_video(
+    tmp_path: Path,
+) -> None:
+    events: list[Event] = []
+    add_pair(
+        events,
+        "two-videos",
+        "preprocessing",
+        "minicpmo_preprocess_video_decode_start",
+        "minicpmo_preprocess_video_decode_end",
+        0,
+        30_000_000,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_backend_decode",
+        10_000_000,
+        0,
+        11.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_backend_decode",
+        11_000_000,
+        1,
+        22.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_resize_convert",
+        12_000_000,
+        1,
+        5.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_resize_convert",
+        13_000_000,
+        0,
+        4.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_tensor_prepare",
+        14_000_000,
+        0,
+        3.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_tensor_prepare",
+        15_000_000,
+        1,
+        7.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_pil_materialize",
+        16_000_000,
+        0,
+        2.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_pil_materialize",
+        17_000_000,
+        1,
+        6.0,
+    )
+    event_path = tmp_path / "events_two_videos.jsonl"
+    write_events(event_path, events)
+
+    summaries = {
+        summary.phase: summary
+        for summary in summarize_preprocessing_intervals(event_path)
+    }
+
+    assert summaries["video_decode"].count == 1
+    assert summaries["video_backend_decode"].count == 2
+    assert summaries["video_backend_decode"].total_ms == pytest.approx(33.0)
+    assert summaries["video_resize_convert"].count == 2
+    assert summaries["video_resize_convert"].total_ms == pytest.approx(9.0)
+    assert summaries["video_tensor_prepare"].count == 2
+    assert summaries["video_tensor_prepare"].total_ms == pytest.approx(10.0)
+    assert summaries["video_pil_materialize"].count == 2
+    assert summaries["video_pil_materialize"].total_ms == pytest.approx(8.0)

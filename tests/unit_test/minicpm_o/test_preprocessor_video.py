@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -10,6 +11,7 @@ from PIL import Image
 
 from sglang_omni.models.minicpm_o.components import preprocessor as preprocessor_mod
 from sglang_omni.models.minicpm_o.components.preprocessor import MiniCPMOPreprocessor
+from sglang_omni.preprocessing import video as video_mod
 from sglang_omni.proto import OmniRequest, StagePayload
 
 
@@ -19,6 +21,16 @@ def make_payload(inputs: dict) -> StagePayload:
         request=OmniRequest(inputs=inputs),
         data=None,
     )
+
+
+def patch_video_resize_constants(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name, value in {
+        "VIDEO_MIN_PIXELS": 8,
+        "VIDEO_TOTAL_PIXELS": 256,
+        "VIDEO_MAX_PIXELS": 128,
+        "IMAGE_FACTOR": 2,
+    }.items():
+        monkeypatch.setattr(video_mod.qwen_vision, name, value, raising=False)
 
 
 class FakeProcessor:
@@ -117,6 +129,7 @@ def test_minicpm_preprocessor_uses_only_requested_video_audio(
 
     result = asyncio.run(preprocessor(payload))
 
+    assert callable(captured_video_kwargs.pop("profile_hook"))
     assert captured_video_kwargs == {
         "fps": 2,
         "max_frames": 8,
@@ -282,6 +295,7 @@ def test_minicpm_preprocessor_events_cover_video_request(monkeypatch) -> None:
         "minicpmo_preprocess_video_decode_start",
         "minicpmo_preprocess_video_decode_end",
         "minicpmo_preprocess_video_to_images_start",
+        "minicpmo_preprocess_video_pil_materialize",
         "minicpmo_preprocess_video_to_images_end",
         "minicpmo_preprocess_prompt_start",
         "minicpmo_preprocess_prompt_end",
@@ -303,10 +317,12 @@ def test_minicpm_preprocessor_events_cover_video_request(monkeypatch) -> None:
         "video_max_pixels": 4096,
         "video_total_pixels": 8192,
     }
-    assert events[7]["metadata"] == {"decoded_frame_count": 1}
-    assert events[9]["metadata"] == {"num_images": 2, "num_audios": 0}
-    assert events[11]["metadata"] == {"num_images": 2}
-    assert events[13]["metadata"] == {
+    assert events[7]["metadata"]["video_index"] == 0
+    assert events[7]["metadata"]["frame_count"] == 1
+    assert events[8]["metadata"] == {"decoded_frame_count": 1}
+    assert events[10]["metadata"] == {"num_images": 2, "num_audios": 0}
+    assert events[12]["metadata"] == {"num_images": 2}
+    assert events[14]["metadata"] == {
         "input_token_count": 3,
         "image_slice_count": 2,
     }
@@ -401,3 +417,262 @@ def test_minicpm_image_only_preprocessing_needs_no_profiler_setup(monkeypatch) -
     assert len(fake_processor.images[0]) == 1
     assert result.data["prompt"]["prompt_text"].count("<image>./</image>") == 1
     assert result.request.inputs is None
+
+
+def test_load_video_path_profiles_backend_and_resize_phases(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, dict[str, video_mod.VideoDiagnosticValue]]] = []
+    source = torch.zeros((2, 3, 4, 6), dtype=torch.uint8)
+    patch_video_resize_constants(monkeypatch)
+
+    def backend(_element: dict[str, object]) -> tuple[torch.Tensor, float]:
+        return source, 12.5
+
+    def smart_resize(
+        height: int,
+        width: int,
+        **_kwargs: object,
+    ) -> tuple[int, int]:
+        assert (height, width) == (4, 6)
+        return 8, 12
+
+    def resize(
+        video: torch.Tensor,
+        size: list[int],
+        **_kwargs: object,
+    ) -> torch.Tensor:
+        return torch.zeros(
+            (video.shape[0], video.shape[1], size[0], size[1]),
+            dtype=video.dtype,
+        )
+
+    monkeypatch.setattr(
+        video_mod.qwen_vision, "get_video_reader_backend", lambda: "fake"
+    )
+    monkeypatch.setitem(video_mod.qwen_vision.VIDEO_READER_BACKENDS, "fake", backend)
+    monkeypatch.setattr(video_mod.qwen_vision, "smart_resize", smart_resize)
+    monkeypatch.setattr(video_mod.tv_f, "resize", resize)
+
+    def collect_profile(
+        phase: str,
+        metadata: dict[str, video_mod.VideoDiagnosticValue],
+    ) -> None:
+        events.append((phase, dict(metadata)))
+
+    video, sample_fps = video_mod.load_video_path(
+        tmp_path / "clip.mp4",
+        min_pixels=8,
+        max_pixels=128,
+        total_pixels=256,
+        profile_hook=collect_profile,
+    )
+
+    assert video.shape == (2, 3, 8, 12)
+    assert video.dtype == torch.float32
+    assert sample_fps == 12.5
+    assert [phase for phase, _metadata in events] == [
+        "backend_decode",
+        "resize_convert",
+    ]
+    backend_metadata = events[0][1]
+    assert backend_metadata["backend"] == "fake"
+    assert backend_metadata["sampled_frame_count"] == 2
+    assert backend_metadata["source_height"] == 4
+    assert backend_metadata["source_width"] == 6
+    assert backend_metadata["sample_fps"] == 12.5
+    assert isinstance(backend_metadata["duration_ms"], float)
+    resize_metadata = events[1][1]
+    assert resize_metadata["frame_count"] == 2
+    assert resize_metadata["resized_height"] == 8
+    assert resize_metadata["resized_width"] == 12
+    assert resize_metadata["output_dtype"] == "torch.float32"
+    assert isinstance(resize_metadata["duration_ms"], float)
+
+
+def test_load_video_path_profiles_successful_torchvision_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, dict[str, video_mod.VideoDiagnosticValue]]] = []
+    source = torch.zeros((1, 3, 4, 4), dtype=torch.uint8)
+    patch_video_resize_constants(monkeypatch)
+
+    def primary_backend(_element: dict[str, object]) -> tuple[torch.Tensor, float]:
+        raise RuntimeError("primary backend failed")
+
+    def fallback_backend(_element: dict[str, object]) -> tuple[torch.Tensor, float]:
+        return source, 6.0
+
+    monkeypatch.setattr(
+        video_mod.qwen_vision, "get_video_reader_backend", lambda: "fake"
+    )
+    monkeypatch.setitem(
+        video_mod.qwen_vision.VIDEO_READER_BACKENDS,
+        "fake",
+        primary_backend,
+    )
+    monkeypatch.setitem(
+        video_mod.qwen_vision.VIDEO_READER_BACKENDS,
+        "torchvision",
+        fallback_backend,
+    )
+    monkeypatch.setattr(
+        video_mod.qwen_vision,
+        "smart_resize",
+        lambda _height, _width, **_kwargs: (4, 4),
+    )
+    monkeypatch.setattr(
+        video_mod.tv_f,
+        "resize",
+        lambda video, _size, **_kwargs: video,
+    )
+
+    def collect_profile(
+        phase: str,
+        metadata: dict[str, video_mod.VideoDiagnosticValue],
+    ) -> None:
+        events.append((phase, dict(metadata)))
+
+    video_mod.load_video_path(tmp_path / "fallback.mp4", profile_hook=collect_profile)
+
+    backend_events = [event for event in events if event[0] == "backend_decode"]
+    assert len(backend_events) == 1
+    assert backend_events[0][1]["backend"] == "torchvision"
+    assert backend_events[0][1]["fallback_used"] is True
+
+    events.clear()
+
+    def broken_fallback(_element: dict[str, object]) -> tuple[torch.Tensor, float]:
+        raise RuntimeError("fallback failed")
+
+    monkeypatch.setitem(
+        video_mod.qwen_vision.VIDEO_READER_BACKENDS,
+        "torchvision",
+        broken_fallback,
+    )
+    with pytest.raises(video_mod.VideoDecodeError):
+        video_mod.load_video_path(tmp_path / "failed.mp4", profile_hook=collect_profile)
+    assert events == []
+
+
+def test_video_to_images_profiles_tensor_and_pil_materialization() -> None:
+    events: list[tuple[str, dict[str, video_mod.VideoDiagnosticValue]]] = []
+    video = torch.stack(
+        [
+            torch.zeros((3, 2, 2), dtype=torch.float32),
+            torch.ones((3, 2, 2), dtype=torch.float32),
+        ]
+    )
+
+    def collect_profile(
+        phase: str,
+        metadata: dict[str, video_mod.VideoDiagnosticValue],
+    ) -> None:
+        events.append((phase, dict(metadata)))
+
+    images = preprocessor_mod.video_to_images(
+        video,
+        profile_hook=collect_profile,
+        video_index=3,
+    )
+
+    assert len(images) == 2
+    assert images[0].mode == "RGB"
+    assert images[1].mode == "RGB"
+    assert [phase for phase, _metadata in events] == [
+        "tensor_prepare",
+        "pil_materialize",
+    ]
+    assert events[0][1]["video_index"] == 3
+    assert events[0][1]["frame_count"] == 2
+    assert events[0][1]["output_dtype"] == "torch.uint8"
+    assert events[1][1]["video_index"] == 3
+    assert events[1][1]["output_dtype"] == "PIL.RGB"
+    assert all(
+        isinstance(metadata["duration_ms"], float) for _phase, metadata in events
+    )
+
+    assert len(preprocessor_mod.video_to_images(video)) == 2
+
+
+def test_video_to_images_existing_pil_input_skips_tensor_prepare() -> None:
+    events: list[tuple[str, dict[str, video_mod.VideoDiagnosticValue]]] = []
+    frame = Image.new("L", (3, 2), color=128)
+
+    def collect_profile(
+        phase: str,
+        metadata: dict[str, video_mod.VideoDiagnosticValue],
+    ) -> None:
+        events.append((phase, dict(metadata)))
+
+    images = preprocessor_mod.video_to_images(
+        [frame], profile_hook=collect_profile, video_index=1
+    )
+
+    assert len(images) == 1
+    assert images[0].mode == "RGB"
+    assert [phase for phase, _metadata in events] == ["pil_materialize"]
+    assert events[0][1]["video_index"] == 1
+    assert events[0][1]["input_kind"] == "pil"
+
+
+def test_ensure_video_list_profiles_multiple_local_videos(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, dict[str, video_mod.VideoDiagnosticValue]]] = []
+    first_path = tmp_path / "first.mp4"
+    second_path = tmp_path / "second.mp4"
+    first_path.touch()
+    second_path.touch()
+
+    def fake_load_video_path(
+        path: str | Path,
+        _fps: float | None = None,
+        _max_frames: int | None = None,
+        _min_pixels: int | None = None,
+        _max_pixels: int | None = None,
+        _total_pixels: int | None = None,
+        profile_hook: video_mod.VideoDiagnosticHook | None = None,
+    ) -> tuple[torch.Tensor, float]:
+        if profile_hook is not None:
+            profile_hook(
+                "backend_decode",
+                {
+                    "backend": "fake",
+                    "sampled_frame_count": 1,
+                    "source_height": 2,
+                    "source_width": 2,
+                    "sample_fps": 1.0,
+                    "duration_ms": 10.0 if Path(path).name == "first.mp4" else 20.0,
+                },
+            )
+        else:
+            pass
+        return torch.zeros((1, 3, 2, 2)), 1.0
+
+    monkeypatch.setattr(video_mod, "load_video_path", fake_load_video_path)
+
+    def collect_profile(
+        phase: str,
+        metadata: dict[str, video_mod.VideoDiagnosticValue],
+    ) -> None:
+        events.append((phase, dict(metadata)))
+
+    videos, sample_fps, audios = asyncio.run(
+        video_mod.ensure_video_list_async(
+            [first_path, second_path],
+            resource_connector=SimpleNamespace(),
+            profile_hook=collect_profile,
+        )
+    )
+
+    assert len(videos) == 2
+    assert sample_fps == [1.0, 1.0]
+    assert audios is None
+    assert sorted(
+        (metadata["video_index"], metadata["duration_ms"])
+        for _phase, metadata in events
+    ) == [(0, 10.0), (1, 20.0)]
