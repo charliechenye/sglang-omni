@@ -9,6 +9,9 @@ when stage residence is needed.
 
 The cache-key phase retains its existing name and covers image/video cache-key
 work before media loading. Audio cache-key work remains inside the audio phase.
+
+Parent phases are request-scoped start/end intervals. Video diagnostic phases
+are completed, per-video duration records; they are not paired by this module.
 """
 
 from __future__ import annotations
@@ -84,6 +87,28 @@ MINICPMO_PREPROCESS_PHASE_NAMES = {
     ): "payload",
 }
 
+MINICPMO_PREPROCESS_DIAGNOSTIC_EVENTS = {
+    "minicpmo_preprocess_video_backend_decode": "video_backend_decode",
+    "minicpmo_preprocess_video_resize_convert": "video_resize_convert",
+    "minicpmo_preprocess_video_tensor_prepare": "video_tensor_prepare",
+    "minicpmo_preprocess_video_pil_materialize": "video_pil_materialize",
+}
+
+MINICPMO_PREPROCESS_PHASE_ORDER = (
+    "cache_key",
+    "image_load",
+    "video_decode",
+    "video_backend_decode",
+    "video_resize_convert",
+    "video_to_images",
+    "video_tensor_prepare",
+    "video_pil_materialize",
+    "audio",
+    "prompt",
+    "processor",
+    "payload",
+)
+
 
 @dataclass(frozen=True, kw_only=True)
 class PreprocessingPhaseSummary:
@@ -116,7 +141,10 @@ def summarize_preprocessing_intervals(
 
     Matching remains scoped by request and stage through
     :func:`compute_stage_intervals`; intervals from other stages are ignored.
-    Phases with no matching interval are omitted rather than reported as zero.
+    Parent phases count one request interval. Diagnostic child phases count
+    one completed per-video duration record, so concurrent videos cannot be
+    cross-paired. Phases with no matching record are omitted rather than
+    reported as zero.
     """
     timelines = reconstruct_timelines(source)
     intervals = compute_stage_intervals(
@@ -134,9 +162,47 @@ def summarize_preprocessing_intervals(
         ]
         durations_by_phase[phase].append(interval.duration_ms)
 
+    for timeline in timelines.values():
+        for event in timeline.events:
+            if event.get("stage") != MINICPMO_PREPROCESS_STAGE:
+                continue
+            else:
+                pass
+            event_name = event.get("event_name")
+            if not isinstance(event_name, str):
+                continue
+            else:
+                pass
+            phase = MINICPMO_PREPROCESS_DIAGNOSTIC_EVENTS.get(event_name)
+            if phase is None:
+                continue
+            else:
+                pass
+            metadata = event.get("metadata")
+            if not isinstance(metadata, dict):
+                continue
+            else:
+                pass
+            video_index = metadata.get("video_index")
+            if isinstance(video_index, bool) or not isinstance(video_index, int):
+                continue
+            else:
+                pass
+            duration_ms = metadata.get("duration_ms")
+            if isinstance(duration_ms, bool) or not isinstance(
+                duration_ms, (int, float)
+            ):
+                continue
+            else:
+                pass
+            if duration_ms < 0:
+                continue
+            else:
+                pass
+            durations_by_phase[phase].append(float(duration_ms))
+
     summaries: list[PreprocessingPhaseSummary] = []
-    for interval_events in MINICPMO_PREPROCESS_INTERVAL_EVENTS:
-        phase = MINICPMO_PREPROCESS_PHASE_NAMES[interval_events]
+    for phase in MINICPMO_PREPROCESS_PHASE_ORDER:
         durations = durations_by_phase.get(phase, [])
         if not durations:
             continue

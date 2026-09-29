@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import threading
+import time
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -23,6 +25,8 @@ from sglang_omni.preprocessing.image import (
     ensure_image_list_async,
 )
 from sglang_omni.preprocessing.video import (
+    VideoDiagnosticHook,
+    VideoDiagnosticValue,
     compute_video_cache_key,
     ensure_video_list_async,
 )
@@ -36,6 +40,12 @@ else:
 
 IMAGE_PLACEHOLDER = "<image>./</image>"
 AUDIO_PLACEHOLDER = "<audio>./</audio>"
+VIDEO_DIAGNOSTIC_EVENT_NAMES = {
+    "backend_decode": "minicpmo_preprocess_video_backend_decode",
+    "resize_convert": "minicpmo_preprocess_video_resize_convert",
+    "tensor_prepare": "minicpmo_preprocess_video_tensor_prepare",
+    "pil_materialize": "minicpmo_preprocess_video_pil_materialize",
+}
 
 # note (MayDomine): task prompts match the checkpoint's audio-understanding template.
 ASR_PROMPT_ZH = "请仔细听这段音频片段，并将其内容逐字记录。"
@@ -57,15 +67,64 @@ def first_batch_item(value: Any) -> Any:
     return value
 
 
-def video_to_images(video: Any) -> list[Image.Image]:
+def video_to_images(
+    video: Any,
+    *,
+    profile_hook: VideoDiagnosticHook | None = None,
+    video_index: int | None = None,
+) -> list[Image.Image]:
     """Convert one decoded video (T, C, H, W) tensor to RGB frames."""
+
+    def emit_video_profile(
+        phase: str,
+        started_ns: int,
+        metadata: dict[str, VideoDiagnosticValue],
+    ) -> None:
+        if profile_hook is not None:
+            if video_index is not None:
+                metadata["video_index"] = video_index
+            else:
+                pass
+            metadata["duration_ms"] = (
+                time.perf_counter_ns() - started_ns
+            ) / 1_000_000.0
+            profile_hook(phase, metadata)
+        else:
+            pass
+
     if isinstance(video, list) and all(
         isinstance(frame, Image.Image) for frame in video
     ):
-        return [frame.convert("RGB") for frame in video]
+        if not video:
+            return []
+        else:
+            pass
+        materialize_started_ns = (
+            time.perf_counter_ns() if profile_hook is not None else 0
+        )
+        images = [frame.convert("RGB") for frame in video]
+        if profile_hook is not None:
+            first_frame = video[0]
+            emit_video_profile(
+                "pil_materialize",
+                materialize_started_ns,
+                {
+                    "frame_count": len(video),
+                    "source_height": first_frame.height,
+                    "source_width": first_frame.width,
+                    "output_dtype": "PIL.RGB",
+                    "input_kind": "pil",
+                },
+            )
+        else:
+            pass
+        return images
     else:
         pass
 
+    tensor_prepare_started_ns = (
+        time.perf_counter_ns() if profile_hook is not None else 0
+    )
     frames = video if isinstance(video, torch.Tensor) else torch.as_tensor(video)
     if frames.ndim != 4:
         raise ValueError(
@@ -90,7 +149,38 @@ def video_to_images(video: Any) -> list[Image.Image]:
     else:
         pass
     frames = frames.clamp(0, 255).to(torch.uint8)
-    return [Image.fromarray(frame.numpy()).convert("RGB") for frame in frames]
+    if profile_hook is not None:
+        emit_video_profile(
+            "tensor_prepare",
+            tensor_prepare_started_ns,
+            {
+                "frame_count": int(frames.shape[0]),
+                "source_height": int(frames.shape[1]),
+                "source_width": int(frames.shape[2]),
+                "output_dtype": str(frames.dtype),
+                "input_kind": "tensor" if isinstance(video, torch.Tensor) else "array",
+            },
+        )
+    else:
+        pass
+
+    materialize_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
+    images = [Image.fromarray(frame.numpy()).convert("RGB") for frame in frames]
+    if profile_hook is not None:
+        emit_video_profile(
+            "pil_materialize",
+            materialize_started_ns,
+            {
+                "frame_count": int(frames.shape[0]),
+                "source_height": int(frames.shape[1]),
+                "source_width": int(frames.shape[2]),
+                "output_dtype": "PIL.RGB",
+                "input_kind": "tensor",
+            },
+        )
+    else:
+        pass
+    return images
 
 
 class MiniCPMOPreprocessor:
@@ -339,11 +429,24 @@ class MiniCPMOPreprocessor:
                 event_name="minicpmo_preprocess_video_decode_start",
                 metadata=video_metadata,
             )
+
+            def emit_video_diagnostic(
+                phase: str,
+                metadata: Mapping[str, VideoDiagnosticValue],
+            ) -> None:
+                _emit_event(
+                    request_id=payload.request_id,
+                    stage="preprocessing",
+                    event_name=VIDEO_DIAGNOSTIC_EVENT_NAMES[phase],
+                    metadata=dict(metadata),
+                )
+
             videos, _, video_audios = await ensure_video_list_async(
                 raw_videos,
                 **video_kwargs,
                 extract_audio=use_audio_in_video,
                 audio_target_sr=16000,
+                profile_hook=emit_video_diagnostic,
             )
             _emit_event(
                 request_id=payload.request_id,
@@ -359,9 +462,15 @@ class MiniCPMOPreprocessor:
                 stage="preprocessing",
                 event_name="minicpmo_preprocess_video_to_images_start",
             )
-            video_images = [
-                frame for video in videos for frame in video_to_images(video)
-            ]
+            video_images = []
+            for video_index, video in enumerate(videos):
+                video_images.extend(
+                    video_to_images(
+                        video,
+                        profile_hook=emit_video_diagnostic,
+                        video_index=video_index,
+                    )
+                )
             _emit_event(
                 request_id=payload.request_id,
                 stage="preprocessing",
