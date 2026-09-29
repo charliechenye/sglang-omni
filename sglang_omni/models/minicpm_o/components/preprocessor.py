@@ -25,6 +25,7 @@ from sglang_omni.preprocessing.video import (
     compute_video_cache_key,
     ensure_video_list_async,
 )
+from sglang_omni.profiler.event_recorder import emit as _emit_event
 from sglang_omni.proto import StagePayload
 
 if TYPE_CHECKING:
@@ -278,33 +279,117 @@ class MiniCPMOPreprocessor:
         video_kwargs = {
             key.removeprefix("video_"): value for key, value in video_params.items()
         }
+        has_images = raw_images is not None and (
+            not isinstance(raw_images, (list, tuple)) or len(raw_images) > 0
+        )
+        has_videos = raw_videos is not None and (
+            not isinstance(raw_videos, (list, tuple)) or len(raw_videos) > 0
+        )
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_cache_key_start",
+            metadata={"has_images": has_images, "has_videos": has_videos},
+        )
         image_cache_key = compute_image_cache_key(raw_images)
         video_cache_key = (
             compute_video_cache_key(raw_videos, **video_kwargs) if raw_videos else None
         )
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_cache_key_end",
+        )
 
+        if has_images:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="minicpmo_preprocess_image_load_start",
+            )
+        else:
+            pass
         images = await ensure_image_list_async(raw_images)
+        if has_images:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="minicpmo_preprocess_image_load_end",
+            )
+        else:
+            pass
         if raw_videos:
+            video_count = len(raw_videos) if isinstance(raw_videos, list) else 1
+            video_metadata = {"video_count": video_count}
+            for key, value in video_params.items():
+                if isinstance(value, (int, float)):
+                    video_metadata[key] = value
+                else:
+                    pass
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="minicpmo_preprocess_video_decode_start",
+                metadata=video_metadata,
+            )
             videos, _, video_audios = await ensure_video_list_async(
                 raw_videos,
                 **video_kwargs,
                 extract_audio=use_audio_in_video,
                 audio_target_sr=16000,
             )
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="minicpmo_preprocess_video_decode_end",
+                metadata={"video_count": video_count},
+            )
         else:
             videos, video_audios = [], None
-        video_images = [frame for video in videos for frame in video_to_images(video)]
+        if videos:
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="minicpmo_preprocess_video_to_images_start",
+            )
+            video_images = [
+                frame for video in videos for frame in video_to_images(video)
+            ]
+            _emit_event(
+                request_id=payload.request_id,
+                stage=None,
+                event_name="minicpmo_preprocess_video_to_images_end",
+                metadata={"decoded_frame_count": len(video_images)},
+            )
+        else:
+            video_images = []
         images.extend(video_images)
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_audio_start",
+        )
         audios = await ensure_audio_list_async(raw_audios, target_sr=16000)
         if video_audios:
             audios.extend(audio for audio in video_audios if audio is not None)
         else:
             pass
         audio_cache_key = compute_audio_cache_key(audios)
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_audio_end",
+            metadata={"num_audios": len(audios)},
+        )
 
         cache_keys = [key for key in (image_cache_key, video_cache_key) if key]
         image_cache_key = "|".join(cache_keys) if cache_keys else None
 
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_prompt_start",
+        )
         if isinstance(messages, list) and not (
             messages and all(isinstance(token, int) for token in messages)
         ):
@@ -317,10 +402,21 @@ class MiniCPMOPreprocessor:
             messages,
             use_tts_template=bool(audios) or self.should_use_tts_template(payload),
         )
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_prompt_end",
+            metadata={"num_images": len(images), "num_audios": len(audios)},
+        )
 
         # Match the checkpoint's video recipe; the policy covers mixed images too.
         video_options = (
             {"max_slice_nums": 1, "use_image_id": False} if raw_videos else {}
+        )
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_processor_start",
         )
         processed = self.processor(
             prompt_text,
@@ -329,12 +425,24 @@ class MiniCPMOPreprocessor:
             return_tensors="pt",
             **video_options,
         )
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_processor_end",
+            metadata={"num_images": len(images)},
+        )
 
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_payload_start",
+        )
         input_ids = processed["input_ids"][0].to(dtype=torch.long)
         attention_mask = torch.ones_like(input_ids)
 
         mm_inputs: dict[str, Any] = {}
         encoder_inputs: dict[str, dict[str, Any]] = {}
+        image_slice_count = None
         if images:
             image_bound = first_batch_item(processed["image_bound"])
             # note (MayDomine): slice order must match the placeholder bound order.
@@ -345,6 +453,7 @@ class MiniCPMOPreprocessor:
                     per_image if isinstance(per_image, list) else [per_image]
                 )
             ]
+            image_slice_count = len(pixel_values)
             tgt_sizes = first_batch_item(processed["tgt_sizes"])
             mm_inputs["image"] = {"bounds": image_bound, "cache_key": image_cache_key}
             encoder_inputs["image_encoder"] = {
@@ -391,4 +500,15 @@ class MiniCPMOPreprocessor:
             "video_total_pixels",
         ):
             payload.request.metadata.pop(key, None)
+        payload_metadata = {"input_token_count": int(input_ids.numel())}
+        if image_slice_count is not None:
+            payload_metadata["image_slice_count"] = image_slice_count
+        else:
+            pass
+        _emit_event(
+            request_id=payload.request_id,
+            stage=None,
+            event_name="minicpmo_preprocess_payload_end",
+            metadata=payload_metadata,
+        )
         return payload
