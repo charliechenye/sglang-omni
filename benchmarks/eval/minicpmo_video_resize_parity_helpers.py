@@ -204,9 +204,7 @@ def compare_processor_outputs(
     )
     baseline_tgt_sizes = flatten_tensors(baseline["tgt_sizes"])
     candidate_tgt_sizes = flatten_tensors(candidate["tgt_sizes"])
-    tgt_sizes_equal = exact_value_equal(
-        baseline["tgt_sizes"], candidate["tgt_sizes"]
-    )
+    tgt_sizes_equal = exact_value_equal(baseline["tgt_sizes"], candidate["tgt_sizes"])
     structural_equal = all(
         (
             input_ids_equal,

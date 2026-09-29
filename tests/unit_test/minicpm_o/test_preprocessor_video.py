@@ -474,6 +474,9 @@ def test_load_video_path_profiles_backend_and_resize_phases(
     assert sample_fps == 12.5
     assert [phase for phase, _metadata in events] == [
         "backend_decode",
+        "resize_geometry",
+        "tensor_resize",
+        "dtype_convert",
         "resize_convert",
     ]
     backend_metadata = events[0][1]
@@ -483,12 +486,82 @@ def test_load_video_path_profiles_backend_and_resize_phases(
     assert backend_metadata["source_width"] == 6
     assert backend_metadata["sample_fps"] == 12.5
     assert isinstance(backend_metadata["duration_ms"], float)
-    resize_metadata = events[1][1]
+    geometry_metadata = events[1][1]
+    assert geometry_metadata["frame_count"] == 2
+    assert geometry_metadata["source_height"] == 4
+    assert geometry_metadata["source_width"] == 6
+    assert geometry_metadata["resized_height"] == 8
+    assert geometry_metadata["resized_width"] == 12
+    tensor_resize_metadata = events[2][1]
+    assert tensor_resize_metadata["input_dtype"] == "torch.uint8"
+    assert tensor_resize_metadata["resize_output_dtype"] == "torch.uint8"
+    dtype_metadata = events[3][1]
+    assert dtype_metadata["input_dtype"] == "torch.uint8"
+    assert dtype_metadata["output_dtype"] == "torch.float32"
+    assert dtype_metadata["dtype_changed"] is True
+    resize_metadata = events[4][1]
     assert resize_metadata["frame_count"] == 2
     assert resize_metadata["resized_height"] == 8
     assert resize_metadata["resized_width"] == 12
     assert resize_metadata["output_dtype"] == "torch.float32"
-    assert isinstance(resize_metadata["duration_ms"], float)
+    assert all(
+        isinstance(metadata["duration_ms"], float) and metadata["duration_ms"] >= 0
+        for _phase, metadata in events
+    )
+    assert resize_metadata["duration_ms"] >= max(
+        metadata["duration_ms"] for _phase, metadata in events[1:4]
+    )
+
+
+def test_load_video_path_dtype_conversion_is_a_noop_for_float32(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, dict[str, video_mod.VideoDiagnosticValue]]] = []
+    source = torch.arange(12, dtype=torch.float32).reshape(1, 3, 2, 2)
+    patch_video_resize_constants(monkeypatch)
+
+    monkeypatch.setattr(
+        video_mod.qwen_vision, "get_video_reader_backend", lambda: "fake"
+    )
+    monkeypatch.setitem(
+        video_mod.qwen_vision.VIDEO_READER_BACKENDS,
+        "fake",
+        lambda _element: (source, 8.0),
+    )
+    monkeypatch.setattr(
+        video_mod.qwen_vision,
+        "smart_resize",
+        lambda _height, _width, **_kwargs: (2, 2),
+    )
+    monkeypatch.setattr(video_mod.tv_f, "resize", lambda video, _size, **_kwargs: video)
+
+    def collect_profile(
+        phase: str,
+        metadata: dict[str, video_mod.VideoDiagnosticValue],
+    ) -> None:
+        events.append((phase, dict(metadata)))
+
+    video, sample_fps = video_mod.load_video_path(
+        tmp_path / "float32.mp4", profile_hook=collect_profile
+    )
+    unprofiled_video, unprofiled_sample_fps = video_mod.load_video_path(
+        tmp_path / "float32-unprofiled.mp4"
+    )
+
+    assert torch.equal(video, source)
+    assert sample_fps == 8.0
+    assert torch.equal(unprofiled_video, source)
+    assert unprofiled_sample_fps == 8.0
+    dtype_metadata = next(
+        metadata for phase, metadata in events if phase == "dtype_convert"
+    )
+    assert dtype_metadata == {
+        "input_dtype": "torch.float32",
+        "output_dtype": "torch.float32",
+        "dtype_changed": False,
+        "duration_ms": dtype_metadata["duration_ms"],
+    }
 
 
 def test_load_video_path_profiles_successful_torchvision_fallback(
@@ -638,17 +711,26 @@ def test_ensure_video_list_profiles_multiple_local_videos(
         profile_hook: video_mod.VideoDiagnosticHook | None = None,
     ) -> tuple[torch.Tensor, float]:
         if profile_hook is not None:
-            profile_hook(
-                "backend_decode",
-                {
-                    "backend": "fake",
-                    "sampled_frame_count": 1,
-                    "source_height": 2,
-                    "source_width": 2,
-                    "sample_fps": 1.0,
-                    "duration_ms": 10.0 if Path(path).name == "first.mp4" else 20.0,
-                },
-            )
+            first_video = Path(path).name == "first.mp4"
+            phase_durations = {
+                "backend_decode": 10.0 if first_video else 20.0,
+                "resize_geometry": 1.0 if first_video else 2.0,
+                "tensor_resize": 3.0 if first_video else 4.0,
+                "dtype_convert": 5.0 if first_video else 6.0,
+                "resize_convert": 9.0 if first_video else 12.0,
+            }
+            for phase, duration_ms in phase_durations.items():
+                profile_hook(
+                    phase,
+                    {
+                        "backend": "fake",
+                        "sampled_frame_count": 1,
+                        "source_height": 2,
+                        "source_width": 2,
+                        "sample_fps": 1.0,
+                        "duration_ms": duration_ms,
+                    },
+                )
         else:
             pass
         return torch.zeros((1, 3, 2, 2)), 1.0
@@ -672,7 +754,15 @@ def test_ensure_video_list_profiles_multiple_local_videos(
     assert len(videos) == 2
     assert sample_fps == [1.0, 1.0]
     assert audios is None
-    assert sorted(
-        (metadata["video_index"], metadata["duration_ms"])
-        for _phase, metadata in events
-    ) == [(0, 10.0), (1, 20.0)]
+    for phase, expected_durations in {
+        "backend_decode": (10.0, 20.0),
+        "resize_geometry": (1.0, 2.0),
+        "tensor_resize": (3.0, 4.0),
+        "dtype_convert": (5.0, 6.0),
+        "resize_convert": (9.0, 12.0),
+    }.items():
+        assert sorted(
+            (metadata["video_index"], metadata["duration_ms"])
+            for event_phase, metadata in events
+            if event_phase == phase
+        ) == [(0, expected_durations[0]), (1, expected_durations[1])]

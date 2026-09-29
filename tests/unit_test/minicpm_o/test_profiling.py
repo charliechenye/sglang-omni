@@ -330,6 +330,54 @@ def test_summarize_video_diagnostics_counts_completed_records_per_video(
     add_diagnostic_event(
         events,
         "two-videos",
+        "minicpmo_preprocess_video_resize_geometry",
+        13_500_000,
+        0,
+        1.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_resize_geometry",
+        13_600_000,
+        1,
+        2.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_tensor_resize",
+        13_700_000,
+        0,
+        2.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_tensor_resize",
+        13_800_000,
+        1,
+        3.0,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_dtype_convert",
+        13_900_000,
+        0,
+        0.5,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
+        "minicpmo_preprocess_video_dtype_convert",
+        14_000_000,
+        1,
+        1.5,
+    )
+    add_diagnostic_event(
+        events,
+        "two-videos",
         "minicpmo_preprocess_video_tensor_prepare",
         14_000_000,
         0,
@@ -372,6 +420,12 @@ def test_summarize_video_diagnostics_counts_completed_records_per_video(
     assert summaries["video_backend_decode"].total_ms == pytest.approx(33.0)
     assert summaries["video_resize_convert"].count == 2
     assert summaries["video_resize_convert"].total_ms == pytest.approx(9.0)
+    assert summaries["video_resize_geometry"].count == 2
+    assert summaries["video_resize_geometry"].total_ms == pytest.approx(3.0)
+    assert summaries["video_tensor_resize"].count == 2
+    assert summaries["video_tensor_resize"].total_ms == pytest.approx(5.0)
+    assert summaries["video_dtype_convert"].count == 2
+    assert summaries["video_dtype_convert"].total_ms == pytest.approx(2.0)
     assert summaries["video_tensor_prepare"].count == 2
     assert summaries["video_tensor_prepare"].total_ms == pytest.approx(10.0)
     assert summaries["video_pil_materialize"].count == 2
