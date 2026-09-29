@@ -43,7 +43,7 @@ def test_minicpm_encoder_events_only_cover_uncached_execution(
     modality: str,
 ) -> None:
     events = []
-    monkeypatch.setattr(stages_mod, "_emit_event", lambda **event: events.append(event))
+    monkeypatch.setattr(stages_mod, "emit_event", lambda **event: events.append(event))
     encoder = FakeEncoder()
     scheduler = stages_mod.create_encoder_executor(encoder, stage_name=stage_name)
 
