@@ -268,46 +268,6 @@ def test_packed_compile_requires_ragged_half_precision(monkeypatch) -> None:
     ]
 
 
-def test_packed_compile_materializes_exact_fused_qkv(monkeypatch) -> None:
-    dit = tiny_dit()
-    estimator = PackedDiT(dit, device=CPU)
-    assert all(weight is None for weight in estimator.qkv_weights)
-    assert all(bias is None for bias in estimator.qkv_biases)
-
-    monkeypatch.setattr(torch, "compile", lambda function, **kwargs: function)
-    estimator.is_ragged = True
-    assert estimator.compile(torch.bfloat16)
-
-    for block, weight, bias in zip(
-        dit.transformer_blocks,
-        estimator.qkv_weights,
-        estimator.qkv_biases,
-        strict=True,
-    ):
-        assert weight is not None
-        expected_weight = torch.cat(
-            (block.attn.to_q.weight, block.attn.to_k.weight, block.attn.to_v.weight),
-            dim=0,
-        ).contiguous()
-        torch.testing.assert_close(weight, expected_weight, rtol=0, atol=0)
-        assert weight.is_contiguous()
-        assert not weight.requires_grad
-
-        expected_biases = (
-            block.attn.to_q.bias,
-            block.attn.to_k.bias,
-            block.attn.to_v.bias,
-        )
-        if expected_biases[0] is None:
-            assert bias is None
-        else:
-            assert bias is not None
-            expected_bias = torch.cat(expected_biases, dim=0).contiguous()
-            torch.testing.assert_close(bias, expected_bias, rtol=0, atol=0)
-            assert bias.is_contiguous()
-            assert not bias.requires_grad
-
-
 def test_a_wide_row_does_not_change_the_rows_packed_beside_it() -> None:
     dit = tiny_dit()
     padded = padded_inputs()

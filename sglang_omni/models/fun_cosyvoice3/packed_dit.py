@@ -322,48 +322,38 @@ class PackedDiT:
         fused_biases: list[torch.Tensor | None] = []
         fused_bytes = 0
         with torch.no_grad():
-            for layer_index, block in enumerate(self.dit.transformer_blocks):
+            for block in self.dit.transformer_blocks:
                 attn = block.attn
-                projections = (attn.to_q, attn.to_k, attn.to_v)
-                weights = tuple(proj.weight for proj in projections)
-                biases = tuple(proj.bias for proj in projections)
 
-                if not (weights[0].shape == weights[1].shape == weights[2].shape):
-                    raise RuntimeError(
-                        "PackedDiT fused QKV requires equal Q/K/V weight shapes; "
-                        f"layer {layer_index} has "
-                        f"{tuple(weights[0].shape)}, {tuple(weights[1].shape)}, "
-                        f"{tuple(weights[2].shape)}"
-                    )
-                if not (
-                    weights[0].dtype == weights[1].dtype == weights[2].dtype
-                    and weights[0].device == weights[1].device == weights[2].device
-                ):
-                    raise RuntimeError(
-                        "PackedDiT fused QKV requires Q/K/V weights on one "
-                        f"dtype/device; layer {layer_index}"
-                    )
-
-                has_bias = tuple(bias is not None for bias in biases)
-                if not (has_bias[0] == has_bias[1] == has_bias[2]):
-                    raise RuntimeError(
-                        "PackedDiT fused QKV requires matching Q/K/V bias "
-                        f"contracts; layer {layer_index} has {has_bias}"
-                    )
-
-                qkv_weight = torch.cat(weights, dim=0).contiguous().detach()
-                qkv_bias = (
-                    torch.cat(
-                        tuple(bias for bias in biases if bias is not None), dim=0
-                    ).contiguous().detach()
-                    if has_bias[0]
-                    else None
+                qkv_weight = torch.cat(
+                    (
+                        attn.to_q.weight,
+                        attn.to_k.weight,
+                        attn.to_v.weight,
+                    ),
+                    dim=0,
                 )
+                if attn.to_q.bias is None:
+                    qkv_bias = None
+                else:
+                    assert attn.to_k.bias is not None
+                    assert attn.to_v.bias is not None
+                    qkv_bias = torch.cat(
+                        (
+                            attn.to_q.bias,
+                            attn.to_k.bias,
+                            attn.to_v.bias,
+                        ),
+                        dim=0,
+                    )
+
                 fused_weights.append(qkv_weight)
                 fused_biases.append(qkv_bias)
-                fused_bytes += qkv_weight.numel() * qkv_weight.element_size()
+                fused_bytes += qkv_weight.nbytes
                 if qkv_bias is not None:
-                    fused_bytes += qkv_bias.numel() * qkv_bias.element_size()
+                    fused_bytes += qkv_bias.nbytes
+                else:
+                    pass
 
         self.qkv_weights = tuple(fused_weights)
         self.qkv_biases = tuple(fused_biases)
