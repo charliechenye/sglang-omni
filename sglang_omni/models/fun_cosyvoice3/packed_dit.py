@@ -269,6 +269,9 @@ class PackedDiT:
         device = torch.device(device)
         self.is_ragged = device.type == "cuda" and _is_fa3_supported()
         self.is_compiled = False
+        blocks = len(self.dit.transformer_blocks)
+        self.qkv_weights: tuple[torch.Tensor | None, ...] = (None,) * blocks
+        self.qkv_biases: tuple[torch.Tensor | None, ...] = (None,) * blocks
         logger.info(
             "Fun-CosyVoice3 Flow row attention on %s: %s",
             device,
@@ -314,6 +317,63 @@ class PackedDiT:
             return False
         else:
             pass
+
+        fused_weights: list[torch.Tensor] = []
+        fused_biases: list[torch.Tensor | None] = []
+        fused_bytes = 0
+        with torch.no_grad():
+            for layer_index, block in enumerate(self.dit.transformer_blocks):
+                attn = block.attn
+                projections = (attn.to_q, attn.to_k, attn.to_v)
+                weights = tuple(proj.weight for proj in projections)
+                biases = tuple(proj.bias for proj in projections)
+
+                if not (weights[0].shape == weights[1].shape == weights[2].shape):
+                    raise RuntimeError(
+                        "PackedDiT fused QKV requires equal Q/K/V weight shapes; "
+                        f"layer {layer_index} has "
+                        f"{tuple(weights[0].shape)}, {tuple(weights[1].shape)}, "
+                        f"{tuple(weights[2].shape)}"
+                    )
+                if not (
+                    weights[0].dtype == weights[1].dtype == weights[2].dtype
+                    and weights[0].device == weights[1].device == weights[2].device
+                ):
+                    raise RuntimeError(
+                        "PackedDiT fused QKV requires Q/K/V weights on one "
+                        f"dtype/device; layer {layer_index}"
+                    )
+
+                has_bias = tuple(bias is not None for bias in biases)
+                if not (has_bias[0] == has_bias[1] == has_bias[2]):
+                    raise RuntimeError(
+                        "PackedDiT fused QKV requires matching Q/K/V bias "
+                        f"contracts; layer {layer_index} has {has_bias}"
+                    )
+
+                qkv_weight = torch.cat(weights, dim=0).contiguous().detach()
+                qkv_bias = (
+                    torch.cat(
+                        tuple(bias for bias in biases if bias is not None), dim=0
+                    ).contiguous().detach()
+                    if has_bias[0]
+                    else None
+                )
+                fused_weights.append(qkv_weight)
+                fused_biases.append(qkv_bias)
+                fused_bytes += qkv_weight.numel() * qkv_weight.element_size()
+                if qkv_bias is not None:
+                    fused_bytes += qkv_bias.numel() * qkv_bias.element_size()
+
+        self.qkv_weights = tuple(fused_weights)
+        self.qkv_biases = tuple(fused_biases)
+        logger.info(
+            "Materialized PackedDiT fused QKV weights+biases for %d blocks "
+            "(%.1f MiB)",
+            len(self.qkv_weights),
+            fused_bytes / (1024 * 1024),
+        )
+
         # note(ratish): not dynamic=True, which makes the head count and size symbolic;
         # the reshape into FA3's layout then copies query and key in every block.
         self.forward = torch.compile(
@@ -347,10 +407,15 @@ class PackedDiT:
         h = dit.input_embed.proj(torch.cat((x, cond, mu, spks), dim=-1))
         h = self.conv_pos_embed(h, rows) + h
         residual = h
-        for block in dit.transformer_blocks:
+        for block_index, block in enumerate(dit.transformer_blocks):
             norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = block.attn_norm(h, emb=t)
             h = h + gate_msa.unsqueeze(1) * self.attend(
-                block.attn, norm, rope, attention
+                block.attn,
+                norm,
+                rope,
+                attention,
+                self.qkv_weights[block_index],
+                self.qkv_biases[block_index],
             )
             ff_norm = block.ff_norm(h) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
             h = h + gate_mlp.unsqueeze(1) * block.ff(ff_norm)
@@ -381,13 +446,19 @@ class PackedDiT:
         x: torch.Tensor,
         rope: tuple[torch.Tensor, torch.Tensor],
         attention: PackedRowAttention,
+        qkv_weight: torch.Tensor | None,
+        qkv_bias: torch.Tensor | None,
     ) -> torch.Tensor:
-        # note (ratish): under autocast to_q, to_k and to_v would each cast the
-        # float32 norm output again.
-        x = x.to(attn.to_q.weight.dtype)
-        query = attn.to_q(x)
-        key = attn.to_k(x)
-        value = attn.to_v(x)
+        if qkv_weight is None:
+            x = x.to(attn.to_q.weight.dtype)
+            query = attn.to_q(x)
+            key = attn.to_k(x)
+            value = attn.to_v(x)
+        else:
+            # note(chenyang): one fused projection removes two GEMM launches per
+            # transformer block while leaving the model's original Q/K/V modules intact.
+            x = x.to(qkv_weight.dtype)
+            query, key, value = F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
         if torch.compiler.is_compiling():
             query = rotated(query, *rope)
             key = rotated(key, *rope)
