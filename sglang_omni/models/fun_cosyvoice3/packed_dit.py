@@ -440,13 +440,16 @@ class PackedDiT:
         qkv_bias: torch.Tensor | None,
     ) -> torch.Tensor:
         if qkv_weight is None:
+            # note (ratish): under autocast to_q, to_k and to_v would each cast the
+            # float32 norm output again.
             x = x.to(attn.to_q.weight.dtype)
             query = attn.to_q(x)
             key = attn.to_k(x)
             value = attn.to_v(x)
         else:
-            # note(chenyang): one fused projection removes two GEMM launches per
-            # transformer block while leaving the model's original Q/K/V modules intact.
+            # note(chenye): one fused projection removes two GEMM launches per
+            # transformer block while leaving the model's original Q/K/V modules
+            # intact.
             x = x.to(qkv_weight.dtype)
             query, key, value = F.linear(x, qkv_weight, qkv_bias).chunk(3, dim=-1)
         if torch.compiler.is_compiling():
