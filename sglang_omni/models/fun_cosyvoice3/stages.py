@@ -690,7 +690,7 @@ def prepare_flow_conditioning(
     )
 
 
-def _flow_mel_mask(conditioning: FlowConditioning) -> torch.Tensor:
+def flow_mel_mask(conditioning: FlowConditioning) -> torch.Tensor:
     """Build the padded mel mask used by native Flow execution."""
     token_condition = conditioning.token_condition
     # Note (chenyang): int64 matches torch.arange's default so the comparison
@@ -727,7 +727,7 @@ def generate_flow(
     decoder = flow.decoder
     mel_mask: torch.Tensor | None = None
     if streaming or not finalize:
-        mel_mask = _flow_mel_mask(conditioning)
+        mel_mask = flow_mel_mask(conditioning)
         return solve_flow_euler(
             decoder,
             conditioning.noisy_mel,
@@ -738,8 +738,10 @@ def generate_flow(
             conditioning.prompt_mel,
             streaming=streaming,
         )
+    else:
+        pass
     if flow.cuda_graph_runner is not None:
-        mel_mask = _flow_mel_mask(conditioning)
+        mel_mask = flow_mel_mask(conditioning)
         generated = flow.cuda_graph_runner.run(
             conditioning.noisy_mel,
             conditioning.time_span,
@@ -750,10 +752,18 @@ def generate_flow(
         )
         if generated is not None:
             return generated
+        else:
+            pass
+    else:
+        pass
     if flow.packed_estimator is not None:
-        return _solve_prepared_flow_packed(flow, conditioning, streaming=False)
+        return solve_prepared_flow_packed(flow, conditioning, streaming=False)
+    else:
+        pass
     if mel_mask is None:
-        mel_mask = _flow_mel_mask(conditioning)
+        mel_mask = flow_mel_mask(conditioning)
+    else:
+        pass
     return solve_flow_euler(
         decoder,
         conditioning.noisy_mel,
@@ -766,7 +776,7 @@ def generate_flow(
     )
 
 
-def _solve_prepared_flow_packed(
+def solve_prepared_flow_packed(
     flow: FunCosyVoice3Flow,
     conditioning: FlowConditioning,
     *,
@@ -776,6 +786,8 @@ def _solve_prepared_flow_packed(
     packed_estimator = flow.packed_estimator
     if packed_estimator is None:
         raise RuntimeError("PackedDiT estimator is required for a packed Flow solve")
+    else:
+        pass
     token_condition = conditioning.token_condition
     rows = pack_rows(conditioning.mel_lengths, token_condition.device)
     generated = solve_flow_euler_packed(
@@ -805,7 +817,7 @@ def generate_flow_packed(
     PackedDiT selects the row-attention implementation for the current device.
     """
     conditioning = prepare_flow_conditioning(flow, packed, finalize=finalize)
-    return _solve_prepared_flow_packed(flow, conditioning, streaming=streaming)
+    return solve_prepared_flow_packed(flow, conditioning, streaming=streaming)
 
 
 def split_generated_mels(

@@ -146,16 +146,16 @@ def test_generate_flow_prefers_cuda_graph_over_packed(monkeypatch) -> None:
     packed_calls: list[object] = []
     eager_calls: list[object] = []
     mask_calls: list[object] = []
-    original_mask = stages._flow_mel_mask
+    original_mask = stages.flow_mel_mask
 
     def build_mask(conditioning):
         mask_calls.append(conditioning)
         return original_mask(conditioning)
 
-    monkeypatch.setattr(stages, "_flow_mel_mask", build_mask)
+    monkeypatch.setattr(stages, "flow_mel_mask", build_mask)
     monkeypatch.setattr(
         stages,
-        "_solve_prepared_flow_packed",
+        "solve_prepared_flow_packed",
         lambda *args, **kwargs: packed_calls.append(args),
     )
     monkeypatch.setattr(
@@ -200,7 +200,7 @@ def test_generate_flow_uses_packed_when_cuda_graph_does_not_run(
         return packed_result
 
     monkeypatch.setattr(stages, "prepare_flow_conditioning", prepare)
-    monkeypatch.setattr(stages, "_solve_prepared_flow_packed", packed_solve)
+    monkeypatch.setattr(stages, "solve_prepared_flow_packed", packed_solve)
     monkeypatch.setattr(
         stages,
         "solve_flow_euler",
@@ -224,12 +224,12 @@ def test_generate_flow_skips_mask_for_graph_disabled_packed_flow(monkeypatch) ->
     packed_result = torch.full((1, 4, 17), 8.0)
     monkeypatch.setattr(
         stages,
-        "_flow_mel_mask",
+        "flow_mel_mask",
         lambda *args, **kwargs: pytest.fail("PackedDiT path built a native mask"),
     )
     monkeypatch.setattr(
         stages,
-        "_solve_prepared_flow_packed",
+        "solve_prepared_flow_packed",
         lambda *args, **kwargs: packed_result,
     )
 
@@ -315,7 +315,7 @@ def test_generate_flow_does_not_retry_eager_after_replay_failure(monkeypatch) ->
     )
     monkeypatch.setattr(
         stages,
-        "_solve_prepared_flow_packed",
+        "solve_prepared_flow_packed",
         lambda *args, **kwargs: packed_calls.append(args),
     )
 
