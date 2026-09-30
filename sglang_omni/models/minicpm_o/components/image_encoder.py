@@ -6,13 +6,15 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from torch.nn.utils.rnn import pad_sequence
-from transformers import AutoConfig, PretrainedConfig
+from transformers import PretrainedConfig
 
+from sglang_omni.models.minicpm_o.hf_config import MiniCPMOConfig
 from sglang_omni.models.weight_loader import (
     load_weights_by_prefix,
     resolve_dtype,
     resolve_model_path,
 )
+from sglang_omni.platforms import current_platform
 
 STACKED_QKV = [
     ("self_attn.qkv_proj", "self_attn.q_proj", "q"),
@@ -21,14 +23,16 @@ STACKED_QKV = [
 ]
 
 
-def _vision_config_object(config: PretrainedConfig) -> PretrainedConfig:
+def vision_config_object(config: PretrainedConfig) -> PretrainedConfig:
     vision_config = config.vision_config
     if isinstance(vision_config, dict):
         return PretrainedConfig.from_dict(vision_config)
+    else:
+        pass
     return vision_config
 
 
-def _init_sglang_tp() -> None:
+def init_sglang_tp() -> None:
     """Reuse a TP=1 context or initialize one for standalone vision encoding."""
     import os
 
@@ -44,7 +48,11 @@ def _init_sglang_tp() -> None:
                 "MiniCPM-o image encoder requires tp_size=1 but the process "
                 f"already initialized tp_size={tp_size}"
             )
+        else:
+            pass
         return
+    else:
+        pass
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     if "MASTER_PORT" not in os.environ:
@@ -53,6 +61,8 @@ def _init_sglang_tp() -> None:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(("", 0))
             os.environ["MASTER_PORT"] = str(s.getsockname()[1])
+    else:
+        pass
 
     # note (MayDomine): an unpublished runtime context raises ValueError.
     try:
@@ -61,18 +71,18 @@ def _init_sglang_tp() -> None:
         set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
     parallel_state.init_distributed_environment(
-        backend="nccl",
+        backend=current_platform.get_torch_distributed_backend_str(),
         world_size=1,
         rank=0,
         local_rank=0,
     )
     parallel_state.initialize_model_parallel(tensor_model_parallel_size=1)
 
-    dp._ATTN_TP_SIZE = 1
-    dp._ATTN_TP_RANK = 0
+    dp._ATTN_TP_SIZE = 1  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
+    dp._ATTN_TP_RANK = 0  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
 
-def _load_srt_weights(module: nn.Module, weights: dict[str, torch.Tensor]) -> None:
+def load_srt_weights(module: nn.Module, weights: dict[str, torch.Tensor]) -> None:
     """Map checkpoint projections onto fused vision-attention parameters."""
     from sglang.srt.model_loader.weight_utils import default_weight_loader
 
@@ -83,9 +93,13 @@ def _load_srt_weights(module: nn.Module, weights: dict[str, torch.Tensor]) -> No
         for param_name, weight_name, shard_id in STACKED_QKV:
             if weight_name not in name:
                 continue
+            else:
+                pass
             target = name.replace(weight_name, param_name)
             if target not in params_dict:
                 continue
+            else:
+                pass
             param = params_dict[target]
             param.weight_loader(param, tensor, shard_id)
             loaded.add(target)
@@ -93,6 +107,8 @@ def _load_srt_weights(module: nn.Module, weights: dict[str, torch.Tensor]) -> No
         else:
             if name not in params_dict:
                 raise KeyError(f"unexpected checkpoint weight: {name}")
+            else:
+                pass
             param = params_dict[name]
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, tensor)
@@ -100,6 +116,8 @@ def _load_srt_weights(module: nn.Module, weights: dict[str, torch.Tensor]) -> No
     missing = set(params_dict) - loaded
     if missing:
         raise KeyError(f"checkpoint missing weights for: {sorted(missing)[:8]}")
+    else:
+        pass
 
 
 class MiniCPMOImageEncoder(nn.Module):
@@ -115,19 +133,21 @@ class MiniCPMOImageEncoder(nn.Module):
         super().__init__()
         torch_dtype = resolve_dtype(dtype)
         model_dir = str(resolve_model_path(model_path))
-        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        config = MiniCPMOConfig.from_pretrained(model_dir)
         self.device = torch.device(device)
         self.dtype = torch_dtype
 
-        _init_sglang_tp()
+        init_sglang_tp()
         from sglang.srt.models.idefics2 import Idefics2VisionTransformer
         from sglang.srt.models.minicpmv import Resampler2_5
 
-        vision_config = _vision_config_object(config)
+        vision_config = vision_config_object(config)
         vpm = Idefics2VisionTransformer(vision_config)
         if getattr(config, "drop_vision_last_layer", False):
             vpm.encoder.layers = vpm.encoder.layers[:-1]
-        _load_srt_weights(vpm, load_weights_by_prefix(model_dir, prefix=("vpm.",)))
+        else:
+            pass
+        load_srt_weights(vpm, load_weights_by_prefix(model_dir, prefix=("vpm.",)))
         self.vpm = vpm
 
         embed_dim = config.hidden_size
@@ -137,7 +157,7 @@ class MiniCPMOImageEncoder(nn.Module):
             num_heads=embed_dim // 128,
             kv_dim=vision_config.hidden_size,
         )
-        _load_srt_weights(
+        load_srt_weights(
             resampler, load_weights_by_prefix(model_dir, prefix=("resampler.",))
         )
         self.resampler = resampler
@@ -145,7 +165,9 @@ class MiniCPMOImageEncoder(nn.Module):
         self.eval()
         self.to(device=self.device, dtype=torch_dtype)
         # note (MayDomine): rebuild the positional cache in fp32 after the bf16 cast.
-        self.resampler._set_2d_pos_cache(self.resampler.max_size, device=device)
+        self.resampler._set_2d_pos_cache(
+            self.resampler.max_size, device=device
+        )  # noqa: leading-underscore  # upstream spelling, or the public name is already taken
 
         self.vision_batch_size = int(getattr(config, "vision_batch_size", 16))
 
@@ -197,6 +219,8 @@ class MiniCPMOImageEncoder(nn.Module):
         """Return (num_slices * query_num, hidden) embeddings in slice order."""
         if not pixel_values or tgt_sizes is None:
             return {}
+        else:
+            pass
         tgt_sizes_cpu = tgt_sizes.to("cpu", dtype=torch.int32)
         tgt_sizes = tgt_sizes_cpu.to(self.device)
 

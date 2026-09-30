@@ -12,9 +12,12 @@ XPU wheel index.
 family and CUDA-only wheels would replace the `+xpu` stack.
 [`pyproject_xpu.toml`](../../pyproject_xpu.toml) encodes the XPU replacements.
 
-Core deps cover the supported models (Qwen3-ASR / TTS / Omni) plus the API server;
-`[eval]` adds SeedTTS/WER tooling and `[all]` aliases it. Other model families
-(S2-Pro, Ming-Omni, Voxtral-TTS) are CUDA-only and are not offered here.
+Core deps cover the supported models (Qwen3-ASR / TTS / Omni / MiniMax Music 3, Fun-ASR-Nano and
+MiniCPM-o) plus the API server;
+`[eval]` adds SeedTTS/WER tooling and `[all]` aliases it. ZONOS2 also serves here,
+but its DAC codec is not a core dep on any platform — see
+[ZONOS2](#zonos2-moe-tts-single-xpu) for the XPU-safe way to add it. Other model
+families (S2-Pro, Ming-Omni, Voxtral-TTS) are CUDA-only and are not offered here.
 
 > **`--no-build-isolation` is required** — without it pip emits a legacy in-tree
 > `egg-info` instead of a PEP 660 editable install. The installer always passes it.
@@ -41,16 +44,6 @@ docker run -it --device /dev/dri --shm-size 32g --ipc host --network host sglang
 
 Built on Intel Deep Learning Essentials with the `+xpu` torch wheels. It deliberately does **not**
 source oneAPI — see [Runtime environment](#runtime-environment-important).
-
-Pinning SGLang does not pin the SYCL kernels: its XPU manifest requires `sgl-kernel-xpu`
-from git with no revision. The Dockerfile therefore pins that commit itself, so rebuilds
-are reproducible by default. Override it only to move deliberately:
-
-```bash
-docker build -f docker/xpu.Dockerfile \
-  --build-arg SGL_KERNEL_XPU_REF=<sgl-kernel-xpu commit sha> \
-  -t sglang-omni:xpu .
-```
 
 ## 🛠️ Option B: Install into an existing XPU env (recommended here)
 
@@ -80,6 +73,8 @@ Or do it manually (the same steps the script automates):
 cp pyproject.toml .pyproject.cuda.bak
 cp pyproject_xpu.toml pyproject.toml
 pip install -e . --no-build-isolation --extra-index-url https://download.pytorch.org/whl/xpu
+# torch+xpu provides triton-xpu; do not let openai-whisper replace it with CUDA Triton.
+pip install --no-deps openai-whisper==20250625
 cp -f .pyproject.cuda.bak pyproject.toml && rm .pyproject.cuda.bak   # restore CUDA pyproject
 ```
 
@@ -91,7 +86,7 @@ It cannot be pinned even as a range: every published wheel requires `flashinfer_
 
 ```bash
 git clone https://github.com/sgl-project/sglang && cd sglang
-git checkout v0.5.19   # the pinned release
+git checkout v0.5.20   # the pinned release
 cd python && cp pyproject_xpu.toml pyproject.toml
 pip install -e . --no-build-isolation --extra-index-url https://download.pytorch.org/whl/xpu
 pip install --no-deps xgrammar==0.1.33
@@ -138,6 +133,22 @@ curl -s -X POST http://localhost:8000/v1/audio/transcriptions \
   -F "file=@sample.wav" -F "model=/path/to/Qwen3-ASR-1.7B"
 ```
 
+### Fun-ASR-Nano (speech-to-text, single XPU)
+
+Same endpoint as Qwen3-ASR, one uploaded clip of 30 s or less per request. See
+[docs/cookbook/fun_asr.md](../cookbook/fun_asr.md) for the request parameters.
+
+```bash
+sgl-omni serve --model-path /path/to/Fun-ASR-Nano-2512-hf --host 0.0.0.0 --port 8000
+# transcribe:
+curl -s -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F "file=@sample.wav" -F "model=/path/to/Fun-ASR-Nano-2512-hf" -F "language=en"
+```
+
+The audio encoder captures a graph per (batch, length) bucket the first time it
+sees one, on XPU as on CUDA. Buckets that fail to capture log a warning and run
+eager, so a transcript is never at stake.
+
 ### Qwen3-TTS (text-to-speech, single XPU)
 
 Qwen3-TTS needs the upstream `qwen-tts` package. Option A already includes it; for
@@ -149,7 +160,7 @@ would replace this project's 5.12.1, and resolving `sox` lifts `numpy` past the
 
 ```bash
 apt-get update && apt-get install -y sox   # the Python sox package shells out to it
-pip install --no-deps sox einops
+pip install --no-deps sox
 pip install --no-deps qwen-tts==0.1.1
 ```
 
@@ -162,6 +173,38 @@ curl -s -X POST http://localhost:8000/v1/audio/speech \
        "voice":"default","ref_audio":"/path/to/ref.wav","ref_text":"reference transcript",
        "response_format":"wav"}' -o out.wav
 ```
+
+### ZONOS2 (MoE TTS, single XPU)
+
+ZONOS2 needs the Descript DAC codec. `--no-deps` is required:
+`descript-audiotools==0.7.2` pins `protobuf<3.20`, which would downgrade this
+environment's `protobuf` to 3.19.6. The other packages on the line are the codec's
+own dependencies.
+
+```bash
+pip install --no-deps "descript-audiotools==0.7.2" "descript-audio-codec==1.0.0" \
+  argbind julius pyloudnorm pystoi torch-stoi flatten-dict randomname \
+  ffmpy fire markdown2 importlib_resources \
+  tensorboard tensorboard-data-server absl-py Markdown Werkzeug
+python -c "import dac; print('ok')"
+```
+
+Voice cloning transcodes the reference clip with **ffmpeg**, so `ffmpeg` must be on
+`PATH`. Then serve — `params.json` auto-selects the architecture, so `--model-path`
+is all that is needed:
+
+```bash
+sgl-omni serve --model-path Zyphra/zonos2 --host 0.0.0.0 --port 8000
+# clone a voice from a reference clip:
+curl -s -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"Hello from Intel XPU.",
+       "references":[{"audio_path":"/path/to/ref.wav","text":"reference transcript"}]}' \
+  -o out.wav
+```
+
+On XPU, ZONOS2 keeps its MoE experts in bf16 and leaves `torch.compile` off; decode
+graphs stay on by default. All three are applied automatically.
 
 ### Qwen3-Omni (30B-A3B MoE, multi-XPU tensor parallel)
 
@@ -183,10 +226,29 @@ curl -s -X POST http://localhost:8000/v1/chat/completions \
        "messages":[{"role":"user","content":"What is Intel XPU?"}],"max_tokens":64}'
 ```
 
+### MiniMax Music 3 (text-to-music, two XPUs)
+```bash
+# server
+sgl-omni serve --model-path MiniMaxAI/MiniMax-Music3 --port 8000 --mem-fraction-static 0.7
+# client request - Genre, instrumentation, tempo, and a production note
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MiniMaxAI/MiniMax-Music3",
+    "input": "[Chorus]\nWe are the fire that never dies\nBurning bright against the sky",
+    "instructions": "An energetic arena rock anthem with distorted electric guitars, punchy live drums and a soaring male vocal at 130 BPM, wide stereo image, lightly compressed",
+    "seed": 7,
+    "max_new_tokens": 750
+  }' \
+  --output rock_1.wav
+```
+
 Health check for any of the above: `curl http://localhost:8000/v1/models`.
 
 > **Expected on XPU:** `Failed to import mooncake` / `Failed to import nixl` warnings are harmless
 > — those CUDA-only transfer backends are omitted; tensors move through the `shm` relay instead.
 
-> ✅ Support status: **Qwen3-ASR, Qwen3-TTS, and Qwen3-Omni all serve end-to-end on Intel XPU**
-> (ASR single-card, TTS single-card, Qwen3-Omni thinker across 8 cards with tensor parallelism).
+> ✅ Support status: **Qwen3-ASR, Fun-ASR-Nano, Qwen3-TTS, ZONOS2, Qwen3-Omni, MiniMax Music 3 and
+> MiniCPM-o all serve end-to-end on Intel XPU** (ASR, Fun-ASR, TTS and MiniCPM-o single-card;
+> ZONOS2 single-card with decode graphs; MiniMax Music 3 needs two cards; Qwen3-Omni thinker
+> across 8 cards with tensor parallelism).

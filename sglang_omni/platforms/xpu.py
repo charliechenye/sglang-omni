@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
     from sglang_omni.pipeline.stage_workers import StageLaunchConfig
     from sglang_omni.platforms.device_graph import DeviceGraphBackend
+else:
+    pass
 
 
 class XPUOmniPlatform(OmniPlatform):
@@ -54,6 +56,20 @@ class XPUOmniPlatform(OmniPlatform):
     def enable_thinker_decode_graph(self) -> bool:
         # Capture leaves the scheduler thread's stream recording; host reads fail.
         return False
+
+    def enable_zonos2_torch_compile(self) -> bool:
+        return False
+
+    def supports_fp8_moe(self) -> bool:
+        return False
+
+    def zonos2_bf16_mem_fraction_static(self, device: torch.device) -> float | None:
+        if device.type != self.device_type:
+            return None
+        else:
+            # Measured on an Arc Pro B60: 14.34 GiB of bf16 experts plus a
+            # 5.98 GiB KV pool.
+            return 0.85
 
     def _get_device_graph_backend(self) -> DeviceGraphBackend:
         from sglang_omni.platforms.device_graph import XpuDeviceGraphBackend
@@ -95,6 +111,8 @@ class XPUOmniPlatform(OmniPlatform):
                 "MoE runners are CUDA-only. Leave the backend as 'auto' or pass "
                 "'triton'."
             )
+        else:
+            pass
 
         return effective_quantization
 
@@ -106,14 +124,20 @@ class XPUOmniPlatform(OmniPlatform):
         """Keep every card visible, preserving a group-wide ZE_AFFINITY_MASK."""
         if spec.tp_size <= 1:
             return {}
+        else:
+            pass
         if spec.gpu_id is None:
             raise ValueError(f"tp stage {spec.stage_name!r} requires a GPU id")
+        else:
+            pass
 
         updates = {"SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK": "false"}
         source_env = env if env is not None else os.environ
         mask = (source_env.get("ZE_AFFINITY_MASK") or "").strip()
         if not mask:
             return updates
+        else:
+            pass
 
         visible = [item.strip() for item in mask.split(",") if item.strip()]
         if len(visible) < spec.tp_size:
@@ -124,10 +148,14 @@ class XPUOmniPlatform(OmniPlatform):
                 "discovery, and dropping the mask instead would relocate the stage "
                 "onto different physical cards."
             )
+        else:
+            pass
         if spec.gpu_id >= len(visible):
             raise ValueError(
                 f"tp stage {spec.stage_name!r} assigned gpu_id={spec.gpu_id}, but "
                 f"ZE_AFFINITY_MASK={mask!r} exposes only {len(visible)} cards "
                 f"({', '.join(visible)}). gpu_id indexes into the mask, not the host."
             )
+        else:
+            pass
         return updates
