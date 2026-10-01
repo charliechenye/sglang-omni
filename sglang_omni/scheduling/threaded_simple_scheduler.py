@@ -83,6 +83,7 @@ class ThreadedSimpleScheduler:
         *,
         max_concurrency: int = 8,
         abort_callback: Callable[[str], None] | None = None,
+        shutdown_callback: Callable[[], None] | None = None,
     ):
         self.lock = threading.Lock()
         self.inbox: CountingInbox = CountingInbox()
@@ -97,6 +98,8 @@ class ThreadedSimpleScheduler:
         self.aborted_futures: set[Future] = set()
         self.running = False
         self.abort_callback = abort_callback
+        self.shutdown_callback = shutdown_callback
+        self.shutdown_lock = threading.Lock()
 
     def start(self) -> None:
         self.running = True
@@ -131,9 +134,20 @@ class ThreadedSimpleScheduler:
                 )
         finally:
             self.executor.shutdown(wait=False, cancel_futures=True)
+            self.run_shutdown_callback()
 
     def stop(self) -> None:
         self.running = False
+        self.run_shutdown_callback()
+
+    def run_shutdown_callback(self) -> None:
+        with self.shutdown_lock:
+            callback = self.shutdown_callback
+            self.shutdown_callback = None
+        if callback is not None:
+            callback()
+        else:
+            pass
 
     def enqueue(self, msg: IncomingMessage) -> None:
         """Promote speculative aborts atomically with enqueue (scheduler lock first)."""

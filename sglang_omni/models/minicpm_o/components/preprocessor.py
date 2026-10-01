@@ -6,6 +6,7 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Mapping
+from concurrent.futures import Executor
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -192,6 +193,9 @@ class MiniCPMOPreprocessor:
         model_path: str,
         *,
         speech_enabled: bool = False,
+        resize_executor: Executor | None = None,
+        resize_workers: int = 0,
+        resize_chunks: int = 1,
     ) -> None:
         local_dir = str(resolve_model_path(model_path))
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -202,6 +206,17 @@ class MiniCPMOPreprocessor:
         self._processor = None  # noqa: leading-underscore
         self._processor_lock = threading.Lock()  # noqa: leading-underscore
         self.speech_enabled = speech_enabled
+        self.video_resize_executor = resize_executor
+        self.video_resize_workers = resize_workers
+        self.video_resize_chunks = resize_chunks
+
+    def shutdown(self) -> None:
+        """Release the optional shared video resize executor."""
+        if self.video_resize_executor is not None:
+            self.video_resize_executor.shutdown(wait=False, cancel_futures=True)
+            self.video_resize_executor = None
+        else:
+            pass
 
     def speech_to_text_inputs(
         self, payload: StagePayload, inputs: dict[str, Any]
@@ -444,12 +459,22 @@ class MiniCPMOPreprocessor:
                     metadata=dict(metadata),
                 )
 
+            resize_options: dict[str, Executor | int] = {}
+            if self.video_resize_executor is not None:
+                resize_options = {
+                    "resize_executor": self.video_resize_executor,
+                    "resize_workers": self.video_resize_workers,
+                    "resize_chunks": self.video_resize_chunks,
+                }
+            else:
+                pass
             videos, _, video_audios = await ensure_video_list_async(
                 raw_videos,
                 **video_kwargs,
                 extract_audio=use_audio_in_video,
                 audio_target_sr=16000,
                 profile_hook=emit_video_diagnostic,
+                **resize_options,
             )
             _emit_event(
                 request_id=payload.request_id,

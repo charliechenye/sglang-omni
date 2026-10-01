@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import defaultdict
+from concurrent.futures import Executor, ThreadPoolExecutor
 from typing import Any
 
 import torch
@@ -53,8 +54,39 @@ def create_preprocessing_executor(
     *,
     speech_enabled: bool = False,
     max_concurrency: int,
+    video_resize_workers: int = 0,
+    video_resize_chunks: int = 8,
 ) -> SimpleScheduler | ThreadedSimpleScheduler:
-    preprocessor = MiniCPMOPreprocessor(model_path, speech_enabled=speech_enabled)
+    if video_resize_workers < 0:
+        raise ValueError("video_resize_workers must be non-negative")
+    else:
+        pass
+    if video_resize_chunks < 1:
+        raise ValueError("video_resize_chunks must be positive")
+    else:
+        pass
+
+    resize_executor: Executor | None = None
+    if video_resize_workers > 1:
+        resize_executor = ThreadPoolExecutor(
+            max_workers=video_resize_workers,
+            thread_name_prefix="minicpmo-video-resize",
+        )
+        logger.info(
+            f"MiniCPM-o video parallel resize enabled: workers={video_resize_workers} "
+            f"chunks={video_resize_chunks} "
+            f"torch_intra_op_threads={torch.get_num_threads()}"
+        )
+    else:
+        pass
+
+    preprocessor = MiniCPMOPreprocessor(
+        model_path,
+        speech_enabled=speech_enabled,
+        resize_executor=resize_executor,
+        resize_workers=video_resize_workers,
+        resize_chunks=video_resize_chunks,
+    )
 
     async def preprocess_with_events(payload: StagePayload) -> StagePayload:
         emit_event(
@@ -72,10 +104,15 @@ def create_preprocessing_executor(
             )
 
     if max_concurrency == 1:
-        return SimpleScheduler(preprocess_with_events)
+        return SimpleScheduler(
+            preprocess_with_events,
+            shutdown_callback=preprocessor.shutdown,
+        )
     else:
         return ThreadedSimpleScheduler(
-            preprocess_with_events, max_concurrency=max_concurrency
+            preprocess_with_events,
+            max_concurrency=max_concurrency,
+            shutdown_callback=preprocessor.shutdown,
         )
 
 
