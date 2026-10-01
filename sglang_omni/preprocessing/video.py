@@ -9,7 +9,9 @@ import logging
 import tempfile
 import time
 from collections.abc import Mapping
+from concurrent.futures import Executor, Future
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -192,6 +194,33 @@ def resize_video_tensor(
     )
 
 
+def resize_video_tensor_parallel(
+    video: torch.Tensor,
+    geometry: VideoResizeGeometry,
+    *,
+    executor: Executor,
+    chunks: int,
+) -> torch.Tensor:
+    """Resize frame chunks with the existing production tensor operation."""
+    frame_count = int(video.shape[0])
+    if frame_count <= 1 or chunks <= 1:
+        return resize_video_tensor(video, geometry)
+    else:
+        pass
+
+    effective_chunks = min(chunks, frame_count)
+    resized_futures: list[Future[torch.Tensor]] = []
+    for video_piece in torch.tensor_split(video, effective_chunks, dim=0):
+        if video_piece.shape[0] > 0:
+            resized_futures.append(
+                executor.submit(resize_video_tensor, video_piece, geometry)
+            )
+        else:
+            pass
+    resized_pieces = [future.result() for future in resized_futures]
+    return torch.cat(resized_pieces, dim=0)
+
+
 class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, Any | None]]):
     """MediaIO implementation for video files with optional audio extraction."""
 
@@ -301,6 +330,9 @@ async def ensure_video_list_async(
     extract_audio: bool = False,
     audio_target_sr: int = 16000,
     profile_hook: VideoDiagnosticHook | None = None,
+    resize_executor: Executor | None = None,
+    resize_workers: int = 0,
+    resize_chunks: int = 1,
 ) -> tuple[list[Any], list[float] | None, list[Any] | None]:
     """Asynchronously normalize video inputs into a list.
 
@@ -317,6 +349,9 @@ async def ensure_video_list_async(
         extract_audio: If True, extract audio from videos and return as third element.
         audio_target_sr: Target sample rate for audio extraction (default: 16000).
         profile_hook: Optional callback for completed local video subphase durations.
+        resize_executor: Optional dedicated executor for frame tensor resize.
+        resize_workers: Configured worker count for resize diagnostics.
+        resize_chunks: Requested frame chunks for each video resize.
 
     Returns:
         Tuple of (normalized video list, sample_fps_list or None, extracted_audio_list or None).
@@ -379,18 +414,27 @@ async def ensure_video_list_async(
         else:
             # Local file path
             video_path = Path(video_item)
-            if extract_audio:
-                video_task = loop.run_in_executor(
-                    global_thread_pool,
-                    load_video_path,
-                    video_path,
-                    fps,
-                    max_frames,
-                    min_pixels,
-                    max_pixels,
-                    total_pixels,
-                    indexed_profile_hook,
+            video_loader = partial(
+                load_video_path,
+                video_path,
+                fps,
+                max_frames,
+                min_pixels,
+                max_pixels,
+                total_pixels,
+                indexed_profile_hook,
+            )
+            if resize_executor is not None:
+                video_loader = partial(
+                    video_loader,
+                    resize_executor=resize_executor,
+                    resize_workers=resize_workers,
+                    resize_chunks=resize_chunks,
                 )
+            else:
+                pass
+            if extract_audio:
+                video_task = loop.run_in_executor(global_thread_pool, video_loader)
                 audio_task = loop.run_in_executor(
                     global_thread_pool,
                     extract_audio_from_path,
@@ -403,15 +447,7 @@ async def ensure_video_list_async(
                 return video, sample_fps, audio
             else:
                 video, sample_fps = await loop.run_in_executor(
-                    global_thread_pool,
-                    load_video_path,
-                    video_path,
-                    fps,
-                    max_frames,
-                    min_pixels,
-                    max_pixels,
-                    total_pixels,
-                    indexed_profile_hook,
+                    global_thread_pool, video_loader
                 )
                 return video, sample_fps, None
 
@@ -527,6 +563,10 @@ def load_video_path(
     max_pixels: int | None = None,
     total_pixels: int | None = None,
     profile_hook: VideoDiagnosticHook | None = None,
+    *,
+    resize_executor: Executor | None = None,
+    resize_workers: int = 0,
+    resize_chunks: int = 1,
 ) -> tuple[torch.Tensor, float]:
     """Load a local video into a torch tensor (T, C, H, W) on CPU."""
     video, sample_fps = decode_video_path(
@@ -568,8 +608,22 @@ def load_video_path(
         pass
 
     input_dtype = str(video.dtype) if profile_hook is not None else ""
+    effective_resize_chunks = min(max(resize_chunks, 1), geometry.frame_count)
+    parallel_resize_enabled = (
+        resize_executor is not None and effective_resize_chunks > 1
+    )
     tensor_resize_started_ns = time.perf_counter_ns() if profile_hook is not None else 0
-    resized_video = resize_video_tensor(video, geometry)
+    if parallel_resize_enabled:
+        assert resize_executor is not None
+        resized_video = resize_video_tensor_parallel(
+            video,
+            geometry,
+            executor=resize_executor,
+            chunks=resize_chunks,
+        )
+    else:
+        resized_video = resize_video_tensor(video, geometry)
+
     tensor_resize_duration_ms = (
         (time.perf_counter_ns() - tensor_resize_started_ns) / 1_000_000.0
         if profile_hook is not None
@@ -586,6 +640,10 @@ def load_video_path(
                 "resized_width": geometry.resized_width,
                 "input_dtype": input_dtype,
                 "resize_output_dtype": str(resized_video.dtype),
+                "parallel_resize": parallel_resize_enabled,
+                "resize_workers": resize_workers,
+                "resize_chunks": resize_chunks,
+                "effective_chunks": effective_resize_chunks,
                 "duration_ms": tensor_resize_duration_ms,
             },
         )
@@ -622,6 +680,10 @@ def load_video_path(
                 "resized_height": geometry.resized_height,
                 "resized_width": geometry.resized_width,
                 "output_dtype": str(video.dtype),
+                "parallel_resize": parallel_resize_enabled,
+                "resize_workers": resize_workers,
+                "resize_chunks": resize_chunks,
+                "effective_chunks": effective_resize_chunks,
                 "duration_ms": (time.perf_counter_ns() - resize_started_ns)
                 / 1_000_000.0,
             },
