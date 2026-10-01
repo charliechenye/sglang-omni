@@ -121,3 +121,5 @@ def test_engine_factory_resolves_native_config_before_server_args(
 def test_preprocessing_concurrency_is_enabled_by_default() -> None:
     stage = preprocessing_stage(process="pipeline")
     assert stage.factory.max_concurrency == 4
+    assert stage.factory.video_resize_workers == 0
+    assert stage.factory.video_resize_chunks == 8

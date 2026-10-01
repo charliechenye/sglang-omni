@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Executor, ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -76,6 +77,9 @@ def test_minicpm_preprocessor_uses_only_requested_video_audio(
         fake_processor  # noqa: leading-underscore  # production name
     )
     preprocessor.speech_enabled = False
+    preprocessor.video_resize_executor = None
+    preprocessor.video_resize_workers = 0
+    preprocessor.video_resize_chunks = 1
     preprocessor.tokenizer = SimpleNamespace()
     monkeypatch.setattr(
         preprocessor,
@@ -175,6 +179,9 @@ def test_minicpm_video_options_preserve_other_media(
         fake_processor  # noqa: leading-underscore  # production name
     )
     preprocessor.speech_enabled = False
+    preprocessor.video_resize_executor = None
+    preprocessor.video_resize_workers = 0
+    preprocessor.video_resize_chunks = 1
     monkeypatch.setattr(
         preprocessor, "render_chat_template", lambda messages, **_: str(messages)
     )
@@ -231,6 +238,9 @@ def make_test_preprocessor(
     preprocessor = object.__new__(MiniCPMOPreprocessor)
     preprocessor._processor = fake_processor  # noqa: leading-underscore
     preprocessor.speech_enabled = False
+    preprocessor.video_resize_executor = None
+    preprocessor.video_resize_workers = 0
+    preprocessor.video_resize_chunks = 1
     monkeypatch.setattr(
         preprocessor, "render_chat_template", lambda messages, **_: str(messages)
     )
@@ -513,6 +523,57 @@ def test_load_video_path_profiles_backend_and_resize_phases(
     )
 
 
+def test_load_video_path_profiles_parallel_resize_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    events: list[tuple[str, dict[str, video_mod.VideoDiagnosticValue]]] = []
+    source = torch.zeros((3, 3, 4, 6), dtype=torch.uint8)
+    patch_video_resize_constants(monkeypatch)
+
+    monkeypatch.setattr(
+        video_mod.qwen_vision, "get_video_reader_backend", lambda: "fake"
+    )
+    monkeypatch.setitem(
+        video_mod.qwen_vision.VIDEO_READER_BACKENDS,
+        "fake",
+        lambda _element: (source, 12.5),
+    )
+    monkeypatch.setattr(
+        video_mod.qwen_vision, "smart_resize", lambda *_args, **_kwargs: (8, 12)
+    )
+    monkeypatch.setattr(
+        video_mod.tv_f,
+        "resize",
+        lambda video, size, **_kwargs: torch.zeros(
+            (video.shape[0], video.shape[1], size[0], size[1]), dtype=video.dtype
+        ),
+    )
+
+    def collect_profile(
+        phase: str,
+        metadata: dict[str, video_mod.VideoDiagnosticValue],
+    ) -> None:
+        events.append((phase, dict(metadata)))
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        video_mod.load_video_path(
+            tmp_path / "parallel.mp4",
+            profile_hook=collect_profile,
+            resize_executor=executor,
+            resize_workers=2,
+            resize_chunks=8,
+        )
+
+    tensor_resize_metadata = next(
+        metadata for phase, metadata in events if phase == "tensor_resize"
+    )
+    assert tensor_resize_metadata["parallel_resize"] is True
+    assert tensor_resize_metadata["resize_workers"] == 2
+    assert tensor_resize_metadata["resize_chunks"] == 8
+    assert tensor_resize_metadata["effective_chunks"] == 3
+
+
 def test_load_video_path_dtype_conversion_is_a_noop_for_float32(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -766,3 +827,45 @@ def test_ensure_video_list_profiles_multiple_local_videos(
             for event_phase, metadata in events
             if event_phase == phase
         ) == [(0, expected_durations[0]), (1, expected_durations[1])]
+
+
+def test_ensure_video_list_passes_dedicated_resize_executor(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    video_path = tmp_path / "parallel.mp4"
+    video_path.touch()
+    captured: list[tuple[Executor | None, int, int]] = []
+
+    def fake_load_video_path(
+        _path: str | Path,
+        _fps: float | None = None,
+        _max_frames: int | None = None,
+        _min_pixels: int | None = None,
+        _max_pixels: int | None = None,
+        _total_pixels: int | None = None,
+        _profile_hook: video_mod.VideoDiagnosticHook | None = None,
+        *,
+        resize_executor: Executor | None = None,
+        resize_workers: int = 0,
+        resize_chunks: int = 1,
+    ) -> tuple[torch.Tensor, float]:
+        captured.append((resize_executor, resize_workers, resize_chunks))
+        return torch.zeros((2, 3, 2, 2)), 1.0
+
+    monkeypatch.setattr(video_mod, "load_video_path", fake_load_video_path)
+    with ThreadPoolExecutor(max_workers=2) as resize_executor:
+        videos, sample_fps, audios = asyncio.run(
+            video_mod.ensure_video_list_async(
+                [video_path],
+                resource_connector=SimpleNamespace(),
+                resize_executor=resize_executor,
+                resize_workers=32,
+                resize_chunks=8,
+            )
+        )
+
+    assert len(videos) == 1
+    assert sample_fps == [1.0]
+    assert audios is None
+    assert captured == [(resize_executor, 32, 8)]
