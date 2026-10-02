@@ -16,15 +16,27 @@ from sglang_omni.config import (
 )
 
 PKG = "sglang_omni.models.minicpm_o"
+PREPROCESSING_STAGE = "preprocessing"
 THINKER_STAGE = "thinker"
 
 
-def preprocessing_stage(*, process: str) -> StageConfig:
-    return StageConfig(
+class MiniCPMOPreprocessingFactoryArgs(FactoryArgs):
+    video_resize_workers: int = Field(default=8, ge=0)
+    video_resize_chunks: int = Field(default=8, ge=0)
+
+
+class MiniCPMOPreprocessingStageConfig(StageConfig):
+    factory: MiniCPMOPreprocessingFactoryArgs = Field(
+        default_factory=MiniCPMOPreprocessingFactoryArgs
+    )
+
+
+def preprocessing_stage(*, process: str) -> MiniCPMOPreprocessingStageConfig:
+    return MiniCPMOPreprocessingStageConfig(
         name="preprocessing",
         process=process,
         factory_path=f"{PKG}.stages.create_preprocessing_executor",
-        factory=FactoryArgs(max_concurrency=4),
+        factory=MiniCPMOPreprocessingFactoryArgs(max_concurrency=4),
         next=["image_encoder", "audio_encoder", "thinker"],
         route_fn=f"{PKG}.routing.resolve_preprocessing_next_stages",
         project_payload={
@@ -165,6 +177,7 @@ class MiniCPMOPipelineConfig(PipelineConfig):
 
     architecture: ClassVar[str] = "MiniCPMO"
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        PREPROCESSING_STAGE: MiniCPMOPreprocessingStageConfig,
         THINKER_STAGE: EngineStageConfig,
     }
 
@@ -176,6 +189,7 @@ class MiniCPMOSpeechPipelineConfig(MiniCPMOPipelineConfig):
     """Text and speech pipeline producing one waveform per request."""
 
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {
+        PREPROCESSING_STAGE: MiniCPMOPreprocessingStageConfig,
         THINKER_STAGE: EngineStageConfig,
         "talker": EngineStageConfig,
     }
