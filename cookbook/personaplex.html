@@ -531,7 +531,7 @@
 </pre></div>
 </div>
 <p>It ships the 7B weights, the Mimi codec, the SentencePiece text model and <code class="docutils literal notranslate"><span class="pre">voices.tgz</span></code>, which is unpacked into <code class="docutils literal notranslate"><span class="pre">voices/</span></code> next to the checkpoint on first use, or into the temp directory when that folder cannot be written. Recorded voice prompts (<code class="docutils literal notranslate"><span class="pre">--voice</span> <span class="pre">some.wav</span></code>) also need <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">pyloudnorm</span></code>; the packaged <code class="docutils literal notranslate"><span class="pre">.pt</span></code> voices do not.</p>
-<p>Everything runs on one GPU. On an H200 the LM engine reserves <code class="docutils literal notranslate"><span class="pre">mem_fraction_static=0.3</span></code> and the two Mimi instances stay under 1 GB each; lower <code class="docutils literal notranslate"><span class="pre">--lm.engine.mem_fraction_static</span></code> on smaller cards.</p>
+<p>Everything runs on one GPU. On an H200 the LM engine reserves <code class="docutils literal notranslate"><span class="pre">mem_fraction_static=0.3</span></code> and the two Mimi instances stay under 1 GB each. This value is a fraction of total device memory, so a smaller-memory device can need a higher fraction to fit the model weights.</p>
 </section>
 <section id="running-the-offline-example">
 <h2>Running the offline example<a class="headerlink" href="#running-the-offline-example" title="Link to this heading">#</a></h2>
@@ -550,6 +550,7 @@
 <li><p>Prompt plus reply must fit the LM context, 8192 positions by default (about 10.8 minutes); a longer recording is rejected with the limit in the message and needs <code class="docutils literal notranslate"><span class="pre">--lm.engine.context_length</span></code>.</p></li>
 <li><p>The reply text is the model’s inner monologue with the frame markers (<code class="docutils literal notranslate"><span class="pre">PAD</span></code>, <code class="docutils literal notranslate"><span class="pre">EPAD</span></code>, <code class="docutils literal notranslate"><span class="pre">BOS</span></code>, <code class="docutils literal notranslate"><span class="pre">EOS</span></code>) removed.</p></li>
 </ul>
+<p>For Intel GPUs, follow the <a class="reference internal" href="../get_started/installation_xpu.html#personaplex-speech-to-speech-single-xpu"><span class="std std-ref">PersonaPlex XPU recipe</span></a>.</p>
 </section>
 <section id="serving-over-http">
 <h2>Serving over HTTP<a class="headerlink" href="#serving-over-http" title="Link to this heading">#</a></h2>
