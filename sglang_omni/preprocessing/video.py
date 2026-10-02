@@ -56,16 +56,16 @@ def resize_video_tensor_parallel(
     resized_width: int,
     *,
     executor: Executor,
-    chunks: int,
+    workers: int,
 ) -> torch.Tensor:
     """Resize frame chunks in submission order using a shared executor."""
     frame_count = int(video.shape[0])
-    if frame_count <= 1 or chunks <= 1:
+    if frame_count <= 1 or workers <= 1:
         return resize_video_tensor(video, resized_height, resized_width)
     else:
         pass
 
-    effective_chunks = min(chunks, frame_count)
+    video_chunks = torch.tensor_split(video, min(workers, frame_count), dim=0)
     resized_futures: list[Future[torch.Tensor]] = [
         executor.submit(
             resize_video_tensor,
@@ -73,7 +73,7 @@ def resize_video_tensor_parallel(
             resized_height,
             resized_width,
         )
-        for video_chunk in torch.tensor_split(video, effective_chunks, dim=0)
+        for video_chunk in video_chunks
     ]
     resized_chunks = [resized_future.result() for resized_future in resized_futures]
     return torch.cat(resized_chunks, dim=0)
@@ -94,7 +94,7 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, npt.NDArray[np.float32] | 
         extract_audio: bool = False,
         audio_target_sr: int = 16000,
         resize_executor: Executor | None = None,
-        resize_chunks: int = 1,
+        resize_workers: int = 1,
         **kwargs: object,
     ) -> None:
         """Initialize VideoMediaIO.
@@ -109,7 +109,7 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, npt.NDArray[np.float32] | 
             extract_audio: If True, extract audio from video and return as third element.
             audio_target_sr: Target sample rate for audio extraction (default: 16000).
             resize_executor: Optional dedicated executor for frame tensor resize.
-            resize_chunks: Number of frame chunks submitted for each resize.
+            resize_workers: Maximum number of frame chunks submitted for each resize.
             **kwargs: Additional arguments (for compatibility with MultiModalResourceConnector).
         """
         super().__init__()
@@ -122,7 +122,7 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, npt.NDArray[np.float32] | 
         self.extract_audio = extract_audio
         self.audio_target_sr = audio_target_sr
         self.resize_executor = resize_executor
-        self.resize_chunks = resize_chunks
+        self.resize_workers = resize_workers
         self.kwargs = kwargs
 
     def load_path(self, filepath: Path) -> tuple[torch.Tensor, float]:
@@ -134,7 +134,7 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, npt.NDArray[np.float32] | 
             max_pixels=self.max_pixels,
             total_pixels=self.total_pixels,
             resize_executor=self.resize_executor,
-            resize_chunks=self.resize_chunks,
+            resize_workers=self.resize_workers,
         )
 
     def load_bytes(
@@ -200,7 +200,7 @@ async def ensure_video_list_async(
     extract_audio: bool = False,
     audio_target_sr: int = 16000,
     resize_executor: Executor | None = None,
-    resize_chunks: int = 1,
+    resize_workers: int = 1,
 ) -> tuple[
     list[object], list[float] | None, list[npt.NDArray[np.float32] | None] | None
 ]:
@@ -219,7 +219,7 @@ async def ensure_video_list_async(
         extract_audio: If True, extract audio from videos and return as third element.
         audio_target_sr: Target sample rate for audio extraction (default: 16000).
         resize_executor: Optional dedicated executor for frame tensor resize.
-        resize_chunks: Number of frame chunks submitted for each resize.
+        resize_workers: Maximum number of frame chunks submitted for each resize.
 
     Returns:
         Tuple of (normalized video list, sample_fps_list or None, extracted_audio_list or None).
@@ -265,7 +265,7 @@ async def ensure_video_list_async(
                 extract_audio=extract_audio,
                 audio_target_sr=audio_target_sr,
                 resize_executor=resize_executor,
-                resize_chunks=resize_chunks,
+                resize_workers=resize_workers,
             )
         else:
             # Local file path
@@ -278,15 +278,9 @@ async def ensure_video_list_async(
                 min_pixels=min_pixels,
                 max_pixels=max_pixels,
                 total_pixels=total_pixels,
+                resize_executor=resize_executor,
+                resize_workers=resize_workers,
             )
-            if resize_executor is not None:
-                video_loader = partial(
-                    video_loader,
-                    resize_executor=resize_executor,
-                    resize_chunks=resize_chunks,
-                )
-            else:
-                pass
             if extract_audio:
                 video_task = loop.run_in_executor(
                     global_thread_pool,
@@ -426,7 +420,7 @@ def load_video_path(
     total_pixels: int | None = None,
     *,
     resize_executor: Executor | None = None,
-    resize_chunks: int = 1,
+    resize_workers: int = 1,
 ) -> tuple[torch.Tensor, float]:
     """Load a local video into a CPU tensor, optionally resizing frame chunks."""
     path = Path(path)
@@ -498,13 +492,13 @@ def load_video_path(
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
-    if resize_executor is not None and resize_chunks > 1 and nframes > 1:
+    if resize_executor is not None and resize_workers > 1 and nframes > 1:
         video = resize_video_tensor_parallel(
             video,
             resized_height,
             resized_width,
             executor=resize_executor,
-            chunks=resize_chunks,
+            workers=resize_workers,
         )
     else:
         video = resize_video_tensor(video, resized_height, resized_width)

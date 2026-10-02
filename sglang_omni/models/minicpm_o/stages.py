@@ -49,55 +49,34 @@ from sglang_omni.utils.misc import avail_gpu_mem
 logger = logging.getLogger(__name__)
 
 
-def create_minicpm_o_video_resize_executor(
-    video_resize_workers: int,
-    video_resize_chunks: int,
-) -> Executor | None:
-    if video_resize_workers < 0:
-        raise ValueError("video_resize_workers must be non-negative")
-    else:
-        pass
-    if video_resize_chunks < 0:
-        raise ValueError("video_resize_chunks must be non-negative")
-    else:
-        pass
-    if video_resize_workers <= 1 or video_resize_chunks <= 1:
-        return None
-    else:
-        pass
-
-    video_resize_executor = ThreadPoolExecutor(
-        max_workers=video_resize_workers,
-        thread_name_prefix="minicpmo-video-resize",
-    )
-    atexit.register(video_resize_executor.shutdown)
-    logger.info(
-        f"MiniCPM-o parallel video resize enabled: workers={video_resize_workers} "
-        f"chunks={video_resize_chunks} "
-        f"torch_intra_op_threads={torch.get_num_threads()}"
-    )
-    return video_resize_executor
-
-
 def create_preprocessing_executor(
     model_path: str,
     *,
     speech_enabled: bool = False,
     max_concurrency: int,
-    video_resize_workers: int = 8,
-    video_resize_chunks: int = 8,
+    video_resize_workers: int,
 ) -> (
     SimpleScheduler[StagePayload, StagePayload]
     | ThreadedSimpleScheduler[StagePayload, StagePayload]
 ):
-    video_resize_executor = create_minicpm_o_video_resize_executor(
-        video_resize_workers, video_resize_chunks
-    )
+    video_resize_executor: Executor | None = None
+    if video_resize_workers > 1:
+        video_resize_executor = ThreadPoolExecutor(
+            max_workers=video_resize_workers,
+            thread_name_prefix="minicpmo-video-resize",
+        )
+        atexit.register(video_resize_executor.shutdown)
+        logger.info(
+            f"MiniCPM-o parallel video resize enabled: workers={video_resize_workers} "
+            f"torch_intra_op_threads={torch.get_num_threads()}"
+        )
+    else:
+        pass
     preprocessor = MiniCPMOPreprocessor(
         model_path,
         speech_enabled=speech_enabled,
         video_resize_executor=video_resize_executor,
-        video_resize_chunks=video_resize_chunks,
+        video_resize_workers=video_resize_workers,
     )
 
     async def preprocess_with_events(payload: StagePayload) -> StagePayload:

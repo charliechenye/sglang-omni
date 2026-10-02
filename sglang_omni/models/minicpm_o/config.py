@@ -22,7 +22,6 @@ THINKER_STAGE = "thinker"
 
 class MiniCPMOPreprocessingFactoryArgs(FactoryArgs):
     video_resize_workers: int = Field(default=8, ge=0)
-    video_resize_chunks: int = Field(default=8, ge=0)
 
 
 class MiniCPMOPreprocessingStageConfig(StageConfig):

@@ -108,8 +108,8 @@ class MiniCPMOPreprocessor:
         model_path: str,
         *,
         speech_enabled: bool = False,
-        video_resize_executor: Executor | None = None,
-        video_resize_chunks: int = 1,
+        video_resize_executor: Executor | None,
+        video_resize_workers: int,
     ) -> None:
         local_dir = str(resolve_model_path(model_path))
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -121,7 +121,7 @@ class MiniCPMOPreprocessor:
         self._processor_lock = threading.Lock()  # noqa: leading-underscore
         self.speech_enabled = speech_enabled
         self.video_resize_executor = video_resize_executor
-        self.video_resize_chunks = video_resize_chunks
+        self.video_resize_workers = video_resize_workers
 
     def speech_to_text_inputs(
         self, payload: StagePayload, inputs: Mapping[str, object]
@@ -307,20 +307,13 @@ class MiniCPMOPreprocessor:
 
         images = await ensure_image_list_async(raw_images)
         if raw_videos:
-            resize_options: dict[str, Executor | int] = {}
-            if self.video_resize_executor is not None:
-                resize_options = {
-                    "resize_executor": self.video_resize_executor,
-                    "resize_chunks": self.video_resize_chunks,
-                }
-            else:
-                pass
             videos, _, video_audios = await ensure_video_list_async(
                 raw_videos,
                 **video_kwargs,
                 extract_audio=use_audio_in_video,
                 audio_target_sr=16000,
-                **resize_options,
+                resize_executor=self.video_resize_executor,
+                resize_workers=self.video_resize_workers,
             )
         else:
             videos, video_audios = [], None

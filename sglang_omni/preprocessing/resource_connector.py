@@ -641,7 +641,7 @@ class MultiModalResourceConnector:
         extract_audio: bool = False,
         audio_target_sr: int = 16000,
         resize_executor: Executor | None = None,
-        resize_chunks: int = 1,
+        resize_workers: int = 1,
     ) -> tuple[torch.Tensor, float, npt.NDArray[np.float32] | None]:
         """Asynchronously load video from a URL.
 
@@ -657,7 +657,7 @@ class MultiModalResourceConnector:
             extract_audio: If True, extract audio from video and return as third element.
             audio_target_sr: Target sample rate for audio extraction (default: 16000).
             resize_executor: Optional dedicated executor for frame tensor resize.
-            resize_chunks: Number of frame chunks submitted for each resize.
+            resize_workers: Maximum number of frame chunks submitted for each resize.
 
         Returns:
             Tuple of (video_tensor, sample_fps, audio_or_None).
@@ -674,7 +674,7 @@ class MultiModalResourceConnector:
             extract_audio=extract_audio,
             audio_target_sr=audio_target_sr,
             resize_executor=resize_executor,
-            resize_chunks=resize_chunks,
+            resize_workers=resize_workers,
             **self.media_io_kwargs.get("video", {}),
         )
 

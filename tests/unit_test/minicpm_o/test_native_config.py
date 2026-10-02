@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -127,7 +126,6 @@ def test_preprocessing_concurrency_is_enabled_by_default() -> None:
     stage = preprocessing_stage(process="pipeline")
     assert stage.factory.max_concurrency == 4
     assert stage.factory.video_resize_workers == 8
-    assert stage.factory.video_resize_chunks == 8
 
 
 def test_preprocessing_video_resize_settings_are_cli_overridable() -> None:
@@ -135,31 +133,7 @@ def test_preprocessing_video_resize_settings_are_cli_overridable() -> None:
     merged = ConfigManager(config).merge_config(
         [
             ("preprocessing.factory.video_resize_workers", "0"),
-            ("preprocessing.factory.video_resize_chunks", "8"),
         ]
     )
     factory = merged.stage_named("preprocessing").factory
     assert factory.video_resize_workers == 0
-    assert factory.video_resize_chunks == 8
-
-
-@pytest.mark.parametrize(
-    ("video_resize_workers", "video_resize_chunks"),
-    [(0, 8), (1, 8), (8, 0), (8, 1)],
-)
-def test_serial_video_resize_settings_do_not_create_a_pool(
-    video_resize_workers: int,
-    video_resize_chunks: int,
-) -> None:
-    assert (
-        stages.create_minicpm_o_video_resize_executor(
-            video_resize_workers, video_resize_chunks
-        )
-        is None
-    )
-
-
-def test_parallel_video_resize_settings_create_a_dedicated_pool() -> None:
-    executor = stages.create_minicpm_o_video_resize_executor(2, 2)
-    assert isinstance(executor, ThreadPoolExecutor)
-    executor.shutdown()
