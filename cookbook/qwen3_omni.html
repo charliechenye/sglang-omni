@@ -874,13 +874,25 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 <td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
 <td><p>Total pixel budget across all video frames</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">use_audio_in_video</span></code></p></td>
+<td><p>bool</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
+<td><p>Set to <code class="docutils literal notranslate"><span class="pre">true</span></code> to process embedded audio. Requests where all videos lack audio use video-only processing; mixing videos with and without audio is rejected. Audio decoding errors are reported.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
+<p>Non-streaming chat requests return HTTP 400 for invalid media and HTTP 500 for
+server failures. With <code class="docutils literal notranslate"><span class="pre">stream=true</span></code>, errors detected after the event stream
+starts are sent as <code class="docutils literal notranslate"><span class="pre">data:</span> <span class="pre">{&quot;error&quot;:</span> <span class="pre">{&quot;message&quot;:</span> <span class="pre">&quot;...&quot;,</span> <span class="pre">&quot;type&quot;:</span> <span class="pre">&quot;invalid_request_error&quot;,</span> <span class="pre">&quot;code&quot;:</span> <span class="pre">400}}</span></code>,
+followed by <code class="docutils literal notranslate"><span class="pre">data:</span> <span class="pre">[DONE]</span></code>. Server failures use <code class="docutils literal notranslate"><span class="pre">type:</span> <span class="pre">&quot;server_error&quot;</span></code> and
+<code class="docutils literal notranslate"><span class="pre">code:</span> <span class="pre">500</span></code>. The HTTP status remains 200 once streaming has started; clients
+must check for an <code class="docutils literal notranslate"><span class="pre">error</span></code> event, including after partial output.</p>
 </section>
 <section id="known-limitations">
 <h3>Known Limitations<a class="headerlink" href="#known-limitations" title="Link to this heading">#</a></h3>
 <ul class="simple">
+<li><p><strong>Multiple videos must have the same sampled frame rate.</strong> The processor accepts one frame rate for video token timestamps. Requests with different sampled frame rates follow the invalid-input error contract above.</p></li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">modalities:</span> <span class="pre">[&quot;text&quot;,</span> <span class="pre">&quot;audio&quot;]</span></code> has no effect on a text-only server.</strong> No error is raised — the response simply contains no audio. Use a speech-mode server (without <code class="docutils literal notranslate"><span class="pre">--text-only</span></code>) to get audio output.</p></li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">content</span></code> must be <code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code> when the query is entirely in <code class="docutils literal notranslate"><span class="pre">audios</span></code>, <code class="docutils literal notranslate"><span class="pre">videos</span></code>, or <code class="docutils literal notranslate"><span class="pre">images</span></code>.</strong> Leaving a text query in <code class="docutils literal notranslate"><span class="pre">content</span></code> alongside audio causes the model to process both, which is usually not what you want.</p></li>
 <li><p><strong>Colocated topology does not support <code class="docutils literal notranslate"><span class="pre">--thinker.tp_size</span> <span class="pre">2</span></code>.</strong> The server raises a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> at startup (“Qwen Phase 1 colocation does not support thinker TP”). Use disaggregated topology for TP=2.</p></li>
