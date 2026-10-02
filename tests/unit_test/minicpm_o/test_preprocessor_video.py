@@ -64,6 +64,8 @@ def test_minicpm_preprocessor_uses_only_requested_video_audio(
         fake_processor  # noqa: leading-underscore  # production name
     )
     preprocessor.speech_enabled = False
+    preprocessor.video_resize_executor = None
+    preprocessor.video_resize_chunks = 1
     preprocessor.tokenizer = SimpleNamespace()
     monkeypatch.setattr(
         preprocessor,
@@ -162,6 +164,8 @@ def test_minicpm_video_options_preserve_other_media(
         fake_processor  # noqa: leading-underscore  # production name
     )
     preprocessor.speech_enabled = False
+    preprocessor.video_resize_executor = None
+    preprocessor.video_resize_chunks = 1
     monkeypatch.setattr(
         preprocessor, "render_chat_template", lambda messages, **_: str(messages)
     )
