@@ -108,8 +108,8 @@ class MiniCPMOPreprocessor:
         model_path: str,
         *,
         speech_enabled: bool = False,
-        video_resize_executor: Executor | None,
-        video_resize_workers: int,
+        video_resize_executor: Executor | None = None,
+        video_resize_workers: int = 1,
     ) -> None:
         local_dir = str(resolve_model_path(model_path))
         self.tokenizer = AutoTokenizer.from_pretrained(

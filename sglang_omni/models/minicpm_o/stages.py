@@ -54,7 +54,7 @@ def create_preprocessing_executor(
     *,
     speech_enabled: bool = False,
     max_concurrency: int,
-    video_resize_workers: int,
+    video_resize_workers: int = 8,
 ) -> (
     SimpleScheduler[StagePayload, StagePayload]
     | ThreadedSimpleScheduler[StagePayload, StagePayload]
