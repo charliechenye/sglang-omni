@@ -27,9 +27,12 @@ from sglang_omni.models.fun_cosyvoice3.prefix_cache import (
 
 logger = logging.getLogger(__name__)
 
+# note(chenye): regular causal Flow hops are aligned to
+# TOKEN_HOP_LEN * TOKEN_MEL_RATIO (25 * 2 = 50) mel frames;
+# final leftovers may differ.
 PREFIX_CUDA_GRAPH_CHUNK_FRAMES = 50
 MAX_SLACK_FRAMES = 100
-CAPTURE_WARMUP_ITERATIONS = 3
+CAPTURE_WARMUP_ITERATIONS = 1
 BYTES_PER_MIB = 1024 * 1024
 
 PrefixCudaGraphCaptureShape = tuple[int, int, int, int, Sequence[int]]
