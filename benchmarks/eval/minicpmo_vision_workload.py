@@ -61,6 +61,7 @@ class CensusEntry:
     patch_counts: list[int]
     total_patches: int
     max_patches: int
+    attention_work_proxy: int
     vpm_chunks: dict[int, int]
 
 
@@ -96,6 +97,7 @@ class CensusSummary:
     samples: int
     num_slices: Distribution
     total_patches: Distribution
+    attention_work_proxy: Distribution
     batches: list[ChunkSummary]
 
 
@@ -103,7 +105,9 @@ class CensusSummary:
 class Selection:
     sample_id: str
     reason: str
-    target_total_patches: float
+    metric: str
+    target_attention_work_proxy: float
+    actual_attention_work_proxy: int
     actual_total_patches: int
 
 
@@ -170,6 +174,9 @@ def summarize_census(entries: list[CensusEntry]) -> CensusSummary:
         samples=len(entries),
         num_slices=summarize([entry.num_slices for entry in entries]),
         total_patches=summarize([entry.total_patches for entry in entries]),
+        attention_work_proxy=summarize(
+            [entry.attention_work_proxy for entry in entries]
+        ),
         batches=batches,
     )
 
@@ -179,26 +186,34 @@ def select_request(
     sample_id: str | None,
     selection: Literal["median", "high"],
 ) -> Selection:
-    work = summarize([entry.total_patches for entry in entries])
+    work = summarize([entry.attention_work_proxy for entry in entries])
     target = work.median if selection == "median" else work.p95
     if sample_id is None:
         selected = min(
             entries,
-            key=lambda entry: (abs(entry.total_patches - target), entry.sample_id),
+            key=lambda entry: (
+                abs(entry.attention_work_proxy - target),
+                entry.sample_id,
+            ),
         )
-        reason = f"closest to {'p50' if selection == 'median' else 'p95'} total patches; ties use sample ID"
+        reason = (
+            f"closest to {'p50' if selection == 'median' else 'p95'} "
+            "attention_work_proxy; ties use sample ID"
+        )
     else:
         matching = [entry for entry in entries if entry.sample_id == sample_id]
         if not matching:
             raise ValueError(f"Sample {sample_id} is not in the frozen cohort")
         else:
             selected = matching[0]
-            target = selected.total_patches
+            target = selected.attention_work_proxy
             reason = "explicit --sample-id"
     return Selection(
         sample_id=selected.sample_id,
         reason=reason,
-        target_total_patches=target,
+        metric="attention_work_proxy",
+        target_attention_work_proxy=target,
+        actual_attention_work_proxy=selected.attention_work_proxy,
         actual_total_patches=selected.total_patches,
     )
 
@@ -258,6 +273,7 @@ def print_census(entries: list[CensusEntry], summary: CensusSummary) -> None:
     for label, distribution in (
         ("num_slices", summary.num_slices),
         ("total_patches", summary.total_patches),
+        ("attention_work_proxy", summary.attention_work_proxy),
     ):
         print(
             f"{label}: min={distribution.minimum:.0f} p50={distribution.median:.1f} p95={distribution.p95:.1f} max={distribution.maximum:.0f}"

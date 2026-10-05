@@ -21,6 +21,7 @@ import torch
 from benchmarks.eval.minicpmo_vision_experiments import (
     BASELINE_BATCH_SIZE,
     ResamplerExperiment,
+    VisionBatchExperiment,
     print_trial,
     resampler_experiment,
     vision_batch_sweep,
@@ -70,6 +71,7 @@ class RunReport:
     expected_base_sha: str
     model: ModelDetails
     parity_limits: ParityLimits
+    vision_batch_size: int
     video_fps: float = VIDEO_FPS
     video_max_frames: int = VIDEO_MAX_FRAMES
     video_max_pixels: int = VIDEO_MAX_PIXELS
@@ -78,7 +80,7 @@ class RunReport:
     census_summary: CensusSummary | None = None
     selection: Selection | None = None
     decomposition: Trial | None = None
-    vision_batch: list[Trial] = field(default_factory=list)
+    vision_batch: VisionBatchExperiment | None = None
     resampler: ResamplerExperiment | None = None
     profile: ProfileArtifacts | None = None
     substantial_drift: bool = False
@@ -141,6 +143,13 @@ def parse_arguments() -> argparse.Namespace:
         nargs="+",
         choices=[8, 16, 32, 64],
         default=[16, 32, 64],
+    )
+    parser.add_argument(
+        "--vision-batch-size",
+        type=int,
+        choices=[8, 16, 32, 64],
+        default=BASELINE_BATCH_SIZE,
+        help="Batch size for a single decompose measurement",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
@@ -267,6 +276,11 @@ def main() -> None:
             max_relative_l2=arguments.parity_max_rel_l2,
             min_cosine_similarity=arguments.parity_min_cosine,
         ),
+        vision_batch_size=(
+            arguments.vision_batch_size
+            if arguments.mode == "decompose"
+            else BASELINE_BATCH_SIZE
+        ),
         census=census,
         census_summary=summarize_census(census),
     )
@@ -288,27 +302,40 @@ def main() -> None:
         )
         report.selection = selection
         print(
-            f"=== SELECTION sample={selection.sample_id} ===\n{selection.reason}; target={selection.target_total_patches:.1f} actual={selection.actual_total_patches}",
+            f"=== SELECTION sample={selection.sample_id} ===\n"
+            f"{selection.reason}; metric={selection.metric} "
+            f"target={selection.target_attention_work_proxy:.1f} "
+            f"actual={selection.actual_attention_work_proxy} "
+            f"total_patches={selection.actual_total_patches}",
             flush=True,
         )
         encoder = MiniCPMOImageEncoder(
             preprocessor.model_dir, device=arguments.device, dtype=arguments.dtype
         )
+        encoder.vision_batch_size = (
+            arguments.vision_batch_size
+            if arguments.mode == "decompose"
+            else BASELINE_BATCH_SIZE
+        )
+        report.vision_batch_size = encoder.vision_batch_size
         report.model = inspect_model(
             preprocessor.model_dir, encoder, arguments.dtype, arguments.device
         )
-        encoder.vision_batch_size = BASELINE_BATCH_SIZE
         print("=== MODEL ===")
         print(json.dumps(asdict(report.model), indent=2), flush=True)
         operation = EncoderForward(encoder=encoder, inputs=selected.inputs)
         if arguments.mode == "decompose":
-            print(f"=== DECOMPOSITION sample={selection.sample_id} ===", flush=True)
+            print(
+                f"=== DECOMPOSITION sample={selection.sample_id} "
+                f"vision_batch_size={encoder.vision_batch_size} ===",
+                flush=True,
+            )
             phases = CudaPhases()
             with phase_hooks(encoder, phases):
                 trial, output = benchmark_forward(
                     operation,
                     arm="decomposition",
-                    batch_size=BASELINE_BATCH_SIZE,
+                    batch_size=encoder.vision_batch_size,
                     device=encoder.device,
                     warmup=arguments.warmup,
                     iters=arguments.iters,
@@ -379,22 +406,38 @@ def main() -> None:
                 not arguments.no_chrome_trace,
             )
             print(json.dumps(asdict(report.profile), indent=2), flush=True)
-    trials = [*report.vision_batch]
+    trials = []
+    if report.vision_batch is not None:
+        trials.extend(report.vision_batch.visits)
+    else:
+        pass
     if report.decomposition is not None:
         trials.append(report.decomposition)
     else:
         pass
     if report.resampler is not None:
-        trials.extend([*report.resampler.isolated, *report.resampler.full_encoder])
+        trials.extend(
+            [
+                *report.resampler.isolated_visits,
+                *report.resampler.full_encoder_visits,
+            ]
+        )
     else:
         pass
     report.substantial_drift = any(
         trial.parity is not None and trial.parity.substantial_drift for trial in trials
     )
+    baseline_oom_arms = {
+        "decomposition",
+        "bs16-A",
+        "bs16-B",
+        "R0-A",
+        "R0-B",
+        "V0-A",
+        "V0-B",
+    }
     report.failed = report.substantial_drift or any(
-        trial.status == "OOM"
-        and not (trial.arm.startswith("bs") and trial.batch_size != BASELINE_BATCH_SIZE)
-        for trial in trials
+        trial.status == "OOM" and trial.arm in baseline_oom_arms for trial in trials
     )
     if arguments.output_json is not None:
         arguments.output_json.parent.mkdir(parents=True, exist_ok=True)

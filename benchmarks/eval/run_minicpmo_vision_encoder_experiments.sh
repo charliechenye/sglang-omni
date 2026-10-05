@@ -81,10 +81,14 @@ run_mode() {
 }
 
 run_mode 01-census census
-run_mode 02-decompose-median decompose --census-file "$RUN_DIR/census.json" --sample-selection median
-run_mode 03-decompose-high decompose --census-file "$RUN_DIR/census.json" --sample-selection high
-run_mode 04-vision-batch-median vision-batch --census-file "$RUN_DIR/census.json" --sample-selection median --vision-batch-sizes 16 32 64
-run_mode 05-vision-batch-high vision-batch --census-file "$RUN_DIR/census.json" --sample-selection high --vision-batch-sizes 16 32 64
-run_mode 06-resampler resampler --census-file "$RUN_DIR/census.json" --sample-selection "$RESAMPLER_SAMPLE_SELECTION"
-run_mode 07-profile profile --census-file "$RUN_DIR/census.json" --sample-selection "$PROFILE_SAMPLE_SELECTION" --profile-iters "$PROFILE_ITERS" --profile-dir "$RUN_DIR/profile"
+run_mode 02-decompose-median-bs16 decompose --census-file "$RUN_DIR/census.json" --sample-selection median --vision-batch-size 16
+run_mode 03-decompose-median-bs32 decompose --census-file "$RUN_DIR/census.json" --sample-selection median --vision-batch-size 32
+run_mode 04-decompose-median-bs64 decompose --census-file "$RUN_DIR/census.json" --sample-selection median --vision-batch-size 64
+run_mode 05-decompose-high-bs16 decompose --census-file "$RUN_DIR/census.json" --sample-selection high --vision-batch-size 16
+run_mode 06-decompose-high-bs32 decompose --census-file "$RUN_DIR/census.json" --sample-selection high --vision-batch-size 32
+run_mode 07-decompose-high-bs64 decompose --census-file "$RUN_DIR/census.json" --sample-selection high --vision-batch-size 64
+run_mode 08-vision-batch-median vision-batch --census-file "$RUN_DIR/census.json" --sample-selection median --vision-batch-sizes 16 32 64
+run_mode 09-vision-batch-high vision-batch --census-file "$RUN_DIR/census.json" --sample-selection high --vision-batch-sizes 16 32 64
+run_mode 10-resampler resampler --census-file "$RUN_DIR/census.json" --sample-selection "$RESAMPLER_SAMPLE_SELECTION"
+run_mode 11-profile profile --census-file "$RUN_DIR/census.json" --sample-selection "$PROFILE_SAMPLE_SELECTION" --profile-iters "$PROFILE_ITERS" --profile-dir "$RUN_DIR/profile"
 printf '\nDone. Paste the JSON summaries and logs from %s\n' "$RUN_DIR"

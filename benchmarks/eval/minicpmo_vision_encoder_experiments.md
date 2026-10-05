@@ -40,8 +40,8 @@ running if resources must already be cached.
 
 Results go to a unique UTC timestamp directory below
 `$SGLANG_RESULTS_DIR/minicpmo-vision` (otherwise the system temporary directory).
-There are seven named logs, six experiment summaries plus `profile.json`, a
-profiler table, and a Chrome trace. Output paths inside Git worktrees are rejected.
+There are eleven named logs and JSON summaries plus a profiler table and a Chrome
+trace. Output paths inside Git worktrees are rejected.
 No tensor caches are written. Each process reuses its real CPU encoder inputs
 in memory; preprocessing is outside all timed regions. The saved census lets
 later processes decode only the selected video instead of all sixteen.
@@ -87,9 +87,23 @@ BENCH=benchmarks.eval.minicpmo_vision_encoder_microbench
 python -m "$BENCH" --mode census --output-json "$OUT/census.json"
 
 python -m "$BENCH" --mode decompose --census-file "$OUT/census.json" \
-  --sample-selection median --output-json "$OUT/decompose-median.json"
+  --sample-selection median --vision-batch-size 16 \
+  --output-json "$OUT/decompose-median-bs16.json"
 python -m "$BENCH" --mode decompose --census-file "$OUT/census.json" \
-  --sample-selection high --output-json "$OUT/decompose-high.json"
+  --sample-selection median --vision-batch-size 32 \
+  --output-json "$OUT/decompose-median-bs32.json"
+python -m "$BENCH" --mode decompose --census-file "$OUT/census.json" \
+  --sample-selection median --vision-batch-size 64 \
+  --output-json "$OUT/decompose-median-bs64.json"
+python -m "$BENCH" --mode decompose --census-file "$OUT/census.json" \
+  --sample-selection high --vision-batch-size 16 \
+  --output-json "$OUT/decompose-high-bs16.json"
+python -m "$BENCH" --mode decompose --census-file "$OUT/census.json" \
+  --sample-selection high --vision-batch-size 32 \
+  --output-json "$OUT/decompose-high-bs32.json"
+python -m "$BENCH" --mode decompose --census-file "$OUT/census.json" \
+  --sample-selection high --vision-batch-size 64 \
+  --output-json "$OUT/decompose-high-bs64.json"
 
 python -m "$BENCH" --mode vision-batch --census-file "$OUT/census.json" \
   --sample-selection median --vision-batch-sizes 16 32 64 --warmup 5 --iters 20 \
@@ -109,11 +123,19 @@ python -m "$BENCH" --mode profile --census-file "$OUT/census.json" \
 
 Use `--sample-id 002-1` instead of `--sample-selection` to select an explicit
 frozen request. Automatic selection minimizes distance to the cohort's p50 or
-p95 **total patch count**; ties use sample ID. The selected ID, target work, actual
-work, and reason print before the measurements.
+p95 **attention work proxy**, defined as `sum(patch_count ** 2)` across slices;
+this is only an approximate proxy for the quadratic self-attention component
+across independently segmented slices, not a FLOPs or runtime claim. Ties use
+sample ID. `total_patches` remains in every census entry and summary for context.
+The selected ID, metric, target work, actual proxy, total patches, and reason
+print before the measurements.
+
+Read `total_patches` as a token-linear volume proxy and
+`attention_work_proxy` as the attention-quadratic proxy; neither is a FLOPs or
+runtime measurement.
 
 - `census`: CPU preprocessing only. Reports all target sizes, per-slice patches,
-  slice/patch distributions, VPM chunk counts for 16/32/64, and the five most
+  total patches, the integer attention work proxy, their distributions, VPM chunk counts for 16/32/64, and the five most
   frequent geometries for each arm, including their frequency/share. Geometry
   includes chunk slice count, request-wide padding, and ordered segment lengths.
   Prints checkpoint configuration; backend and strided QKV require an initialized
@@ -124,18 +146,22 @@ work, and reason print before the measurements.
   post-LayerNorm/unpack, and resampler (including final concatenation). Chunk
   spans are summed by phase. Only the whole-forward end event is waited on.
   Reports phase distributions, whole-forward GPU and CPU wall times, memory,
-  and parity against an uninstrumented forward.
-- `vision-batch`: Always establishes bs16 first, then measures the requested
-  alternatives with identical cached CPU inputs. Only the benchmark instance's
-  `vision_batch_size` changes, and its value is restored afterward. Production
-  chunks both VPM and resampler using this value. bs8 is an optional diagnostic.
+  and parity against an uninstrumented forward. `--vision-batch-size` records
+  the selected 8/16/32/64 value in the heading, trial, and JSON report.
+- `vision-batch`: Visits the same cached input in the order
+  `bs16-A, bs32-A, bs64-A, bs64-B, bs32-B, bs16-B`. Every visit has independent
+  warmup, timed iterations, and peak-memory reset. JSON includes each visit,
+  pair averages for bs16/32/64, and repeat spread; candidate deltas use the bs16
+  pair average.
 - `resampler`: Captures every real bs16 VPM-output chunk using a temporary
   resampler input hook. R0/R1 measure the **complete request's resampler stage**,
   including all production chunks and output concatenation, with VPM and H2D
-  excluded. R1 adds only `need_weights=False` via a reversible MHA pre-hook;
-  weights, masks, and the resampler implementation are unchanged. If R1 passes
-  parity and improves median latency, V0/V1 then measure the complete encoder
-  at bs16. Frozen GPU VPM inputs are released before this full-encoder A/B.
+  excluded. Visits are `R0-A, R1-A, R1-B, R0-B`; pair averages, repeat spread,
+  and candidate deltas are reported. R1 adds only `need_weights=False` via a
+  reversible MHA pre-hook; weights, masks, and the resampler implementation are
+  unchanged. If the **paired** R1 result passes parity and improves paired median
+  latency, `V0-A, V1-A, V1-B, V0-B` measure the complete encoder at bs16.
+  Frozen GPU VPM inputs are released before this full-encoder A/B.
 - `profile`: Warms up then profiles 1–3 baseline forwards with CPU/CUDA activities
   and `record_shapes=True`. Saves a table sorted by CUDA time and, by default,
   a Chrome trace (`--no-chrome-trace` disables it). Module ranges attribute CUDA
@@ -169,8 +195,9 @@ after reviewing observed error magnitudes using `--parity-max-abs`,
 Substantial drift saves the summary and exits 2, stopping the driver. A batch
 alternative OOM is recorded without shrinking its workload and the sweep
 continues after cleanup. A baseline/resampler/decomposition OOM exits 2. Unexpected
-failures remain visible as exceptions. If isolated resampler latency does not
-improve, the full-encoder comparison is explicitly marked skipped.
+failures remain visible as exceptions. If the paired isolated resampler latency
+does not improve, or parity fails, the full-encoder comparison is explicitly
+marked skipped.
 
 No server, serving ABBA, compilation, CUDA Graph integration, attention rewrite,
 or custom kernel is part of this harness. Run on an idle GPU before using its

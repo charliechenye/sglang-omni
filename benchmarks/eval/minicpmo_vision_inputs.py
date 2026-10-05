@@ -129,7 +129,10 @@ async def preprocess_requests(
             )
         else:
             pass
-        patch_counts = (target_sizes[:, 0] * target_sizes[:, 1]).tolist()
+        patch_counts = [
+            int(patch_count)
+            for patch_count in (target_sizes[:, 0] * target_sizes[:, 1]).tolist()
+        ]
         video_stat = Path(request.video_path).stat()
         census = CensusEntry(
             sample_id=request.sample_id,
@@ -140,6 +143,7 @@ async def preprocess_requests(
             tgt_sizes=target_sizes.tolist(),
             patch_counts=patch_counts,
             total_patches=sum(patch_counts),
+            attention_work_proxy=sum(patch_count**2 for patch_count in patch_counts),
             max_patches=max(patch_counts),
             vpm_chunks={
                 batch_size: math.ceil(len(patch_counts) / batch_size)
