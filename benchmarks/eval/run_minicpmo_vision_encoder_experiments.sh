@@ -12,7 +12,7 @@ fi
 MODEL_ID="${MODEL_ID:-${SGLANG_MINICPMO_MODEL_ID:-openbmb/MiniCPM-o-4_5}}"
 VIDEOMME_REPO="${VIDEOMME_REPO:-${SGLANG_VIDEOMME_CI_REPO_ID:-zhaochenyang20/Video_MME_ci}}"
 RESULT_ROOT="${RESULT_ROOT:-${SGLANG_RESULTS_DIR:-${TMPDIR:-/tmp}}/minicpmo-vision}"
-DEVICE="${DEVICE:-cuda}"
+DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-bf16}"
 PYTHON="${PYTHON:-python}"
 WARMUP="${WARMUP:-5}"

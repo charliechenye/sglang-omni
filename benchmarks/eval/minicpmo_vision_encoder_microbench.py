@@ -61,6 +61,19 @@ Mode = Literal["census", "decompose", "vision-batch", "resampler", "profile"]
 EXPECTED_BASE_SHA = "a266a0894d8964ca592a86cb198b446acef8908a"
 
 
+def resolve_measurement_device(value: str) -> torch.device:
+    device = torch.device(value)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError(
+            "Measurement modes require CUDA; census supports CPU preprocessing"
+        )
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    else:
+        pass
+    return device
+
+
 @dataclass(kw_only=True)
 class RunReport:
     mode: Mode
@@ -216,13 +229,10 @@ def main() -> None:
     else:
         pass
     if arguments.mode != "census":
-        device = torch.device(arguments.device)
-        if device.type != "cuda" or not torch.cuda.is_available():
-            raise RuntimeError(
-                "Measurement modes require CUDA; census supports CPU preprocessing"
-            )
-        else:
-            torch.cuda.set_device(device)
+        device = resolve_measurement_device(arguments.device)
+        arguments.device = str(device)
+        torch.cuda.set_device(device)
+        print(f"measurement_device={arguments.device}", flush=True)
     else:
         pass
     requests = resolve_requests(
