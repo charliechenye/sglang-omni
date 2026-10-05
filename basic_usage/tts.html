@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.7" />
-    <meta name="docbuild:last-update" content="Oct 02, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 05, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -230,7 +230,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_transcribe_diarize.html">MOSS-Transcribe-Diarize</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_omni.html">Qwen3-Omni</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../cookbook/minicpm_o.html">MiniCPM-o Reference Audio</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/minicpm_o.html">MiniCPM-o</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/ming_omni.html">Ming-Omni</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/nemotron_voicechat.html">NemotronLabs VoiceChat</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/personaplex.html">PersonaPlex</a></li>
@@ -543,7 +543,7 @@
 <a class="reference internal" href="../cookbook/fishaudio_s2_pro.html#prerequisites"><span class="std std-ref">Fish Audio S2-Pro prerequisites</span></a>
 before starting the server.</p>
 <p>Qwen3-TTS uses the upstream <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> package. Install it without dependencies
-so the SGLang-Omni Transformers 5.12 / SGLang 0.5.20 stack remains in place:</p>
+so the SGLang-Omni Transformers 5.12 / SGLang 0.5.21 stack remains in place:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>sox
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--no-deps<span class="w"> </span>sox<span class="w"> </span>einops
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--no-deps<span class="w"> </span>qwen-tts<span class="o">==</span><span class="m">0</span>.1.1
@@ -855,11 +855,24 @@ in response headers. It does not include in-band JSON events, final usage, or a
 terminal sentinel. Set <code class="docutils literal notranslate"><span class="pre">&quot;stream_format&quot;:</span> <span class="pre">&quot;sse&quot;</span></code> to receive the same PCM as
 Server-Sent Events instead; <code class="docutils literal notranslate"><span class="pre">sse</span></code> streams even when <code class="docutils literal notranslate"><span class="pre">stream</span></code> is omitted. Each
 <code class="docutils literal notranslate"><span class="pre">speech.audio.delta</span></code> event carries base64 PCM in <code class="docutils literal notranslate"><span class="pre">audio</span></code>, and the stream ends
-with one <code class="docutils literal notranslate"><span class="pre">speech.audio.done</span></code> event carrying <code class="docutils literal notranslate"><span class="pre">usage</span></code>, or with an <code class="docutils literal notranslate"><span class="pre">error</span></code> event if
+with one <code class="docutils literal notranslate"><span class="pre">speech.audio.done</span></code> event carrying <code class="docutils literal notranslate"><span class="pre">usage</span></code> and <code class="docutils literal notranslate"><span class="pre">finish_reason</span></code>, or with an <code class="docutils literal notranslate"><span class="pre">error</span></code> event if
 generation fails mid-stream. The sample-rate headers are the same for both
 formats. <code class="docutils literal notranslate"><span class="pre">usage</span></code> reports the model’s own token counts, so what <code class="docutils literal notranslate"><span class="pre">input_tokens</span></code>
 covers depends on the model: Qwen3-TTS counts reference-audio codec frames, not
 text tokens.</p>
+<p>For raw PCM, use the response’s <code class="docutils literal notranslate"><span class="pre">X-SGLang-Omni-Speech-Id</span></code> with
+<code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/v1/audio/speech/{request_id}</span></code> after the stream ends to retrieve its
+<code class="docutils literal notranslate"><span class="pre">finish_reason</span></code> and <code class="docutils literal notranslate"><span class="pre">usage</span></code>. This generated speech ID is independent of the
+<code class="docutils literal notranslate"><span class="pre">X-Request-Id</span></code> correlation header. Behind a router, also echo the response’s
+<code class="docutils literal notranslate"><span class="pre">X-SGLang-Omni-Worker</span></code> as <code class="docutils literal notranslate"><span class="pre">X-SGLang-Omni-Route-Worker</span></code> on the GET.
+Only the most recent outcomes are retained; missing outcomes do not establish
+a natural stop or a cap hit.</p>
+<p>The SeedTTS benchmark collects raw PCM outcomes over a separate connection pool.
+Collection still consumes server resources during generation. Use
+<code class="docutils literal notranslate"><span class="pre">--no-collect-stream-outcomes</span></code> for an instrumentation control, and keep the setting
+identical between performance arms. The setting is saved with the results.
+Missing reasons remain unknown and are excluded from the observed-reason count;
+a cap hit does not by itself establish poor audio quality.</p>
 <p>When the client does not set <code class="docutils literal notranslate"><span class="pre">initial_codec_chunk_frames</span></code>,
 the model selects a continuity-safe first vocoder chunk. Set the field explicitly
 to override that default, or set it to <code class="docutils literal notranslate"><span class="pre">0</span></code> to use the model’s steady chunk size
@@ -1465,7 +1478,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 02, 2026.
+  Last updated on Oct 05, 2026.
   <br/>
 </p>
   </div>

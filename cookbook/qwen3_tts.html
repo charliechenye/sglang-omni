@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.7" />
-    <meta name="docbuild:last-update" content="Oct 02, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 05, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -230,7 +230,7 @@
 <li class="toctree-l1"><a class="reference internal" href="moss_transcribe_diarize.html">MOSS-Transcribe-Diarize</a></li>
 <li class="toctree-l1"><a class="reference internal" href="whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="qwen3_omni.html">Qwen3-Omni</a></li>
-<li class="toctree-l1"><a class="reference internal" href="minicpm_o.html">MiniCPM-o Reference Audio</a></li>
+<li class="toctree-l1"><a class="reference internal" href="minicpm_o.html">MiniCPM-o</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ming_omni.html">Ming-Omni</a></li>
 <li class="toctree-l1"><a class="reference internal" href="nemotron_voicechat.html">NemotronLabs VoiceChat</a></li>
 <li class="toctree-l1"><a class="reference internal" href="personaplex.html">PersonaPlex</a></li>
@@ -558,7 +558,7 @@ endpoint.</p>
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
 <p>Install <code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> by following <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a>.</p>
 <p>Qwen3-TTS Base uses the upstream <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> package. Install it without
-dependencies so the SGLang-Omni Transformers 5.12 / SGLang 0.5.20 stack remains
+dependencies so the SGLang-Omni Transformers 5.12 / SGLang 0.5.21 stack remains
 in place:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>apt-get<span class="w"> </span>update<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>apt-get<span class="w"> </span>install<span class="w"> </span>-y<span class="w"> </span>sox
 uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--no-deps<span class="w"> </span>sox<span class="w"> </span>einops
@@ -583,7 +583,7 @@ factories (<code class="docutils literal notranslate"><span class="pre">create_c
 <code class="docutils literal notranslate"><span class="pre">inputs_embeds</span></code> and no longer accept <code class="docutils literal notranslate"><span class="pre">cache_position</span></code>. SGLang-Omni patches these
 differences in
 <code class="docutils literal notranslate"><span class="pre">sglang_omni/models/qwen3_tts/compat.py</span></code>, which every Qwen3-TTS entry point
-applies before importing <code class="docutils literal notranslate"><span class="pre">qwen_tts</span></code>. The pinned Transformers 5.12 / SGLang 0.5.20
+applies before importing <code class="docutils literal notranslate"><span class="pre">qwen_tts</span></code>. The pinned Transformers 5.12 / SGLang 0.5.21
 stack is therefore the supported configuration, not a workaround.</p>
 <p>If you hit a <code class="docutils literal notranslate"><span class="pre">TypeError</span></code> raised from inside <code class="docutils literal notranslate"><span class="pre">qwen_tts</span></code>, do not resolve it by
 installing the package’s own Transformers pin — that breaks the rest of the
@@ -711,7 +711,7 @@ graph per token bucket; the codec head and sampling still run outside it.
 them. Each backend is accepted only on models that declare it, so a stage that
 has not adopted <code class="docutils literal notranslate"><span class="pre">full</span></code> still rejects it. <code class="docutils literal notranslate"><span class="pre">full</span></code> also needs a prefill attention
 backend that captures an ordinary prefill batch, <code class="docutils literal notranslate"><span class="pre">fa3</span></code> or <code class="docutils literal notranslate"><span class="pre">flashinfer</span></code> in
-SGLang 0.5.20: with any other backend the CustomVoice default stays
+SGLang 0.5.21: with any other backend the CustomVoice default stays
 <code class="docutils literal notranslate"><span class="pre">breakable</span></code>, and an explicit <code class="docutils literal notranslate"><span class="pre">full</span></code> fails at startup. SGLang logs the full
 prefill backend as experimental and its own compatibility rules never
 auto-disable it, so the generation batch policy’s checks are what guard it
@@ -891,6 +891,7 @@ mode.</p>
 <p>Non-streaming responses include <code class="docutils literal notranslate"><span class="pre">X-Finish-Reason:</span> <span class="pre">stop</span></code> after codec EOS or
 <code class="docutils literal notranslate"><span class="pre">X-Finish-Reason:</span> <span class="pre">length</span></code> when generation reaches <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code>. A <code class="docutils literal notranslate"><span class="pre">length</span></code>
 response still contains decodable audio, but the utterance may be incomplete.
+Models that do not report how generation ended send <code class="docutils literal notranslate"><span class="pre">X-Finish-Reason:</span> <span class="pre">unknown</span></code>.
 Batch responses expose the same value as each item’s <code class="docutils literal notranslate"><span class="pre">finish_reason</span></code>.</p>
 </section>
 <section id="leading-silence-in-x-vector-mode">
@@ -1026,9 +1027,10 @@ first chunk, so their audio arrives complete in a single final flush.</p>
 <h4>Codec decoding defaults<a class="headerlink" href="#codec-decoding-defaults" title="Link to this heading">#</a></h4>
 <p>Streaming decodes run on the stateful incremental codec by default: each
 follow-up chunk decodes only its fresh frames against per-stream state held in
-a preallocated arena, steady-state cohorts replay CUDA graphs whose decode step
-is <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>d, and the follow-up workers collect for 4 ms. Startup spends
-about a minute compiling the steady shapes. The left-context decoder remains
+a preallocated arena, and the follow-up workers collect for 4 ms. On NVIDIA, AMD
+and MUSA GPUs steady-state cohorts also decode asynchronously on a priority stream
+and replay CUDA graphs whose decode step is <code class="docutils literal notranslate"><span class="pre">torch.compile</span></code>d, which costs about
+a minute of startup compiling the steady shapes. The left-context decoder remains
 available as a rollback:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">stages</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">vocoder</span><span class="p">:</span>
@@ -1036,12 +1038,15 @@ available as a rollback:</p>
 <span class="w">      </span><span class="nt">enable_stateful_codec_decoder</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
 </pre></div>
 </div>
-<p><code class="docutils literal notranslate"><span class="pre">incremental_codec_cuda_graph</span></code>, <code class="docutils literal notranslate"><span class="pre">incremental_codec_compile</span></code> and
+<p><code class="docutils literal notranslate"><span class="pre">incremental_codec_cuda_graph</span></code>, <code class="docutils literal notranslate"><span class="pre">incremental_codec_compile</span></code>, <code class="docutils literal notranslate"><span class="pre">async_decode</span></code> and
 <code class="docutils literal notranslate"><span class="pre">followup_batch_wait_ms</span></code> are the individual switches. Measured on one H100
 80GB at 20 requests per second, three client seeds of roughly 1200 requests
 each: the default path holds 0.6% to 2.3% of streams underrun against 20.9%
 for the left-context decoder, with first playable audio at 55 to 58 ms
 against 82 to 89 ms.</p>
+<p>Intel XPU, Ascend NPU, CPU and Apple MPS decode synchronously by default. To opt
+in on Intel GPUs, follow the
+<a class="reference internal" href="../get_started/installation_xpu.html#qwen3-tts-text-to-speech-single-xpu"><span class="std std-ref">Qwen3-TTS XPU recipe</span></a>.</p>
 </section>
 <section id="first-audio-chunk-ramp">
 <h4>First-audio chunk ramp<a class="headerlink" href="#first-audio-chunk-ramp" title="Link to this heading">#</a></h4>
@@ -1474,7 +1479,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 02, 2026.
+  Last updated on Oct 05, 2026.
   <br/>
 </p>
   </div>
