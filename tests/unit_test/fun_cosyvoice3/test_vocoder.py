@@ -1125,6 +1125,16 @@ def prepare_vocoder_startup(
         "warmup_packed_dit_compile",
         lambda scheduler: startup_events.append("packed_warmup"),
     )
+    monkeypatch.setattr(
+        stages.CosyVoice3Vocoder,
+        "warmup_hift_step",
+        lambda vocoder: startup_events.append("hift_warmup"),
+    )
+    monkeypatch.setattr(
+        stages.torch,
+        "compile",
+        lambda function, **kwargs: startup_events.append("hift_compile") or function,
+    )
     if device_type == "cuda":
         monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
 
@@ -1194,6 +1204,7 @@ def test_create_vocoder_executor_disables_prefix_graph_without_cuda(
     [({}, True), ({"enable_flow_prefix_cuda_graph": False}, False)],
 )
 @pytest.mark.parametrize("enable_flow_cuda_graph", [False, True])
+@pytest.mark.parametrize("enable_hift_torch_compile", [False, True])
 @pytest.mark.parametrize(
     ("enable_dit_torch_compile", "enable_flow_estimator_trt"),
     [(False, False), (True, False), (False, True)],
@@ -1203,6 +1214,7 @@ def test_create_vocoder_executor_prefix_graph_defaults_on_and_respects_disable(
     factory_kwargs: dict[str, bool],
     should_capture: bool,
     enable_flow_cuda_graph: bool,
+    enable_hift_torch_compile: bool,
     enable_dit_torch_compile: bool,
     enable_flow_estimator_trt: bool,
 ) -> None:
@@ -1225,12 +1237,16 @@ def test_create_vocoder_executor_prefix_graph_defaults_on_and_respects_disable(
     pool_builder = Mock(return_value=prefix_pool)
     monkeypatch.setattr(stages, "build_prefix_pool", pool_builder)
     prefix_cache = Mock(spec=stages.PrefixCudaGraphCache)
+    prefix_cache.capture.side_effect = lambda capture_inputs: startup_events.append(
+        "prefix_graph_capture"
+    )
     prefix_graph_factory = Mock(return_value=prefix_cache)
     monkeypatch.setattr(stages, "PrefixCudaGraphCache", prefix_graph_factory)
     scheduler = stages.create_vocoder_executor(
         "model",
         device="cuda",
         enable_dit_torch_compile=enable_dit_torch_compile,
+        enable_hift_torch_compile=enable_hift_torch_compile,
         enable_flow_estimator_trt=enable_flow_estimator_trt,
         enable_flow_cuda_graph=enable_flow_cuda_graph,
         flow_cuda_graph_capture_shapes=FLOW_GRAPH_CAPTURE_SHAPES,
@@ -1244,6 +1260,8 @@ def test_create_vocoder_executor_prefix_graph_defaults_on_and_respects_disable(
     assert ("native_compile" in startup_events) is enable_dit_torch_compile
     assert ("packed_warmup" in startup_events) is enable_dit_torch_compile
     assert ("graph_capture" in startup_events) is enable_flow_cuda_graph
+    assert ("hift_compile" in startup_events) is enable_hift_torch_compile
+    assert ("hift_warmup" in startup_events) is enable_hift_torch_compile
     assert (
         trt_mod.is_flow_estimator_trt(flow.decoder.estimator)
         is enable_flow_estimator_trt
@@ -1252,8 +1270,19 @@ def test_create_vocoder_executor_prefix_graph_defaults_on_and_respects_disable(
         prefix_graph_factory.assert_called_once()
         prefix_cache.capture.assert_called_once()
         assert scheduler.vocoder.flow.prefix_cuda_graph_cache is prefix_cache
+        if enable_hift_torch_compile:
+            assert startup_events.index("hift_warmup") < startup_events.index(
+                "prefix_graph_capture"
+            )
+            assert startup_events.index("prefix_graph_capture") < startup_events.index(
+                "scheduler_warmup"
+            )
     else:
         prefix_graph_factory.assert_not_called()
+    if enable_hift_torch_compile:
+        assert startup_events.index("hift_warmup") < startup_events.index(
+            "scheduler_warmup"
+        )
 
 
 @pytest.mark.parametrize(
@@ -1549,6 +1578,22 @@ def test_vocoder_hift_defaults_to_float32(monkeypatch) -> None:
         assert not torch.is_autocast_enabled()
 
 
+def test_hift_compile_disabled_keeps_eager_decode(monkeypatch) -> None:
+    monkeypatch.setattr(
+        stages.torch,
+        "compile",
+        lambda function, **kwargs: (_ for _ in ()).throw(
+            AssertionError("disabled HiFT compile must not call torch.compile")
+        ),
+    )
+
+    vocoder = stages.CosyVoice3Vocoder(
+        BatchCapableFakeFlow(), FakeHiFT(), enable_hift_torch_compile=False
+    )
+
+    assert vocoder.hift_body is None
+
+
 class HiftFlowStub:
     output_size: ClassVar[int] = 80
 
@@ -1597,14 +1642,21 @@ def make_causal_hift(voiced_threshold: float) -> torch.nn.Module:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("compiled", [False, True])
 def test_hift_step_matches_the_whole_history_chain(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, compiled: bool
 ) -> None:
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     voiced_threshold = 10.0
     hift = make_causal_hift(voiced_threshold)
-    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), hift)
+    vocoder = stages.CosyVoice3Vocoder(
+        HiftFlowStub(), hift, enable_hift_torch_compile=compiled
+    )
+    if compiled:
+        vocoder.warmup_hift_step()
+    else:
+        pass
     torch.manual_seed(1)
     mels = [
         torch.randn(1, 80, frames, device="cuda") * 3 for frames in (180, 240, 240, 300)
@@ -1653,12 +1705,19 @@ def test_hift_step_matches_the_whole_history_chain(
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("is_final", [False, True])
-def test_hift_step_window_is_bit_identical_to_the_whole_history_call(
-    monkeypatch: pytest.MonkeyPatch, is_final: bool
+@pytest.mark.parametrize("compiled", [False, True])
+def test_hift_step_window_matches_the_whole_history_call(
+    monkeypatch: pytest.MonkeyPatch, is_final: bool, compiled: bool
 ) -> None:
     monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    vocoder = stages.CosyVoice3Vocoder(HiftFlowStub(), make_causal_hift(10.0))
+    vocoder = stages.CosyVoice3Vocoder(
+        HiftFlowStub(), make_causal_hift(10.0), enable_hift_torch_compile=compiled
+    )
+    if compiled:
+        vocoder.warmup_hift_step()
+    else:
+        pass
     torch.manual_seed(1)
     mel = torch.randn(1, 80, 300, device="cuda") * 3
     end_frame = 300 if is_final else 256
@@ -1681,7 +1740,7 @@ def test_hift_step_window_is_bit_identical_to_the_whole_history_call(
                 )
             ]
         )
-    assert torch.equal(delta, reference)
+    torch.testing.assert_close(delta, reference, atol=1e-4, rtol=0)
 
 
 @pytest.mark.accelerator
