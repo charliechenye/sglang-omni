@@ -1740,7 +1740,10 @@ def test_hift_step_window_matches_the_whole_history_call(
                 )
             ]
         )
-    torch.testing.assert_close(delta, reference, atol=1e-4, rtol=0)
+    if compiled:
+        torch.testing.assert_close(delta, reference, atol=1e-4, rtol=0)
+    else:
+        assert torch.equal(delta, reference)
 
 
 @pytest.mark.accelerator
