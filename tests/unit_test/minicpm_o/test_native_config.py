@@ -18,10 +18,12 @@ from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.runtime import (
     apply_typed_stage_kwargs,
+    resolve_stage_factory_args,
     resolve_stage_typed_kwargs,
 )
 from sglang_omni.models.minicpm_o import native_stages, stages
 from sglang_omni.models.minicpm_o.components import audio_encoder, image_encoder
+from sglang_omni.models.minicpm_o.config import MiniCPMOPipelineConfig
 from sglang_omni.models.minicpm_o.hf_config import MiniCPMOConfig
 from sglang_omni.models.minicpm_o.native_config import (
     MiniCPMODuplexPipelineConfig,
@@ -29,10 +31,52 @@ from sglang_omni.models.minicpm_o.native_config import (
 )
 from sglang_omni.models.minicpm_o.session_adapters import build_realtime_deployment
 from sglang_omni.scheduling.session import SessionHooks
+from sglang_omni.scheduling.simple_scheduler import SimpleScheduler
 
 
 class ConfigLoaded(Exception):
     """Stop at the configuration boundary before allocating any model or GPU."""
+
+
+def test_minicpm_video_resize_config_and_serial_scheduler(monkeypatch) -> None:
+    config = MiniCPMOPipelineConfig(model_path="unused")
+    preprocessing = config.stage_named("preprocessing")
+    assert preprocessing.factory.video_resize_workers == 8
+
+    disabled = ConfigManager(config).merge_config(
+        [("preprocessing.factory.video_resize_workers", "0")]
+    )
+    assert disabled.stage_named("preprocessing").factory.video_resize_workers == 0
+    factory_kwargs = resolve_stage_factory_args(
+        disabled.stage_named("preprocessing"), disabled
+    )
+    assert factory_kwargs["video_resize_workers"] == 0
+
+    fake_preprocessor = Mock()
+    constructor = Mock(return_value=fake_preprocessor)
+    monkeypatch.setattr(stages, "MiniCPMOPreprocessor", constructor)
+
+    class UnexpectedThreadPool:
+        def __init__(self, **_kwargs):
+            raise AssertionError("serial resize must not allocate a thread pool")
+
+    monkeypatch.setattr(stages, "ThreadPoolExecutor", UnexpectedThreadPool)
+    scheduler = stages.create_preprocessing_executor(
+        "unused",
+        video_resize_workers=disabled.stage_named(
+            "preprocessing"
+        ).factory.video_resize_workers,
+    )
+    try:
+        assert isinstance(scheduler, SimpleScheduler)
+        constructor.assert_called_once_with(
+            "unused",
+            speech_enabled=False,
+            video_resize_executor=None,
+            video_resize_workers=0,
+        )
+    finally:
+        scheduler.stop()
 
 
 @pytest.fixture

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -42,6 +43,229 @@ def write_video_with_audio(path: Path) -> None:
             container.mux(packet)
         for packet in audio.encode():
             container.mux(packet)
+
+
+@pytest.mark.parametrize(
+    ("frame_count", "workers"),
+    [(1, 8), (5, 3), (3, 8), (5, 1), (5, 0)],
+)
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float32])
+@pytest.mark.parametrize("non_contiguous", [False, True])
+def test_resize_video_tensor_parallel_is_exact_and_ordered(
+    frame_count: int,
+    workers: int,
+    dtype: torch.dtype,
+    non_contiguous: bool,
+) -> None:
+    video_tensor = torch.arange(frame_count * 3 * 6 * 7, dtype=torch.float32).reshape(
+        frame_count, 3, 6, 7
+    )
+    if non_contiguous:
+        video_tensor = video_tensor[..., :-1]
+    else:
+        pass
+    video_tensor = video_tensor.to(dtype)
+    if non_contiguous:
+        assert not video_tensor.is_contiguous()
+    else:
+        pass
+    executor = (
+        ThreadPoolExecutor(max_workers=workers)
+        if workers > 1 and frame_count > 1
+        else None
+    )
+    try:
+        serial = video.resize_video_tensor(video_tensor, 4, 5)
+        parallel = video.resize_video_tensor_parallel(
+            video_tensor,
+            4,
+            5,
+            executor=executor,
+            workers=workers,
+        )
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        else:
+            pass
+    assert torch.equal(serial, parallel)
+
+
+def test_resize_video_tensor_parallel_propagates_worker_errors(monkeypatch) -> None:
+    def fail_resize(*_args, **_kwargs):
+        raise RuntimeError("resize failed")
+
+    monkeypatch.setattr(video, "resize_video_tensor", fail_resize)
+    video_tensor = torch.zeros((4, 3, 6, 6))
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        with pytest.raises(RuntimeError, match="resize failed"):
+            video.resize_video_tensor_parallel(
+                video_tensor,
+                4,
+                4,
+                executor=executor,
+                workers=2,
+            )
+
+
+def test_resize_video_tensor_parallel_reuses_one_executor() -> None:
+    video_tensor = torch.arange(4 * 3 * 6 * 6, dtype=torch.float32).reshape(4, 3, 6, 6)
+    serial = video.resize_video_tensor(video_tensor, 4, 4)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first = video.resize_video_tensor_parallel(
+            video_tensor,
+            4,
+            4,
+            executor=executor,
+            workers=2,
+        )
+        second = video.resize_video_tensor_parallel(
+            video_tensor + 1,
+            4,
+            4,
+            executor=executor,
+            workers=2,
+        )
+    assert torch.equal(first, serial)
+    assert torch.equal(second, video.resize_video_tensor(video_tensor + 1, 4, 4))
+
+
+def test_load_video_path_converts_to_float_after_resize(monkeypatch, tmp_path) -> None:
+    decoded_video = torch.zeros((2, 3, 6, 6), dtype=torch.uint8)
+    resize_inputs = []
+
+    monkeypatch.setattr(
+        video.qwen_vision,
+        "get_video_reader_backend",
+        lambda: "torchvision",
+    )
+    monkeypatch.setattr(
+        video.qwen_vision,
+        "VIDEO_READER_BACKENDS",
+        {"torchvision": lambda _element: (decoded_video, 2.0)},
+    )
+    monkeypatch.setattr(
+        video.qwen_vision,
+        "smart_resize",
+        lambda *_args, **_kwargs: (4, 4),
+    )
+
+    def capture_resize(
+        video_tensor,
+        resized_height,
+        resized_width,
+        *,
+        executor,
+        workers,
+    ):
+        resize_inputs.append(
+            (video_tensor.dtype, resized_height, resized_width, executor, workers)
+        )
+        return video_tensor
+
+    monkeypatch.setattr(video, "resize_video_tensor_parallel", capture_resize)
+    loaded_video, sample_fps = video.load_video_path(
+        tmp_path / "clip.mp4",
+        resize_workers=8,
+    )
+
+    assert resize_inputs == [(torch.uint8, 4, 4, None, 8)]
+    assert loaded_video.dtype == torch.float32
+    assert sample_fps == 2.0
+
+
+@pytest.mark.asyncio
+async def test_ensure_video_list_forwards_resize_settings_to_local_video(
+    tmp_path,
+) -> None:
+    video_path = tmp_path / "clip.mp4"
+    video_path.touch()
+    executor = ThreadPoolExecutor(max_workers=1)
+    captured_settings = {}
+
+    def load_path(media_io, filepath):
+        captured_settings.update(
+            executor=media_io.resize_executor,
+            workers=media_io.resize_workers,
+            filepath=filepath,
+        )
+        return torch.zeros((2, 3, 4, 4)), 2.0
+
+    original_load_path = video.VideoMediaIO.load_path
+    video.VideoMediaIO.load_path = load_path
+    try:
+        videos, sample_fps, audios = await video.ensure_video_list_async(
+            [video_path],
+            resize_executor=executor,
+            resize_workers=6,
+        )
+    finally:
+        video.VideoMediaIO.load_path = original_load_path
+        executor.shutdown()
+
+    assert captured_settings == {
+        "executor": executor,
+        "workers": 6,
+        "filepath": video_path,
+    }
+    assert isinstance(videos[0], torch.Tensor)
+    assert sample_fps == [2.0]
+    assert audios is None
+
+
+@pytest.mark.asyncio
+async def test_ensure_video_list_forwards_resize_settings_to_remote_connector() -> None:
+    captured_settings = {}
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    class Connector:
+        async def fetch_video_async(self, video_url, **kwargs):
+            captured_settings.update(video_url=video_url, **kwargs)
+            return torch.zeros((2, 3, 4, 4)), 2.0, None
+
+    try:
+        await video.ensure_video_list_async(
+            ["https://example/clip.mp4"],
+            resource_connector=Connector(),
+            resize_executor=executor,
+            resize_workers=6,
+        )
+    finally:
+        executor.shutdown()
+
+    assert captured_settings["resize_executor"] is executor
+    assert captured_settings["resize_workers"] == 6
+
+
+@pytest.mark.asyncio
+async def test_resource_connector_constructs_video_io_with_resize_settings(
+    monkeypatch,
+) -> None:
+    connector = MultiModalResourceConnector()
+    captured_media_io = []
+    executor = ThreadPoolExecutor(max_workers=1)
+
+    async def load_resource_async(video_url, media_io, timeout=30.0, max_bytes=None):
+        captured_media_io.append((video_url, media_io, timeout, max_bytes))
+        return torch.zeros((2, 3, 4, 4)), 2.0, None
+
+    monkeypatch.setattr(connector, "load_resource_async", load_resource_async)
+    try:
+        await connector.fetch_video_async(
+            "https://example/clip.mp4",
+            resize_executor=executor,
+            resize_workers=6,
+        )
+    finally:
+        executor.shutdown()
+
+    video_url, media_io, timeout, max_bytes = captured_media_io[0]
+    assert video_url == "https://example/clip.mp4"
+    assert isinstance(media_io, video.VideoMediaIO)
+    assert media_io.resize_executor is executor
+    assert media_io.resize_workers == 6
+    assert timeout == 30.0
+    assert max_bytes is None
 
 
 @pytest.mark.parametrize("has_frame", [False, True])
