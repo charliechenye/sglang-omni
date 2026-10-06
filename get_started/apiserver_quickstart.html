@@ -719,8 +719,9 @@ detection is not enabled yet; select the backend explicitly with
 <p>When requests fail, the server returns standard HTTP error codes:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">400</span> <span class="pre">Bad</span> <span class="pre">Request</span></code>: malformed request body or invalid parameters</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">422</span> <span class="pre">Unprocessable</span> <span class="pre">Entity</span></code>: a request field fails schema validation, such as empty <code class="docutils literal notranslate"><span class="pre">messages</span></code> without top-level <code class="docutils literal notranslate"><span class="pre">audios</span></code>, <code class="docutils literal notranslate"><span class="pre">images</span></code> or <code class="docutils literal notranslate"><span class="pre">videos</span></code>, or <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> below 1 (the response names the field)</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">500</span> <span class="pre">Internal</span> <span class="pre">Server</span> <span class="pre">Error</span></code>: runtime error during generation (check server logs for details)</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">503</span> <span class="pre">Service</span> <span class="pre">Unavailable</span></code>: the runtime is not healthy (verify with <code class="docutils literal notranslate"><span class="pre">/health</span></code>)</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">503</span> <span class="pre">Service</span> <span class="pre">Unavailable</span></code>: the request queue is full (retry later), or the runtime is not healthy (verify with <code class="docutils literal notranslate"><span class="pre">/health</span></code>)</p></li>
 </ul>
 <p>If you see a 500 error, check the server logs for the full traceback. Common issues include:</p>
 <ul class="simple">

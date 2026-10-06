@@ -831,7 +831,7 @@ concurrency 32:</p>
 </tbody>
 </table>
 </div>
-<p>A single worker sheds requests with HTTP 500 by design once the
+<p>A single worker sheds requests with HTTP 503 by design once the
 request-build backlog is full; the current default admits at most 32 pending
 builds per worker. Under the pre-coalescing defaults above (16 pending
 builds) that cost roughly 2 to 5 percent of requests at concurrency 64.
