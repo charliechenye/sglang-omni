@@ -51,7 +51,7 @@ def create_preprocessing_executor(
     model_path: str,
     *,
     speech_enabled: bool = False,
-    video_resize_workers: int,
+    video_resize_workers: int = 8,
 ) -> SimpleScheduler[StagePayload, StagePayload]:
     video_resize_executor: Executor | None = None
     if video_resize_workers > 1:

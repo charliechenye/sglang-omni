@@ -38,6 +38,27 @@ class ConfigLoaded(Exception):
     """Stop at the configuration boundary before allocating any model or GPU."""
 
 
+def test_minicpm_preprocessing_factory_preserves_default(monkeypatch) -> None:
+    fake_preprocessor = Mock()
+    constructor = Mock(return_value=fake_preprocessor)
+    monkeypatch.setattr(stages, "MiniCPMOPreprocessor", constructor)
+
+    scheduler = stages.create_preprocessing_executor("unused")
+    try:
+        assert isinstance(scheduler, SimpleScheduler)
+        assert scheduler.max_concurrency == 1
+        video_resize_executor = constructor.call_args.kwargs["video_resize_executor"]
+        constructor.assert_called_once_with(
+            "unused",
+            speech_enabled=False,
+            video_resize_executor=video_resize_executor,
+            video_resize_workers=8,
+        )
+        assert video_resize_executor is not None
+    finally:
+        scheduler.stop()
+
+
 def test_minicpm_video_resize_config_and_serial_scheduler(monkeypatch) -> None:
     config = MiniCPMOPipelineConfig(model_path="unused")
     preprocessing = config.stage_named("preprocessing")
