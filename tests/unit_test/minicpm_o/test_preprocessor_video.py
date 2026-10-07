@@ -122,6 +122,8 @@ def assert_processor_outputs_equal(
     expected: BatchFeature, actual: BatchFeature
 ) -> None:
     assert expected.keys() == actual.keys()
+    for key in ("pixel_values", "image_sizes", "tgt_sizes"):
+        assert len(expected[key]) == len(actual[key]) == 1
     expected_pixel_values = expected["pixel_values"][0]
     actual_pixel_values = actual["pixel_values"][0]
     assert len(expected_pixel_values) == len(actual_pixel_values)

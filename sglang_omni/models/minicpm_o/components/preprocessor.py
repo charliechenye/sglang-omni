@@ -223,14 +223,18 @@ class MiniCPMOPreprocessor:
             return BatchFeature(
                 data={
                     "pixel_values": [
-                        value
-                        for output in processor_outputs
-                        for value in output["pixel_values"][0]
+                        [
+                            value
+                            for output in processor_outputs
+                            for value in output["pixel_values"][0]
+                        ]
                     ],
                     "image_sizes": [
-                        value
-                        for output in processor_outputs
-                        for value in output["image_sizes"][0]
+                        [
+                            value
+                            for output in processor_outputs
+                            for value in output["image_sizes"][0]
+                        ]
                     ],
                     "tgt_sizes": [
                         torch.cat(
