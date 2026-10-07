@@ -55,8 +55,7 @@ def create_preprocessing_executor(
 ) -> SimpleScheduler[StagePayload, StagePayload]:
     video_frame_executor: Executor | None = None
     if video_frame_workers > 1:
-        # note(chenye): shared CPU pool for sequential resize and checkpoint image
-        # processing
+        # Shared by sequential resize and checkpoint image-processing phases.
         video_frame_executor = ThreadPoolExecutor(
             max_workers=video_frame_workers,
             thread_name_prefix="minicpmo-video-frame",

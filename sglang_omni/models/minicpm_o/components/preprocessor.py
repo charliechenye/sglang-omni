@@ -39,8 +39,6 @@ from sglang_omni.proto import StagePayload
 IMAGE_PLACEHOLDER = "<image>./</image>"
 AUDIO_PLACEHOLDER = "<audio>./</audio>"
 
-ProcessorOptionValue = bool | float | int | str | None
-
 # note (MayDomine): task prompts match the checkpoint's audio-understanding template.
 ASR_PROMPT_ZH = "请仔细听这段音频片段，并将其内容逐字记录。"
 ASR_PROMPT_EN = (
@@ -138,14 +136,20 @@ class MiniCPMOPreprocessor:
             self._processor = AutoProcessor.from_pretrained(  # noqa: leading-underscore
                 self.model_dir, trust_remote_code=True
             )
-            self.install_parallel_video_image_processor(
+            self._install_parallel_video_image_processor(  # noqa: leading-underscore
                 self._processor  # noqa: leading-underscore
             )
         else:
             pass
         return self._processor  # noqa: leading-underscore
 
-    def install_parallel_video_image_processor(self, processor: ProcessorMixin) -> None:
+    def _install_parallel_video_image_processor(  # noqa: leading-underscore
+        self, processor: ProcessorMixin
+    ) -> None:  # noqa: leading-underscore
+        if self.video_frame_executor is None or self.video_frame_workers <= 1:
+            return
+        else:
+            pass
         image_processor = processor.image_processor
         assert image_processor is not None
         original_preprocess = image_processor.preprocess
@@ -157,12 +161,10 @@ class MiniCPMOPreprocessor:
             do_pad: bool = True,
             max_slice_nums: int | None = None,
             return_tensors: str | None = None,
-            **processor_options: ProcessorOptionValue,
+            **processor_options: object,
         ) -> BatchFeature:
             if (
-                video_frame_executor is None
-                or video_frame_workers <= 1
-                or max_slice_nums != 1
+                max_slice_nums != 1
                 or return_tensors != "pt"
                 or processor_options.get("use_image_id") is not False
                 or not isinstance(images, list)
@@ -453,8 +455,8 @@ class MiniCPMOPreprocessor:
                 **video_kwargs,
                 extract_audio=use_audio_in_video,
                 audio_target_sr=16000,
-                video_frame_executor=self.video_frame_executor,
-                video_frame_workers=self.video_frame_workers,
+                resize_executor=self.video_frame_executor,
+                resize_workers=self.video_frame_workers,
             )
         else:
             videos, video_audios = [], None
