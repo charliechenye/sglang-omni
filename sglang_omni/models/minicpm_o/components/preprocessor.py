@@ -164,7 +164,6 @@ class MiniCPMOPreprocessor:
             if (
                 max_slice_nums != 1
                 or return_tensors != "pt"
-                or processor_options.get("use_image_id") is not False
                 or not isinstance(images, list)
                 or len(images) != 1
                 or not isinstance(images[0], list)

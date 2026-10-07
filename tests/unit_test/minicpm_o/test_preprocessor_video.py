@@ -161,7 +161,6 @@ def test_parallel_video_image_processor_is_exact_ordered_and_reuses_executor(
             do_pad=False,
             return_tensors="pt",
             max_slice_nums=1,
-            use_image_id=False,
         )
         image_processor.calls.clear()
         image_processor.call_thread_names.clear()
@@ -178,7 +177,6 @@ def test_parallel_video_image_processor_is_exact_ordered_and_reuses_executor(
             do_pad=False,
             return_tensors="pt",
             max_slice_nums=1,
-            use_image_id=False,
         )
 
     assert sorted(image_processor.calls, key=lambda frame_ids: frame_ids[0]) == (
@@ -190,20 +188,19 @@ def test_parallel_video_image_processor_is_exact_ordered_and_reuses_executor(
     )
     assert len(image_processor.call_arguments) == len(expected_chunks)
     assert all(
-        arguments == (False, "pt", {"max_slice_nums": 1, "use_image_id": False})
+        arguments == (False, "pt", {"max_slice_nums": 1})
         for arguments in image_processor.call_arguments
     )
     assert_processor_outputs_equal(serial, parallel)
 
 
 @pytest.mark.parametrize(
-    ("images", "max_slice_nums", "return_tensors", "use_image_id"),
+    ("images", "max_slice_nums", "return_tensors"),
     [
-        ([[0]], 1, "pt", False),
-        ([0, 1], 1, "pt", False),
-        ([[0, 1]], 2, "pt", False),
-        ([[0, 1]], 1, None, False),
-        ([[0, 1]], 1, "pt", True),
+        ([[0]], 1, "pt"),
+        ([0, 1], 1, "pt"),
+        ([[0, 1]], 2, "pt"),
+        ([[0, 1]], 1, None),
     ],
 )
 def test_parallel_video_image_processor_serial_fallbacks(
@@ -211,7 +208,6 @@ def test_parallel_video_image_processor_serial_fallbacks(
     images: list[list[int]] | list[int],
     max_slice_nums: int,
     return_tensors: str | None,
-    use_image_id: bool,
 ) -> None:
     image_processor = FakeCheckpointImageProcessor()
     with ThreadPoolExecutor(
@@ -227,7 +223,6 @@ def test_parallel_video_image_processor_serial_fallbacks(
             images,
             return_tensors=return_tensors,
             max_slice_nums=max_slice_nums,
-            use_image_id=use_image_id,
         )
 
     expected_frames = images[0] if isinstance(images[0], list) else images
@@ -251,7 +246,6 @@ def test_parallel_video_image_processor_falls_back_for_unknown_output_field(
             [[0, 1, 2]],
             return_tensors="pt",
             max_slice_nums=1,
-            use_image_id=False,
         )
 
     assert image_processor.calls[-1] == [0, 1, 2]
@@ -318,7 +312,6 @@ def test_parallel_video_image_processor_drains_futures_before_propagating(
                     [[0, 1]],
                     return_tensors="pt",
                     max_slice_nums=1,
-                    use_image_id=False,
                 )
             except Exception as exception:
                 errors.append(exception)
