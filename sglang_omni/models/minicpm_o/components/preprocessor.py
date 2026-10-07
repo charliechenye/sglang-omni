@@ -5,13 +5,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Executor
-from typing import TYPE_CHECKING
 
 import numpy as np
 import numpy.typing as npt
 import torch
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer
+from transformers import AutoProcessor, AutoTokenizer, BatchFeature, ProcessorMixin
 
 from sglang_omni.models.minicpm_o.payload_types import (
     AudioEncoderInputs,
@@ -37,13 +36,10 @@ from sglang_omni.preprocessing.video import (
 )
 from sglang_omni.proto import StagePayload
 
-if TYPE_CHECKING:
-    from transformers import ProcessorMixin
-else:
-    pass
-
 IMAGE_PLACEHOLDER = "<image>./</image>"
 AUDIO_PLACEHOLDER = "<audio>./</audio>"
+
+ProcessorOptionValue = bool | float | int | str | None
 
 # note (MayDomine): task prompts match the checkpoint's audio-understanding template.
 ASR_PROMPT_ZH = "请仔细听这段音频片段，并将其内容逐字记录。"
@@ -116,7 +112,7 @@ class MiniCPMOPreprocessor:
         )
         # note (MayDomine): text-only requests do not need Whisper feature extraction.
         self.model_dir = local_dir
-        self._processor = None  # noqa: leading-underscore
+        self._processor: ProcessorMixin | None = None  # noqa: leading-underscore
         self.speech_enabled = speech_enabled
         self.video_resize_executor = video_resize_executor
         self.video_resize_workers = video_resize_workers
@@ -142,9 +138,161 @@ class MiniCPMOPreprocessor:
             self._processor = AutoProcessor.from_pretrained(  # noqa: leading-underscore
                 self.model_dir, trust_remote_code=True
             )
+            self._install_parallel_video_image_processor(  # noqa: leading-underscore
+                self._processor  # noqa: leading-underscore
+            )
         else:
             pass
         return self._processor  # noqa: leading-underscore
+
+    def _install_parallel_video_image_processor(  # noqa: leading-underscore
+        self, processor: ProcessorMixin
+    ) -> None:  # noqa: leading-underscore
+        image_processor = processor.image_processor
+        assert image_processor is not None
+        original_preprocess = image_processor.preprocess
+        video_resize_executor = self.video_resize_executor
+        video_resize_workers = self.video_resize_workers
+
+        def parallel_preprocess(
+            images: list[Image.Image] | list[list[Image.Image]],
+            do_pad: bool = True,
+            max_slice_nums: int | None = None,
+            return_tensors: str | None = None,
+            **processor_options: ProcessorOptionValue,
+        ) -> BatchFeature:
+            if (
+                video_resize_executor is None
+                or video_resize_workers <= 1
+                or max_slice_nums != 1
+                or return_tensors != "pt"
+                or processor_options.get("use_image_id") is not False
+                or not isinstance(images, list)
+                or len(images) != 1
+                or not isinstance(images[0], list)
+                or len(images[0]) <= 1
+            ):
+                return original_preprocess(
+                    images,
+                    do_pad=do_pad,
+                    max_slice_nums=max_slice_nums,
+                    return_tensors=return_tensors,
+                    **processor_options,
+                )
+            else:
+                pass
+
+            frame_images = images[0]
+            chunk_count = min(video_resize_workers, len(frame_images))
+            base_chunk_size, remainder = divmod(len(frame_images), chunk_count)
+            frame_chunks: list[list[Image.Image]] = []
+            frame_start = 0
+            for chunk_index in range(chunk_count):
+                chunk_size = base_chunk_size + int(chunk_index < remainder)
+                frame_chunks.append(
+                    frame_images[frame_start : frame_start + chunk_size]
+                )
+                frame_start += chunk_size
+
+            futures = [
+                video_resize_executor.submit(
+                    original_preprocess,
+                    [frame_chunk],
+                    do_pad=do_pad,
+                    max_slice_nums=max_slice_nums,
+                    return_tensors=return_tensors,
+                    **processor_options,
+                )
+                for frame_chunk in frame_chunks
+            ]
+            processor_outputs: list[BatchFeature] = []
+            first_exception: Exception | None = None
+            for future in futures:
+                try:
+                    processor_outputs.append(future.result())
+                except Exception as exception:
+                    if first_exception is None:
+                        first_exception = exception
+                    else:
+                        pass
+            if first_exception is not None:
+                raise first_exception
+            else:
+                pass
+
+            combined_output = (
+                self._combine_video_processor_parts(  # noqa: leading-underscore
+                    processor_outputs
+                )
+            )
+            if combined_output is None:
+                return original_preprocess(
+                    images,
+                    do_pad=do_pad,
+                    max_slice_nums=max_slice_nums,
+                    return_tensors=return_tensors,
+                    **processor_options,
+                )
+            else:
+                return combined_output
+
+        image_processor.preprocess = parallel_preprocess
+
+    @staticmethod
+    def _combine_video_processor_parts(  # noqa: leading-underscore
+        processor_outputs: list[BatchFeature],
+    ) -> BatchFeature | None:  # noqa: leading-underscore
+        expected_keys = {"pixel_values", "image_sizes", "tgt_sizes"}
+        if not processor_outputs:
+            return None
+        else:
+            pass
+        if any(
+            not isinstance(processor_output, BatchFeature)
+            or set(processor_output.data) != expected_keys
+            for processor_output in processor_outputs
+        ):
+            return None
+        else:
+            pass
+
+        combined_pixel_values: list[torch.Tensor | list[torch.Tensor]] = []
+        combined_image_sizes: list[torch.Tensor | list[int] | tuple[int, int]] = []
+        tgt_size_tensors: list[torch.Tensor] = []
+        for processor_output in processor_outputs:
+            pixel_values = processor_output["pixel_values"]
+            image_sizes = processor_output["image_sizes"]
+            tgt_sizes = processor_output["tgt_sizes"]
+            if not (
+                isinstance(pixel_values, list)
+                and len(pixel_values) == 1
+                and isinstance(pixel_values[0], list)
+                and isinstance(image_sizes, list)
+                and len(image_sizes) == 1
+                and isinstance(image_sizes[0], list)
+                and isinstance(tgt_sizes, list)
+                and len(tgt_sizes) == 1
+                and isinstance(tgt_sizes[0], torch.Tensor)
+            ):
+                return None
+            else:
+                pass
+            combined_pixel_values.extend(pixel_values[0])
+            combined_image_sizes.extend(image_sizes[0])
+            tgt_size_tensors.append(tgt_sizes[0])
+
+        try:
+            combined_tgt_sizes = torch.cat(tgt_size_tensors, dim=0)
+        except RuntimeError:
+            return None
+
+        return BatchFeature(
+            data={
+                "pixel_values": [combined_pixel_values],
+                "image_sizes": [combined_image_sizes],
+                "tgt_sizes": [combined_tgt_sizes],
+            }
+        )
 
     async def __call__(self, payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs

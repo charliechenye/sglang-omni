@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
 from PIL import Image
+from transformers import BatchFeature
 
 from sglang_omni.models.minicpm_o.components import preprocessor as preprocessor_mod
 from sglang_omni.models.minicpm_o.components.preprocessor import MiniCPMOPreprocessor
@@ -41,6 +44,331 @@ class FakeProcessor:
             "audio_feature_lens": [[]],
             "audio_features": [],
         }
+
+
+class FakeCheckpointImageProcessor:
+    def __init__(
+        self,
+        *,
+        include_unknown_field: bool = False,
+        failure_frame: int | None = None,
+        blocking_frame: int | None = None,
+        blocking_started: threading.Event | None = None,
+        blocking_release: threading.Event | None = None,
+        blocking_finished: threading.Event | None = None,
+    ) -> None:
+        self.include_unknown_field = include_unknown_field
+        self.failure_frame = failure_frame
+        self.blocking_frame = blocking_frame
+        self.blocking_started = blocking_started
+        self.blocking_release = blocking_release
+        self.blocking_finished = blocking_finished
+        self.calls: list[list[int]] = []
+        self.call_thread_names: list[str] = []
+        self.call_arguments: list[
+            tuple[bool, str | None, dict[str, bool | float | int | str | None]]
+        ] = []
+
+    def preprocess(
+        self,
+        images: list[list[int]] | list[int],
+        do_pad: bool = True,
+        return_tensors: str | None = None,
+        **options: bool | float | int | str | None,
+    ) -> BatchFeature:
+        if isinstance(images[0], list):
+            frame_ids = list(images[0])
+        else:
+            frame_ids = list(images)
+
+        self.calls.append(frame_ids)
+        self.call_thread_names.append(threading.current_thread().name)
+        self.call_arguments.append((do_pad, return_tensors, options))
+        if self.failure_frame is not None and self.failure_frame in frame_ids:
+            raise RuntimeError("checkpoint preprocessing failed")
+        else:
+            pass
+        if (
+            self.blocking_frame is not None
+            and self.blocking_frame in frame_ids
+            and self.blocking_started is not None
+            and self.blocking_release is not None
+            and self.blocking_finished is not None
+        ):
+            self.blocking_started.set()
+            self.blocking_release.wait(timeout=5)
+            self.blocking_finished.set()
+        else:
+            pass
+
+        data = {
+            "pixel_values": [
+                [
+                    torch.tensor([[frame_id]], dtype=torch.float32)
+                    for frame_id in frame_ids
+                ]
+            ],
+            "image_sizes": [
+                [
+                    torch.tensor([frame_id, frame_id], dtype=torch.long)
+                    for frame_id in frame_ids
+                ]
+            ],
+            "tgt_sizes": [
+                torch.tensor(
+                    [[frame_id, frame_id] for frame_id in frame_ids],
+                    dtype=torch.long,
+                )
+            ],
+        }
+        if self.include_unknown_field:
+            data["future_field"] = [torch.tensor([1], dtype=torch.long)]
+        else:
+            pass
+        return BatchFeature(data=data)
+
+
+class FakeCheckpointProcessor:
+    def __init__(self, image_processor: FakeCheckpointImageProcessor) -> None:
+        self.image_processor = image_processor
+
+
+def make_processor_with_parallel_image_processor(
+    monkeypatch: pytest.MonkeyPatch,
+    image_processor: FakeCheckpointImageProcessor,
+    executor: ThreadPoolExecutor | None,
+    workers: int,
+) -> MiniCPMOPreprocessor:
+    checkpoint_processor = FakeCheckpointProcessor(image_processor)
+    preprocessor = object.__new__(MiniCPMOPreprocessor)
+    preprocessor._processor = None  # noqa: leading-underscore  # production name
+    preprocessor.model_dir = "unused"
+    preprocessor.video_resize_executor = executor
+    preprocessor.video_resize_workers = workers
+    monkeypatch.setattr(
+        preprocessor_mod.AutoProcessor,
+        "from_pretrained",
+        lambda *_args, **_kwargs: checkpoint_processor,
+    )
+    assert preprocessor.processor is checkpoint_processor
+    return preprocessor
+
+
+def assert_processor_outputs_equal(
+    expected: BatchFeature, actual: BatchFeature
+) -> None:
+    assert expected.keys() == actual.keys()
+    expected_pixel_values = expected["pixel_values"][0]
+    actual_pixel_values = actual["pixel_values"][0]
+    assert len(expected_pixel_values) == len(actual_pixel_values)
+    for expected_value, actual_value in zip(expected_pixel_values, actual_pixel_values):
+        assert torch.equal(expected_value, actual_value)
+
+    expected_image_sizes = expected["image_sizes"][0]
+    actual_image_sizes = actual["image_sizes"][0]
+    assert len(expected_image_sizes) == len(actual_image_sizes)
+    for expected_value, actual_value in zip(expected_image_sizes, actual_image_sizes):
+        assert torch.equal(expected_value, actual_value)
+    assert torch.equal(expected["tgt_sizes"][0], actual["tgt_sizes"][0])
+
+
+def test_parallel_video_image_processor_is_exact_ordered_and_reuses_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_processor = FakeCheckpointImageProcessor()
+    with ThreadPoolExecutor(
+        max_workers=3, thread_name_prefix="shared-video-pool"
+    ) as executor:
+        serial_preprocess = image_processor.preprocess
+        serial = serial_preprocess(
+            [[0, 1, 2, 3, 4]],
+            do_pad=False,
+            return_tensors="pt",
+            max_slice_nums=1,
+            use_image_id=False,
+        )
+        image_processor.calls.clear()
+        image_processor.call_thread_names.clear()
+        image_processor.call_arguments.clear()
+        preprocessor = make_processor_with_parallel_image_processor(
+            monkeypatch, image_processor, executor, workers=3
+        )
+
+        parallel = preprocessor.processor.image_processor.preprocess(
+            [[0, 1, 2, 3, 4]],
+            do_pad=False,
+            return_tensors="pt",
+            max_slice_nums=1,
+            use_image_id=False,
+        )
+
+    assert sorted(image_processor.calls, key=lambda frame_ids: frame_ids[0]) == [
+        [0, 1],
+        [2, 3],
+        [4],
+    ]
+    assert all(
+        thread_name.startswith("shared-video-pool")
+        for thread_name in image_processor.call_thread_names
+    )
+    assert len(image_processor.call_arguments) == 3
+    assert all(
+        arguments == (False, "pt", {"max_slice_nums": 1, "use_image_id": False})
+        for arguments in image_processor.call_arguments
+    )
+    assert_processor_outputs_equal(serial, parallel)
+
+
+def test_parallel_video_image_processor_submits_no_empty_chunks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_processor = FakeCheckpointImageProcessor()
+    with ThreadPoolExecutor(
+        max_workers=8, thread_name_prefix="shared-video-pool"
+    ) as executor:
+        preprocessor = make_processor_with_parallel_image_processor(
+            monkeypatch, image_processor, executor, workers=8
+        )
+        preprocessor.processor.image_processor.preprocess(
+            [[0, 1, 2]],
+            return_tensors="pt",
+            max_slice_nums=1,
+            use_image_id=False,
+        )
+
+    assert sorted(image_processor.calls, key=lambda frame_ids: frame_ids[0]) == [
+        [0],
+        [1],
+        [2],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("executor_enabled", "workers", "images"),
+    [
+        (True, 8, [[0]]),
+        (False, 8, [[0, 1]]),
+        (True, 1, [[0, 1]]),
+        (True, 8, [0, 1]),
+    ],
+)
+def test_parallel_video_image_processor_serial_fallbacks(
+    monkeypatch: pytest.MonkeyPatch,
+    executor_enabled: bool,
+    workers: int,
+    images: list[list[int]] | list[int],
+) -> None:
+    image_processor = FakeCheckpointImageProcessor()
+    executor = (
+        ThreadPoolExecutor(max_workers=2, thread_name_prefix="shared-video-pool")
+        if executor_enabled
+        else None
+    )
+    try:
+        preprocessor = make_processor_with_parallel_image_processor(
+            monkeypatch, image_processor, executor, workers
+        )
+        preprocessor.processor.image_processor.preprocess(
+            images,
+            return_tensors="pt",
+            max_slice_nums=1,
+            use_image_id=False,
+        )
+    finally:
+        if executor is not None:
+            executor.shutdown()
+        else:
+            pass
+
+    expected_frames = images[0] if isinstance(images[0], list) else images
+    assert image_processor.calls == [expected_frames]
+
+
+def test_parallel_video_image_processor_falls_back_for_unknown_output_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_processor = FakeCheckpointImageProcessor(include_unknown_field=True)
+    with ThreadPoolExecutor(
+        max_workers=3, thread_name_prefix="shared-video-pool"
+    ) as executor:
+        serial_preprocess = image_processor.preprocess
+        preprocessor = make_processor_with_parallel_image_processor(
+            monkeypatch, image_processor, executor, workers=3
+        )
+        result = preprocessor.processor.image_processor.preprocess(
+            [[0, 1, 2]],
+            return_tensors="pt",
+            max_slice_nums=1,
+            use_image_id=False,
+        )
+        expected = serial_preprocess(
+            [[0, 1, 2]],
+            return_tensors="pt",
+            max_slice_nums=1,
+            use_image_id=False,
+        )
+
+    assert [0, 1, 2] in image_processor.calls
+    assert_processor_outputs_equal(expected, result)
+    assert "future_field" in result
+    assert torch.equal(result["future_field"][0], torch.tensor([1]))
+
+
+def test_parallel_video_image_processor_drains_futures_before_propagating(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    blocking_started = threading.Event()
+    blocking_release = threading.Event()
+    blocking_finished = threading.Event()
+    image_processor = FakeCheckpointImageProcessor(
+        failure_frame=0,
+        blocking_frame=1,
+        blocking_started=blocking_started,
+        blocking_release=blocking_release,
+        blocking_finished=blocking_finished,
+    )
+    with ThreadPoolExecutor(
+        max_workers=2, thread_name_prefix="shared-video-pool"
+    ) as executor:
+        preprocessor = make_processor_with_parallel_image_processor(
+            monkeypatch, image_processor, executor, workers=2
+        )
+        errors: list[Exception] = []
+
+        def run_processor() -> None:
+            try:
+                preprocessor.processor.image_processor.preprocess(
+                    [[0, 1]],
+                    return_tensors="pt",
+                    max_slice_nums=1,
+                    use_image_id=False,
+                )
+            except Exception as exception:
+                errors.append(exception)
+
+        processing_thread = threading.Thread(target=run_processor)
+        processing_thread.start()
+        assert blocking_started.wait(timeout=2)
+        assert not blocking_finished.is_set()
+        blocking_release.set()
+        processing_thread.join(timeout=2)
+
+    assert not processing_thread.is_alive()
+    assert len(errors) == 1
+    assert str(errors[0]) == "checkpoint preprocessing failed"
+    assert blocking_finished.is_set()
+
+
+def test_processor_property_wraps_checkpoint_image_processor_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_processor = FakeCheckpointImageProcessor()
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        preprocessor = make_processor_with_parallel_image_processor(
+            monkeypatch, image_processor, executor, workers=2
+        )
+        wrapped_preprocess = preprocessor.processor.image_processor.preprocess
+        assert preprocessor.processor.image_processor.preprocess is wrapped_preprocess
 
 
 async def empty_images(images):
