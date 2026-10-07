@@ -204,12 +204,6 @@ class MiniCPMOPreprocessor:
                 for frame_chunk in frame_chunks
             ]
             wait(futures)
-            for future in futures:
-                exception = future.exception()
-                if exception is not None:
-                    raise exception
-                else:
-                    pass
             processor_outputs: list[BatchFeature] = [
                 future.result() for future in futures
             ]
