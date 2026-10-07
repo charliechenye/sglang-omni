@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.7" />
-    <meta name="docbuild:last-update" content="Oct 06, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 07, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -517,6 +517,7 @@
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#codec-decoding-on-xpu">Codec decoding on XPU</a></li>
 </ul>
 </li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dots-tts-text-to-speech-single-xpu">dots.tts (text-to-speech, single XPU)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#zonos2-moe-tts-single-xpu">ZONOS2 (MoE TTS, single XPU)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#personaplex-speech-to-speech-single-xpu">PersonaPlex (speech-to-speech, single XPU)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-omni-30b-a3b-moe-multi-xpu-tensor-parallel">Qwen3-Omni (30B-A3B MoE, multi-XPU tensor parallel)</a></li>
@@ -548,7 +549,7 @@ XPU wheel index.</p>
 family and CUDA-only wheels would replace the <code class="docutils literal notranslate"><span class="pre">+xpu</span></code> stack.
 <a class="reference download internal" download="" href="../_downloads/e6282636738987ea324fd398b24bcb06/pyproject_xpu.toml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">pyproject_xpu.toml</span></code></span></a> encodes the XPU replacements.</p>
 <p>Core deps cover the supported models (Qwen3-ASR / TTS / Omni / MiniMax Music 3, Fun-ASR-Nano,
-MOSS-Transcribe-Diarize, MiniCPM-o, Ming-Omni-TTS and PersonaPlex) plus the API server;
+MOSS-Transcribe-Diarize, MiniCPM-o, Ming-Omni-TTS, PersonaPlex and dots.tts) plus the API server;
 <code class="docutils literal notranslate"><span class="pre">[eval]</span></code> adds SeedTTS/WER tooling and <code class="docutils literal notranslate"><span class="pre">[all]</span></code> aliases it. ZONOS2 also serves here,
 but its DAC codec is not a core dep on any platform — see
 <a class="reference internal" href="#zonos2-moe-tts-single-xpu"><span class="std std-ref">ZONOS2</span></a> for the XPU-safe way to add it. Other model
@@ -725,6 +726,86 @@ startup:</p>
 defaults in <a class="reference internal" href="../cookbook/qwen3_tts.html"><span class="std std-doc">docs/cookbook/qwen3_tts.md</span></a>.</p>
 </section>
 </section>
+<section id="dots-tts-text-to-speech-single-xpu">
+<h3>dots.tts (text-to-speech, single XPU)<a class="headerlink" href="#dots-tts-text-to-speech-single-xpu" title="Link to this heading">#</a></h3>
+<p>The XPU installation includes <code class="docutils literal notranslate"><span class="pre">dots.tts==0.2.1</span></code>.
+All three checkpoints were validated on one 24 GB Intel Arc Pro B60 with bf16,
+<code class="docutils literal notranslate"><span class="pre">mem_fraction_static=0.20</span></code>, and <code class="docutils literal notranslate"><span class="pre">max_generate_length=500</span></code>:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Checkpoint</p></th>
+<th class="head"><p>Config</p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">num_steps</span></code></p></th>
+<th class="head"><p><code class="docutils literal notranslate"><span class="pre">max_running_requests</span></code> tested</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dots-studio/dots.tts-mf</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/dots_tts.yaml</span></code></p></td>
+<td><p>4</p></td>
+<td><p>4</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">dots-studio/dots.tts-soar</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/dots_tts_soar.yaml</span></code></p></td>
+<td><p>10</p></td>
+<td><p>1</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">dots-studio/dots.tts-base</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/dots_tts_soar.yaml</span></code></p></td>
+<td><p>10</p></td>
+<td><p>1</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For MF on B60, lower the config’s default 16 request slots to the 4 slots used in validation. Keep the checkpoint revision pinned by the config:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ZE_AFFINITY_MASK</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/dots_tts.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--latent_engine.engine.max_running_requests<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--latent_engine.engine.cuda_graph_max_bs<span class="w"> </span><span class="m">4</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--allowed-local-media-path<span class="w"> </span>docs/_static/audio<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p>For SOAR, use its single-request config:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">ZE_AFFINITY_MASK</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>dots-studio/dots.tts-soar<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--config<span class="w"> </span>examples/configs/dots_tts_soar.yaml<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--allowed-local-media-path<span class="w"> </span>docs/_static/audio<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p>For base, use the same command with
+<code class="docutils literal notranslate"><span class="pre">--model-path</span> <span class="pre">dots-studio/dots.tts-base</span></code>. Base and SOAR require
+<code class="docutils literal notranslate"><span class="pre">max_running_requests=1</span></code>; continuous batching is MF-only.</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">disable_cuda_graph</span></code> and <code class="docutils literal notranslate"><span class="pre">cuda_graph_max_bs</span></code> config names also control
+SGLang backbone decode graphs on XPU. The configs enable them; use
+<code class="docutils literal notranslate"><span class="pre">--latent_engine.engine.disable_cuda_graph</span> <span class="pre">true</span></code> for eager backbone decode.
+The batched acoustic tail runs eager on XPU. Its memory admission precheck
+queries free XPU memory and rejects oversized pools before allocation.
+Lower <code class="docutils literal notranslate"><span class="pre">max_running_requests</span></code> and/or
+<code class="docutils literal notranslate"><span class="pre">max_generate_length</span></code> explicitly; <code class="docutils literal notranslate"><span class="pre">mem_fraction_static</span></code> only budgets
+the backbone KV cache.</p>
+<p>Each request needs one reference clip and its matching transcript:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-sS<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/audio/speech<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">'{</span>
+<span class="s1">    "model": "dots-studio/dots.tts-mf",</span>
+<span class="s1">    "input": "Have a nice day and enjoy south california sunshine.",</span>
+<span class="s1">    "references": [{</span>
+<span class="s1">      "audio_path": "docs/_static/audio/male-voice.wav",</span>
+<span class="s1">      "text": "Hey, Adam here. Let'</span><span class="se">\'</span><span class="s1">'s create something that feels real, sounds human, and connects every time."</span>
+<span class="s1">    }],</span>
+<span class="s1">    "seed": 42</span>
+<span class="s1">  }'</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--output<span class="w"> </span>output.wav
+</pre></div>
+</div>
+<p>Set <code class="docutils literal notranslate"><span class="pre">model</span></code> to the checkpoint being served. The validation runs produced
+48 kHz mono audio and passed ASR checks against the requested text.
+See the <a class="reference internal" href="../cookbook/dots_tts.html"><span class="std std-doc">dots.tts cookbook</span></a> for streaming and
+solver parameters.</p>
+</section>
 <section id="zonos2-moe-tts-single-xpu">
 <h3>ZONOS2 (MoE TTS, single XPU)<a class="headerlink" href="#zonos2-moe-tts-single-xpu" title="Link to this heading">#</a></h3>
 <p>ZONOS2 needs the Descript DAC codec. <code class="docutils literal notranslate"><span class="pre">--no-deps</span></code> is required:
@@ -835,8 +916,8 @@ in a graph.</p>
 </div></blockquote>
 <blockquote>
 <div><p>✅ Support status: <strong>Qwen3-ASR, Fun-ASR-Nano, MOSS-Transcribe-Diarize, Qwen3-TTS, ZONOS2,
-Qwen3-Omni, MiniMax Music 3, MiniCPM-o, Ming-Omni-TTS and PersonaPlex all serve end-to-end on Intel XPU</strong>
-(Qwen3-ASR, Fun-ASR-Nano, MOSS-Transcribe-Diarize, Qwen3-TTS, MiniCPM-o and PersonaPlex single-card;
+Qwen3-Omni, MiniMax Music 3, MiniCPM-o, Ming-Omni-TTS, PersonaPlex and dots.tts all serve end-to-end on Intel XPU</strong>
+(Qwen3-ASR, Fun-ASR-Nano, MOSS-Transcribe-Diarize, Qwen3-TTS, MiniCPM-o, PersonaPlex and dots.tts single-card;
 ZONOS2 single-card with decode graphs; MiniMax Music 3 and Ming-Omni-TTS need two cards;
 Qwen3-Omni thinker across 8 cards with tensor parallelism).</p>
 </div></blockquote>
@@ -907,6 +988,7 @@ Qwen3-Omni thinker across 8 cards with tensor parallelism).</p>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#codec-decoding-on-xpu">Codec decoding on XPU</a></li>
 </ul>
 </li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#dots-tts-text-to-speech-single-xpu">dots.tts (text-to-speech, single XPU)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#zonos2-moe-tts-single-xpu">ZONOS2 (MoE TTS, single XPU)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#personaplex-speech-to-speech-single-xpu">PersonaPlex (speech-to-speech, single XPU)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-omni-30b-a3b-moe-multi-xpu-tensor-parallel">Qwen3-Omni (30B-A3B MoE, multi-XPU tensor parallel)</a></li>
@@ -947,7 +1029,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 06, 2026.
+  Last updated on Oct 07, 2026.
   <br/>
 </p>
   </div>

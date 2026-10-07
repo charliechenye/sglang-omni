@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.7" />
-    <meta name="docbuild:last-update" content="Oct 06, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 07, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -832,11 +832,15 @@ python<span class="w"> </span>-m<span class="w"> </span>sglang_omni.cli<span cla
 <td><p>checkpoint default</p></td>
 <td><p>Voice used when a session sends no reference</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vision.max_frames_per_unit</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">speech_state_bytes_per_session</span></code></p></td>
+<td><p>2 GiB</p></td>
+<td><p>Memory the speech stage may hold per conversation; a conversation that needs more is closed and the others keep running</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vision.max_frames_per_unit</span></code></p></td>
 <td><p>4</p></td>
 <td><p>Frames accepted per unit (1 s of audio)</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">vision.max_slice_nums_limit</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">vision.max_slice_nums_limit</span></code></p></td>
 <td><p>9</p></td>
 <td><p>Highest slice count a session may request</p></td>
 </tr>
@@ -938,7 +942,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 06, 2026.
+  Last updated on Oct 07, 2026.
   <br/>
 </p>
   </div>
