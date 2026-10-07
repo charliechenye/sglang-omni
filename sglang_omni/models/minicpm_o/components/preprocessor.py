@@ -136,16 +136,14 @@ class MiniCPMOPreprocessor:
             self._processor = AutoProcessor.from_pretrained(  # noqa: leading-underscore
                 self.model_dir, trust_remote_code=True
             )
-            self._install_parallel_video_image_processor(  # noqa: leading-underscore
+            self.enable_video_frame_parallelism(
                 self._processor  # noqa: leading-underscore
             )
         else:
             pass
         return self._processor  # noqa: leading-underscore
 
-    def _install_parallel_video_image_processor(  # noqa: leading-underscore
-        self, processor: ProcessorMixin
-    ) -> None:  # noqa: leading-underscore
+    def enable_video_frame_parallelism(self, processor: ProcessorMixin) -> None:
         if self.video_frame_executor is None or self.video_frame_workers <= 1:
             return
         else:
@@ -220,11 +218,7 @@ class MiniCPMOPreprocessor:
             else:
                 pass
 
-            combined_output = (
-                self._combine_video_processor_parts(  # noqa: leading-underscore
-                    processor_outputs
-                )
-            )
+            combined_output = self.combine_video_processor_parts(processor_outputs)
             if combined_output is None:
                 return original_preprocess(
                     images,
@@ -239,52 +233,37 @@ class MiniCPMOPreprocessor:
         image_processor.preprocess = parallel_preprocess
 
     @staticmethod
-    def _combine_video_processor_parts(  # noqa: leading-underscore
+    def combine_video_processor_parts(
         processor_outputs: list[BatchFeature],
-    ) -> BatchFeature | None:  # noqa: leading-underscore
+    ) -> BatchFeature | None:
         expected_keys = {"pixel_values", "image_sizes", "tgt_sizes"}
         if not processor_outputs:
             return None
-        else:
-            pass
-        if any(
-            not isinstance(processor_output, BatchFeature)
-            or set(processor_output.data) != expected_keys
+        elif any(
+            set(processor_output.data) != expected_keys
             for processor_output in processor_outputs
         ):
             return None
         else:
             pass
 
-        combined_pixel_values: list[torch.Tensor | list[torch.Tensor]] = []
-        combined_image_sizes: list[torch.Tensor | list[int] | tuple[int, int]] = []
-        tgt_size_tensors: list[torch.Tensor] = []
-        for processor_output in processor_outputs:
-            pixel_values = processor_output["pixel_values"]
-            image_sizes = processor_output["image_sizes"]
-            tgt_sizes = processor_output["tgt_sizes"]
-            if not (
-                isinstance(pixel_values, list)
-                and len(pixel_values) == 1
-                and isinstance(pixel_values[0], list)
-                and isinstance(image_sizes, list)
-                and len(image_sizes) == 1
-                and isinstance(image_sizes[0], list)
-                and isinstance(tgt_sizes, list)
-                and len(tgt_sizes) == 1
-                and isinstance(tgt_sizes[0], torch.Tensor)
-            ):
-                return None
-            else:
-                pass
-            combined_pixel_values.extend(pixel_values[0])
-            combined_image_sizes.extend(image_sizes[0])
-            tgt_size_tensors.append(tgt_sizes[0])
-
-        try:
-            combined_tgt_sizes = torch.cat(tgt_size_tensors, dim=0)
-        except RuntimeError:
-            return None
+        combined_pixel_values = [
+            value
+            for processor_output in processor_outputs
+            for value in processor_output["pixel_values"][0]
+        ]
+        combined_image_sizes = [
+            value
+            for processor_output in processor_outputs
+            for value in processor_output["image_sizes"][0]
+        ]
+        combined_tgt_sizes = torch.cat(
+            [
+                processor_output["tgt_sizes"][0]
+                for processor_output in processor_outputs
+            ],
+            dim=0,
+        )
 
         return BatchFeature(
             data={

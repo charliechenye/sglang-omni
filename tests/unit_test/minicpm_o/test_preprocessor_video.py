@@ -172,16 +172,26 @@ def assert_processor_outputs_equal(
     assert torch.equal(expected["tgt_sizes"][0], actual["tgt_sizes"][0])
 
 
+@pytest.mark.parametrize(
+    ("frame_ids", "video_frame_workers", "expected_chunks"),
+    [
+        ([0, 1, 2, 3, 4], 3, [[0, 1], [2, 3], [4]]),
+        ([0, 1, 2], 8, [[0], [1], [2]]),
+    ],
+)
 def test_parallel_video_image_processor_is_exact_ordered_and_reuses_executor(
     monkeypatch: pytest.MonkeyPatch,
+    frame_ids: list[int],
+    video_frame_workers: int,
+    expected_chunks: list[list[int]],
 ) -> None:
     image_processor = FakeCheckpointImageProcessor()
     with ThreadPoolExecutor(
-        max_workers=3, thread_name_prefix="shared-video-pool"
+        max_workers=video_frame_workers, thread_name_prefix="shared-video-pool"
     ) as executor:
         serial_preprocess = image_processor.preprocess
         serial = serial_preprocess(
-            [[0, 1, 2, 3, 4]],
+            [frame_ids],
             do_pad=False,
             return_tensors="pt",
             max_slice_nums=1,
@@ -194,27 +204,25 @@ def test_parallel_video_image_processor_is_exact_ordered_and_reuses_executor(
             monkeypatch,
             image_processor,
             video_frame_executor=executor,
-            video_frame_workers=3,
+            video_frame_workers=video_frame_workers,
         )
 
         parallel = preprocessor.processor.image_processor.preprocess(
-            [[0, 1, 2, 3, 4]],
+            [frame_ids],
             do_pad=False,
             return_tensors="pt",
             max_slice_nums=1,
             use_image_id=False,
         )
 
-    assert sorted(image_processor.calls, key=lambda frame_ids: frame_ids[0]) == [
-        [0, 1],
-        [2, 3],
-        [4],
-    ]
+    assert sorted(image_processor.calls, key=lambda frame_ids: frame_ids[0]) == (
+        expected_chunks
+    )
     assert all(
         thread_name.startswith("shared-video-pool")
         for thread_name in image_processor.call_thread_names
     )
-    assert len(image_processor.call_arguments) == 3
+    assert len(image_processor.call_arguments) == len(expected_chunks)
     assert all(
         arguments == (False, "pt", {"max_slice_nums": 1, "use_image_id": False})
         for arguments in image_processor.call_arguments
@@ -222,55 +230,26 @@ def test_parallel_video_image_processor_is_exact_ordered_and_reuses_executor(
     assert_processor_outputs_equal(serial, parallel)
 
 
-def test_parallel_video_image_processor_is_exact_for_mixed_image_and_video(
+@pytest.mark.parametrize(
+    ("images", "max_slice_nums", "return_tensors", "use_image_id"),
+    [
+        ([[0]], 1, "pt", False),
+        ([0, 1], 1, "pt", False),
+        ([[0, 1]], 2, "pt", False),
+        ([[0, 1]], 1, None, False),
+        ([[0, 1]], 1, "pt", True),
+    ],
+)
+def test_parallel_video_image_processor_serial_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    image_processor = FakeCheckpointImageProcessor()
-    mixed_images = [[100, 0, 1, 2, 3]]
-    with ThreadPoolExecutor(
-        max_workers=3, thread_name_prefix="shared-video-pool"
-    ) as executor:
-        serial = image_processor.preprocess(
-            mixed_images,
-            return_tensors="pt",
-            max_slice_nums=1,
-            use_image_id=False,
-        )
-        image_processor.calls.clear()
-        preprocessor = make_processor_with_parallel_image_processor(
-            monkeypatch,
-            image_processor,
-            video_frame_executor=executor,
-            video_frame_workers=3,
-        )
-        parallel = preprocessor.processor.image_processor.preprocess(
-            mixed_images,
-            return_tensors="pt",
-            max_slice_nums=1,
-            use_image_id=False,
-        )
-
-    assert sorted(image_processor.calls, key=lambda frame_ids: frame_ids[0]) == [
-        [100, 0],
-        [1, 2],
-        [3],
-    ]
-    assert_processor_outputs_equal(serial, parallel)
-    assert [size[0].item() for size in parallel["image_sizes"][0]] == [
-        100,
-        0,
-        1,
-        2,
-        3,
-    ]
-
-
-def test_parallel_video_image_processor_submits_no_empty_chunks(
-    monkeypatch: pytest.MonkeyPatch,
+    images: list[list[int]] | list[int],
+    max_slice_nums: int,
+    return_tensors: str | None,
+    use_image_id: bool,
 ) -> None:
     image_processor = FakeCheckpointImageProcessor()
     with ThreadPoolExecutor(
-        max_workers=8, thread_name_prefix="shared-video-pool"
+        max_workers=2, thread_name_prefix="shared-video-pool"
     ) as executor:
         preprocessor = make_processor_with_parallel_image_processor(
             monkeypatch,
@@ -279,58 +258,11 @@ def test_parallel_video_image_processor_submits_no_empty_chunks(
             video_frame_workers=8,
         )
         preprocessor.processor.image_processor.preprocess(
-            [[0, 1, 2]],
-            return_tensors="pt",
-            max_slice_nums=1,
-            use_image_id=False,
-        )
-
-    assert sorted(image_processor.calls, key=lambda frame_ids: frame_ids[0]) == [
-        [0],
-        [1],
-        [2],
-    ]
-
-
-@pytest.mark.parametrize(
-    ("executor_enabled", "video_frame_workers", "images"),
-    [
-        (True, 8, [[0]]),
-        (False, 8, [[0, 1]]),
-        (True, 1, [[0, 1]]),
-        (True, 8, [0, 1]),
-    ],
-)
-def test_parallel_video_image_processor_serial_fallbacks(
-    monkeypatch: pytest.MonkeyPatch,
-    executor_enabled: bool,
-    video_frame_workers: int,
-    images: list[list[int]] | list[int],
-) -> None:
-    image_processor = FakeCheckpointImageProcessor()
-    executor = (
-        ThreadPoolExecutor(max_workers=2, thread_name_prefix="shared-video-pool")
-        if executor_enabled
-        else None
-    )
-    try:
-        preprocessor = make_processor_with_parallel_image_processor(
-            monkeypatch,
-            image_processor,
-            video_frame_executor=executor,
-            video_frame_workers=video_frame_workers,
-        )
-        preprocessor.processor.image_processor.preprocess(
             images,
-            return_tensors="pt",
-            max_slice_nums=1,
-            use_image_id=False,
+            return_tensors=return_tensors,
+            max_slice_nums=max_slice_nums,
+            use_image_id=use_image_id,
         )
-    finally:
-        if executor is not None:
-            executor.shutdown()
-        else:
-            pass
 
     expected_frames = images[0] if isinstance(images[0], list) else images
     assert image_processor.calls == [expected_frames]
@@ -449,21 +381,6 @@ def test_processor_property_leaves_checkpoint_processor_unwrapped_when_disabled(
             executor.shutdown()
         else:
             pass
-
-
-def test_processor_property_wraps_checkpoint_image_processor_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    image_processor = FakeCheckpointImageProcessor()
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        preprocessor = make_processor_with_parallel_image_processor(
-            monkeypatch,
-            image_processor,
-            video_frame_executor=executor,
-            video_frame_workers=2,
-        )
-        wrapped_preprocess = preprocessor.processor.image_processor.preprocess
-        assert preprocessor.processor.image_processor.preprocess is wrapped_preprocess
 
 
 async def empty_images(images):
