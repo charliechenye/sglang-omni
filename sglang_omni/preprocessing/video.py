@@ -53,19 +53,21 @@ def resize_video_tensor_parallel(
     resized_height: int,
     resized_width: int,
     *,
-    executor: Executor | None,
-    workers: int,
+    video_frame_executor: Executor | None,
+    video_frame_workers: int,
 ) -> torch.Tensor:
-    """Resize temporal chunks in submission order using a dedicated executor."""
+    """Resize temporal chunks in submission order using the shared frame pool."""
     frame_count = int(video.shape[0])
-    if executor is None or workers <= 1 or frame_count <= 1:
+    if video_frame_executor is None or video_frame_workers <= 1 or frame_count <= 1:
         return resize_video_tensor(video, resized_height, resized_width)
     else:
         pass
 
-    video_chunks = torch.tensor_split(video, min(workers, frame_count), dim=0)
+    video_chunks = torch.tensor_split(
+        video, min(video_frame_workers, frame_count), dim=0
+    )
     resized_futures: list[Future[torch.Tensor]] = [
-        executor.submit(
+        video_frame_executor.submit(
             resize_video_tensor,
             video_chunk,
             resized_height,
@@ -91,8 +93,8 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, npt.NDArray[np.float32] | 
         image_mode: str = "RGB",
         extract_audio: bool = False,
         audio_target_sr: int = 16000,
-        resize_executor: Executor | None = None,
-        resize_workers: int = 1,
+        video_frame_executor: Executor | None = None,
+        video_frame_workers: int = 1,
         **kwargs: object,
     ) -> None:
         """Initialize VideoMediaIO.
@@ -106,8 +108,8 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, npt.NDArray[np.float32] | 
             image_mode: Target image mode (default: "RGB").
             extract_audio: If True, extract audio from video and return as third element.
             audio_target_sr: Target sample rate for audio extraction (default: 16000).
-            resize_executor: Optional dedicated executor for frame tensor resize.
-            resize_workers: Maximum number of frame chunks submitted for each resize.
+            video_frame_executor: Optional shared executor for per-frame video work.
+            video_frame_workers: Maximum number of frame chunks submitted per phase.
             **kwargs: Additional arguments (for compatibility with MultiModalResourceConnector).
         """
         super().__init__()
@@ -119,8 +121,8 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, npt.NDArray[np.float32] | 
         self.image_mode = image_mode
         self.extract_audio = extract_audio
         self.audio_target_sr = audio_target_sr
-        self.resize_executor = resize_executor
-        self.resize_workers = resize_workers
+        self.video_frame_executor = video_frame_executor
+        self.video_frame_workers = video_frame_workers
         self.kwargs = kwargs
 
     def load_path(self, filepath: Path) -> tuple[torch.Tensor, float]:
@@ -131,8 +133,8 @@ class VideoMediaIO(MediaIO[tuple[torch.Tensor, float, npt.NDArray[np.float32] | 
             min_pixels=self.min_pixels,
             max_pixels=self.max_pixels,
             total_pixels=self.total_pixels,
-            resize_executor=self.resize_executor,
-            resize_workers=self.resize_workers,
+            video_frame_executor=self.video_frame_executor,
+            video_frame_workers=self.video_frame_workers,
         )
 
     def load_bytes(
@@ -197,8 +199,8 @@ async def ensure_video_list_async(
     resource_connector: MultiModalResourceConnector | None = None,
     extract_audio: bool = False,
     audio_target_sr: int = 16000,
-    resize_executor: Executor | None = None,
-    resize_workers: int = 1,
+    video_frame_executor: Executor | None = None,
+    video_frame_workers: int = 1,
 ) -> tuple[
     list[object], list[float] | None, list[npt.NDArray[np.float32] | None] | None
 ]:
@@ -216,8 +218,8 @@ async def ensure_video_list_async(
                         the global connector.
         extract_audio: If True, extract audio from videos and return as third element.
         audio_target_sr: Target sample rate for audio extraction (default: 16000).
-        resize_executor: Optional dedicated executor for frame tensor resize.
-        resize_workers: Maximum number of frame chunks submitted for each resize.
+        video_frame_executor: Optional shared executor for per-frame video work.
+        video_frame_workers: Maximum number of frame chunks submitted per phase.
 
     Returns:
         Tuple of (normalized video list, sample_fps_list or None, extracted_audio_list or None).
@@ -261,8 +263,8 @@ async def ensure_video_list_async(
                 image_mode=image_mode,
                 extract_audio=extract_audio,
                 audio_target_sr=audio_target_sr,
-                resize_executor=resize_executor,
-                resize_workers=resize_workers,
+                video_frame_executor=video_frame_executor,
+                video_frame_workers=video_frame_workers,
             )
         else:
             media_io = VideoMediaIO(
@@ -273,8 +275,8 @@ async def ensure_video_list_async(
                 total_pixels=total_pixels,
                 extract_audio=extract_audio,
                 audio_target_sr=audio_target_sr,
-                resize_executor=resize_executor,
-                resize_workers=resize_workers,
+                video_frame_executor=video_frame_executor,
+                video_frame_workers=video_frame_workers,
             )
             video_path = Path(video_item)
             loop = asyncio.get_running_loop()
@@ -501,8 +503,8 @@ def load_video_path(
     max_pixels: int | None = None,
     total_pixels: int | None = None,
     *,
-    resize_executor: Executor | None = None,
-    resize_workers: int = 1,
+    video_frame_executor: Executor | None = None,
+    video_frame_workers: int = 1,
 ) -> tuple[torch.Tensor, float]:
     """Load a local video into a torch tensor (T, C, H, W) on CPU."""
     path = Path(path)
@@ -596,8 +598,8 @@ def load_video_path(
         video,
         resized_height,
         resized_width,
-        executor=resize_executor,
-        workers=resize_workers,
+        video_frame_executor=video_frame_executor,
+        video_frame_workers=video_frame_workers,
     ).float()
     return video, sample_fps
 

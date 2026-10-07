@@ -51,13 +51,15 @@ def create_preprocessing_executor(
     model_path: str,
     *,
     speech_enabled: bool = False,
-    video_resize_workers: int = 8,
+    video_frame_workers: int = 8,
 ) -> SimpleScheduler[StagePayload, StagePayload]:
-    video_resize_executor: Executor | None = None
-    if video_resize_workers > 1:
-        video_resize_executor = ThreadPoolExecutor(
-            max_workers=video_resize_workers,
-            thread_name_prefix="minicpmo-video-resize",
+    video_frame_executor: Executor | None = None
+    if video_frame_workers > 1:
+        # note(chenye): shared CPU pool for sequential resize and checkpoint image
+        # processing
+        video_frame_executor = ThreadPoolExecutor(
+            max_workers=video_frame_workers,
+            thread_name_prefix="minicpmo-video-frame",
         )
     else:
         pass
@@ -65,16 +67,14 @@ def create_preprocessing_executor(
     preprocessor = MiniCPMOPreprocessor(
         model_path,
         speech_enabled=speech_enabled,
-        video_resize_executor=video_resize_executor,
-        video_resize_workers=video_resize_workers,
+        video_frame_executor=video_frame_executor,
+        video_frame_workers=video_frame_workers,
     )
 
     return SimpleScheduler[StagePayload, StagePayload](
         preprocessor,
         shutdown_callback=(
-            video_resize_executor.shutdown
-            if video_resize_executor is not None
-            else None
+            video_frame_executor.shutdown if video_frame_executor is not None else None
         ),
     )
 

@@ -136,15 +136,15 @@ class FakeCheckpointProcessor:
 def make_processor_with_parallel_image_processor(
     monkeypatch: pytest.MonkeyPatch,
     image_processor: FakeCheckpointImageProcessor,
-    executor: ThreadPoolExecutor | None,
-    workers: int,
+    video_frame_executor: ThreadPoolExecutor | None,
+    video_frame_workers: int,
 ) -> MiniCPMOPreprocessor:
     checkpoint_processor = FakeCheckpointProcessor(image_processor)
     preprocessor = object.__new__(MiniCPMOPreprocessor)
     preprocessor._processor = None  # noqa: leading-underscore  # production name
     preprocessor.model_dir = "unused"
-    preprocessor.video_resize_executor = executor
-    preprocessor.video_resize_workers = workers
+    preprocessor.video_frame_executor = video_frame_executor
+    preprocessor.video_frame_workers = video_frame_workers
     monkeypatch.setattr(
         preprocessor_mod.AutoProcessor,
         "from_pretrained",
@@ -191,7 +191,10 @@ def test_parallel_video_image_processor_is_exact_ordered_and_reuses_executor(
         image_processor.call_thread_names.clear()
         image_processor.call_arguments.clear()
         preprocessor = make_processor_with_parallel_image_processor(
-            monkeypatch, image_processor, executor, workers=3
+            monkeypatch,
+            image_processor,
+            video_frame_executor=executor,
+            video_frame_workers=3,
         )
 
         parallel = preprocessor.processor.image_processor.preprocess(
@@ -227,7 +230,10 @@ def test_parallel_video_image_processor_submits_no_empty_chunks(
         max_workers=8, thread_name_prefix="shared-video-pool"
     ) as executor:
         preprocessor = make_processor_with_parallel_image_processor(
-            monkeypatch, image_processor, executor, workers=8
+            monkeypatch,
+            image_processor,
+            video_frame_executor=executor,
+            video_frame_workers=8,
         )
         preprocessor.processor.image_processor.preprocess(
             [[0, 1, 2]],
@@ -244,7 +250,7 @@ def test_parallel_video_image_processor_submits_no_empty_chunks(
 
 
 @pytest.mark.parametrize(
-    ("executor_enabled", "workers", "images"),
+    ("executor_enabled", "video_frame_workers", "images"),
     [
         (True, 8, [[0]]),
         (False, 8, [[0, 1]]),
@@ -255,7 +261,7 @@ def test_parallel_video_image_processor_submits_no_empty_chunks(
 def test_parallel_video_image_processor_serial_fallbacks(
     monkeypatch: pytest.MonkeyPatch,
     executor_enabled: bool,
-    workers: int,
+    video_frame_workers: int,
     images: list[list[int]] | list[int],
 ) -> None:
     image_processor = FakeCheckpointImageProcessor()
@@ -266,7 +272,10 @@ def test_parallel_video_image_processor_serial_fallbacks(
     )
     try:
         preprocessor = make_processor_with_parallel_image_processor(
-            monkeypatch, image_processor, executor, workers
+            monkeypatch,
+            image_processor,
+            video_frame_executor=executor,
+            video_frame_workers=video_frame_workers,
         )
         preprocessor.processor.image_processor.preprocess(
             images,
@@ -293,7 +302,10 @@ def test_parallel_video_image_processor_falls_back_for_unknown_output_field(
     ) as executor:
         serial_preprocess = image_processor.preprocess
         preprocessor = make_processor_with_parallel_image_processor(
-            monkeypatch, image_processor, executor, workers=3
+            monkeypatch,
+            image_processor,
+            video_frame_executor=executor,
+            video_frame_workers=3,
         )
         result = preprocessor.processor.image_processor.preprocess(
             [[0, 1, 2]],
@@ -331,7 +343,10 @@ def test_parallel_video_image_processor_drains_futures_before_propagating(
         max_workers=2, thread_name_prefix="shared-video-pool"
     ) as executor:
         preprocessor = make_processor_with_parallel_image_processor(
-            monkeypatch, image_processor, executor, workers=2
+            monkeypatch,
+            image_processor,
+            video_frame_executor=executor,
+            video_frame_workers=2,
         )
         errors: list[Exception] = []
 
@@ -365,7 +380,10 @@ def test_processor_property_wraps_checkpoint_image_processor_once(
     image_processor = FakeCheckpointImageProcessor()
     with ThreadPoolExecutor(max_workers=2) as executor:
         preprocessor = make_processor_with_parallel_image_processor(
-            monkeypatch, image_processor, executor, workers=2
+            monkeypatch,
+            image_processor,
+            video_frame_executor=executor,
+            video_frame_workers=2,
         )
         wrapped_preprocess = preprocessor.processor.image_processor.preprocess
         assert preprocessor.processor.image_processor.preprocess is wrapped_preprocess
@@ -392,8 +410,8 @@ def test_minicpm_preprocessor_uses_only_requested_video_audio(
         fake_processor  # noqa: leading-underscore  # production name
     )
     preprocessor.speech_enabled = False
-    preprocessor.video_resize_executor = None
-    preprocessor.video_resize_workers = 1
+    preprocessor.video_frame_executor = None
+    preprocessor.video_frame_workers = 1
     preprocessor.tokenizer = SimpleNamespace()
     monkeypatch.setattr(
         preprocessor,
@@ -455,8 +473,8 @@ def test_minicpm_preprocessor_uses_only_requested_video_audio(
         "total_pixels": 8192,
         "extract_audio": bool(use_audio_in_video),
         "audio_target_sr": 16000,
-        "resize_executor": None,
-        "resize_workers": 1,
+        "video_frame_executor": None,
+        "video_frame_workers": 1,
     }
     assert len(fake_processor.images[0]) == 2
     assert fake_processor.options == {"max_slice_nums": 1, "use_image_id": False}
@@ -494,8 +512,8 @@ def test_minicpm_video_options_preserve_other_media(
         fake_processor  # noqa: leading-underscore  # production name
     )
     preprocessor.speech_enabled = False
-    preprocessor.video_resize_executor = None
-    preprocessor.video_resize_workers = 1
+    preprocessor.video_frame_executor = None
+    preprocessor.video_frame_workers = 1
     monkeypatch.setattr(
         preprocessor, "render_chat_template", lambda messages, **_: str(messages)
     )
@@ -553,8 +571,8 @@ def test_minicpm_visual_cache_key_tracks_decoded_content(monkeypatch, changed) -
         FakeProcessor()  # noqa: leading-underscore  # production name
     )
     preprocessor.speech_enabled = False
-    preprocessor.video_resize_executor = None
-    preprocessor.video_resize_workers = 1
+    preprocessor.video_frame_executor = None
+    preprocessor.video_frame_workers = 1
     monkeypatch.setattr(
         preprocessor, "render_chat_template", lambda messages, **_: str(messages)
     )

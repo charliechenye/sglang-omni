@@ -38,19 +38,19 @@ class ConfigLoaded(Exception):
     """Stop at the configuration boundary before allocating any model or GPU."""
 
 
-def test_minicpm_video_resize_config() -> None:
+def test_minicpm_video_frame_config() -> None:
     config = MiniCPMOPipelineConfig(model_path="unused")
     preprocessing = config.stage_named("preprocessing")
-    assert preprocessing.factory.video_resize_workers == 8
+    assert preprocessing.factory.video_frame_workers == 8
 
     disabled = ConfigManager(config).merge_config(
-        [("preprocessing.factory.video_resize_workers", "0")]
+        [("preprocessing.factory.video_frame_workers", "0")]
     )
-    assert disabled.stage_named("preprocessing").factory.video_resize_workers == 0
+    assert disabled.stage_named("preprocessing").factory.video_frame_workers == 0
     factory_kwargs = resolve_stage_factory_args(
         disabled.stage_named("preprocessing"), disabled
     )
-    assert factory_kwargs["video_resize_workers"] == 0
+    assert factory_kwargs["video_frame_workers"] == 0
 
 
 @pytest.mark.parametrize(("workers", "uses_pool"), [(8, True), (0, False)])
@@ -61,12 +61,12 @@ def test_minicpm_preprocessing_factory(
     constructor = Mock(return_value=fake_preprocessor)
     monkeypatch.setattr(stages, "MiniCPMOPreprocessor", constructor)
 
-    resize_executor = Mock()
-    thread_pool = Mock(return_value=resize_executor)
+    video_frame_executor = Mock()
+    thread_pool = Mock(return_value=video_frame_executor)
     monkeypatch.setattr(stages, "ThreadPoolExecutor", thread_pool)
 
     scheduler = stages.create_preprocessing_executor(
-        "unused", video_resize_workers=workers
+        "unused", video_frame_workers=workers
     )
     try:
         assert isinstance(scheduler, SimpleScheduler)
@@ -74,13 +74,13 @@ def test_minicpm_preprocessing_factory(
         constructor.assert_called_once_with(
             "unused",
             speech_enabled=False,
-            video_resize_executor=resize_executor if uses_pool else None,
-            video_resize_workers=workers,
+            video_frame_executor=video_frame_executor if uses_pool else None,
+            video_frame_workers=workers,
         )
         if uses_pool:
             thread_pool.assert_called_once_with(
                 max_workers=8,
-                thread_name_prefix="minicpmo-video-resize",
+                thread_name_prefix="minicpmo-video-frame",
             )
         else:
             thread_pool.assert_not_called()
@@ -88,9 +88,9 @@ def test_minicpm_preprocessing_factory(
         scheduler.stop()
 
     if uses_pool:
-        resize_executor.shutdown.assert_called_once_with()
+        video_frame_executor.shutdown.assert_called_once_with()
     else:
-        resize_executor.shutdown.assert_not_called()
+        video_frame_executor.shutdown.assert_not_called()
 
 
 @pytest.fixture

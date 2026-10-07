@@ -103,8 +103,8 @@ class MiniCPMOPreprocessor:
         model_path: str,
         *,
         speech_enabled: bool = False,
-        video_resize_executor: Executor | None = None,
-        video_resize_workers: int = 1,
+        video_frame_executor: Executor | None = None,
+        video_frame_workers: int = 1,
     ) -> None:
         local_dir = str(resolve_model_path(model_path))
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -114,8 +114,8 @@ class MiniCPMOPreprocessor:
         self.model_dir = local_dir
         self._processor: ProcessorMixin | None = None  # noqa: leading-underscore
         self.speech_enabled = speech_enabled
-        self.video_resize_executor = video_resize_executor
-        self.video_resize_workers = video_resize_workers
+        self.video_frame_executor = video_frame_executor
+        self.video_frame_workers = video_frame_workers
 
     def speech_to_text_inputs(
         self, payload: StagePayload, inputs: Mapping[str, object]
@@ -138,21 +138,19 @@ class MiniCPMOPreprocessor:
             self._processor = AutoProcessor.from_pretrained(  # noqa: leading-underscore
                 self.model_dir, trust_remote_code=True
             )
-            self._install_parallel_video_image_processor(  # noqa: leading-underscore
+            self.install_parallel_video_image_processor(
                 self._processor  # noqa: leading-underscore
             )
         else:
             pass
         return self._processor  # noqa: leading-underscore
 
-    def _install_parallel_video_image_processor(  # noqa: leading-underscore
-        self, processor: ProcessorMixin
-    ) -> None:  # noqa: leading-underscore
+    def install_parallel_video_image_processor(self, processor: ProcessorMixin) -> None:
         image_processor = processor.image_processor
         assert image_processor is not None
         original_preprocess = image_processor.preprocess
-        video_resize_executor = self.video_resize_executor
-        video_resize_workers = self.video_resize_workers
+        video_frame_executor = self.video_frame_executor
+        video_frame_workers = self.video_frame_workers
 
         def parallel_preprocess(
             images: list[Image.Image] | list[list[Image.Image]],
@@ -162,8 +160,8 @@ class MiniCPMOPreprocessor:
             **processor_options: ProcessorOptionValue,
         ) -> BatchFeature:
             if (
-                video_resize_executor is None
-                or video_resize_workers <= 1
+                video_frame_executor is None
+                or video_frame_workers <= 1
                 or max_slice_nums != 1
                 or return_tensors != "pt"
                 or processor_options.get("use_image_id") is not False
@@ -183,7 +181,7 @@ class MiniCPMOPreprocessor:
                 pass
 
             frame_images = images[0]
-            chunk_count = min(video_resize_workers, len(frame_images))
+            chunk_count = min(video_frame_workers, len(frame_images))
             base_chunk_size, remainder = divmod(len(frame_images), chunk_count)
             frame_chunks: list[list[Image.Image]] = []
             frame_start = 0
@@ -195,7 +193,7 @@ class MiniCPMOPreprocessor:
                 frame_start += chunk_size
 
             futures = [
-                video_resize_executor.submit(
+                video_frame_executor.submit(
                     original_preprocess,
                     [frame_chunk],
                     do_pad=do_pad,
@@ -455,8 +453,8 @@ class MiniCPMOPreprocessor:
                 **video_kwargs,
                 extract_audio=use_audio_in_video,
                 audio_target_sr=16000,
-                resize_executor=self.video_resize_executor,
-                resize_workers=self.video_resize_workers,
+                video_frame_executor=self.video_frame_executor,
+                video_frame_workers=self.video_frame_workers,
             )
         else:
             videos, video_audios = [], None

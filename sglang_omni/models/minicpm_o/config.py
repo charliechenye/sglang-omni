@@ -24,7 +24,7 @@ CODE2WAV_DECODE_STREAM_PRIORITY = -1
 
 
 class MiniCPMOPreprocessingFactoryArgs(FactoryArgs):
-    video_resize_workers: int = Field(default=8, ge=0)
+    video_frame_workers: int = Field(default=8, ge=0)
 
 
 class MiniCPMOPreprocessingStageConfig(StageConfig):
