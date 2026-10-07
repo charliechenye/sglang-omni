@@ -47,22 +47,8 @@ class FakeProcessor:
 
 
 class FakeCheckpointImageProcessor:
-    def __init__(
-        self,
-        *,
-        include_unknown_field: bool = False,
-        failure_frame: int | None = None,
-        blocking_frame: int | None = None,
-        blocking_started: threading.Event | None = None,
-        blocking_release: threading.Event | None = None,
-        blocking_finished: threading.Event | None = None,
-    ) -> None:
+    def __init__(self, *, include_unknown_field: bool = False) -> None:
         self.include_unknown_field = include_unknown_field
-        self.failure_frame = failure_frame
-        self.blocking_frame = blocking_frame
-        self.blocking_started = blocking_started
-        self.blocking_release = blocking_release
-        self.blocking_finished = blocking_finished
         self.calls: list[list[int]] = []
         self.call_thread_names: list[str] = []
         self.call_arguments: list[
@@ -84,23 +70,6 @@ class FakeCheckpointImageProcessor:
         self.calls.append(frame_ids)
         self.call_thread_names.append(threading.current_thread().name)
         self.call_arguments.append((do_pad, return_tensors, options))
-        if self.failure_frame is not None and self.failure_frame in frame_ids:
-            raise RuntimeError("checkpoint preprocessing failed")
-        else:
-            pass
-        if (
-            self.blocking_frame is not None
-            and self.blocking_frame in frame_ids
-            and self.blocking_started is not None
-            and self.blocking_release is not None
-            and self.blocking_finished is not None
-        ):
-            self.blocking_started.set()
-            self.blocking_release.wait(timeout=5)
-            self.blocking_finished.set()
-        else:
-            pass
-
         data = {
             "pixel_values": [
                 [
@@ -128,18 +97,13 @@ class FakeCheckpointImageProcessor:
         return BatchFeature(data=data)
 
 
-class FakeCheckpointProcessor:
-    def __init__(self, image_processor: FakeCheckpointImageProcessor) -> None:
-        self.image_processor = image_processor
-
-
 def make_processor_with_parallel_image_processor(
     monkeypatch: pytest.MonkeyPatch,
     image_processor: FakeCheckpointImageProcessor,
     video_frame_executor: ThreadPoolExecutor | None,
     video_frame_workers: int,
 ) -> MiniCPMOPreprocessor:
-    checkpoint_processor = FakeCheckpointProcessor(image_processor)
+    checkpoint_processor = SimpleNamespace(image_processor=image_processor)
     preprocessor = object.__new__(MiniCPMOPreprocessor)
     preprocessor._processor = None  # noqa: leading-underscore  # production name
     preprocessor.model_dir = "unused"
@@ -275,7 +239,6 @@ def test_parallel_video_image_processor_falls_back_for_unknown_output_field(
     with ThreadPoolExecutor(
         max_workers=3, thread_name_prefix="shared-video-pool"
     ) as executor:
-        serial_preprocess = image_processor.preprocess
         preprocessor = make_processor_with_parallel_image_processor(
             monkeypatch,
             image_processor,
@@ -288,15 +251,17 @@ def test_parallel_video_image_processor_falls_back_for_unknown_output_field(
             max_slice_nums=1,
             use_image_id=False,
         )
-        expected = serial_preprocess(
-            [[0, 1, 2]],
-            return_tensors="pt",
-            max_slice_nums=1,
-            use_image_id=False,
-        )
 
-    assert [0, 1, 2] in image_processor.calls
-    assert_processor_outputs_equal(expected, result)
+    assert image_processor.calls[-1] == [0, 1, 2]
+    assert set(result.data) == {
+        "pixel_values",
+        "image_sizes",
+        "tgt_sizes",
+        "future_field",
+    }
+    assert [value.item() for value in result["pixel_values"][0]] == [0, 1, 2]
+    assert [value[0].item() for value in result["image_sizes"][0]] == [0, 1, 2]
+    assert result["tgt_sizes"][0][:, 0].tolist() == [0, 1, 2]
     assert "future_field" in result
     assert torch.equal(result["future_field"][0], torch.tensor([1]))
 
@@ -307,13 +272,33 @@ def test_parallel_video_image_processor_drains_futures_before_propagating(
     blocking_started = threading.Event()
     blocking_release = threading.Event()
     blocking_finished = threading.Event()
-    image_processor = FakeCheckpointImageProcessor(
-        failure_frame=0,
-        blocking_frame=1,
-        blocking_started=blocking_started,
-        blocking_release=blocking_release,
-        blocking_finished=blocking_finished,
-    )
+
+    class DrainingImageProcessor(FakeCheckpointImageProcessor):
+        def preprocess(
+            self,
+            images: list[list[int]] | list[int],
+            do_pad: bool = True,
+            return_tensors: str | None = None,
+            **options: bool | float | int | str | None,
+        ) -> BatchFeature:
+            if isinstance(images[0], list):
+                frame_ids = list(images[0])
+            else:
+                frame_ids = list(images)
+            self.calls.append(frame_ids)
+            if 0 in frame_ids:
+                raise RuntimeError("checkpoint preprocessing failed")
+            else:
+                pass
+            if 1 in frame_ids:
+                blocking_started.set()
+                blocking_release.wait(timeout=5)
+                blocking_finished.set()
+            else:
+                pass
+            return BatchFeature(data={})
+
+    image_processor = DrainingImageProcessor()
     with ThreadPoolExecutor(
         max_workers=2, thread_name_prefix="shared-video-pool"
     ) as executor:

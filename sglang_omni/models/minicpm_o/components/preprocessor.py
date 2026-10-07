@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from concurrent.futures import Executor
+from concurrent.futures import Executor, wait
 
 import numpy as np
 import numpy.typing as npt
@@ -203,23 +203,19 @@ class MiniCPMOPreprocessor:
                 )
                 for frame_chunk in frame_chunks
             ]
-            processor_outputs: list[BatchFeature] = []
-            first_exception: Exception | None = None
+            wait(futures)
             for future in futures:
-                try:
-                    processor_outputs.append(future.result())
-                except Exception as exception:
-                    if first_exception is None:
-                        first_exception = exception
-                    else:
-                        pass
-            if first_exception is not None:
-                raise first_exception
-            else:
-                pass
+                exception = future.exception()
+                if exception is not None:
+                    raise exception
+                else:
+                    pass
+            processor_outputs: list[BatchFeature] = [
+                future.result() for future in futures
+            ]
 
-            combined_output = self.combine_video_processor_parts(processor_outputs)
-            if combined_output is None:
+            expected_keys = {"pixel_values", "image_sizes", "tgt_sizes"}
+            if any(set(output.data) != expected_keys for output in processor_outputs):
                 return original_preprocess(
                     images,
                     do_pad=do_pad,
@@ -228,50 +224,30 @@ class MiniCPMOPreprocessor:
                     **processor_options,
                 )
             else:
-                return combined_output
+                pass
+
+            return BatchFeature(
+                data={
+                    "pixel_values": [
+                        value
+                        for output in processor_outputs
+                        for value in output["pixel_values"][0]
+                    ],
+                    "image_sizes": [
+                        value
+                        for output in processor_outputs
+                        for value in output["image_sizes"][0]
+                    ],
+                    "tgt_sizes": [
+                        torch.cat(
+                            [output["tgt_sizes"][0] for output in processor_outputs],
+                            dim=0,
+                        )
+                    ],
+                }
+            )
 
         image_processor.preprocess = parallel_preprocess
-
-    @staticmethod
-    def combine_video_processor_parts(
-        processor_outputs: list[BatchFeature],
-    ) -> BatchFeature | None:
-        expected_keys = {"pixel_values", "image_sizes", "tgt_sizes"}
-        if not processor_outputs:
-            return None
-        elif any(
-            set(processor_output.data) != expected_keys
-            for processor_output in processor_outputs
-        ):
-            return None
-        else:
-            pass
-
-        combined_pixel_values = [
-            value
-            for processor_output in processor_outputs
-            for value in processor_output["pixel_values"][0]
-        ]
-        combined_image_sizes = [
-            value
-            for processor_output in processor_outputs
-            for value in processor_output["image_sizes"][0]
-        ]
-        combined_tgt_sizes = torch.cat(
-            [
-                processor_output["tgt_sizes"][0]
-                for processor_output in processor_outputs
-            ],
-            dim=0,
-        )
-
-        return BatchFeature(
-            data={
-                "pixel_values": [combined_pixel_values],
-                "image_sizes": [combined_image_sizes],
-                "tgt_sizes": [combined_tgt_sizes],
-            }
-        )
 
     async def __call__(self, payload: StagePayload) -> StagePayload:
         inputs = payload.request.inputs
