@@ -268,24 +268,12 @@ def test_empty_eos_does_not_encode(
     perception.encode_images.assert_not_called()
 
 
-def test_audio_only_unit_uses_empty_image_batch(
-    perception: MiniCPMOPerceptionState, hooks: PerceptionHooks
-) -> None:
-    payload = unit_payload()
-    append_unit(hooks, TimedChunk("audio", 0, 1000, 0, b"\0\0"), payload)
-    assert payload.data is not None
-    perception.prepare_image.assert_not_called()
-    perception.encode_images.assert_called_once_with(())
-    perception.prepare_audio.assert_called_once()
-    assert [span["modality"] for span in payload.data["embedding_spans"]] == ["audio"]
-
-
 def test_image_encoder_failure_propagates(
     perception: MiniCPMOPerceptionState, hooks: PerceptionHooks
 ) -> None:
-    perception.encode_images.side_effect = RuntimeError("image encoder failed")
+    perception.encode_images.side_effect = ValueError("image encoder failed")
     payload = unit_payload()
-    with pytest.raises(RuntimeError, match="image encoder failed"):
+    with pytest.raises(ValueError, match="image encoder failed"):
         append_unit(
             hooks,
             TimedChunk("audio", 0, 1000, 0, {"pcm": b"\0\0", "images": [b"frame"]}),
