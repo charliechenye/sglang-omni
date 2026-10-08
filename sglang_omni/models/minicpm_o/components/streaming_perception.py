@@ -375,32 +375,28 @@ class MiniCPMOPerceptionState:
         if not prepared_image_features:
             return ()
         else:
-            pixel_values = [
-                slice_pixel_values
-                for prepared_image in prepared_image_features
-                for slice_pixel_values in prepared_image.pixel_values
-            ]
-            tgt_sizes = torch.cat(
-                [
-                    prepared_image.tgt_sizes
-                    for prepared_image in prepared_image_features
-                ],
-                dim=0,
-            )
-            image_embeds = self.image_encoder(
-                pixel_values=pixel_values,
-                tgt_sizes=tgt_sizes,
-            )["image_embeds"]
-            row_counts = [
-                len(prepared_image.pixel_values) * IMAGE_TOKENS
-                for prepared_image in prepared_image_features
-            ]
-            assert image_embeds.ndim == 2
-            assert image_embeds.shape[0] == sum(row_counts)
-            return image_embeds.split(row_counts, dim=0)
+            pass
 
-    def encode_image(self, encoded_image: bytes) -> torch.Tensor:
-        return self.encode_images((self.prepare_image(encoded_image),))[0]
+        pixel_values = [
+            slice_pixel_values
+            for prepared_image in prepared_image_features
+            for slice_pixel_values in prepared_image.pixel_values
+        ]
+        tgt_sizes = torch.cat(
+            [prepared_image.tgt_sizes for prepared_image in prepared_image_features],
+            dim=0,
+        )
+        image_embeds = self.image_encoder(
+            pixel_values=pixel_values,
+            tgt_sizes=tgt_sizes,
+        )["image_embeds"]
+        row_counts = [
+            len(prepared_image.pixel_values) * IMAGE_TOKENS
+            for prepared_image in prepared_image_features
+        ]
+        assert image_embeds.ndim == 2
+        assert image_embeds.shape[0] == sum(row_counts)
+        return image_embeds.split(row_counts, dim=0)
 
     def build_step_plan(
         self, audio_embeds: torch.Tensor, image_embeds: tuple[torch.Tensor, ...] = ()

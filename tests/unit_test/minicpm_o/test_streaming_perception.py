@@ -248,7 +248,7 @@ def test_reject_frame_before_processor(
     else:
         pass
     with pytest.raises(error, match=match):
-        state.encode_image(encoded)
+        state.prepare_image(encoded)
     state.processor.process_image.assert_not_called()
 
 
