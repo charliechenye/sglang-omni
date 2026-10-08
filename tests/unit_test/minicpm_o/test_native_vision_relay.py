@@ -50,7 +50,8 @@ def perception() -> MiniCPMOPerceptionState:
         max_slice_nums=1,
     )
     state.encode_audio = Mock(return_value=torch.full((10, 4), 9.0))
-    state.encode_image = Mock(return_value=torch.full((64, 4), 6.0))
+    state.prepare_image = Mock()
+    state.encode_images = Mock(return_value=(torch.full((64, 4), 6.0),))
     return state
 
 
@@ -145,9 +146,13 @@ def test_append_and_thinker_splice(
         np.arange(16000, dtype=np.float32) / 32768,
     )
     if has_image:
-        perception.encode_image.assert_called_once_with(b"frame")
+        perception.prepare_image.assert_called_once_with(b"frame")
+        perception.encode_images.assert_called_once_with(
+            (perception.prepare_image.return_value,)
+        )
     else:
-        perception.encode_image.assert_not_called()
+        perception.prepare_image.assert_not_called()
+        perception.encode_images.assert_called_once_with(())
     adapter = ThinkerAdapter(perception.tokenizer, 100)
     adapter.open(IDENTITY, payload.request)
     adapter.states[IDENTITY].is_prefix_pending = first_unit
@@ -241,7 +246,10 @@ def test_undecodable_frame_is_dropped_and_siblings_kept(
 ) -> None:
     first = torch.full((64, 4), 3.0)
     last = torch.full((64, 4), 7.0)
-    perception.encode_image.side_effect = [first, error, last]
+    first_prepared = Mock()
+    last_prepared = Mock()
+    perception.prepare_image.side_effect = [first_prepared, error, last_prepared]
+    perception.encode_images.return_value = (first, last)
     payload = unit_payload()
     hooks.append(
         TimedChunk(
@@ -250,6 +258,7 @@ def test_undecodable_frame_is_dropped_and_siblings_kept(
         payload,
         SimpleNamespace(session_identity=IDENTITY),
     )
+    perception.encode_images.assert_called_once_with((first_prepared, last_prepared))
     spans = payload.data["embedding_spans"]
     assert [span["modality"] for span in spans] == ["image", "image", "audio"]
     assert torch.equal(payload.data["input_embeds"][:128], torch.cat([first, last]))

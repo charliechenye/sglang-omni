@@ -109,6 +109,12 @@ class AudioFeatureBatch:
     audio_feature_lens: torch.Tensor
 
 
+@dataclass(kw_only=True)
+class PreparedImageFeatures:
+    pixel_values: list[torch.Tensor]
+    tgt_sizes: torch.Tensor
+
+
 def audio_feature_batch(processor_output: ProcessorAudioFeatures) -> AudioFeatureBatch:
     return AudioFeatureBatch(
         audio_features=processor_output["audio_features"],
@@ -262,7 +268,7 @@ class MiniCPMOPerceptionState:
         self.audio_chunk_index += 1
         return audio_embeds
 
-    def encode_image(self, encoded_image: bytes) -> torch.Tensor:
+    def prepare_image(self, encoded_image: bytes) -> PreparedImageFeatures:
         with Image.open(BytesIO(encoded_image)) as image:
             if image.format not in ("JPEG", "PNG"):
                 raise ValueError("unit image must be JPEG or PNG")
@@ -270,15 +276,56 @@ class MiniCPMOPerceptionState:
                 raise ValueError("unit image exceeds pixel limit")
             else:
                 frame = image.convert("RGB")
-        processed = self.processor.process_image(
+        processed_image = self.processor.process_image(
             [frame], max_slice_nums=self.max_slice_nums
         )
+        return PreparedImageFeatures(
+            pixel_values=processed_image["pixel_values"][0],
+            tgt_sizes=processed_image["tgt_sizes"][0],
+        )
+
+    def encode_images(
+        self, prepared_image_features: tuple[PreparedImageFeatures, ...]
+    ) -> tuple[torch.Tensor, ...]:
+        if not prepared_image_features:
+            return ()
+        else:
+            pass
+        pixel_values = [
+            slice_pixel_values
+            for prepared_image in prepared_image_features
+            for slice_pixel_values in prepared_image.pixel_values
+        ]
+        tgt_sizes = torch.cat(
+            [prepared_image.tgt_sizes for prepared_image in prepared_image_features],
+            dim=0,
+        )
         image_embeds = self.image_encoder(
-            pixel_values=processed["pixel_values"][0],
-            tgt_sizes=processed["tgt_sizes"][0],
+            pixel_values=pixel_values,
+            tgt_sizes=tgt_sizes,
         )["image_embeds"]
-        assert image_embeds.ndim == 2 and image_embeds.shape[0] % IMAGE_TOKENS == 0
-        return image_embeds
+        assert image_embeds.ndim == 2
+        slice_counts = [
+            len(prepared_image.pixel_values)
+            for prepared_image in prepared_image_features
+        ]
+        expected_embedding_count = sum(slice_counts) * IMAGE_TOKENS
+        assert image_embeds.shape[0] == expected_embedding_count
+
+        frame_image_embeds: list[torch.Tensor] = []
+        embedding_cursor = 0
+        for slice_count in slice_counts:
+            frame_embedding_count = slice_count * IMAGE_TOKENS
+            frame_image_embeds.append(
+                image_embeds[
+                    embedding_cursor : embedding_cursor + frame_embedding_count
+                ]
+            )
+            embedding_cursor += frame_embedding_count
+        return tuple(frame_image_embeds)
+
+    def encode_image(self, encoded_image: bytes) -> torch.Tensor:
+        return self.encode_images((self.prepare_image(encoded_image),))[0]
 
     def build_step_plan(
         self, audio_embeds: torch.Tensor, image_embeds: tuple[torch.Tensor, ...] = ()

@@ -19,6 +19,7 @@ from sglang_omni.models.minicpm_o.components.code2wav import (
 from sglang_omni.models.minicpm_o.components.image_encoder import MiniCPMOImageEncoder
 from sglang_omni.models.minicpm_o.components.streaming_perception import (
     MiniCPMOPerceptionState,
+    PreparedImageFeatures,
     ProcessorFactory,
 )
 from sglang_omni.models.minicpm_o.components.tts_runtime import MiniCPMOVocoderRuntime
@@ -82,17 +83,18 @@ class PerceptionHooks(SessionHooks):
             else:
                 pcm, encoded_images = chunk.payload, ()
             # note (Junnan Li): Frames are acked before decoding, so a bad frame is dropped, not fatal.
-            image_embeds = []
+            prepared_image_features: list[PreparedImageFeatures] = []
             for encoded_image in encoded_images:
                 try:
-                    image_embeds.append(state.encode_image(encoded_image))
+                    prepared_image_features.append(state.prepare_image(encoded_image))
                 except (OSError, ValueError, Image.DecompressionBombError) as exc:
                     logger.warning(
                         f"Dropping undecodable frame of unit {chunk.seq}: {exc}"
                     )
+            image_embeds = state.encode_images(tuple(prepared_image_features))
             waveform = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
             payload.data = state.build_step_plan(
-                state.encode_audio(waveform), tuple(image_embeds)
+                state.encode_audio(waveform), image_embeds
             )
         return payload
 

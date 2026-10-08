@@ -116,6 +116,52 @@ def encoded_image(format: str) -> bytes:
     return encoded.getvalue()
 
 
+def test_prepare_images_and_batch_encoder_preserve_frame_order(
+    state: MiniCPMOPerceptionState,
+) -> None:
+    first_slice = torch.full((3, 2, 3), 1.0)
+    second_slice = torch.full((3, 2, 6), 2.0)
+    third_slice = torch.full((3, 2, 9), 3.0)
+    first_tgt_sizes = torch.tensor([[1, 1], [1, 2]], dtype=torch.int32)
+    second_tgt_sizes = torch.tensor([[1, 3]], dtype=torch.int32)
+    state.processor.process_image.side_effect = [
+        {
+            "pixel_values": [[first_slice, second_slice]],
+            "tgt_sizes": [first_tgt_sizes],
+        },
+        {"pixel_values": [[third_slice]], "tgt_sizes": [second_tgt_sizes]},
+    ]
+    all_image_embeds = torch.arange(3 * 64 * 4, dtype=torch.float32).reshape(
+        3 * 64, 4
+    )
+    state.image_encoder.return_value = {"image_embeds": all_image_embeds}
+
+    first_image = state.prepare_image(encoded_image("PNG"))
+    second_image = state.prepare_image(encoded_image("JPEG"))
+    image_embeds = state.encode_images((first_image, second_image))
+
+    assert state.processor.process_image.call_count == 2
+    for process_image_call in state.processor.process_image.call_args_list:
+        assert len(process_image_call.args) == 1
+        assert len(process_image_call.args[0]) == 1
+        assert process_image_call.kwargs == {"max_slice_nums": 1}
+    state.image_encoder.assert_called_once()
+    encoder_call = state.image_encoder.call_args
+    assert encoder_call is not None
+    for actual, expected in zip(
+        encoder_call.kwargs["pixel_values"],
+        [first_slice, second_slice, third_slice],
+        strict=True,
+    ):
+        torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(
+        encoder_call.kwargs["tgt_sizes"],
+        torch.cat([first_tgt_sizes, second_tgt_sizes]),
+    )
+    torch.testing.assert_close(image_embeds[0], all_image_embeds[: 2 * 64])
+    torch.testing.assert_close(image_embeds[1], all_image_embeds[2 * 64 :])
+
+
 @pytest.mark.parametrize(
     ("encoded", "error", "match", "pixel_limit"),
     [
