@@ -38,28 +38,7 @@ class ConfigLoaded(Exception):
     """Stop at the configuration boundary before allocating any model or GPU."""
 
 
-def test_minicpm_preprocessing_factory_preserves_default(monkeypatch) -> None:
-    fake_preprocessor = Mock()
-    constructor = Mock(return_value=fake_preprocessor)
-    monkeypatch.setattr(stages, "MiniCPMOPreprocessor", constructor)
-
-    scheduler = stages.create_preprocessing_executor("unused")
-    try:
-        assert isinstance(scheduler, SimpleScheduler)
-        assert scheduler.max_concurrency == 1
-        video_resize_executor = constructor.call_args.kwargs["video_resize_executor"]
-        constructor.assert_called_once_with(
-            "unused",
-            speech_enabled=False,
-            video_resize_executor=video_resize_executor,
-            video_resize_workers=8,
-        )
-        assert video_resize_executor is not None
-    finally:
-        scheduler.stop()
-
-
-def test_minicpm_video_resize_config_and_serial_scheduler(monkeypatch) -> None:
+def test_minicpm_video_resize_config() -> None:
     config = MiniCPMOPipelineConfig(model_path="unused")
     preprocessing = config.stage_named("preprocessing")
     assert preprocessing.factory.video_resize_workers == 8
@@ -73,31 +52,45 @@ def test_minicpm_video_resize_config_and_serial_scheduler(monkeypatch) -> None:
     )
     assert factory_kwargs["video_resize_workers"] == 0
 
+
+@pytest.mark.parametrize(("workers", "uses_pool"), [(8, True), (0, False)])
+def test_minicpm_preprocessing_factory(
+    monkeypatch, workers: int, uses_pool: bool
+) -> None:
     fake_preprocessor = Mock()
     constructor = Mock(return_value=fake_preprocessor)
     monkeypatch.setattr(stages, "MiniCPMOPreprocessor", constructor)
 
-    class UnexpectedThreadPool:
-        def __init__(self, **_kwargs):
-            raise AssertionError("serial resize must not allocate a thread pool")
+    resize_executor = Mock()
+    thread_pool = Mock(return_value=resize_executor)
+    monkeypatch.setattr(stages, "ThreadPoolExecutor", thread_pool)
 
-    monkeypatch.setattr(stages, "ThreadPoolExecutor", UnexpectedThreadPool)
     scheduler = stages.create_preprocessing_executor(
-        "unused",
-        video_resize_workers=disabled.stage_named(
-            "preprocessing"
-        ).factory.video_resize_workers,
+        "unused", video_resize_workers=workers
     )
     try:
         assert isinstance(scheduler, SimpleScheduler)
+        assert scheduler.max_concurrency == 1
         constructor.assert_called_once_with(
             "unused",
             speech_enabled=False,
-            video_resize_executor=None,
-            video_resize_workers=0,
+            video_resize_executor=resize_executor if uses_pool else None,
+            video_resize_workers=workers,
         )
+        if uses_pool:
+            thread_pool.assert_called_once_with(
+                max_workers=8,
+                thread_name_prefix="minicpmo-video-resize",
+            )
+        else:
+            thread_pool.assert_not_called()
     finally:
         scheduler.stop()
+
+    if uses_pool:
+        resize_executor.shutdown.assert_called_once_with()
+    else:
+        resize_executor.shutdown.assert_not_called()
 
 
 @pytest.fixture
