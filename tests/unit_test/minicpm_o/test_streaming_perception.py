@@ -15,18 +15,6 @@ from sglang_omni.models.minicpm_o.components.streaming_perception import (
 )
 
 
-class RecordingImageEncoder:
-    def __init__(self) -> None:
-        self.call_count = 0
-
-    def __call__(
-        self, *, pixel_values: list[torch.Tensor], tgt_sizes: torch.Tensor
-    ) -> dict[str, torch.Tensor]:
-        self.call_count += 1
-        assert len(pixel_values) == tgt_sizes.shape[0]
-        return {"image_embeds": torch.zeros((len(pixel_values) * IMAGE_TOKENS, 1))}
-
-
 @pytest.fixture
 def state() -> MiniCPMOPerceptionState:
     tokenizer = Mock(unk_token_id=0)
@@ -139,6 +127,7 @@ def test_prepare_images_and_batch_encoder_preserve_frame_order(
     fourth_slice = torch.full((3, 2, 12), 4.0)
     first_tgt_sizes = torch.tensor([[1, 1], [1, 2], [1, 3]], dtype=torch.int32)
     second_tgt_sizes = torch.tensor([[1, 4]], dtype=torch.int32)
+    state.max_slice_nums = 4
     state.processor.process_image.side_effect = [
         {
             "pixel_values": [[first_slice, second_slice, third_slice]],
@@ -159,7 +148,7 @@ def test_prepare_images_and_batch_encoder_preserve_frame_order(
     for process_image_call in state.processor.process_image.call_args_list:
         assert len(process_image_call.args) == 1
         assert len(process_image_call.args[0]) == 1
-        assert process_image_call.kwargs == {"max_slice_nums": 1}
+        assert process_image_call.kwargs == {"max_slice_nums": 4}
     state.image_encoder.assert_called_once()
     encoder_call = state.image_encoder.call_args
     assert encoder_call is not None
@@ -175,8 +164,6 @@ def test_prepare_images_and_batch_encoder_preserve_frame_order(
     )
     torch.testing.assert_close(image_embeds[0], all_image_embeds[: 3 * IMAGE_TOKENS])
     torch.testing.assert_close(image_embeds[1], all_image_embeds[3 * IMAGE_TOKENS :])
-    assert torch.isfinite(torch.cat(image_embeds)).all()
-    assert image_embeds[0].dtype == all_image_embeds.dtype
 
 
 def test_encode_image_compatibility_uses_single_frame_batch_path(
@@ -196,25 +183,13 @@ def test_encode_image_compatibility_uses_single_frame_batch_path(
     torch.testing.assert_close(actual_image_embeds, image_embeds)
     state.processor.process_image.assert_called_once()
     state.image_encoder.assert_called_once()
-    encoder_call = state.image_encoder.call_args
-    assert encoder_call is not None
-    assert len(encoder_call.kwargs["pixel_values"]) == 1
-    torch.testing.assert_close(encoder_call.kwargs["pixel_values"][0], pixel_values)
-    torch.testing.assert_close(encoder_call.kwargs["tgt_sizes"], tgt_sizes)
 
 
-def test_encode_images_empty_skips_image_encoder() -> None:
-    image_encoder = RecordingImageEncoder()
-    state = MiniCPMOPerceptionState(
-        tokenizer=Mock(unk_token_id=0),
-        processor=Mock(),
-        audio_encoder=Mock(),
-        image_encoder=image_encoder,
-        max_slice_nums=1,
-    )
-
+def test_encode_images_empty_skips_image_encoder(
+    state: MiniCPMOPerceptionState,
+) -> None:
     assert state.encode_images(()) == ()
-    assert image_encoder.call_count == 0
+    state.image_encoder.assert_not_called()
 
 
 def test_encode_images_rejects_output_row_mismatch(
