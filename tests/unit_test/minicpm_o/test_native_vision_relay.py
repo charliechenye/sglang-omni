@@ -297,7 +297,7 @@ def test_undecodable_frame_is_dropped_and_siblings_kept(
     first_prepared = Mock()
     last_prepared = Mock()
     perception.prepare_image.side_effect = [first_prepared, error, last_prepared]
-    perception.encode_images.return_value = (first, last)
+    perception.encode_images.side_effect = lambda _: (first, last)
     payload = unit_payload()
     append_unit(
         hooks,
