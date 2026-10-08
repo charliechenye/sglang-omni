@@ -166,25 +166,6 @@ def test_prepare_images_and_batch_encoder_preserve_frame_order(
     torch.testing.assert_close(image_embeds[1], all_image_embeds[3 * IMAGE_TOKENS :])
 
 
-def test_encode_image_compatibility_uses_single_frame_batch_path(
-    state: MiniCPMOPerceptionState,
-) -> None:
-    pixel_values = torch.full((3, 2, 3), 1.0)
-    tgt_sizes = torch.tensor([[1, 1]], dtype=torch.int32)
-    image_embeds = torch.full((IMAGE_TOKENS, 4), 2.0)
-    state.processor.process_image.return_value = {
-        "pixel_values": [[pixel_values]],
-        "tgt_sizes": [tgt_sizes],
-    }
-    state.image_encoder.return_value = {"image_embeds": image_embeds}
-
-    actual_image_embeds = state.encode_image(encoded_image("PNG"))
-
-    torch.testing.assert_close(actual_image_embeds, image_embeds)
-    state.processor.process_image.assert_called_once()
-    state.image_encoder.assert_called_once()
-
-
 def test_encode_images_empty_skips_image_encoder(
     state: MiniCPMOPerceptionState,
 ) -> None:
@@ -232,5 +213,5 @@ def test_reject_frame_before_processor(
     else:
         pass
     with pytest.raises(error, match=match):
-        state.encode_image(encoded)
+        state.prepare_image(encoded)
     state.processor.process_image.assert_not_called()
