@@ -58,8 +58,13 @@ def perception() -> MiniCPMOPerceptionState:
     state.prepare_audio = Mock(return_value=np.zeros(4, dtype=np.float32))
     state.mel_chunk = Mock(return_value=Mock(batch_key=Mock(return_value=())))
     state.finish_audio = Mock()
+    image = torch.full((64, 4), 6.0)
     state.prepare_image = Mock()
-    state.encode_images = Mock(return_value=(torch.full((64, 4), 6.0),))
+    state.encode_images = Mock(
+        side_effect=lambda prepared_image_features: (
+            (image,) if prepared_image_features else ()
+        )
+    )
     return state
 
 
@@ -259,7 +264,34 @@ def test_empty_eos_does_not_encode(
     append_unit(hooks, TimedChunk("audio", 0, 0, 1, None, eos=True), payload)
     assert payload.data is None
     perception.prepare_audio.assert_not_called()
-    perception.encode_image.assert_not_called()
+    perception.prepare_image.assert_not_called()
+    perception.encode_images.assert_not_called()
+
+
+def test_audio_only_unit_uses_empty_image_batch(
+    perception: MiniCPMOPerceptionState, hooks: PerceptionHooks
+) -> None:
+    payload = unit_payload()
+    append_unit(hooks, TimedChunk("audio", 0, 1000, 0, b"\0\0"), payload)
+    assert payload.data is not None
+    perception.prepare_image.assert_not_called()
+    perception.encode_images.assert_called_once_with(())
+    perception.prepare_audio.assert_called_once()
+    assert [span["modality"] for span in payload.data["embedding_spans"]] == ["audio"]
+
+
+def test_image_encoder_failure_propagates(
+    perception: MiniCPMOPerceptionState, hooks: PerceptionHooks
+) -> None:
+    perception.encode_images.side_effect = RuntimeError("image encoder failed")
+    payload = unit_payload()
+    with pytest.raises(RuntimeError, match="image encoder failed"):
+        append_unit(
+            hooks,
+            TimedChunk("audio", 0, 1000, 0, {"pcm": b"\0\0", "images": [b"frame"]}),
+            payload,
+        )
+    perception.prepare_image.assert_called_once_with(b"frame")
 
 
 @pytest.mark.parametrize(
