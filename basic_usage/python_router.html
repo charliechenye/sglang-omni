@@ -59,7 +59,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.7" />
-    <meta name="docbuild:last-update" content="Oct 07, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 08, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -914,6 +914,9 @@ the original bytes to the selected worker.</p>
 </div>
 <p>Worker update requests are atomic. If an update returns <code class="docutils literal notranslate"><span class="pre">400</span></code>, the live worker
 state is not partially changed.</p>
+<p>When an admin key is set (<code class="docutils literal notranslate"><span class="pre">--admin-api-key</span></code> or <code class="docutils literal notranslate"><span class="pre">SGLANG_OMNI_ADMIN_KEY</span></code>), adding,
+updating, and deleting workers require <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>, like the
+other admin routes, while <code class="docutils literal notranslate"><span class="pre">GET</span> <span class="pre">/workers</span></code> stays open.</p>
 </section>
 <section id="routing-behavior">
 <h2>Routing Behavior<a class="headerlink" href="#routing-behavior" title="Link to this heading">#</a></h2>
@@ -1477,7 +1480,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 07, 2026.
+  Last updated on Oct 08, 2026.
   <br/>
 </p>
   </div>
