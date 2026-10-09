@@ -162,6 +162,9 @@ class PerceptionHooks(BatchedSessionHooks):
                 else:
                     try:
                         prepared_image_features = state.prepare_image(chunk.payload)
+                        state.prefetched_images.setdefault(chunk.seq, []).append(
+                            (chunk.payload, prepared_image_features)
+                        )
                     except (
                         OSError,
                         ValueError,
@@ -171,9 +174,10 @@ class PerceptionHooks(BatchedSessionHooks):
                             f"Dropping undecodable prefetched frame of unit "
                             f"{chunk.seq}: {exc}"
                         )
-                    else:
-                        state.prefetched_images.setdefault(chunk.seq, []).append(
-                            (chunk.payload, prepared_image_features)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Image prefetch failed for unit {chunk.seq}: {exc}",
+                            exc_info=True,
                         )
                 payload.data = None
             elif chunk.modality == IMAGE_PREFETCH_CLEAR_MODALITY:
