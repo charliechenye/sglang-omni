@@ -327,7 +327,7 @@ def test_close_drops_prefetched_images(perception: MiniCPMOPerceptionState) -> N
     assert perception.held().bytes == 0
 
 
-def test_held_counts_prefetched_tensor_bytes(
+def test_held_counts_prefetched_raw_and_tensor_bytes(
     perception: MiniCPMOPerceptionState,
 ) -> None:
     prepared_image = PreparedImageFeatures(
@@ -336,7 +336,7 @@ def test_held_counts_prefetched_tensor_bytes(
     )
     perception.prefetched_images[0] = [(b"frame", prepared_image)]
 
-    assert perception.held().bytes == 40
+    assert perception.held().bytes == 45
 
 
 @pytest.mark.asyncio

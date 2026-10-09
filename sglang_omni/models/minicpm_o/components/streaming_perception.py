@@ -262,9 +262,10 @@ class MiniCPMOPerceptionState:
                 )
                 + estimate_cache_bytes(self.prefix_embeds)
                 + sum(
-                    self.prepared_image_nbytes(prepared_image_features)
+                    len(encoded_image)
+                    + self.prepared_image_nbytes(prepared_image_features)
                     for prefetched_images in self.prefetched_images.values()
-                    for _, prepared_image_features in prefetched_images
+                    for encoded_image, prepared_image_features in prefetched_images
                 )
             )
             return ResourceUsage(slots={"perception": 1}, bytes=max(size, 1))

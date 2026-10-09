@@ -287,7 +287,9 @@ class CoordinatorSessions:
             raise ValueError(f"stage {stage!r} is not part of the session route")
         else:
             pass
-        await self.session_operation(session, "append", owner=owner, chunk=chunk)
+        await self.session_operation(
+            session, "append", owner=owner, chunk=chunk, close_on_error=False
+        )
 
     async def session_outputs(
         self, session_identity: SessionIdentity
@@ -392,6 +394,7 @@ class CoordinatorSessions:
         *,
         owner: str | None = None,
         chunk: TimedChunk | None = None,
+        close_on_error: bool = True,
     ) -> None:
         session_identity = session.session_identity
         operation_stages = session.stages
@@ -454,11 +457,17 @@ class CoordinatorSessions:
             else:
                 await asyncio.wait_for(run(), session.limits.operation_timeout_s)
         except asyncio.TimeoutError as exc:
-            self.begin_session_close(session)
+            if close_on_error:
+                self.begin_session_close(session)
+            else:
+                pass
             raise TimeoutError(f"session {operation} timed out") from exc
         except BaseException:
             # Note (Junnan Li): Request abort can yield before the pump sees this fatal failure.
-            self.begin_session_close(session)
+            if close_on_error:
+                self.begin_session_close(session)
+            else:
+                pass
             raise
         finally:
             self.session_stream_handlers.pop(request_id, None)
