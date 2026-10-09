@@ -207,6 +207,27 @@ async def test_append_visits_owners_in_route_order(linear_triple) -> None:
 
 
 @pytest.mark.asyncio(loop_scope="session")
+async def test_stage_local_append_stops_at_requested_owner(linear_pair) -> None:
+    coordinator, events, _ = linear_pair
+    session_identity = await coordinator.open_session(
+        OmniRequest(None), stages=["source", "sink"]
+    )
+    await coordinator.append_session_stage(
+        session_identity,
+        TimedChunk("image_prefetch", 0, 0, 0, b"frame"),
+        stage="source",
+    )
+    assert append_owners(events) == ["source"]
+    with pytest.raises(ValueError, match="not part of the session route"):
+        await coordinator.append_session_stage(
+            session_identity,
+            TimedChunk("image_prefetch", 0, 0, 1, b"frame"),
+            stage="missing",
+        )
+    await coordinator.close_session(session_identity)
+
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_mismatched_route_fails_before_leaving_the_session_route(
     linear_triple,
 ) -> None:
