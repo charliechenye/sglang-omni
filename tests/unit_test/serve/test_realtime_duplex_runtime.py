@@ -60,6 +60,21 @@ class GatedAdapter(InteractionAdapter):
         pass
 
 
+class GatedPrefetchAdapter(GatedAdapter):
+    def __init__(self) -> None:
+        super().__init__([])
+        self.prefetch_started = asyncio.Event()
+        self.prefetch_release = asyncio.Event()
+        self.prefetch_finished = asyncio.Event()
+        self.prefetched: list[tuple[int, float, bytes]] = []
+
+    async def prefetch_image(self, unit_index: int, t_ms: float, image: bytes) -> None:
+        self.prefetch_started.set()
+        await self.prefetch_release.wait()
+        self.prefetched.append((unit_index, t_ms, image))
+        self.prefetch_finished.set()
+
+
 async def open_runtime(adapter: GatedAdapter) -> SessionRuntime:
     runtime = SessionRuntime(
         MODEL_NAME, Capabilities(), lambda: adapter, RuntimeLimits()
@@ -93,10 +108,32 @@ async def test_eos_marks_only_the_last_unit_when_end_arrives_mid_backlog() -> No
     adapter.release.set()
     drained = (await receive_until(runtime, Drained))[-1].event
     await runtime.close("client_closed")
-
     assert [unit.eos for unit in adapter.units] == [False, False, True]
     assert isinstance(drained, Drained)
     assert (drained.accepted_end_ms, drained.consumed_ms) == (60.0, 60.0)
+
+
+@pytest.mark.asyncio
+async def test_image_append_schedules_prefetch_without_waiting() -> None:
+    adapter = GatedPrefetchAdapter()
+    runtime = SessionRuntime(
+        MODEL_NAME,
+        Capabilities(input_modalities=("audio", "image")),
+        lambda: adapter,
+        RuntimeLimits(),
+    )
+    await runtime.update({}, "client_update")
+    image = b"\xff\xd8frame"
+
+    await asyncio.wait_for(runtime.append_image(image, 0.0, "frame"), 1)
+    assert runtime.pending_frames == {0: [(0.0, image)]}
+    await asyncio.wait_for(adapter.prefetch_started.wait(), 1)
+    assert not adapter.prefetch_finished.is_set()
+
+    adapter.prefetch_release.set()
+    await asyncio.wait_for(adapter.prefetch_finished.wait(), 1)
+    assert adapter.prefetched == [(0, 0.0, image)]
+    await runtime.close("client_closed")
 
 
 @pytest.mark.asyncio

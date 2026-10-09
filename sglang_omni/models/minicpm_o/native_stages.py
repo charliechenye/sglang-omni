@@ -18,6 +18,8 @@ from sglang_omni.models.minicpm_o.components.code2wav import (
 )
 from sglang_omni.models.minicpm_o.components.image_encoder import MiniCPMOImageEncoder
 from sglang_omni.models.minicpm_o.components.streaming_perception import (
+    IMAGE_PREFETCH_CLEAR_MODALITY,
+    IMAGE_PREFETCH_MODALITY,
     MiniCPMOPerceptionState,
     PreparedImageFeatures,
     ProcessorFactory,
@@ -74,7 +76,29 @@ class PerceptionHooks(SessionHooks):
     def append(
         self, chunk: TimedChunk, payload: StagePayload, context: SessionContext
     ) -> StagePayload:
-        if chunk.eos and chunk.duration_ms == 0:
+        if chunk.modality == IMAGE_PREFETCH_MODALITY:
+            state = self.states[context.session_identity]
+            if not isinstance(chunk.payload, bytes):
+                logger.warning(f"Ignoring invalid image prefetch for unit {chunk.seq}")
+            elif chunk.seq < state.next_image_unit_index:
+                pass
+            else:
+                try:
+                    prepared_image_features = state.prepare_image(chunk.payload)
+                except (OSError, ValueError, Image.DecompressionBombError) as exc:
+                    logger.warning(
+                        f"Dropping undecodable prefetched frame of unit "
+                        f"{chunk.seq}: {exc}"
+                    )
+                else:
+                    state.prefetched_images.setdefault(chunk.seq, []).append(
+                        (chunk.payload, prepared_image_features)
+                    )
+            payload.data = None
+        elif chunk.modality == IMAGE_PREFETCH_CLEAR_MODALITY:
+            self.states[context.session_identity].prefetched_images.clear()
+            payload.data = None
+        elif chunk.eos and chunk.duration_ms == 0:
             payload.data = None
         else:
             state = self.states[context.session_identity]
@@ -85,12 +109,20 @@ class PerceptionHooks(SessionHooks):
             # note (Junnan Li): Frames are acked before decoding, so a bad frame is dropped, not fatal.
             prepared_image_features: list[PreparedImageFeatures] = []
             for encoded_image in encoded_images:
-                try:
-                    prepared_image_features.append(state.prepare_image(encoded_image))
-                except (OSError, ValueError, Image.DecompressionBombError) as exc:
-                    logger.warning(
-                        f"Dropping undecodable frame of unit {chunk.seq}: {exc}"
-                    )
+                prepared_image = state.take_prefetched_image(chunk.seq, encoded_image)
+                if prepared_image is not None:
+                    prepared_image_features.append(prepared_image)
+                else:
+                    try:
+                        prepared_image_features.append(
+                            state.prepare_image(encoded_image)
+                        )
+                    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+                        logger.warning(
+                            f"Dropping undecodable frame of unit {chunk.seq}: {exc}"
+                        )
+                        continue
+            state.finish_image_unit(chunk.seq)
             image_embeds = state.encode_images(tuple(prepared_image_features))
             waveform = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
             payload.data = state.build_step_plan(
