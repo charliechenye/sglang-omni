@@ -2,7 +2,7 @@
 """Native relay of unit images and audio from perception into the thinker session."""
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import numpy as np
 import pytest
@@ -209,6 +209,103 @@ def test_append_and_thinker_splice(
         assert torch.equal(rows[prefix_length + 66], torch.full((4,), -1.0))
     else:
         pass
+
+
+def test_batched_sessions_keep_vision_and_audio_associated(
+    perception: MiniCPMOPerceptionState, hooks: PerceptionHooks
+) -> None:
+    second_identity = SessionIdentity("second")
+    second_state = MiniCPMOPerceptionState(
+        tokenizer=perception.tokenizer,
+        processor=perception.processor,
+        audio_encoder=perception.audio_encoder,
+        image_encoder=perception.image_encoder,
+        max_slice_nums=1,
+        mel_filter_bank=perception.mel_filter_bank,
+    )
+    second_state.prepare_audio = Mock(return_value=np.ones(4, dtype=np.float32))
+    second_state.mel_chunk = Mock(return_value=Mock(batch_key=Mock(return_value=())))
+    second_state.finish_audio = Mock()
+    second_prepared_images = [Mock(), Mock()]
+    second_state.prepare_image = Mock(side_effect=second_prepared_images)
+    second_image_embeds = (
+        torch.full((64, 4), 3.0),
+        torch.full((64, 4), 4.0),
+    )
+    second_state.encode_images = Mock(return_value=second_image_embeds)
+    hooks.states[second_identity] = second_state
+
+    first_prepared_images = [Mock(), Mock()]
+    first_image_embeds = (
+        torch.full((64, 4), 1.0),
+        torch.full((64, 4), 2.0),
+    )
+    perception.prepare_image.side_effect = first_prepared_images
+    perception.encode_images.side_effect = None
+    perception.encode_images.return_value = first_image_embeds
+    perception.audio_encoder.forward_streaming_batch.side_effect = lambda chunks: [
+        (torch.full((10, 4), 9.0 + index), None) for index, _ in enumerate(chunks)
+    ]
+
+    first_payload = unit_payload()
+    second_payload = unit_payload()
+    appends = [
+        SessionAppend(
+            chunk=TimedChunk(
+                "audio",
+                0,
+                1000,
+                0,
+                {"pcm": b"\0\0", "images": [b"first-0", b"first-1"]},
+            ),
+            payload=first_payload,
+            context=SimpleNamespace(session_identity=IDENTITY),
+        ),
+        SessionAppend(
+            chunk=TimedChunk(
+                "audio",
+                0,
+                1000,
+                0,
+                {"pcm": b"\0\0", "images": [b"second-0", b"second-1"]},
+            ),
+            payload=second_payload,
+            context=SimpleNamespace(session_identity=second_identity),
+        ),
+    ]
+
+    assert hooks.append_batch(appends) == [first_payload, second_payload]
+    assert perception.prepare_image.call_args_list == [
+        call(b"first-0"),
+        call(b"first-1"),
+    ]
+    assert second_state.prepare_image.call_args_list == [
+        call(b"second-0"),
+        call(b"second-1"),
+    ]
+    perception.encode_images.assert_called_once_with(tuple(first_prepared_images))
+    second_state.encode_images.assert_called_once_with(tuple(second_prepared_images))
+    perception.audio_encoder.forward_streaming_batch.assert_called_once()
+    assert len(perception.audio_encoder.forward_streaming_batch.call_args.args[0]) == 2
+    perception.finish_audio.assert_called_once_with(None)
+    second_state.finish_audio.assert_called_once_with(None)
+
+    assert first_payload.data is not None
+    assert second_payload.data is not None
+    assert torch.equal(first_payload.data["input_embeds"][:64], first_image_embeds[0])
+    assert torch.equal(
+        first_payload.data["input_embeds"][64:128], first_image_embeds[1]
+    )
+    assert torch.equal(second_payload.data["input_embeds"][:64], second_image_embeds[0])
+    assert torch.equal(
+        second_payload.data["input_embeds"][64:128], second_image_embeds[1]
+    )
+    assert torch.equal(
+        first_payload.data["input_embeds"][-10:], torch.full((10, 4), 9.0)
+    )
+    assert torch.equal(
+        second_payload.data["input_embeds"][-10:], torch.full((10, 4), 10.0)
+    )
 
 
 @pytest.mark.parametrize("finish", ["complete", "abort"])
