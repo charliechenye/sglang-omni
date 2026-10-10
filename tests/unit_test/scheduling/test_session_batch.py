@@ -59,6 +59,7 @@ class RecordingHooks(SequentialHooks, BatchedSessionHooks):
         super().__init__()
         self.fail_batch = fail_batch
         self.growing_session = growing_session
+        self.appended_sequences_by_session: dict[SessionIdentity, list[int]] = {}
 
     def append_batch(self, appends: list[SessionAppend]) -> list[StagePayload]:
         self.calls.append([append.payload.request_id for append in appends])
@@ -68,6 +69,9 @@ class RecordingHooks(SequentialHooks, BatchedSessionHooks):
             pass
         for append in appends:
             session_identity = append.context.session_identity
+            self.appended_sequences_by_session.setdefault(session_identity, []).append(
+                append.chunk.seq
+            )
             if session_identity.id == self.growing_session:
                 self.units_by_session[session_identity] += 1
             else:
@@ -242,4 +246,27 @@ def test_aborted_unit_leaves_the_batch_without_blocking_its_session():
         aborted=("b0",),
     )
     assert set(outputs) == {"open-a", "open-b", "a0", "b1"}
-    assert hooks.calls == [["a0", "b1"]]
+    assert outputs["b1"].type == "error"
+    assert hooks.calls == [["a0"]]
+
+
+def test_aborted_session_row_does_not_advance_persistent_state_of_later_rows():
+    hooks = RecordingHooks()
+    scheduler = SessionScheduler(hooks)
+    outputs = run_backlog(
+        scheduler,
+        opens("a", "b", "c")
+        + [
+            message("a0", "append", "a", 0),
+            message("b0", "append", "b", 0),
+            message("c0", "append", "c", 0),
+            message("b1", "append", "b", 1),
+        ],
+        aborted=("b0",),
+    )
+    assert outputs["a0"].type == outputs["c0"].type == "result"
+    assert outputs["b1"].type == "error"
+    assert hooks.calls == [["a0", "c0"]]
+    assert hooks.appended_sequences_by_session[SessionIdentity("a")] == [0]
+    assert hooks.appended_sequences_by_session[SessionIdentity("c")] == [0]
+    assert SessionIdentity("b") not in hooks.appended_sequences_by_session
