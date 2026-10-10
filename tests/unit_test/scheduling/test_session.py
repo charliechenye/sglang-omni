@@ -484,6 +484,84 @@ def test_abort_at_commit_settlement_boundary_fences_session():
     assert not scheduler.open_sessions
 
 
+def test_abort_after_atomic_append_retirement_is_stale():
+    hooks = BlockingHooks()
+    hooks.release.set()
+    scheduler = SessionScheduler(hooks)
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+    first_payload = session_stage_payload("first", "append")
+    second_payload = session_stage_payload("second", "append")
+    scheduler.inbox.put(IncomingMessage("first", "new_request", first_payload))
+    scheduler.inbox.put(IncomingMessage("second", "new_request", second_payload))
+    first_message = scheduler.inbox.get_nowait()
+    second_message = scheduler.inbox.get_nowait()
+    retirement_entered = threading.Event()
+    release_retirement = threading.Event()
+    abort_attempted = threading.Event()
+    abort_finished = threading.Event()
+    original_finish_locked = scheduler.finish_operation_locked
+    original_abort_callback = scheduler.abort_callback
+    errors: dict[str, BaseException] = {}
+
+    def pause_finish_locked(request_id: str) -> None:
+        if request_id == "first":
+            retirement_entered.set()
+            assert abort_attempted.wait(5)
+            assert release_retirement.wait(5)
+        else:
+            pass
+        original_finish_locked(request_id)
+
+    def observe_abort(request_id: str) -> None:
+        abort_attempted.set()
+        original_abort_callback(request_id)
+        abort_finished.set()
+
+    scheduler.finish_operation_locked = pause_finish_locked
+    scheduler.abort_callback = observe_abort
+
+    def run(message: IncomingMessage) -> None:
+        try:
+            scheduler.compute(message.data)
+        except BaseException as exc:
+            errors[message.request_id] = exc
+
+    first = threading.Thread(target=run, args=(first_message,))
+    first.start()
+    assert retirement_entered.wait(5)
+    abort = threading.Thread(target=scheduler.abort, args=("first",))
+    abort.start()
+    assert abort_attempted.wait(5)
+    release_retirement.set()
+    assert abort_finished.wait(5)
+    first.join(5)
+    assert not first.is_alive()
+
+    second = threading.Thread(target=run, args=(second_message,))
+    second.start()
+    second.join(5)
+    abort.join(5)
+    assert not second.is_alive() and not abort.is_alive()
+    assert not errors
+    assert scheduler.open_sessions[SessionIdentity("session")].is_failed is False
+    assert not scheduler.append_operation_states
+    assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id
+    assert scheduler.consume_if_aborted("first")
+    assert scheduler.open_sessions[SessionIdentity("session")].is_failed is False
+
+    events: list[tuple[object, ...]] = []
+    while not hooks.events.empty():
+        events.append(hooks.events.get_nowait())
+    assert events == [
+        ("open", "source", "session"),
+        ("append", "first"),
+        ("append", "second"),
+    ]
+    compute_registered(scheduler, session_stage_payload("close", "close"))
+    assert not scheduler.open_sessions
+    assert hooks.events.get_nowait() == ("close", "source", "session")
+
+
 def test_abort_after_append_settlement_does_not_fence_session():
     hooks = BlockingHooks()
     hooks.release.set()

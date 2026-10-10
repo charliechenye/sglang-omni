@@ -251,24 +251,28 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
 
     def finish_operation(self, request_id: str) -> None:
         with self.operation_finished:
-            arrival = self.arrivals_by_request_id.pop(request_id, None)
-            if arrival is None:
+            self.finish_operation_locked(request_id)
+
+    def finish_operation_locked(self, request_id: str) -> None:
+        """Retire an arrival while operation_finished holds session_table_lock."""
+        arrival = self.arrivals_by_request_id.pop(request_id, None)
+        if arrival is None:
+            return
+        else:
+            cursor = self.cursors_by_session.get(arrival.session_identity)
+            if cursor is None:
                 return
             else:
-                cursor = self.cursors_by_session.get(arrival.session_identity)
-                if cursor is None:
-                    return
+                # Note (Junnan Li): An aborted operation can finish before its predecessors ran.
+                cursor.completed_sequences.add(arrival.sequence)
+                while cursor.runnable_sequence in cursor.completed_sequences:
+                    cursor.completed_sequences.discard(cursor.runnable_sequence)
+                    cursor.runnable_sequence += 1
+                if cursor.runnable_sequence == cursor.next_sequence:
+                    self.cursors_by_session.pop(arrival.session_identity)
                 else:
-                    # Note (Junnan Li): An aborted operation can finish before its predecessors ran.
-                    cursor.completed_sequences.add(arrival.sequence)
-                    while cursor.runnable_sequence in cursor.completed_sequences:
-                        cursor.completed_sequences.discard(cursor.runnable_sequence)
-                        cursor.runnable_sequence += 1
-                    if cursor.runnable_sequence == cursor.next_sequence:
-                        self.cursors_by_session.pop(arrival.session_identity)
-                    else:
-                        pass
-                    self.operation_finished.notify_all()
+                    pass
+                self.operation_finished.notify_all()
 
     def mark_session_failed_locked(self, session_identity: SessionIdentity) -> None:
         """Keep the failure fence on the object that outlives this operation."""
@@ -416,22 +420,23 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
     ) -> None:
         # Note (Junnan Li): An active append remains fenced through local settlement,
         # so a stage commit cannot be mistaken for end-to-end success.
-        try:
-            with self.session_table_lock:
-                session = self.open_sessions.get(session_identity)
-            if session is not None:
-                with session.lock:
-                    with self.session_table_lock:
-                        should_close = self.is_shutting_down or session.is_failed
-                    if should_close:
-                        self.close_session(session_identity, session)
-                    else:
-                        pass
-            else:
-                pass
-        finally:
-            self.finish_operation(request_id)
-            with self.session_table_lock:
+        with self.session_table_lock:
+            session = self.open_sessions.get(session_identity)
+        if session is not None:
+            with session.lock:
+                with self.operation_finished:
+                    should_close = self.open_sessions.get(
+                        session_identity
+                    ) is session and (self.is_shutting_down or session.is_failed)
+                    self.finish_operation_locked(request_id)
+                    self.append_operation_states.pop(request_id, None)
+                if should_close:
+                    self.close_session(session_identity, session)
+                else:
+                    pass
+        else:
+            with self.operation_finished:
+                self.finish_operation_locked(request_id)
                 self.append_operation_states.pop(request_id, None)
 
     def run_batch(
