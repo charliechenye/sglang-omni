@@ -116,8 +116,8 @@ def test_state_budget_is_per_session():
     invoke("one", "append")
     with pytest.raises(QueueFullError):
         invoke("one", "append")
-    # note (Junnan Li): The failed session is released at once, so a unit queued behind it cannot run.
-    with pytest.raises(ValueError, match="unknown session"):
+    # note (Junnan Li): A failed session remains fenced until close releases the state.
+    with pytest.raises(RuntimeError, match="terminal"):
         invoke("one", "append")
     # note (Junnan Li): Session two stays within its own budget while session one outgrows it.
     invoke("two", "append")
@@ -232,7 +232,9 @@ class BlockingHooks(Hooks):
 
 
 def session_stage_payload(
-    request_id: str, operation: Literal["open", "append", "close"]
+    request_id: str,
+    operation: Literal["open", "append", "close"],
+    session_identity: SessionIdentity = SessionIdentity("session"),
 ) -> StagePayload:
     return StagePayload(
         request_id,
@@ -240,7 +242,7 @@ def session_stage_payload(
             None,
             metadata=operation_metadata(
                 operation,
-                SessionIdentity("session"),
+                session_identity,
                 TimedChunk("audio", 0, 20, 0, b"x"),
             ),
         ),
@@ -248,7 +250,7 @@ def session_stage_payload(
     )
 
 
-def test_session_operations_run_in_arrival_order_even_when_one_is_aborted():
+def test_aborted_unit_fences_later_session_operations():
     hooks = BlockingHooks()
     scheduler = SessionScheduler(hooks, max_concurrency=3)
     compute_registered(scheduler, session_stage_payload("open", "open"))
@@ -259,12 +261,20 @@ def test_session_operations_run_in_arrival_order_even_when_one_is_aborted():
     for payload in payloads:
         scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))
     messages = [scheduler.inbox.get_nowait() for _ in payloads]
-    threads = [threading.Thread(target=scheduler.compute, args=(messages[0].data,))]
+    errors: list[BaseException] = []
+
+    def run(message: IncomingMessage) -> None:
+        try:
+            scheduler.compute(message.data)
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(messages[0],))]
     threads[0].start()
     assert hooks.entered.wait(5)
     scheduler.abort("second")
     assert scheduler.consume_if_aborted("second")
-    threads.append(threading.Thread(target=scheduler.compute, args=(messages[2].data,)))
+    threads.append(threading.Thread(target=run, args=(messages[2],)))
     threads[1].start()
     threads[1].join(0.2)
     assert threads[1].is_alive(), "third operation ran before the first finished"
@@ -272,13 +282,17 @@ def test_session_operations_run_in_arrival_order_even_when_one_is_aborted():
     for thread in threads:
         thread.join(5)
     assert not any(thread.is_alive() for thread in threads)
-    order = []
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    order: list[str] = []
     while not hooks.events.empty():
         event = hooks.events.get_nowait()
         if event[0] == "append":
             order.append(event[1])
-    assert order == ["first", "third"]
+    assert order == ["first"]
     assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id
+    assert scheduler.open_sessions[SessionIdentity("session")].is_failed
+    compute_registered(scheduler, session_stage_payload("close", "close"))
+    assert not scheduler.open_sessions
 
 
 def test_later_operation_does_not_start_before_the_session_lock() -> None:
@@ -302,12 +316,20 @@ def test_later_operation_does_not_start_before_the_session_lock() -> None:
     for payload in payloads:
         scheduler.inbox.put(IncomingMessage(payload.request_id, "new_request", payload))
     messages = [scheduler.inbox.get_nowait() for _ in payloads]
-    first = threading.Thread(target=scheduler.compute, args=(messages[0].data,))
+    errors: list[BaseException] = []
+
+    def run(message: IncomingMessage) -> None:
+        try:
+            scheduler.compute(message.data)
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=run, args=(messages[0],))
     first.start()
     assert hooks.entered.wait(5)
     scheduler.abort("second")
     assert scheduler.consume_if_aborted("second")
-    third = threading.Thread(target=scheduler.compute, args=(messages[2].data,))
+    third = threading.Thread(target=run, args=(messages[2],))
     third.start()
     third.join(0.2)
     assert started == [("open", "open"), ("first", "append")]
@@ -315,6 +337,11 @@ def test_later_operation_does_not_start_before_the_session_lock() -> None:
     for thread in (first, third):
         thread.join(5)
     assert started == [("open", "open"), ("first", "append"), ("third", "append")]
+    assert len(errors) == 1 and isinstance(errors[0], RuntimeError)
+    assert hooks.events.get_nowait()[0] == "open"
+    assert hooks.events.get_nowait() == ("append", "first")
+    compute_registered(scheduler, session_stage_payload("close", "close"))
+    assert not scheduler.open_sessions
 
 
 def test_close_runs_after_its_request_is_aborted():
@@ -343,7 +370,25 @@ def test_close_runs_after_its_request_is_aborted():
     assert not scheduler.open_sessions and not scheduler.arrivals_by_request_id
 
 
-def test_operation_finished_by_abort_before_running_does_not_wait():
+def test_repeated_abort_and_close_do_not_leak_fenced_session():
+    hooks = BlockingHooks()
+    scheduler = SessionScheduler(hooks)
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+    payload = session_stage_payload("late", "append")
+    scheduler.inbox.put(IncomingMessage("late", "new_request", payload))
+    message = scheduler.inbox.get_nowait()
+    scheduler.abort("late")
+    scheduler.abort("late")
+    assert scheduler.consume_if_aborted("late")
+    assert not scheduler.consume_if_aborted("late")
+    with pytest.raises(RuntimeError, match="terminal"):
+        scheduler.compute(message.data)
+    compute_registered(scheduler, session_stage_payload("close", "close"))
+    compute_registered(scheduler, session_stage_payload("close-again", "close"))
+    assert not scheduler.open_sessions
+
+
+def test_aborted_operation_never_invokes_append_hook():
 
     class AppendHooks(Hooks):
         def append(
@@ -363,10 +408,10 @@ def test_operation_finished_by_abort_before_running_does_not_wait():
     payload = session_stage_payload("late", "append")
     scheduler.inbox.put(IncomingMessage("late", "new_request", payload))
     message = scheduler.inbox.get_nowait()
-    # Note (Junnan Li): A request-level abort consumed the ticket first; the command still runs.
+    # Note (Junnan Li): The accepted append is fenced even when abort is consumed first.
     scheduler.abort("late")
     assert scheduler.consume_if_aborted("late")
-    errors = []
+    errors: list[BaseException] = []
 
     def run():
         try:
@@ -378,12 +423,110 @@ def test_operation_finished_by_abort_before_running_does_not_wait():
     worker.start()
     worker.join(5)
     assert not worker.is_alive(), "command waited for a number that was already served"
-    assert not errors, errors
-    seen = []
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "terminal" in str(errors[0])
+    seen: list[str] = []
     while not events.empty():
         seen.append(events.get_nowait()[0])
-    assert seen == ["open", "append"]
+    assert seen == ["open"]
     assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id
+    assert scheduler.open_sessions[SessionIdentity("session")].is_failed
+    compute_registered(scheduler, session_stage_payload("close", "close"))
+    assert not scheduler.open_sessions
+
+
+def test_cancellation_during_append_fences_successor_until_hook_settles():
+    hooks = BlockingHooks()
+    scheduler = SessionScheduler(hooks, max_concurrency=3)
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+    first_payload = session_stage_payload("first", "append")
+    second_payload = session_stage_payload("second", "append")
+    scheduler.inbox.put(IncomingMessage("first", "new_request", first_payload))
+    scheduler.inbox.put(IncomingMessage("second", "new_request", second_payload))
+    first_message = scheduler.inbox.get_nowait()
+    second_message = scheduler.inbox.get_nowait()
+    errors: dict[str, BaseException] = {}
+
+    def run(message: IncomingMessage) -> None:
+        try:
+            scheduler.compute(message.data)
+        except BaseException as exc:
+            errors[message.request_id] = exc
+
+    first = threading.Thread(target=run, args=(first_message,))
+    first.start()
+    assert hooks.entered.wait(5)
+    scheduler.abort("first")
+    second = threading.Thread(target=run, args=(second_message,))
+    second.start()
+    second.join(0.2)
+    assert second.is_alive(), "successor ran while its predecessor hook was active"
+    hooks.release.set()
+    first.join(5)
+    second.join(5)
+    assert not first.is_alive() and not second.is_alive()
+    assert set(errors) == {"first", "second"}
+    assert hooks.events.get_nowait()[0] == "open"
+    assert hooks.events.get_nowait() == ("append", "first")
+    assert scheduler.open_sessions[SessionIdentity("session")].is_failed
+    assert not scheduler.append_cancel_events
+    assert not scheduler.append_operation_states
+    assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id
+    compute_registered(scheduler, session_stage_payload("close", "close"))
+    assert not scheduler.open_sessions
+
+
+def test_cancellation_after_append_commit_does_not_fence_session():
+    hooks = BlockingHooks()
+    scheduler = SessionScheduler(hooks)
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+    compute_registered(scheduler, session_stage_payload("first", "append"))
+    scheduler.abort("first")
+    assert scheduler.consume_if_aborted("first")
+    compute_registered(scheduler, session_stage_payload("second", "append"))
+    append_events: list[str] = []
+    while not hooks.events.empty():
+        event = hooks.events.get_nowait()
+        if event[0] == "append":
+            append_events.append(event[1])
+    assert append_events == ["first", "second"]
+    compute_registered(scheduler, session_stage_payload("close", "close"))
+    assert not scheduler.open_sessions
+
+
+def test_reopened_session_does_not_inherit_terminal_failure():
+    hooks = BlockingHooks()
+    scheduler = SessionScheduler(hooks)
+    first_identity = SessionIdentity("session", 1)
+    compute_registered(
+        scheduler, session_stage_payload("open-1", "open", first_identity)
+    )
+    payload = session_stage_payload("aborted", "append", first_identity)
+    scheduler.inbox.put(IncomingMessage("aborted", "new_request", payload))
+    scheduler.inbox.get_nowait()
+    scheduler.abort("aborted")
+    assert scheduler.consume_if_aborted("aborted")
+    with pytest.raises(RuntimeError, match="terminal"):
+        compute_registered(
+            scheduler, session_stage_payload("blocked", "append", first_identity)
+        )
+    compute_registered(
+        scheduler, session_stage_payload("close-1", "close", first_identity)
+    )
+
+    second_identity = SessionIdentity("session", 2)
+    compute_registered(
+        scheduler, session_stage_payload("open-2", "open", second_identity)
+    )
+    compute_registered(
+        scheduler, session_stage_payload("append-2", "append", second_identity)
+    )
+    assert scheduler.open_sessions[second_identity].is_open
+    compute_registered(
+        scheduler, session_stage_payload("close-2", "close", second_identity)
+    )
+    assert not scheduler.open_sessions
 
 
 def test_context_exhaustion_releases_append_unit() -> None:
