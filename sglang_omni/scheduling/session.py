@@ -622,17 +622,16 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         return [results[payload.request_id] for payload in payloads]
 
     def cancel_operation(self, request_id: str) -> None:
-        should_finish = False
         with self.operation_finished:
+            # Note (Junnan Li): Direct compute can race the abort callback before ticket retirement.
             arrival = self.arrivals_by_request_id.get(request_id)
             if arrival is not None and arrival.operation == "open":
                 self.mark_session_failed_locked(arrival.session_identity)
+                self.finish_operation_locked(request_id)
+            elif self.fence_aborted_append_locked(request_id):
+                self.finish_operation_locked(request_id)
             else:
-                should_finish = self.fence_aborted_append_locked(request_id)
-        if should_finish:
-            self.finish_operation(request_id)
-        else:
-            pass
+                pass
 
     def release_sessions_on_scheduler_stop(self) -> None:
         """Release every session still open when this stage's scheduler stops.

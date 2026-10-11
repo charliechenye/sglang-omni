@@ -321,6 +321,72 @@ def test_close_runs_after_its_request_is_aborted():
     assert not scheduler.open_sessions and not scheduler.arrivals_by_request_id
 
 
+def test_preexecution_aborted_append_is_skipped_before_close():
+    hooks = BlockingHooks()
+    scheduler = SessionScheduler(hooks, max_concurrency=1)
+    target_identity = SessionIdentity("target")
+    blocker_identity = SessionIdentity("blocker")
+    compute_registered(
+        scheduler, session_stage_payload("open-target", "open", target_identity)
+    )
+    compute_registered(
+        scheduler, session_stage_payload("open-blocker", "open", blocker_identity)
+    )
+    messages = [
+        IncomingMessage(request_id, "new_request", payload)
+        for request_id, payload in (
+            (
+                "first",
+                session_stage_payload("first", "append", blocker_identity),
+            ),
+            (
+                "append",
+                session_stage_payload("append", "append", target_identity),
+            ),
+            (
+                "close-target",
+                session_stage_payload("close-target", "close", target_identity),
+            ),
+            (
+                "close-blocker",
+                session_stage_payload("close-blocker", "close", blocker_identity),
+            ),
+        )
+    ]
+    for message in messages:
+        scheduler.inbox.put(message)
+    worker = threading.Thread(target=scheduler.start)
+    worker.start()
+    outputs: dict[str, OutgoingMessage] = {}
+    try:
+        assert hooks.entered.wait(5)
+        scheduler.abort("append")
+        hooks.release.set()
+        while len(outputs) < 3:
+            output = scheduler.outbox.get(timeout=5)
+            if output.type == "stream":
+                pass
+            else:
+                outputs[output.request_id] = output
+    finally:
+        hooks.release.set()
+        scheduler.stop()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert set(outputs) == {"first", "close-target", "close-blocker"}
+    assert all(output.type == "result" for output in outputs.values())
+    assert [event[0] for event in list(hooks.events.queue)] == [
+        "open",
+        "open",
+        "append",
+        "close",
+        "close",
+    ]
+    assert not scheduler.open_sessions
+    assert not scheduler.arrivals_by_request_id
+    assert not scheduler.cursors_by_session
+
+
 def test_aborted_open_retires_cursor_before_later_operations():
     hooks = BlockingHooks()
     hooks.release.set()
@@ -659,6 +725,53 @@ def test_aborted_operation_never_invokes_append_hook():
     assert not scheduler.open_sessions
     compute_registered(scheduler, session_stage_payload("close", "close"))
     assert not scheduler.open_sessions
+
+
+def test_abort_callback_retires_append_before_direct_compute_can_settle():
+    hooks = BlockingHooks()
+    hooks.release.set()
+    scheduler = SessionScheduler(hooks)
+    identity = SessionIdentity("session")
+    compute_registered(scheduler, session_stage_payload("open", "open", identity))
+    payload = session_stage_payload("append", "append", identity)
+    scheduler.inbox.put(IncomingMessage("append", "new_request", payload))
+    message = scheduler.inbox.get_nowait()
+
+    signals: queue.Queue[str] = queue.Queue()
+    compute_done = threading.Event()
+    original_cancel = scheduler.cancel_operation
+    original_finish = scheduler.finish_operation
+
+    def pause_finish(request_id: str) -> None:
+        signals.put("retirement_gap")
+        assert compute_done.wait(5)
+        original_finish(request_id)
+
+    def observe_cancel(request_id: str) -> None:
+        original_cancel(request_id)
+        signals.put("cancel_finished")
+
+    # The old callback called finish_operation after releasing the condition;
+    # pausing that call exposes the gap to direct compute. The fixed callback
+    # retires the arrival under the same condition and signals only afterward.
+    scheduler.finish_operation = pause_finish
+    scheduler.abort_callback = observe_cancel
+    abort = threading.Thread(target=scheduler.abort, args=("append",))
+    abort.start()
+    signal = signals.get(timeout=5)
+    try:
+        with pytest.raises(RuntimeError, match="terminal"):
+            scheduler.compute(message.data)
+    finally:
+        compute_done.set()
+        abort.join(timeout=5)
+    assert not abort.is_alive()
+    assert signal in {"retirement_gap", "cancel_finished"}
+    assert not scheduler.open_sessions
+    assert list(hooks.events.queue) == [
+        ("open", "source", "session"),
+        ("close", "source", "session"),
+    ]
 
 
 def test_cancellation_during_append_fences_successor_until_hook_settles():
