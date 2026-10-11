@@ -22,7 +22,7 @@ from sglang_omni.proto.session import (
     TimedChunk,
     wire_size,
 )
-from sglang_omni.scheduling.message import IncomingMessage
+from sglang_omni.scheduling.message import IncomingMessage, OutgoingMessage
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.session import (
     SessionAppend,
@@ -321,6 +321,113 @@ def test_close_runs_after_its_request_is_aborted():
     assert not scheduler.open_sessions and not scheduler.arrivals_by_request_id
 
 
+def test_aborted_open_retires_cursor_before_later_operations():
+    hooks = BlockingHooks()
+    hooks.release.set()
+    scheduler = SessionScheduler(hooks, max_concurrency=1)
+    aborted_identity = SessionIdentity("aborted")
+    healthy_identity = SessionIdentity("healthy")
+    messages = [
+        IncomingMessage(
+            request_id,
+            "new_request",
+            session_stage_payload(request_id, operation, identity),
+        )
+        for request_id, operation, identity in (
+            ("open-aborted", "open", aborted_identity),
+            ("open-healthy", "open", healthy_identity),
+            ("append-aborted", "append", aborted_identity),
+            ("append-healthy", "append", healthy_identity),
+            ("close-aborted", "close", aborted_identity),
+            ("close-healthy", "close", healthy_identity),
+        )
+    ]
+    for message in messages:
+        scheduler.inbox.put(message)
+    scheduler.abort("open-aborted")
+    worker = threading.Thread(target=scheduler.start)
+    worker.start()
+    outputs: dict[str, OutgoingMessage] = {}
+    try:
+        while len(outputs) < len(messages) - 1:
+            output = scheduler.outbox.get(timeout=5)
+            if output.type == "stream":
+                pass
+            else:
+                outputs[output.request_id] = output
+    finally:
+        scheduler.finish_operation("open-aborted")
+        scheduler.stop()
+        worker.join(timeout=5)
+    assert not worker.is_alive()
+    assert "open-aborted" not in outputs
+    assert outputs["append-aborted"].type == "error"
+    assert isinstance(outputs["append-aborted"].data, ValueError)
+    assert outputs["close-aborted"].data.data == {"closed": True}
+    assert outputs["open-healthy"].type == "result"
+    assert outputs["append-healthy"].type == "result"
+    assert outputs["close-healthy"].type == "result"
+    assert not scheduler.open_sessions
+    assert not scheduler.append_operation_states
+    assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id
+    events: list[tuple[object, ...]] = []
+    while not hooks.events.empty():
+        events.append(hooks.events.get_nowait())
+    assert events == [
+        ("open", "source", "healthy"),
+        ("append", "append-healthy"),
+        ("close", "source", "healthy"),
+    ]
+
+
+def test_cancellation_during_open_closes_owned_state():
+    class BlockingOpenHooks(Hooks):
+        def __init__(self, events: queue.Queue[tuple[object, ...]]) -> None:
+            super().__init__("source", events)
+            self.entered = threading.Event()
+            self.release = threading.Event()
+
+        def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
+            super().open(session_identity, request)
+            self.entered.set()
+            assert self.release.wait(5)
+
+    events = queue.Queue()
+    hooks = BlockingOpenHooks(events)
+    scheduler = SessionScheduler(hooks)
+    payload = session_stage_payload("open", "open")
+    scheduler.inbox.put(IncomingMessage("open", "new_request", payload))
+    message = scheduler.inbox.get_nowait()
+    errors: list[BaseException] = []
+    finished = threading.Event()
+
+    def run() -> None:
+        try:
+            scheduler.compute(message.data)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            finished.set()
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert hooks.entered.wait(5)
+    scheduler.abort("open")
+    hooks.release.set()
+    assert finished.wait(5)
+    worker.join(timeout=5)
+    assert not worker.is_alive() and not errors
+    assert scheduler.consume_if_aborted("open")
+    assert not scheduler.open_sessions
+    assert not scheduler.append_operation_states
+    assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id
+    assert [events.get_nowait(), events.get_nowait()] == [
+        ("open", "source", "session"),
+        ("close", "source", "session"),
+    ]
+    scheduler.stop()
+
+
 def test_repeated_abort_and_close_do_not_leak_fenced_session():
     hooks = BlockingHooks()
     scheduler = SessionScheduler(hooks)
@@ -388,7 +495,25 @@ def test_aborted_operation_never_invokes_append_hook():
 
 
 def test_cancellation_during_append_fences_successor_until_hook_settles():
-    hooks = BlockingHooks()
+    class SuccessorAwareHooks(BlockingHooks):
+        def __init__(self) -> None:
+            super().__init__()
+            self.successor_entered = threading.Event()
+
+        def append(
+            self,
+            chunk: TimedChunk,
+            payload: StagePayload,
+            context: SessionContext,
+        ) -> StagePayload:
+            updated_payload = super().append(chunk, payload, context)
+            if payload.request_id == "second":
+                self.successor_entered.set()
+            else:
+                pass
+            return updated_payload
+
+    hooks = SuccessorAwareHooks()
     scheduler = SessionScheduler(hooks, max_concurrency=3)
     compute_registered(scheduler, session_stage_payload("open", "open"))
     first_payload = session_stage_payload("first", "append")
@@ -398,6 +523,24 @@ def test_cancellation_during_append_fences_successor_until_hook_settles():
     first_message = scheduler.inbox.get_nowait()
     second_message = scheduler.inbox.get_nowait()
     errors: dict[str, BaseException] = {}
+    settlement_started = threading.Event()
+    allow_settlement = threading.Event()
+    settlement_finished = threading.Event()
+    original_settle = scheduler.settle_operation
+
+    def pause_settlement(request_id: str, session_identity: SessionIdentity) -> None:
+        if request_id == "first":
+            settlement_started.set()
+            assert allow_settlement.wait(5)
+        else:
+            pass
+        original_settle(request_id, session_identity)
+        if request_id == "first":
+            settlement_finished.set()
+        else:
+            pass
+
+    scheduler.settle_operation = pause_settlement
 
     def run(message: IncomingMessage) -> None:
         try:
@@ -412,6 +555,10 @@ def test_cancellation_during_append_fences_successor_until_hook_settles():
     second = threading.Thread(target=run, args=(second_message,))
     second.start()
     hooks.release.set()
+    assert settlement_started.wait(5)
+    assert not hooks.successor_entered.is_set()
+    allow_settlement.set()
+    assert settlement_finished.wait(5)
     first.join(5)
     second.join(5)
     assert not first.is_alive() and not second.is_alive()

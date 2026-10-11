@@ -157,7 +157,7 @@ class OperationArrival:
 
 @dataclass(kw_only=True)
 class SessionOperationCursor:
-    """Arrival cursor for one session. An operation starts when its sequence is runnable."""
+    """Arrival cursor whose failure fence can outlive a not-yet-open session."""
 
     next_sequence: int = 0
     runnable_sequence: int = 0
@@ -343,8 +343,8 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
             append_state.is_executing = True
             return True
 
-    def commit_append(self, request_id: str) -> None:
-        """Validate a stage commit while keeping the append fence active."""
+    def validate_append_completion(self, request_id: str) -> None:
+        """Validate append completion while keeping its fence active."""
         with self.operation_finished:
             append_state = self.append_operation_states.get(request_id)
             shutdown_owns_cleanup = False
@@ -371,12 +371,15 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         with self.operation_finished:
             arrival = self.arrivals_by_request_id.get(request_id)
             is_close_operation = arrival is not None and arrival.operation == "close"
+            is_open_operation = arrival is not None and arrival.operation == "open"
             append_state = self.append_operation_states.get(request_id)
             is_append_operation = append_state is not None or (
                 arrival is not None and arrival.operation == "append"
             )
             if aborted and is_append_operation:
                 should_finish = self.fence_aborted_append_locked(request_id)
+            elif aborted and is_open_operation:
+                should_finish = True
             else:
                 pass
         if aborted and is_close_operation:
@@ -590,7 +593,11 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
     def cancel_operation(self, request_id: str) -> None:
         should_finish = False
         with self.operation_finished:
-            should_finish = self.fence_aborted_append_locked(request_id)
+            arrival = self.arrivals_by_request_id.get(request_id)
+            if arrival is not None and arrival.operation == "open":
+                self.mark_session_failed_locked(arrival.session_identity)
+            else:
+                should_finish = self.fence_aborted_append_locked(request_id)
         if should_finish:
             self.finish_operation(request_id)
         else:
@@ -659,14 +666,24 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
             pass
 
     def open_session(
-        self, session_identity: SessionIdentity, request: OmniRequest
+        self,
+        request_id: str,
+        session_identity: SessionIdentity,
+        request: OmniRequest,
     ) -> None:
         session = StageSession()
         session.lock.acquire()
         with self.session_table_lock:
+            cursor = self.cursors_by_session.get(session_identity)
             if self.is_shutting_down:
                 session.lock.release()
                 raise RuntimeError("session scheduler is stopping")
+            elif self.is_aborted(request_id):
+                session.lock.release()
+                raise RuntimeError("session open was aborted before execution")
+            elif cursor is not None and cursor.is_failed:
+                session.lock.release()
+                raise RuntimeError("session is terminal before open")
             elif session_identity in self.open_sessions:
                 session.lock.release()
                 raise ValueError("session already opened")
@@ -674,8 +691,6 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                 session.lock.release()
                 raise QueueFullError()
             else:
-                cursor = self.cursors_by_session.get(session_identity)
-                session.is_failed = cursor is not None and cursor.is_failed
                 self.open_sessions[session_identity] = session
         try:
             self.session_hooks.open(session_identity, request)
@@ -697,7 +712,7 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         session_identity = session_operation.session_identity
         operation = session_operation.operation
         if operation == "open":
-            self.open_session(session_identity, payload.request)
+            self.open_session(payload.request_id, session_identity, payload.request)
             payload.data = {"opened": True}
             return payload
         else:
@@ -744,7 +759,7 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                                 append.chunk, append.payload, append.context
                             )
                             self.check_usage(session_identity)
-                            self.commit_append(payload.request_id)
+                            self.validate_append_completion(payload.request_id)
                             return updated_payload
                         except BaseException:
                             self.mark_session_failed(session_identity)
@@ -886,7 +901,9 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                         ):
                             try:
                                 self.check_usage(append.context.session_identity)
-                                self.commit_append(append.payload.request_id)
+                                self.validate_append_completion(
+                                    append.payload.request_id
+                                )
                                 results[append.payload.request_id] = updated_payload
                             except Exception as exc:
                                 fail(

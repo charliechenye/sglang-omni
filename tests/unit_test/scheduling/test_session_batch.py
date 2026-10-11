@@ -377,6 +377,27 @@ def test_aborted_batch_row_fences_session_without_affecting_healthy_rows():
     assert SessionIdentity("b") not in hooks.appended_sequences_by_session
 
 
+def test_aborted_open_retires_batch_cursor_before_later_rows():
+    hooks = RecordingHooks()
+    scheduler = SessionScheduler(hooks)
+    outputs = run_backlog(
+        scheduler,
+        opens("aborted", "healthy")
+        + [
+            message("aborted0", "append", "aborted", 0),
+            message("healthy0", "append", "healthy", 0),
+        ],
+        aborted=("open-aborted",),
+    )
+    assert outputs["open-healthy"].type == "result"
+    assert outputs["aborted0"].type == "error"
+    assert outputs["healthy0"].type == "result"
+    assert hooks.calls == [["healthy0"]]
+    assert not hooks.opened
+    assert not scheduler.open_sessions
+    assert not scheduler.cursors_by_session and not scheduler.arrivals_by_request_id
+
+
 def test_batch_setup_failure_fences_only_the_faulty_session():
     hooks = RecordingHooks()
     scheduler = SessionScheduler(hooks)
