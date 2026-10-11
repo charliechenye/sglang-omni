@@ -503,6 +503,7 @@
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#server-readiness">Server Readiness</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#text-only-mode">Text-Only Mode</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-server">Launch the Server</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#image-and-text-input">Image and Text Input</a></li>
@@ -542,6 +543,20 @@
 <section id="prerequisites">
 <h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
 <p>Install <code class="docutils literal notranslate"><span class="pre">sglang-omni</span></code> by following <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a>.</p>
+</section>
+<section id="server-readiness">
+<h2>Server Readiness<a class="headerlink" href="#server-readiness" title="Link to this heading">#</a></h2>
+<p>Before it reports ready, the server sends itself a chat request with a small
+image, one second of audio and a short instruction (text and audio output in
+speech mode, text output in text-only mode, at most 8 new tokens from each
+stage that generates tokens), once per replica of its most
+replicated process, one after another, so that every replica serves one.
+<code class="docutils literal notranslate"><span class="pre">/health</span></code> returns 503 with status <code class="docutils literal notranslate"><span class="pre">starting</span></code> until these requests have passed
+through every stage, so the one-time kernel builds of that request path happen
+before the first user request. Inputs of other shapes, such as video or a large
+concurrent batch, can still build a kernel variant on first use. A failed
+warmup stops the server. <code class="docutils literal notranslate"><span class="pre">SGLANG_OMNI_WARMUP_TIMEOUT</span></code> (seconds, default 600)
+bounds each request, and <code class="docutils literal notranslate"><span class="pre">--skip-server-warmup</span></code> reports ready without them.</p>
 </section>
 <section id="text-only-mode">
 <h2>Text-Only Mode<a class="headerlink" href="#text-only-mode" title="Link to this heading">#</a></h2>
@@ -1341,6 +1356,7 @@ with the AutoRound checkpoint:</p>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#server-readiness">Server Readiness</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#text-only-mode">Text-Only Mode</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-server">Launch the Server</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#image-and-text-input">Image and Text Input</a></li>
