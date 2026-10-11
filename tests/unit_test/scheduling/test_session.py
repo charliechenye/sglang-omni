@@ -355,8 +355,9 @@ def test_aborted_open_retires_cursor_before_later_operations():
                 pass
             else:
                 outputs[output.request_id] = output
+        assert not scheduler.arrivals_by_request_id
+        assert not scheduler.cursors_by_session
     finally:
-        scheduler.finish_operation("open-aborted")
         scheduler.stop()
         worker.join(timeout=5)
     assert not worker.is_alive()
@@ -453,6 +454,73 @@ def test_stop_retires_queued_session_operations():
     assert not scheduler.cursors_by_session
 
 
+def test_stop_retires_active_and_queued_session_operations():
+    hooks = BlockingHooks()
+    scheduler = SessionScheduler(hooks, max_concurrency=2)
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+    first_payload = session_stage_payload("first", "append")
+    second_payload = session_stage_payload("second", "append")
+    scheduler.inbox.put(IncomingMessage("first", "new_request", first_payload))
+    scheduler.inbox.put(IncomingMessage("second", "new_request", second_payload))
+    first_message = scheduler.inbox.get_nowait()
+    second_message = scheduler.inbox.get_nowait()
+    errors: dict[str, BaseException] = {}
+    second_started = threading.Event()
+
+    def run(message: IncomingMessage) -> None:
+        if message.request_id == "second":
+            second_started.set()
+        else:
+            pass
+        try:
+            scheduler.compute(message.data)
+        except BaseException as exc:
+            errors[message.request_id] = exc
+
+    first = threading.Thread(target=run, args=(first_message,))
+    second = threading.Thread(target=run, args=(second_message,))
+    try:
+        first.start()
+        assert hooks.entered.wait(5)
+        second.start()
+        assert second_started.wait(5)
+        scheduler.stop()
+        assert SessionIdentity("session") in scheduler.open_sessions
+        assert "first" in scheduler.append_operation_states
+        assert "second" not in scheduler.append_operation_states
+        assert not scheduler.arrivals_by_request_id
+        assert not scheduler.cursors_by_session
+        assert list(hooks.events.queue) == [
+            ("open", "source", "session"),
+            ("append", "first"),
+        ]
+        hooks.release.set()
+        first.join(timeout=5)
+        second.join(timeout=5)
+        assert not first.is_alive() and not second.is_alive()
+        assert set(errors) == {"second"}
+        assert list(hooks.events.queue) == [
+            ("open", "source", "session"),
+            ("append", "first"),
+            ("close", "source", "session"),
+        ]
+        scheduler.stop()
+        assert list(hooks.events.queue) == [
+            ("open", "source", "session"),
+            ("append", "first"),
+            ("close", "source", "session"),
+        ]
+        assert not scheduler.open_sessions
+        assert not scheduler.append_operation_states
+        assert not scheduler.arrivals_by_request_id
+        assert not scheduler.cursors_by_session
+    finally:
+        hooks.release.set()
+        scheduler.stop()
+        first.join(timeout=5)
+        second.join(timeout=5)
+
+
 def test_shutdown_retirement_survives_close_failure():
     class BrokenCloseHooks(Hooks):
         def close(self, session_identity: SessionIdentity) -> None:
@@ -467,9 +535,64 @@ def test_shutdown_retirement_survives_close_failure():
         scheduler.stop()
 
     assert SessionIdentity("session") in scheduler.open_sessions
+    assert scheduler.open_sessions[SessionIdentity("session")].is_failed
     assert not scheduler.append_operation_states
     assert not scheduler.arrivals_by_request_id
     assert not scheduler.cursors_by_session
+    with pytest.raises(RuntimeError, match="terminal"):
+        compute_registered(scheduler, session_stage_payload("after-stop", "append"))
+    assert SessionIdentity("session") in scheduler.open_sessions
+
+
+def test_failed_close_fences_session_until_explicit_retry():
+    class RetryCloseHooks(Hooks):
+        def __init__(self, events: queue.Queue[tuple[object, ...]]) -> None:
+            super().__init__("source", events)
+            self.close_attempts = 0
+
+        def append(
+            self,
+            chunk: TimedChunk,
+            payload: StagePayload,
+            context: SessionContext,
+        ) -> StagePayload:
+            self.events.put(("append", payload.request_id))
+            return payload
+
+        def close(self, session_identity: SessionIdentity) -> None:
+            self.close_attempts += 1
+            if self.close_attempts == 1:
+                raise RuntimeError("close failed")
+            else:
+                super().close(session_identity)
+
+    events = queue.Queue()
+    hooks = RetryCloseHooks(events)
+    scheduler = SessionScheduler(hooks)
+    identity = SessionIdentity("session")
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        compute_registered(scheduler, session_stage_payload("close", "close"))
+
+    session = scheduler.open_sessions[identity]
+    assert session.is_open and session.is_failed
+    assert hooks.close_attempts == 1
+    with pytest.raises(RuntimeError, match="terminal"):
+        compute_registered(scheduler, session_stage_payload("append", "append"))
+    assert hooks.close_attempts == 1
+    assert list(events.queue) == [("open", "source", "session")]
+
+    compute_registered(scheduler, session_stage_payload("close-retry", "close"))
+    assert hooks.close_attempts == 2
+    assert not scheduler.open_sessions
+    assert list(events.queue) == [
+        ("open", "source", "session"),
+        ("close", "source", "session"),
+    ]
+    compute_registered(scheduler, session_stage_payload("close-again", "close"))
+    assert hooks.close_attempts == 2
+    scheduler.stop()
 
 
 def test_repeated_abort_and_close_do_not_leak_fenced_session():
@@ -572,13 +695,25 @@ def test_cancellation_during_append_fences_successor_until_hook_settles():
     settlement_finished = threading.Event()
     original_settle = scheduler.settle_operation
 
-    def pause_settlement(request_id: str, session_identity: SessionIdentity) -> None:
+    def pause_settlement(
+        request_id: str,
+        session_identity: SessionIdentity,
+        operation: Literal["open", "append", "close"],
+        operation_failed: bool = False,
+        session_was_failed: bool = False,
+    ) -> None:
         if request_id == "first":
             settlement_started.set()
             assert allow_settlement.wait(5)
         else:
             pass
-        original_settle(request_id, session_identity)
+        original_settle(
+            request_id,
+            session_identity,
+            operation,
+            operation_failed,
+            session_was_failed,
+        )
         if request_id == "first":
             settlement_finished.set()
         else:
@@ -632,13 +767,25 @@ def test_abort_at_commit_settlement_boundary_fences_session():
     errors: dict[str, BaseException] = {}
     finished = {request_id: threading.Event() for request_id in ("first", "second")}
 
-    def pause_settle(request_id: str, session_identity: SessionIdentity) -> None:
+    def pause_settle(
+        request_id: str,
+        session_identity: SessionIdentity,
+        operation: Literal["open", "append", "close"],
+        operation_failed: bool = False,
+        session_was_failed: bool = False,
+    ) -> None:
         if request_id == "first":
             settle_entered.set()
             assert release_settle.wait(5)
         else:
             pass
-        original_settle(request_id, session_identity)
+        original_settle(
+            request_id,
+            session_identity,
+            operation,
+            operation_failed,
+            session_was_failed,
+        )
 
     scheduler.settle_operation = pause_settle
 

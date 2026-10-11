@@ -131,6 +131,8 @@ def run_backlog(
                 finals[output.request_id] = output
             else:
                 pass
+        assert not scheduler.arrivals_by_request_id
+        assert not scheduler.cursors_by_session
     finally:
         scheduler.stop()
         worker.join(timeout=OUTBOX_TIMEOUT_S)
