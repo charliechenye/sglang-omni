@@ -428,6 +428,50 @@ def test_cancellation_during_open_closes_owned_state():
     scheduler.stop()
 
 
+def test_stop_retires_queued_session_operations():
+    scheduler = SessionScheduler(Hooks("source", queue.Queue()))
+    messages = [
+        IncomingMessage(
+            request_id,
+            "new_request",
+            session_stage_payload(request_id, operation),
+        )
+        for request_id, operation in (
+            ("queued-open", "open"),
+            ("queued-append", "append"),
+            ("queued-close", "close"),
+        )
+    ]
+    for message in messages:
+        scheduler.inbox.put(message)
+
+    scheduler.stop()
+
+    assert not scheduler.open_sessions
+    assert not scheduler.append_operation_states
+    assert not scheduler.arrivals_by_request_id
+    assert not scheduler.cursors_by_session
+
+
+def test_shutdown_retirement_survives_close_failure():
+    class BrokenCloseHooks(Hooks):
+        def close(self, session_identity: SessionIdentity) -> None:
+            raise RuntimeError("close failed")
+
+    scheduler = SessionScheduler(BrokenCloseHooks("source", queue.Queue()))
+    compute_registered(scheduler, session_stage_payload("open", "open"))
+    queued = session_stage_payload("queued-append", "append")
+    scheduler.inbox.put(IncomingMessage(queued.request_id, "new_request", queued))
+
+    with pytest.raises(RuntimeError, match="shutdown cleanup failed"):
+        scheduler.stop()
+
+    assert SessionIdentity("session") in scheduler.open_sessions
+    assert not scheduler.append_operation_states
+    assert not scheduler.arrivals_by_request_id
+    assert not scheduler.cursors_by_session
+
+
 def test_repeated_abort_and_close_do_not_leak_fenced_session():
     hooks = BlockingHooks()
     scheduler = SessionScheduler(hooks)

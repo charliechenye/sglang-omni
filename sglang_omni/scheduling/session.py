@@ -627,6 +627,10 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                     session.lock.release()
             else:
                 pass
+        with self.operation_finished:
+            # Stopping prevents queued operations from reaching compute.
+            for request_id in tuple(self.arrivals_by_request_id):
+                self.finish_operation_locked(request_id)
         if errors:
             raise RuntimeError("session shutdown cleanup failed") from errors[0]
         else:
