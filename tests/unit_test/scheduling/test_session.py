@@ -734,8 +734,11 @@ def test_abort_callback_retires_append_before_direct_compute_can_settle():
     identity = SessionIdentity("session")
     compute_registered(scheduler, session_stage_payload("open", "open", identity))
     payload = session_stage_payload("append", "append", identity)
+    successor_payload = session_stage_payload("successor", "append", identity)
     scheduler.inbox.put(IncomingMessage("append", "new_request", payload))
+    scheduler.inbox.put(IncomingMessage("successor", "new_request", successor_payload))
     message = scheduler.inbox.get_nowait()
+    successor_message = scheduler.inbox.get_nowait()
 
     signals: queue.Queue[str] = queue.Queue()
     compute_done = threading.Event()
@@ -758,16 +761,21 @@ def test_abort_callback_retires_append_before_direct_compute_can_settle():
     scheduler.abort_callback = observe_cancel
     abort = threading.Thread(target=scheduler.abort, args=("append",))
     abort.start()
-    signal = signals.get(timeout=5)
+    signal = ""
     try:
+        signal = signals.get(timeout=5)
         with pytest.raises(RuntimeError, match="terminal"):
             scheduler.compute(message.data)
     finally:
         compute_done.set()
         abort.join(timeout=5)
     assert not abort.is_alive()
-    assert signal in {"retirement_gap", "cancel_finished"}
+    assert signal == "cancel_finished"
+    with pytest.raises(ValueError, match="unknown session"):
+        scheduler.compute(successor_message.data)
     assert not scheduler.open_sessions
+    assert not scheduler.arrivals_by_request_id
+    assert not scheduler.cursors_by_session
     assert list(hooks.events.queue) == [
         ("open", "source", "session"),
         ("close", "source", "session"),

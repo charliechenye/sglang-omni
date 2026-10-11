@@ -659,7 +659,7 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                 pass
         with self.operation_finished:
             # note(chenye): Stop retires queued tickets and lets active hooks
-            # keep ownership ntil their settlement closes the session.
+            # keep ownership until their settlement closes the session.
             for request_id in tuple(self.arrivals_by_request_id):
                 self.finish_operation_locked(request_id)
         if errors:
