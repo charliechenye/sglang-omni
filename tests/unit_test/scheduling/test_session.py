@@ -117,7 +117,7 @@ def test_state_budget_is_per_session():
     invoke("one", "append")
     with pytest.raises(QueueFullError):
         invoke("one", "append")
-    # Note (Junnan Li): A failed session is closed at append settlement.
+    # Note (Junnan Li, chenye): A failed session is closed at append settlement.
     with pytest.raises(ValueError, match="unknown session"):
         invoke("one", "append")
     assert SessionIdentity("one") not in scheduler.open_sessions
@@ -699,7 +699,7 @@ def test_aborted_operation_never_invokes_append_hook():
     payload = session_stage_payload("late", "append")
     scheduler.inbox.put(IncomingMessage("late", "new_request", payload))
     message = scheduler.inbox.get_nowait()
-    # Note (Junnan Li): The accepted append is fenced even when abort is consumed first.
+    # Note (Junnan Li, chenye): The accepted append is fenced even when abort is consumed first.
     scheduler.abort("late")
     assert scheduler.consume_if_aborted("late")
     errors: list[BaseException] = []

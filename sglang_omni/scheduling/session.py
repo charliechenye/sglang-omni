@@ -339,9 +339,8 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                 self.mark_session_failed_locked(session_identity)
                 return False
             else:
-                pass
-            append_state.is_executing = True
-            return True
+                append_state.is_executing = True
+                return True
 
     def validate_append_completion(self, request_id: str) -> None:
         """Validate append completion while keeping its fence active."""
@@ -357,7 +356,7 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                     and session is not None
                     and not session.is_failed
                 )
-            # Note (Junnan Li): Shutdown already owns the terminal cleanup, so an
+            # Note (chenye): Shutdown already owns the terminal cleanup, so an
             # active hook that finishes normally must not turn stop into a request error.
             if append_state.cancelled.is_set() and not shutdown_owns_cleanup:
                 self.mark_session_failed_locked(append_state.session_identity)
@@ -448,7 +447,7 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
         operation_failed: bool = False,
         session_was_failed: bool = False,
     ) -> None:
-        # Note (Junnan Li): An active append remains fenced through local settlement,
+        # Note (chenye): An active append remains fenced through local settlement,
         # so a stage commit cannot be mistaken for end-to-end success.
         with self.session_table_lock:
             session = self.open_sessions.get(session_identity)
@@ -457,7 +456,8 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                 with self.operation_finished:
                     append_was_started = request_id in self.append_operation_states
                     arrival = self.arrivals_by_request_id.get(request_id)
-                    # A later append that only observes a terminal session does not own cleanup.
+                    # note(chenye): A later append that only observes a terminal session
+                    # does not own cleanup.
                     append_requires_cleanup = operation == "append" and (
                         append_was_started
                         or not session_was_failed
@@ -623,7 +623,7 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
 
     def cancel_operation(self, request_id: str) -> None:
         with self.operation_finished:
-            # Note (Junnan Li): Direct compute can race the abort callback before ticket retirement.
+            # Note (chenye): Direct compute can race the abort callback before ticket retirement.
             arrival = self.arrivals_by_request_id.get(request_id)
             if arrival is not None and arrival.operation == "open":
                 self.mark_session_failed_locked(arrival.session_identity)
@@ -658,8 +658,8 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
             else:
                 pass
         with self.operation_finished:
-            # Stop retires queued tickets and lets active hooks keep ownership
-            # until their settlement closes the session.
+            # note(chenye): Stop retires queued tickets and lets active hooks
+            # keep ownership ntil their settlement closes the session.
             for request_id in tuple(self.arrivals_by_request_id):
                 self.finish_operation_locked(request_id)
         if errors:
@@ -987,7 +987,7 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
                         session_was_failed.get(payload.request_id, False),
                     )
                 except Exception as exc:
-                    # Note (Junnan Li): Continue settling every row; a failed close
-                    # remains open and fail-closed for a later cleanup attempt.
+                    # Note (chenye): Continue settling every row; a failed close
+                    # remains open and fail closed for a later cleanup attempt.
                     results[payload.request_id] = exc
         return results
