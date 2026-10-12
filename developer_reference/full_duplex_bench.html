@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.7" />
-    <meta name="docbuild:last-update" content="Oct 11, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 12, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -525,6 +525,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#concurrent-runs">Concurrent runs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#full-duplex-bench-v1-0">Full-Duplex-Bench v1.0</a></li>
 </ul>
             </nav>
         </div>
@@ -540,6 +541,7 @@
 <h1>Full-Duplex-Bench v1.5 runbook<a class="headerlink" href="#full-duplex-bench-v1-5-runbook" title="Link to this heading">#</a></h1>
 <p>This page runs <a class="reference external" href="https://github.com/DanielLin94144/Full-Duplex-Bench">Full-Duplex-Bench</a> v1.5 against a native full-duplex model served by SGLang-Omni (MiniCPM-o 4.5 by default).</p>
 <p>Every step is a subcommand of <code class="docutils literal notranslate"><span class="pre">python</span> <span class="pre">-m</span> <span class="pre">benchmarks.duplex.fdb_v15</span></code>; the code lives in <code class="docutils literal notranslate"><span class="pre">benchmarks/duplex/fdb_v15/</span></code>.</p>
+<p>Full-Duplex-Bench v1.0 is scored separately; see Full-Duplex-Bench v1.0.</p>
 <section id="what-is-measured">
 <h2>What is Measured<a class="headerlink" href="#what-is-measured" title="Link to this heading">#</a></h2>
 <p>v1.5 has 498 sample pairs in four categories: <code class="docutils literal notranslate"><span class="pre">user_interruption</span></code> (200), <code class="docutils literal notranslate"><span class="pre">user_backchannel</span></code> (98), <code class="docutils literal notranslate"><span class="pre">talking_to_other</span></code> (100) and <code class="docutils literal notranslate"><span class="pre">background_speech</span></code> (100). Each pair contains two input audio files with the same initial user query. <code class="docutils literal notranslate"><span class="pre">input.wav</span></code> also includes a later speech event intended to overlap with the model’s answer: an interruption, a backchannel, speech directed at someone else, or background speech. <code class="docutils literal notranslate"><span class="pre">clean_input.wav</span></code> contains the initial query without that later event. Each file is streamed in a separate session, and the model’s output audio is recorded separately.</p>
@@ -1170,6 +1172,77 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.duplex.fdb_v1
 <p><code class="docutils literal notranslate"><span class="pre">generate</span></code> prints <code class="docutils literal notranslate"><span class="pre">Job</span> <span class="pre">GPU</span> <span class="pre">1:</span> <span class="pre">model</span> <span class="pre">port</span> <span class="pre">8107,</span> <span class="pre">judge</span> <span class="pre">port</span> <span class="pre">30010</span> <span class="pre">(nccl</span> <span class="pre">30011),</span> <span class="pre">judge</span> <span class="pre">config</span> <span class="pre">/data/chenyang/fdb/judge/port-30010</span></code> when <code class="docutils literal notranslate"><span class="pre">FDB_WORK</span></code> is <code class="docutils literal notranslate"><span class="pre">/data/chenyang/fdb</span></code>. <code class="docutils literal notranslate"><span class="pre">aggregate</span></code> writes <code class="docutils literal notranslate"><span class="pre">$FDB_WORK/runs/minicpmo-30-t2/RESULTS.md</span></code>.</p>
 <p>A third terminal is the same block with <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">CUDA_VISIBLE_DEVICES=2</span></code>, <code class="docutils literal notranslate"><span class="pre">--run-name</span> <span class="pre">minicpmo-30-t3</span></code>, model port 8117 and judge port 30020. Do not point two terminals at the same <code class="docutils literal notranslate"><span class="pre">--run-name</span></code>.</p>
 </section>
+<section id="full-duplex-bench-v1-0">
+<h2>Full-Duplex-Bench v1.0<a class="headerlink" href="#full-duplex-bench-v1-0" title="Link to this heading">#</a></h2>
+<p>v1.0 tests turn taking while the user is speaking: when the model should take the turn and when it should hold it. v1.5, above, plays overlapping speech while the model is speaking. v1.0 has 727 samples in five subsets, one session each:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Subset</p></th>
+<th class="head text-right"><p>Samples</p></th>
+<th class="head"><p>Task</p></th>
+<th class="head"><p>Data</p></th>
+<th class="head"><p>Reported numbers</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">synthetic_pause_handling</span></code></p></td>
+<td class="text-right"><p>137</p></td>
+<td><p>Pause handling</p></td>
+<td><p>Synthetic</p></td>
+<td><p>Takeover rate (lower is better)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">candor_pause_handling</span></code></p></td>
+<td class="text-right"><p>216</p></td>
+<td><p>Pause handling</p></td>
+<td><p>Candor</p></td>
+<td><p>Takeover rate (lower is better)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">candor_turn_taking</span></code></p></td>
+<td class="text-right"><p>119</p></td>
+<td><p>Smooth turn-taking</p></td>
+<td><p>Candor</p></td>
+<td><p>Takeover rate (higher), latency (lower)</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">synthetic_user_interruption</span></code></p></td>
+<td class="text-right"><p>200</p></td>
+<td><p>User interruption</p></td>
+<td><p>Synthetic</p></td>
+<td><p>Takeover rate (higher), latency (lower), relevance 0-5 (higher)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">icc_backchannel</span></code></p></td>
+<td class="text-right"><p>55</p></td>
+<td><p>Backchannel</p></td>
+<td><p>ICC</p></td>
+<td><p>Takeover rate (lower), frequency, timing JSD to human backchannels (lower)</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>The reference path is the primary result. It runs the pinned Full-Duplex-Bench <code class="docutils literal notranslate"><span class="pre">get_transcript/asr.py</span></code> and <code class="docutils literal notranslate"><span class="pre">evaluation/evaluate.py</span></code> unchanged (revision <code class="docutils literal notranslate"><span class="pre">3e799c4</span></code>, SHA-256 checked) on the native recordings. Call these numbers pinned-reference scoring under the SGLang-Omni capture protocol: capture, VAD and judge versions can differ from the paper, so they are not directly comparable to published rows.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">OUT</span><span class="o">=</span>results/fdb10
+python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_duplex_v10<span class="w"> </span>record<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--profile<span class="w"> </span>nemotron-voicechat-pr2188<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset-root<span class="w"> </span><span class="s2">"</span><span class="nv">$FDB10_DATASET</span><span class="s2">"</span><span class="w"> </span>--dataset-revision<span class="w"> </span><span class="s2">"</span><span class="nv">$FDB10_REVISION</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--url<span class="w"> </span><span class="s2">"</span><span class="nv">$REALTIME_URL</span><span class="s2">"</span><span class="w"> </span>--model<span class="w"> </span><span class="s2">"</span><span class="nv">$MODEL_ID</span><span class="s2">"</span><span class="w"> </span>--model-revision<span class="w"> </span><span class="s2">"</span><span class="nv">$MODEL_REVISION</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--server-revision<span class="w"> </span><span class="s2">"</span><span class="k">$(</span>git<span class="w"> </span>rev-parse<span class="w"> </span>HEAD<span class="k">)</span><span class="s2">"</span><span class="w"> </span>--output<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/recording"</span>
+python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_duplex_v10<span class="w"> </span>reference-export<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--run<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/recording"</span><span class="w"> </span>--dataset-root<span class="w"> </span><span class="s2">"</span><span class="nv">$FDB10_DATASET</span><span class="s2">"</span><span class="w"> </span>--out<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/reference"</span>
+python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_duplex_v10<span class="w"> </span>reference-asr<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tree<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/reference"</span><span class="w"> </span>--reference-source<span class="w"> </span><span class="s2">"</span><span class="nv">$FDB_SOURCE</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--nemo<span class="w"> </span><span class="s2">"</span><span class="nv">$PARAKEET_NEMO</span><span class="s2">"</span><span class="w"> </span>--nemo-sha256<span class="w"> </span><span class="s2">"</span><span class="nv">$PARAKEET_SHA256</span><span class="s2">"</span><span class="w"> </span>--device<span class="w"> </span>cuda
+python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_duplex_v10<span class="w"> </span>reference-evaluate<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tree<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/reference"</span><span class="w"> </span>--reference-source<span class="w"> </span><span class="s2">"</span><span class="nv">$FDB_SOURCE</span><span class="s2">"</span>
+</pre></div>
+</div>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">reference-export</span></code> writes <code class="docutils literal notranslate"><span class="pre">&lt;subset&gt;/&lt;id&gt;/output.wav</span></code> (mono 16 kHz PCM16 over <code class="docutils literal notranslate"><span class="pre">[0,</span> <span class="pre">T]</span></code>, the same observation window as v1.5) and the sample’s dataset annotation into a new directory, with <code class="docutils literal notranslate"><span class="pre">manifest.json</span></code> at the top. Repeat <code class="docutils literal notranslate"><span class="pre">--run</span></code> for shards; a later run may replace an incomplete capture, and a sample captured completely twice is an error. Ineligible sessions get no sample folder and stay in <code class="docutils literal notranslate"><span class="pre">manifest.json</span></code> with their reasons.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">reference-asr</span></code> transcribes every sample with the local Parakeet checkpoint (CUDA graph decoding off). For user interruption it cuts the audio at the end of the interruption and shifts the word times back, so the transcript holds only the response. It writes <code class="docutils literal notranslate"><span class="pre">output.json</span></code> per sample and the receipt <code class="docutils literal notranslate"><span class="pre">asr.json</span></code>, and refuses to run twice on one tree.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">reference-evaluate</span></code> runs <code class="docutils literal notranslate"><span class="pre">evaluate.py</span></code> for each subset with the current interpreter and saves the printed <code class="docutils literal notranslate"><span class="pre">[Result]</span></code> numbers, the selected and evaluated counts and the log path per subset in <code class="docutils literal notranslate"><span class="pre">summary.json</span></code>. Synthetic and Candor pause handling are separate rows and are never pooled. <code class="docutils literal notranslate"><span class="pre">--subset</span></code> evaluates only the named subsets; the others can be added later, and repeating a subset needs a new export. The scoring venv also needs <code class="docutils literal notranslate"><span class="pre">python-dotenv</span></code> (imported by <code class="docutils literal notranslate"><span class="pre">evaluate.py</span></code>) and <code class="docutils literal notranslate"><span class="pre">torchcodec</span></code>, so that torchaudio 2.11 can read WAV files for backchannel.</p></li>
+</ul>
+<p><strong>Interruption relevance.</strong> The pinned evaluator requests <code class="docutils literal notranslate"><span class="pre">gpt-4-turbo</span></code> with seed 0 for every interruption the model takes over, although the benchmark README labels this column GPT-4o. It needs a key in <code class="docutils literal notranslate"><span class="pre">OPENAI_API_KEY</span></code> (or <code class="docutils literal notranslate"><span class="pre">--api-key-env</span></code>); without one, evaluate the other subsets with <code class="docutils literal notranslate"><span class="pre">--subset</span></code>. <code class="docutils literal notranslate"><span class="pre">--base-url</span> <span class="pre">URL</span> <span class="pre">--served-model</span> <span class="pre">NAME</span></code> sends the identical requests to a self-hosted OpenAI-compatible judge, and <code class="docutils literal notranslate"><span class="pre">summary.json</span></code> then marks relevance <code class="docutils literal notranslate"><span class="pre">&quot;official&quot;:</span> <span class="pre">false</span></code>. Every exchange is appended to <code class="docutils literal notranslate"><span class="pre">judge/user-interruption-&lt;UTC</span> <span class="pre">time&gt;.jsonl</span></code>.</p>
+<p><strong>Retry bug in the pinned evaluator.</strong> When a rating does not parse, it resends the identical request without limit, and it has already appended that sample’s takeover, so each retry counts the sample again in the takeover rate. Each parsed rating is also appended twice, which leaves the mean unchanged. The client stops after three identical requests, which fails the run, and <code class="docutils literal notranslate"><span class="pre">summary.json</span></code> reports <code class="docutils literal notranslate"><span class="pre">retries</span></code>. A nonzero value means the interruption takeover rate is inflated.</p>
+<p><strong>Diagnostic score.</strong> <code class="docutils literal notranslate"><span class="pre">transcribe</span></code> and <code class="docutils literal notranslate"><span class="pre">score</span></code> (<code class="docutils literal notranslate"><span class="pre">fdb-v10-synthetic-v4</span></code>) remain as a diagnostic, not the headline. It windows words to the input, uses its own backchannel classifier and adds gates the reference evaluator does not have: turn-taking samples where the model already speaks at the turn end, interruptions where the model was silent at the onset (<code class="docutils literal notranslate"><span class="pre">not_exercised</span></code>), and interruptions it talks straight through. Report its gate counts next to the reference numbers, never in their place.</p>
+</section>
 </section>
 
 
@@ -1242,6 +1315,7 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.duplex.fdb_v1
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#concurrent-runs">Concurrent runs</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#full-duplex-bench-v1-0">Full-Duplex-Bench v1.0</a></li>
 </ul>
   </nav></div>
 
@@ -1275,7 +1349,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 11, 2026.
+  Last updated on Oct 12, 2026.
   <br/>
 </p>
   </div>
