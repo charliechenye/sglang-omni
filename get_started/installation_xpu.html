@@ -217,6 +217,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/higgs_tts.html">Higgs TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/voxtral_tts.html">Voxtral TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/fishaudio_s2_pro.html">Fish Audio S2-Pro</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/fishaudio_drama3.html">Fish Audio Drama 3</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_tts.html">Qwen3 TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/ming_tts.html">Ming-Omni-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/moss_tts.html">MOSS-TTS</a></li>
@@ -534,6 +535,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#personaplex-speech-to-speech-single-xpu">PersonaPlex (speech-to-speech, single XPU)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-omni-30b-a3b-moe-multi-xpu-tensor-parallel">Qwen3-Omni (30B-A3B MoE, multi-XPU tensor parallel)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#minimax-music-3-text-to-music-two-xpus">MiniMax Music 3 (text-to-music, two XPUs)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ming-omni-omni-chat-and-speech-one-or-two-xpus">Ming-Omni (omni chat and speech, one or two XPUs)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ming-omni-tts-16-8b-a3b-moe-two-xpus">Ming-Omni-TTS (16.8B-A3B MoE, two XPUs)</a></li>
 </ul>
 </li>
@@ -560,13 +562,13 @@ XPU wheel index.</p>
 <p><code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">-e</span> <span class="pre">.</span></code> resolves the CUDA <a class="reference download internal" download="" href="../_downloads/079962c730e6e61f3f9971f670e9cf70/pyproject.toml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">pyproject.toml</span></code></span></a>, whose torch
 family and CUDA-only wheels would replace the <code class="docutils literal notranslate"><span class="pre">+xpu</span></code> stack.
 <a class="reference download internal" download="" href="../_downloads/e6282636738987ea324fd398b24bcb06/pyproject_xpu.toml"><span class="xref download myst"><code class="docutils literal notranslate"><span class="pre">pyproject_xpu.toml</span></code></span></a> encodes the XPU replacements.</p>
-<p>Core deps cover the supported models (Qwen3-ASR / TTS / Omni / MiniMax Music 3, Whisper ASR, Fun-ASR-Nano, Nemotron 3.5 ASR, MOSS-Transcribe-Diarize, MiniCPM-o, Ming-Omni-TTS, PersonaPlex, AuK/AuK-Flash and dots.tts) plus the API server;
+<p>Core deps cover the supported models (Qwen3-ASR / TTS / Omni / MiniMax Music 3, Whisper ASR, Fun-ASR-Nano, Nemotron 3.5 ASR, MOSS-Transcribe-Diarize, MiniCPM-o, Ming-Omni, Ming-Omni-TTS, PersonaPlex, AuK/AuK-Flash and dots.tts) plus the API server;
 <code class="docutils literal notranslate"><span class="pre">[eval]</span></code> adds SeedTTS/WER tooling and <code class="docutils literal notranslate"><span class="pre">[all]</span></code> aliases it. <code class="docutils literal notranslate"><span class="pre">[fun-cosyvoice3]</span></code> adds
 that model’s CosyVoice dependencies — see
 <a class="reference internal" href="#fun-cosyvoice3-text-to-speech-single-xpu"><span class="std std-ref">Fun-CosyVoice3</span></a>. ZONOS2 also serves here,
 but its DAC codec is not a core dep on any platform — see
 <a class="reference internal" href="#zonos2-moe-tts-single-xpu"><span class="std std-ref">ZONOS2</span></a> for the XPU-safe way to add it. Other model
-families (S2-Pro, Ming-Omni, Voxtral-TTS) are CUDA-only and are not offered here.</p>
+families (S2-Pro, Voxtral-TTS) are CUDA-only and are not offered here.</p>
 <blockquote>
 <div><p><strong><code class="docutils literal notranslate"><span class="pre">--no-build-isolation</span></code> is required</strong> — without it pip emits a legacy in-tree
 <code class="docutils literal notranslate"><span class="pre">egg-info</span></code> instead of a PEP 660 editable install. The installer always passes it.
@@ -1005,6 +1007,42 @@ curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </spa
 </pre></div>
 </div>
 </section>
+<section id="ming-omni-omni-chat-and-speech-one-or-two-xpus">
+<h3>Ming-Omni (omni chat and speech, one or two XPUs)<a class="headerlink" href="#ming-omni-omni-chat-and-speech-one-or-two-xpus" title="Link to this heading">#</a></h3>
+<p>Ming-flash-omni-2.0’s thinker holds 194 GiB of bf16 weights, so on 24 GB cards it runs TP=1 with
+<code class="docutils literal notranslate"><span class="pre">cpu_offload_gb</span> <span class="pre">190</span></code>. Offload re-uploads weights inside a captured region and outside the KV budget,
+so disable the decode graph and keep <code class="docutils literal notranslate"><span class="pre">--mem-fraction-static</span></code> at 0.30. Staging the offloaded weights
+can take longer than the default 600 s startup timeout.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">SGLANG_OMNI_STARTUP_TIMEOUT</span><span class="o">=</span><span class="m">1800</span>
+<span class="c1"># omni chat (text, image, audio and video in, text out) on one card</span>
+<span class="nv">ZE_AFFINITY_MASK</span><span class="o">=</span><span class="m">0</span><span class="w"> </span>sgl-omni<span class="w"> </span>serve<span class="w"> </span>--model-path<span class="w"> </span>inclusionAI/Ming-flash-omni-2.0<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-name<span class="w"> </span>ming-omni<span class="w"> </span>--text-only<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--thinker.tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span>--thinker.gpu<span class="w"> </span><span class="m">0</span><span class="w"> </span>--audio_encoder.gpu<span class="w"> </span><span class="m">0</span><span class="w"> </span>--image_encoder.gpu<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.30<span class="w"> </span>--thinker.engine.cpu_offload_gb<span class="w"> </span><span class="m">190</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--thinker.engine.cuda_graph_backend_decode<span class="w"> </span>disabled<span class="w"> </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span>
+curl<span class="w"> </span>-s<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>-d<span class="w"> </span><span class="s1">'{"model":"ming-omni","messages":[{"role":"user","content":"What is Intel XPU?"}],"max_tokens":64}'</span>
+</pre></div>
+</div>
+<p>Speech needs a voice preset, and the published checkpoint ships no <code class="docutils literal notranslate"><span class="pre">talker/data</span></code>. Register a short
+reference recording and its transcript in the downloaded checkpoint, then select it with
+<code class="docutils literal notranslate"><span class="pre">--talker.factory.voice</span></code>; the talker takes a second card:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">MING</span><span class="o">=</span>/path/to/Ming-flash-omni-2.0
+mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span><span class="nv">$MING</span><span class="s2">/talker/data"</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>cp<span class="w"> </span>/path/to/reference.wav<span class="w"> </span><span class="s2">"</span><span class="nv">$MING</span><span class="s2">/talker/data/en_ref.wav"</span>
+cat<span class="w"> </span>&gt;<span class="w"> </span><span class="s2">"</span><span class="nv">$MING</span><span class="s2">/talker/data/voice_name.json"</span><span class="w"> </span><span class="s">&lt;&lt;'EOF'</span>
+<span class="s">{"EN_REF": {"prompt_text": "Transcript of reference.wav.", "prompt_wav_path": "data/en_ref.wav"}}</span>
+<span class="s">EOF</span>
+<span class="nv">ZE_AFFINITY_MASK</span><span class="o">=</span><span class="m">0</span>,1<span class="w"> </span>sgl-omni<span class="w"> </span>serve<span class="w"> </span>--model-path<span class="w"> </span><span class="s2">"</span><span class="nv">$MING</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-name<span class="w"> </span>ming-omni<span class="w"> </span>--talker.factory.voice<span class="w"> </span>EN_REF<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--thinker.tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span>--thinker.gpu<span class="w"> </span><span class="m">0</span><span class="w"> </span>--audio_encoder.gpu<span class="w"> </span><span class="m">0</span><span class="w"> </span>--image_encoder.gpu<span class="w"> </span><span class="m">0</span><span class="w"> </span>--talker.gpu<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.30<span class="w"> </span>--thinker.engine.cpu_offload_gb<span class="w"> </span><span class="m">190</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--thinker.engine.cuda_graph_backend_decode<span class="w"> </span>disabled<span class="w"> </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p>Each decode step streams the offloaded weights to the card (about 7 s per token on an Arc Pro B60),
+so concurrent requests raise throughput almost linearly.</p>
+</section>
 <section id="ming-omni-tts-16-8b-a3b-moe-two-xpus">
 <h3>Ming-Omni-TTS (16.8B-A3B MoE, two XPUs)<a class="headerlink" href="#ming-omni-tts-16-8b-a3b-moe-two-xpus" title="Link to this heading">#</a></h3>
 <p>The bf16 AR backbone does not fit one 24 GB card, so <code class="docutils literal notranslate"><span class="pre">tts_engine</span></code> runs with TP=2. Its joint
@@ -1034,9 +1072,10 @@ in a graph.</p>
 </div></blockquote>
 <blockquote>
 <div><p>✅ Support status: <strong>Qwen3-ASR, Whisper ASR, Fun-ASR-Nano, Nemotron 3.5 ASR, MOSS-Transcribe-Diarize, Qwen3-TTS, Fun-CosyVoice3, ZONOS2,
-Qwen3-Omni, MiniMax Music 3, MiniCPM-o, Ming-Omni-TTS, PersonaPlex, AuK/AuK-Flash and dots.tts all serve end-to-end on Intel XPU</strong>
+Qwen3-Omni, MiniMax Music 3, MiniCPM-o, Ming-Omni, Ming-Omni-TTS, PersonaPlex, AuK/AuK-Flash and dots.tts all serve end-to-end on Intel XPU</strong>
 (Qwen3-ASR, Whisper ASR, Fun-ASR-Nano, Nemotron 3.5 ASR, MOSS-Transcribe-Diarize, Qwen3-TTS, Fun-CosyVoice3, MiniCPM-o, PersonaPlex, AuK/AuK-Flash and dots.tts single-card;
 ZONOS2 single-card with decode graphs; MiniMax Music 3 and Ming-Omni-TTS need two cards;
+Ming-Omni chat single-card and speech two-card, with the thinker offloaded to host memory;
 Qwen3-Omni thinker across 8 cards with tensor parallelism).</p>
 </div></blockquote>
 </section>
@@ -1118,6 +1157,7 @@ Qwen3-Omni thinker across 8 cards with tensor parallelism).</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#personaplex-speech-to-speech-single-xpu">PersonaPlex (speech-to-speech, single XPU)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-omni-30b-a3b-moe-multi-xpu-tensor-parallel">Qwen3-Omni (30B-A3B MoE, multi-XPU tensor parallel)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#minimax-music-3-text-to-music-two-xpus">MiniMax Music 3 (text-to-music, two XPUs)</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ming-omni-omni-chat-and-speech-one-or-two-xpus">Ming-Omni (omni chat and speech, one or two XPUs)</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ming-omni-tts-16-8b-a3b-moe-two-xpus">Ming-Omni-TTS (16.8B-A3B MoE, two XPUs)</a></li>
 </ul>
 </li>
