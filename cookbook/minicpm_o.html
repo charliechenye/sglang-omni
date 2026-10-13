@@ -509,6 +509,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#normal-usage">Normal Usage</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#video-chat-inputs">Video Chat Inputs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-full-duplex-ability">Native Full-Duplex Ability</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#browser-demo">Browser demo</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#full-duplex-protocol">Full-duplex protocol</a></li>
@@ -583,6 +584,22 @@
 <span class="nb">print</span><span class="p">(</span><span class="n">message</span><span class="o">.</span><span class="n">audio</span><span class="o">.</span><span class="n">transcript</span> <span class="ow">or</span> <span class="n">message</span><span class="o">.</span><span class="n">content</span><span class="p">)</span>
 </pre></div>
 </div>
+</section>
+<section id="video-chat-inputs">
+<h2>Video Chat Inputs<a class="headerlink" href="#video-chat-inputs" title="Link to this heading">#</a></h2>
+<p>Chat accepts inline video_url content and top-level video or videos fields.
+Top-level requests without use_audio_in_video retain the existing shared video
+sampling and resizing policy. They place explicit images, video frames, and
+independent audio before the final user message’s text, in that order.
+Predecoded video tensors remain supported, including mixed file/tensor inputs.</p>
+<p>Inline videos and top-level requests with use_audio_in_video use MiniCPM timed
+video sampling. Set use_audio on an inline video, or use_audio_in_video on a
+top-level request, to include interleaved audio from file or URL sources.
+Top-level interleaved videos follow explicit images and independent audio.</p>
+<p>Timed video frames retain native resolution by default; the MiniCPM image processor
+performs the final resize. video_max_frames limits the sampled frame count,
+while video_max_pixels and video_total_pixels resize frames after decoding.
+Those pixel options do not bound the initial native-resolution allocation.</p>
 </section>
 <section id="native-full-duplex-ability">
 <h2>Native Full-Duplex Ability<a class="headerlink" href="#native-full-duplex-ability" title="Link to this heading">#</a></h2>
@@ -765,6 +782,7 @@
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#normal-usage">Normal Usage</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#video-chat-inputs">Video Chat Inputs</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-full-duplex-ability">Native Full-Duplex Ability</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#browser-demo">Browser demo</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#full-duplex-protocol">Full-duplex protocol</a></li>
