@@ -511,7 +511,10 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#server-configuration">Server Configuration</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#transcribe-audio">Transcribe Audio</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-streaming">Native Streaming</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-streaming">Native Streaming</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#persistent-encoder-state-pool">Persistent encoder state pool</a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -770,8 +773,18 @@ validated and counted toward duration without further inference or buffering.
 Budget errors after stage acceptance terminate the stream; they are not a
 promise that retrying the same seq is safe. Public admission rejection follows
 the shared runtime’s sequence/retry contract.</p>
+<section id="persistent-encoder-state-pool">
+<h3>Persistent encoder state pool<a class="headerlink" href="#persistent-encoder-state-pool" title="Link to this heading">#</a></h3>
+<p>Streaming preallocates a bounded pool for attention and convolution history.
+Each session leases one slot, and batches address state by slot ID, preserving
+stable device storage across audio windows.</p>
+<p>Capacity is limited by <code class="docutils literal notranslate"><span class="pre">max_open_sessions</span></code> and <code class="docutils literal notranslate"><span class="pre">max_state_bytes</span></code>; a budget too
+small for one slot fails at startup. Completion, cancellation, failure and
+shutdown release slots, which are cleared before reuse. The pool is the sole
+streaming encoder state representation. Offline transcription is unchanged.</p>
 <p>Setting stream=true on /v1/audio/transcriptions streams the response to a
 complete uploaded file. It does not select native PCM input.</p>
+</section>
 </section>
 </section>
 
@@ -826,7 +839,10 @@ complete uploaded file. It does not select native PCM input.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#server-configuration">Server Configuration</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#transcribe-audio">Transcribe Audio</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-streaming">Native Streaming</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#native-streaming">Native Streaming</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#persistent-encoder-state-pool">Persistent encoder state pool</a></li>
+</ul>
+</li>
 </ul>
   </nav></div>
 
