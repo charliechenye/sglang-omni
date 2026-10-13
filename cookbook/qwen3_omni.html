@@ -42,7 +42,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
-    <script src="../_static/documentation_options.js?v=3476fdda"></script>
+    <script src="../_static/documentation_options.js?v=7ed07c24"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -60,8 +60,8 @@
     <link rel="prev" title="Whisper ASR" href="whisper_asr.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.1.7" />
-    <meta name="docbuild:last-update" content="Oct 12, 2026"/>
+  <meta name="docsearch:version" content="0.1.8" />
+    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -266,7 +266,10 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/reference_encode_service.html">Reference Encode Service</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/qwen3_asr_concurrency_profile.html">Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_bench.html">Full-Duplex-Bench v1.5 runbook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_bench.html">Full-Duplex-Bench runbook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/tts_bench.html">TTS benchmark runbook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/asr_bench.html">ASR benchmark runbook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/omni_offline_bench.html">MiniCPM-o offline benchmark runbook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/rl_admin_control.html">RL Admin Control</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/bump_version.html">Bumping the SGLang Pin</a></li>
 </ul>
@@ -537,7 +540,7 @@ docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </s
 pip<span class="w"> </span>install<span class="w"> </span>uv
 
 uv<span class="w"> </span>venv<span class="w"> </span>.venv<span class="w"> </span>-p<span class="w"> </span><span class="m">3</span>.12<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">source</span><span class="w"> </span>.venv/bin/activate
-uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--prerelease<span class="o">=</span>allow<span class="w"> </span><span class="s2">"sglang-omni==0.1.7"</span>
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--prerelease<span class="o">=</span>allow<span class="w"> </span><span class="s2">"sglang-omni==0.1.8"</span>
 </pre></div>
 </div>
 <p>See <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a> for Docker digests and source installs.</p>
@@ -898,7 +901,7 @@ must check for an <code class="docutils literal notranslate"><span class="pre">e
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">modalities:</span> <span class="pre">[&quot;text&quot;,</span> <span class="pre">&quot;audio&quot;]</span></code> has no effect on a text-only server.</strong> No error is raised — the response simply contains no audio. Use a speech-mode server (without <code class="docutils literal notranslate"><span class="pre">--text-only</span></code>) to get audio output.</p></li>
 <li><p><strong><code class="docutils literal notranslate"><span class="pre">content</span></code> must be <code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code> when the query is entirely in <code class="docutils literal notranslate"><span class="pre">audios</span></code>, <code class="docutils literal notranslate"><span class="pre">videos</span></code>, or <code class="docutils literal notranslate"><span class="pre">images</span></code>.</strong> Leaving a text query in <code class="docutils literal notranslate"><span class="pre">content</span></code> alongside audio causes the model to process both, which is usually not what you want.</p></li>
 <li><p><strong>Colocated topology does not support <code class="docutils literal notranslate"><span class="pre">--thinker.tp_size</span> <span class="pre">2</span></code>.</strong> The server raises a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> at startup (“Qwen Phase 1 colocation does not support thinker TP”). Use disaggregated topology for TP=2.</p></li>
-<li><p><strong>Requests that exceed the model’s context length are rejected with an error.</strong> The preprocessor raises a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> when the prompt token count alone meets or exceeds <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, or when <code class="docutils literal notranslate"><span class="pre">prompt</span> <span class="pre">tokens</span> <span class="pre">+</span> <span class="pre">max_new_tokens</span> <span class="pre">≥</span> <span class="pre">max_seq_len</span></code>. Reduce input length or lower <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> to stay within the limit.</p></li>
+<li><p><strong>Requests that exceed the model’s context length are rejected with an error.</strong> The preprocessor raises a <code class="docutils literal notranslate"><span class="pre">ValueError</span></code> when the prompt token count alone meets or exceeds <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>, or when <code class="docutils literal notranslate"><span class="pre">prompt</span> <span class="pre">tokens</span> <span class="pre">+</span> <span class="pre">max_new_tokens</span> <span class="pre">≥</span> <span class="pre">max_seq_len</span></code>. Reduce input length or lower <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> to stay within the limit. Without <code class="docutils literal notranslate"><span class="pre">--preprocessing.factory.max_seq_len</span></code> and <code class="docutils literal notranslate"><span class="pre">--thinker.factory.max_seq_len</span></code>, the limit is the thinker’s context in the checkpoint config (65,536 tokens for the Instruct checkpoint). Setting both to a lower value caps it. The talker’s context is likewise the checkpoint’s unless <code class="docutils literal notranslate"><span class="pre">--talker_ar.factory.max_seq_len</span></code> sets it. When a long spoken prompt leaves less room than <code class="docutils literal notranslate"><span class="pre">talker_max_new_tokens</span></code>, the talker generates only the frames that fit, so the audio can end before the text.</p></li>
 </ul>
 </section>
 </section>
@@ -992,7 +995,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 12, 2026.
+  Last updated on Oct 13, 2026.
   <br/>
 </p>
   </div>
