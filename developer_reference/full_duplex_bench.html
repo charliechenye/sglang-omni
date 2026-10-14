@@ -56,12 +56,12 @@
     <link rel="icon" href="../_static/logo.ico"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="TTS benchmark runbook" href="tts_bench.html" />
+    <link rel="next" title="Full-Duplex-Bench v1.0 unified metrics" href="full_duplex_metrics.html" />
     <link rel="prev" title="Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile" href="qwen3_asr_concurrency_profile.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.8" />
-    <meta name="docbuild:last-update" content="Oct 13, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -268,6 +268,7 @@
 <li class="toctree-l1"><a class="reference internal" href="profiler.html">Request-level profiler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="qwen3_asr_concurrency_profile.html">Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Full-Duplex-Bench runbook</a></li>
+<li class="toctree-l1"><a class="reference internal" href="full_duplex_metrics.html">Full-Duplex-Bench v1.0 unified metrics</a></li>
 <li class="toctree-l1"><a class="reference internal" href="tts_bench.html">TTS benchmark runbook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="asr_bench.html">ASR benchmark runbook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="omni_offline_bench.html">MiniCPM-o offline benchmark runbook</a></li>
@@ -1077,7 +1078,7 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.duplex.fdb<sp
 <h2>Notes<a class="headerlink" href="#notes" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p><strong>Keep the settings fixed across the repeats of a run.</strong> Mixing repeats with different selections, <code class="docutils literal notranslate"><span class="pre">--num-shards</span></code> or judges makes their mean meaningless; use a new run name instead.</p></li>
-<li><p><strong><code class="docutils literal notranslate"><span class="pre">--num-shards</span></code> changes what you measure.</strong> With <code class="docutils literal notranslate"><span class="pre">--num-shards</span> <span class="pre">2</span></code>, two sessions share the GPU, so the latencies are measured under load and do not compare with one shard. The model server accepts at most 2 sessions; a third connection gets HTTP 503.</p></li>
+<li><p><strong><code class="docutils literal notranslate"><span class="pre">--num-shards</span></code> changes what you measure.</strong> With <code class="docutils literal notranslate"><span class="pre">--num-shards</span> <span class="pre">2</span></code>, two sessions share the GPU, so the latencies are measured under load and do not compare with one shard. The model server keeps <code class="docutils literal notranslate"><span class="pre">max_sessions</span></code> at 2, so <code class="docutils literal notranslate"><span class="pre">generate</span></code> refuses a larger value up front.</p></li>
 <li><p><strong>The first N samples are not a random sample.</strong> They give fast numbers that compare between runs, not estimates for the full dataset.</p></li>
 <li><p><strong>Failed sessions are never dropped.</strong> They stay in the denominators as ineligible, and an empty set of intervals shows as <code class="docutils literal notranslate"><span class="pre">n/a</span></code>, not as zero.</p></li>
 </ul>
@@ -1124,43 +1125,46 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.duplex.fdb<sp
 <tr class="row-even"><td><p>A shard log reports <code class="docutils literal notranslate"><span class="pre">fail</span></code> or <code class="docutils literal notranslate"><span class="pre">error</span></code> sessions</p></td>
 <td><p>They stay in the denominators. Read <code class="docutils literal notranslate"><span class="pre">repeat-N/logs/record-shard-*.log</span></code> or <code class="docutils literal notranslate"><span class="pre">repeat-N/v10/logs/record-shard-*.log</span></code>; if most sessions fail, fix the server and redo the repeat</p></td>
 </tr>
-<tr class="row-odd"><td><p>HTTP 503 in a record log</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">--num-shards</span></code> is above 2</p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ERROR:</span> <span class="pre">--num-shards</span> <span class="pre">N</span> <span class="pre">exceeds</span> <span class="pre">the</span> <span class="pre">model</span> <span class="pre">server's</span> <span class="pre">max_sessions</span></code></p></td>
+<td><p>Lower <code class="docutils literal notranslate"><span class="pre">--num-shards</span></code>; <code class="docutils literal notranslate"><span class="pre">generate</span></code> refuses values above the server capacity before recording</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ERROR:</span> <span class="pre">set</span> <span class="pre">CUDA_VISIBLE_DEVICES</span> <span class="pre">to</span> <span class="pre">exactly</span> <span class="pre">one</span> <span class="pre">GPU</span> <span class="pre">index</span></code>, or <code class="docutils literal notranslate"><span class="pre">--device</span> <span class="pre">cuda</span> <span class="pre">needs</span> <span class="pre">exactly</span> <span class="pre">one</span> <span class="pre">visible</span> <span class="pre">GPU</span></code></p></td>
+<tr class="row-even"><td><p>HTTP 503 in a record log</p></td>
+<td><p>Another client may hold the server’s sessions; check for competing recordings</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ERROR:</span> <span class="pre">set</span> <span class="pre">CUDA_VISIBLE_DEVICES</span> <span class="pre">to</span> <span class="pre">exactly</span> <span class="pre">one</span> <span class="pre">GPU</span> <span class="pre">index</span></code>, or <code class="docutils literal notranslate"><span class="pre">--device</span> <span class="pre">cuda</span> <span class="pre">needs</span> <span class="pre">exactly</span> <span class="pre">one</span> <span class="pre">visible</span> <span class="pre">GPU</span></code></p></td>
 <td><p>Export a single index, a different one in each terminal</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ERROR:</span> <span class="pre">GPU</span> <span class="pre">and</span> <span class="pre">CUDA_VISIBLE_DEVICES</span> <span class="pre">disagree</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ERROR:</span> <span class="pre">GPU</span> <span class="pre">and</span> <span class="pre">CUDA_VISIBLE_DEVICES</span> <span class="pre">disagree</span></code></p></td>
 <td><p>Unset <code class="docutils literal notranslate"><span class="pre">GPU</span></code>, or set it to the same index</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">WARNING:</span> <span class="pre">a</span> <span class="pre">v1.5</span> <span class="pre">phase</span> <span class="pre">reported</span> <span class="pre">failures</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">WARNING:</span> <span class="pre">a</span> <span class="pre">v1.5</span> <span class="pre">phase</span> <span class="pre">reported</span> <span class="pre">failures</span></code></p></td>
 <td><p>Rerun the command the warning prints; it adds <code class="docutils literal notranslate"><span class="pre">--retry-failed</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">WARNING:</span> <span class="pre">the</span> <span class="pre">v1.0</span> <span class="pre">ASR</span> <span class="pre">failed</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">WARNING:</span> <span class="pre">the</span> <span class="pre">v1.0</span> <span class="pre">ASR</span> <span class="pre">failed</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">repeat-N/v10/reference/logs/asr.log</span></code> has the official script’s output and the terminal has the traceback. A rerun of <code class="docutils literal notranslate"><span class="pre">asr</span></code> transcribes every v1.0 sample again</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">WARNING:</span> <span class="pre">the</span> <span class="pre">v1.0</span> <span class="pre">evaluation</span> <span class="pre">failed</span> <span class="pre">for</span> <span class="pre">...</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">WARNING:</span> <span class="pre">the</span> <span class="pre">v1.0</span> <span class="pre">evaluation</span> <span class="pre">failed</span> <span class="pre">for</span> <span class="pre">...</span></code></p></td>
 <td><p>The traceback is at the end of <code class="docutils literal notranslate"><span class="pre">repeat-N/v10/reference/logs/evaluate-&lt;subset&gt;.log</span></code>. A <code class="docutils literal notranslate"><span class="pre">ZeroDivisionError</span></code> in <code class="docutils literal notranslate"><span class="pre">candor_turn_taking</span></code> or <code class="docutils literal notranslate"><span class="pre">synthetic_user_interruption</span></code> means no selected sample took the turn, so select more samples in a new run. After fixing another cause, rerun <code class="docutils literal notranslate"><span class="pre">judge</span></code>; it evaluates the missing subsets again</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">judge</span> <span class="pre">request</span> <span class="pre">...</span> <span class="pre">got</span> <span class="pre">no</span> <span class="pre">parsable</span> <span class="pre">rating</span> <span class="pre">in</span> <span class="pre">3</span> <span class="pre">attempts</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">judge</span> <span class="pre">request</span> <span class="pre">...</span> <span class="pre">got</span> <span class="pre">no</span> <span class="pre">parsable</span> <span class="pre">rating</span> <span class="pre">in</span> <span class="pre">3</span> <span class="pre">attempts</span></code></p></td>
 <td><p>The v1.0 relevance judge answered without a rating; the ledger in <code class="docutils literal notranslate"><span class="pre">v10/reference/judge/</span></code> has each reply. The official parser needs <code class="docutils literal notranslate"><span class="pre">Analysis:</span> <span class="pre">&lt;text&gt;</span></code>, a line break, then <code class="docutils literal notranslate"><span class="pre">I</span> <span class="pre">would</span> <span class="pre">rate</span> <span class="pre">the</span> <span class="pre">AI's</span> <span class="pre">response</span> <span class="pre">as</span> <span class="pre">&lt;digit&gt;</span></code>. The attempts share a seed, so a local judge repeats the same reply and a rerun fails again</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">custom</span> <span class="pre">judge</span> <span class="pre">identity</span> <span class="pre">changed;</span> <span class="pre">use</span> <span class="pre">a</span> <span class="pre">new</span> <span class="pre">--out</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">custom</span> <span class="pre">judge</span> <span class="pre">identity</span> <span class="pre">changed;</span> <span class="pre">use</span> <span class="pre">a</span> <span class="pre">new</span> <span class="pre">--out</span></code></p></td>
 <td><p>The judge config changed since this repeat was judged, for example after an SGLang upgrade. Delete <code class="docutils literal notranslate"><span class="pre">repeat-N/judge-qwen</span></code> and rerun <code class="docutils literal notranslate"><span class="pre">judge</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Control</span> <span class="pre">check</span> <span class="pre">failed:</span> <span class="pre">this</span> <span class="pre">judge</span> <span class="pre">configuration</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">accepted.</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Control</span> <span class="pre">check</span> <span class="pre">failed:</span> <span class="pre">this</span> <span class="pre">judge</span> <span class="pre">configuration</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">accepted.</span></code></p></td>
 <td><p>The judge missed a control case, listed in the output; nothing graded alongside the controls is kept. Check that the judge server runs the pinned Qwen3.8-27B revision; do not grade with a configuration that fails the controls</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">changed</span> <span class="pre">since</span> <span class="pre">this</span> <span class="pre">directory</span> <span class="pre">was</span> <span class="pre">created;</span> <span class="pre">use</span> <span class="pre">a</span> <span class="pre">new</span> <span class="pre">--out</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">...</span> <span class="pre">changed</span> <span class="pre">since</span> <span class="pre">this</span> <span class="pre">directory</span> <span class="pre">was</span> <span class="pre">created;</span> <span class="pre">use</span> <span class="pre">a</span> <span class="pre">new</span> <span class="pre">--out</span></code></p></td>
 <td><p>The semantic judge settings, prompt or inputs changed since this repeat was graded. Delete <code class="docutils literal notranslate"><span class="pre">repeat-N/semantic-qwen</span></code> and rerun <code class="docutils literal notranslate"><span class="pre">judge</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">model_mismatch</span></code> with <code class="docutils literal notranslate"><span class="pre">JUDGE=gpt</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model_mismatch</span></code> with <code class="docutils literal notranslate"><span class="pre">JUDGE=gpt</span></code></p></td>
 <td><p>The endpoint answered with a model other than <code class="docutils literal notranslate"><span class="pre">gpt-4o-2024-08-06</span></code>; use an endpoint that serves exactly that model</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">No</span> <span class="pre">module</span> <span class="pre">named</span> <span class="pre">'onnx'</span></code> (or <code class="docutils literal notranslate"><span class="pre">einops</span></code>) in <code class="docutils literal notranslate"><span class="pre">model-server.log</span></code>, or <code class="docutils literal notranslate"><span class="pre">ModuleNotFoundError</span></code> in <code class="docutils literal notranslate"><span class="pre">asr</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">No</span> <span class="pre">module</span> <span class="pre">named</span> <span class="pre">'onnx'</span></code> (or <code class="docutils literal notranslate"><span class="pre">einops</span></code>) in <code class="docutils literal notranslate"><span class="pre">model-server.log</span></code>, or <code class="docutils literal notranslate"><span class="pre">ModuleNotFoundError</span></code> in <code class="docutils literal notranslate"><span class="pre">asr</span></code></p></td>
 <td><p>Rerun <code class="docutils literal notranslate"><span class="pre">setup</span></code></p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">setup</span></code> stops with <code class="docutils literal notranslate"><span class="pre">torchcodec</span> <span class="pre">cannot</span> <span class="pre">load</span> <span class="pre">its</span> <span class="pre">FFmpeg</span> <span class="pre">libraries</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">setup</span></code> stops with <code class="docutils literal notranslate"><span class="pre">torchcodec</span> <span class="pre">cannot</span> <span class="pre">load</span> <span class="pre">its</span> <span class="pre">FFmpeg</span> <span class="pre">libraries</span></code></p></td>
 <td><p>Install the FFmpeg shared libraries (version 4 to 8) and rerun <code class="docutils literal notranslate"><span class="pre">setup</span></code></p></td>
 </tr>
 </tbody>
@@ -1330,11 +1334,11 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmar
       </div>
     </a>
     <a class="right-next"
-       href="tts_bench.html"
+       href="full_duplex_metrics.html"
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">TTS benchmark runbook</p>
+        <p class="prev-next-title">Full-Duplex-Bench v1.0 unified metrics</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -1415,7 +1419,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 13, 2026.
+  Last updated on Oct 14, 2026.
   <br/>
 </p>
   </div>
