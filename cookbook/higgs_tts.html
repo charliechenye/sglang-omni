@@ -657,6 +657,14 @@ sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\<
 </div>
 <p>The voice-cloning examples below use local reference clips from
 <code class="docutils literal notranslate"><span class="pre">docs/_static/audio</span></code>.</p>
+<p>CUDA reference encoding temporarily disables cuDNN convolutions and cuDNN
+attention. These settings affect the whole process, so <code class="docutils literal notranslate"><span class="pre">audio_encoder</span></code> must
+run in a separate process from CUDA stages such as <code class="docutils literal notranslate"><span class="pre">tts_engine</span></code> and <code class="docutils literal notranslate"><span class="pre">vocoder</span></code>,
+even when they use different GPUs. The default layout already does this:
+CPU preprocessing and the audio encoder share <code class="docutils literal notranslate"><span class="pre">tts_frontend</span></code>, while the
+engine and vocoder share <code class="docutils literal notranslate"><span class="pre">pipeline</span></code> on the same GPU. Custom layouts that
+combine the CUDA encoder with another CUDA stage are rejected at configuration
+validation; CPU encoding does not have this restriction.</p>
 </section>
 <section id="synthesizing-speech">
 <h2>Synthesizing Speech<a class="headerlink" href="#synthesizing-speech" title="Link to this heading">#</a></h2>
@@ -1313,17 +1321,17 @@ onomatopoeia gives the model the acoustic cue to realize the effect.</p></li>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">temperature</span></code></p></td>
 <td><p>float</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">1.0</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.8</span></code></p></td>
 <td><p>Sampling temperature</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">top_p</span></code></p></td>
 <td><p>float</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">0.8</span></code></p></td>
 <td><p>Top-p sampling</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">top_k</span></code></p></td>
 <td><p>int</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">null</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">30</span></code></p></td>
 <td><p>Top-k sampling</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">seed</span></code></p></td>

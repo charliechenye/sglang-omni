@@ -863,12 +863,17 @@ as the static superset because runtime prep derives stream receivers from it.</p
 <td><p>defaults</p></td>
 <td><p>Placement planning limits, e.g. <code class="docutils literal notranslate"><span class="pre">max_total_gpu_memory_fraction_per_gpu</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">terminal_stages_fn</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">stream_delivery</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">StreamDeliveryConfig</span></code></p></td>
+<td><p>1 GiB</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">max_total_backlog_bytes</span></code>: undelivered stream bytes the coordinator may hold for all readers together; over it, the longest-idle streams fail. <code class="docutils literal notranslate"><span class="pre">none</span></code> turns it off.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">terminal_stages_fn</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">str</span></code> or <code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
 <td><p>Dotted function path for request-aware terminal-stage resolution.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">config_cls</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">config_cls</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">str</span></code></p></td>
 <td><p>class name</p></td>
 <td><p>Stored automatically and used when loading a saved config file.</p></td>

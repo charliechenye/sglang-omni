@@ -521,6 +521,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-backend">Attention Backend</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#int4-checkpoint">Int4 Checkpoint</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deployment-performance">Deployment Performance</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#high-concurrency">High Concurrency</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#production-serving">Production Serving</a></li>
@@ -546,7 +547,7 @@
 <ul class="simple">
 <li><p><strong>35B parameters, 3B active per token</strong>: MoE text backbone with hybrid (full + linear) attention</p></li>
 <li><p><strong>Codebook-MTP audio decoder</strong>: 10 codebooks decoded causally over the whole sequence</p></li>
-<li><p><strong>FP8 MoE experts</strong> with the remaining weights in bf16</p></li>
+<li><p><strong>FP8 MoE experts</strong> with the remaining weights in bf16; an <a class="reference internal" href="#int4-checkpoint"><span class="std std-ref">int4 checkpoint</span></a> cuts the weight memory from 37.0 GB to 20.8 GB</p></li>
 <li><p><strong>Speaker tags</strong> <code class="docutils literal notranslate"><span class="pre">&lt;|speaker:0|&gt;</span></code> … <code class="docutils literal notranslate"><span class="pre">&lt;|speaker:15|&gt;</span></code> — one text can carry up to 16 characters</p></li>
 <li><p><strong>Long text</strong> is chunked automatically and can be streamed per chunk</p></li>
 </ul>
@@ -692,6 +693,55 @@ the preprocessing stage. The budgets of all stages on the GPU must still fit the
 <section id="attention-backend">
 <h2>Attention Backend<a class="headerlink" href="#attention-backend" title="Link to this heading">#</a></h2>
 <p>Drama 3 runs its attention on the <code class="docutils literal notranslate"><span class="pre">triton</span></code> backend only. The server refuses to start with any other attention backend, for example <code class="docutils literal notranslate"><span class="pre">--tts_engine.engine.attention_backend</span> <span class="pre">fa3</span></code>.</p>
+</section>
+<section id="int4-checkpoint">
+<h2>Int4 Checkpoint<a class="headerlink" href="#int4-checkpoint" title="Link to this heading">#</a></h2>
+<p><a class="reference external" href="https://huggingface.co/fishaudio/drama-3-int4"><code class="docutils literal notranslate"><span class="pre">fishaudio/drama-3-int4</span></code></a> is a 4-bit GPTQ quantization of Drama 3. Thanks so much to <a class="reference external" href="https://x.com/_akhaliq">AK</a> for the quantization! The server reads its quantization from the checkpoint, so it starts with the same command:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>hf<span class="w"> </span>download<span class="w"> </span>fishaudio/drama-3-int4
+
+sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span>fishaudio/drama-3-int4<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span>
+</pre></div>
+</div>
+<p>The routed MoE experts and the attention projections (<code class="docutils literal notranslate"><span class="pre">q/k/v/o_proj</span></code> of the full attention layers, <code class="docutils literal notranslate"><span class="pre">in_proj_qkv</span></code>, <code class="docutils literal notranslate"><span class="pre">in_proj_z</span></code> and <code class="docutils literal notranslate"><span class="pre">out_proj</span></code> of the linear attention layers) hold symmetric 4-bit weights with one scale per 128 input channels, and run on GPTQ-Marlin kernels. The shared expert, the router, the linear attention’s <code class="docutils literal notranslate"><span class="pre">in_proj_a/b</span></code>, the output head and the codebook-MTP audio decoder stay in bf16. The engine’s weights take 20.8 GB of GPU memory instead of 37.0 GB, which leaves more of the engine’s share for the KV cache. GPTQ-Marlin needs compute capability 8.0 or newer.</p>
+<p>Table 3 compares the two checkpoints on one H200 with the default server settings: the 1,088 Seed-TTS English prompts, each cloning the voice of its own reference clip, sent as non-streaming requests at concurrency 8. WER is computed on the generated audio transcribed by Qwen3-ASR-1.7B.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Checkpoint</p></th>
+<th class="head text-right"><p>Weights</p></th>
+<th class="head text-right"><p>Latency mean</p></th>
+<th class="head text-right"><p>Latency p95</p></th>
+<th class="head text-right"><p>RTF mean</p></th>
+<th class="head text-right"><p>Throughput (req/s)</p></th>
+<th class="head text-right"><p>WER (corpus)</p></th>
+<th class="head text-right"><p>WER without samples above 50%</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">fishaudio/drama-3</span></code> (FP8 experts)</p></td>
+<td class="text-right"><p>37.0 GB</p></td>
+<td class="text-right"><p>1.235 s</p></td>
+<td class="text-right"><p>1.902 s</p></td>
+<td class="text-right"><p>0.281</p></td>
+<td class="text-right"><p>6.47</p></td>
+<td class="text-right"><p>1.99%</p></td>
+<td class="text-right"><p>1.32%</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">fishaudio/drama-3-int4</span></code></p></td>
+<td class="text-right"><p>20.8 GB</p></td>
+<td class="text-right"><p>1.334 s</p></td>
+<td class="text-right"><p>2.178 s</p></td>
+<td class="text-right"><p>0.320</p></td>
+<td class="text-right"><p>5.99</p></td>
+<td class="text-right"><p>1.63%</p></td>
+<td class="text-right"><p>1.42%</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p><em>Table 3. Drama 3 FP8 and int4 checkpoints on Seed-TTS English, concurrency 8, one H200.</em></p>
+<p>The int4 checkpoint is about 8% slower per request and its WER stays at the FP8 level: the gap between the two is about as large as the run-to-run spread of one checkpoint (a second FP8 run measured 1.365 s mean latency and 2.02% WER).</p>
 </section>
 <section id="deployment-performance">
 <h2>Deployment Performance<a class="headerlink" href="#deployment-performance" title="Link to this heading">#</a></h2>
@@ -960,6 +1010,7 @@ Drama 3 tower fused layers: off, untested GPU sm_120
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-backend">Attention Backend</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#int4-checkpoint">Int4 Checkpoint</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deployment-performance">Deployment Performance</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#high-concurrency">High Concurrency</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#production-serving">Production Serving</a></li>

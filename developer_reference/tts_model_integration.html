@@ -651,13 +651,11 @@ into a <code class="docutils literal notranslate"><span class="pre">GenerateRequ
 request builder turns it into whatever the AR scheduler needs.</p>
 <p>Two things are easy to get wrong at this boundary:</p>
 <ul class="simple">
-<li><p><strong>Endpoint defaults silently override model defaults.</strong> The HTTP layer fills
-in a single set of sampling defaults (currently the S2-Pro values). For any
-other model, those values look exactly like the user explicitly asking for
-them. Pass an <code class="docutils literal notranslate"><span class="pre">explicit_generation_params</span></code> list (or equivalent) through the
-request and have your request builder distinguish “user set this” from “the
-endpoint filled it in”. The same trick is needed for any field where the
-endpoint has an opinion.</p></li>
+<li><p><strong>Model defaults belong in the request builder.</strong> The HTTP layer passes only
+the sampling fields the caller set, so a field missing from the request
+params is one the caller left unset. Read each field with your model’s
+default, for example <code class="docutils literal notranslate"><span class="pre">params.get(&quot;temperature&quot;,</span> <span class="pre">0.7)</span></code>, and treat a present
+value as the caller’s choice.</p></li>
 <li><p><strong>Input is heterogeneous.</strong> TTS clients send text under several names
 (<code class="docutils literal notranslate"><span class="pre">input</span></code>, <code class="docutils literal notranslate"><span class="pre">text</span></code>, sometimes a chat-style structure) and references under
 several shapes (<code class="docutils literal notranslate"><span class="pre">ref_audio</span></code> + <code class="docutils literal notranslate"><span class="pre">ref_text</span></code>, or a <code class="docutils literal notranslate"><span class="pre">references[]</span></code> list).

@@ -684,6 +684,24 @@ must be <strong>≥ 1</strong>. Capacity is about <code class="docutils literal 
 HTTP <strong>503</strong> (<code class="docutils literal notranslate"><span class="pre">The</span> <span class="pre">request</span> <span class="pre">queue</span> <span class="pre">is</span> <span class="pre">full.</span></code>) before preprocessing, or later
 if the AR waiting queue or request-build backlog is full. Qwen3-TTS
 defaults to 4 request-build workers with pending depth 16.</p>
+<p>A finished request no longer counts toward that capacity, but its streamed
+audio waits in the API process until the client reads it.
+<code class="docutils literal notranslate"><span class="pre">--stream_delivery.max_total_backlog_bytes</span></code> caps the undelivered stream bytes
+all requests may hold together, per API process (default <code class="docutils literal notranslate"><span class="pre">1073741824</span></code>,
+1 GiB; <code class="docutils literal notranslate"><span class="pre">none</span></code> turns it off).</p>
+<p>A client that reads at least as fast as audio is generated holds almost
+nothing in the API process. A slower client holds the audio that is
+generated but not yet in its socket buffers; 24 kHz float32 audio is
+about 96 kB per second. This includes a client that reads at playback
+speed while generation runs faster than real time, once its socket
+buffers are full.</p>
+<p>Over the cap, the streams whose readers have been idle longest fail first,
+until the total fits. A failed stream’s generation is aborted if it is
+still running. SSE (<code class="docutils literal notranslate"><span class="pre">stream_format=sse</span></code>) and WebSocket clients get an error
+event with <code class="docutils literal notranslate"><span class="pre">The</span> <span class="pre">request</span> <span class="pre">queue</span> <span class="pre">is</span> <span class="pre">full.</span></code>; a raw PCM stream is closed early.
+New requests are not refused because of the cap. <code class="docutils literal notranslate"><span class="pre">/health</span></code> reports the
+backlog under <code class="docutils literal notranslate"><span class="pre">stream_delivery</span></code>, including the held bytes, open streams and
+failed streams.</p>
 </section>
 <section id="prefill-cuda-graphs">
 <h3>Prefill CUDA graphs<a class="headerlink" href="#prefill-cuda-graphs" title="Link to this heading">#</a></h3>

@@ -679,8 +679,8 @@ for a full Python raw PCM consumer.</p>
 </table>
 </div>
 <blockquote>
-<div><p>Voxtral generation is <strong>deterministic</strong>: the engine fixes <code class="docutils literal notranslate"><span class="pre">temperature</span></code> to <code class="docutils literal notranslate"><span class="pre">0.0</span></code>, so sampling
-parameters such as <code class="docutils literal notranslate"><span class="pre">top_p</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, and <code class="docutils literal notranslate"><span class="pre">temperature</span></code> are not used. Reference-clip voice
+<div><p>Voxtral generation is <strong>deterministic</strong>: the engine fixes <code class="docutils literal notranslate"><span class="pre">temperature</span></code> to <code class="docutils literal notranslate"><span class="pre">0.0</span></code>, so a request
+that sets <code class="docutils literal notranslate"><span class="pre">temperature</span></code>, <code class="docutils literal notranslate"><span class="pre">top_p</span></code>, <code class="docutils literal notranslate"><span class="pre">top_k</span></code>, <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code> or <code class="docutils literal notranslate"><span class="pre">seed</span></code> is rejected. Reference-clip voice
 cloning (<code class="docutils literal notranslate"><span class="pre">references</span></code>) is <strong>not</strong> supported for Voxtral — use a preset <code class="docutils literal notranslate"><span class="pre">voice</span></code> instead.</p>
 </div></blockquote>
 </section>
