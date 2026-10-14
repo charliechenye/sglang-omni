@@ -8,6 +8,7 @@ import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 DEFAULT_EVENT_QUEUE_CAPACITY = 8192
 EVENT_FILE_BUFFER_BYTES = 64 * 1024
@@ -17,6 +18,8 @@ MAX_METADATA_STRING_LENGTH = 4096
 MAX_PENDING_FINALIZATIONS = 4
 WRITER_POLL_INTERVAL_SECONDS = 0.05
 DEFAULT_FINALIZATION_TIMEOUT_SECONDS = 5.0
+
+DiagnosticWriterMode = Literal["normal", "deferred"]
 
 
 _thread_active_stage = threading.local()
@@ -117,6 +120,8 @@ class RecorderRunState:
     path: Path
     status_path: Path
     finalization: RequestEventFinalization
+    diagnostic_writer_mode: DiagnosticWriterMode = "normal"
+    writer_gate: threading.Event | None = None
     accepted_events: int = 0
     processed_events: int = 0
     written_events: int = 0

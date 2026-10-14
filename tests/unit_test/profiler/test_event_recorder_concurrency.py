@@ -6,10 +6,13 @@ from __future__ import annotations
 import threading
 from io import TextIOWrapper
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
+from sglang_omni.profiler import event_recorder_writer
 from sglang_omni.profiler.event_recorder import RequestEventRecorder
+from sglang_omni.profiler.event_recorder_writer import DEFERRED_WRITER_RUN_ID_PREFIX
 from sglang_omni.profiler.event_recorder_types import (
     QueuedRequestEvent,
     RecorderRunState,
@@ -21,6 +24,21 @@ from tests.unit_test.profiler.event_recorder_test_utils import (
     read_status_file,
     stall_writer,
 )
+
+
+class ObservedWriterGate(threading.Event):
+    def __init__(self, wait_entered: threading.Event) -> None:
+        super().__init__()
+        self.wait_entered = wait_entered
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.wait_entered.set()
+        return super().wait(timeout)
+
+
+class FailingWriterGate(threading.Event):
+    def wait(self, timeout: float | None = None) -> bool:
+        raise RuntimeError("synthetic deferred gate failure")
 
 
 def test_slow_writer_does_not_block_producers(
@@ -57,6 +75,95 @@ def test_slow_writer_does_not_block_producers(
 
     events = read_events(path)
     assert all(event["run_id"] == "slow" for event in events)
+
+
+def test_deferred_run_gates_writer_until_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = RequestEventRecorder(queue_capacity=8)
+    run_id = f"{DEFERRED_WRITER_RUN_ID_PREFIX}active"
+    path = recorder.start(run_id=run_id, event_dir=str(tmp_path), stage="stage")
+    run_state = recorder.active_state
+    assert run_state is not None
+    assert run_state.diagnostic_writer_mode == "deferred"
+    assert run_state.writer_gate is not None
+
+    writer_wait_entered = threading.Event()
+    run_state.writer_gate = ObservedWriterGate(writer_wait_entered)
+    open_calls: list[str] = []
+    write_calls: list[str] = []
+    original_open = recorder.open_event_file
+    original_write = recorder.write_queued_event
+
+    def observe_open(run_state: RecorderRunState) -> TextIOWrapper | None:
+        open_calls.append(run_state.run_id)
+        return original_open(run_state)
+
+    def observe_write(
+        queued_event: QueuedRequestEvent,
+        file_handle: TextIOWrapper | None,
+    ) -> TextIOWrapper | None:
+        write_calls.append(queued_event.event.request_id)
+        return original_write(queued_event, file_handle)
+
+    monkeypatch.setattr(recorder, "open_event_file", observe_open)
+    monkeypatch.setattr(recorder, "write_queued_event", observe_write)
+    json_dumps = Mock(wraps=event_recorder_writer.json.dumps)
+    monkeypatch.setattr(event_recorder_writer.json, "dumps", json_dumps)
+
+    recorder.emit(request_id="first", stage="stage", event_name="event")
+    assert writer_wait_entered.wait(timeout=5)
+
+    producer_finished = threading.Event()
+
+    def produce_events() -> None:
+        for event_number in range(3):
+            recorder.emit(
+                request_id=f"request-{event_number}",
+                stage="stage",
+                event_name="event",
+            )
+        producer_finished.set()
+
+    producer_thread = threading.Thread(target=produce_events)
+    producer_thread.start()
+    finalization = None
+    try:
+        assert producer_finished.wait(timeout=5)
+        assert open_calls == []
+        assert write_calls == []
+        assert json_dumps.call_count == 0
+        assert Path(path).exists() is False
+
+        finalization = recorder.deactivate(run_id=run_id)
+        assert finalization is not None
+        assert finalization.wait(timeout_seconds=5)
+    finally:
+        if recorder.is_active():
+            recorder.deactivate(run_id=run_id)
+        else:
+            pass
+        producer_thread.join(timeout=5)
+
+    assert producer_thread.is_alive() is False
+    assert finalization is not None
+    assert [event["request_id"] for event in read_events(path)] == [
+        "first",
+        "request-0",
+        "request-1",
+        "request-2",
+    ]
+    status = read_status(path)
+    assert status["diagnostic_writer_mode"] == "deferred"
+    assert status["accepted_events"] == 4
+    assert status["processed_events"] == 4
+    assert status["written_events"] == 4
+    assert status["dropped_events"] == 0
+    assert status["unwritten_events"] == 0
+    assert status["incomplete_reasons"] == []
+    assert status["complete"] is True
+    assert len(open_calls) == 1
+    assert len(write_calls) == 4
 
 
 def test_concurrent_producers_preserve_counts_and_per_producer_order(
@@ -102,6 +209,49 @@ def test_concurrent_producers_preserve_counts_and_per_producer_order(
     assert status["accepted_events"] == len(events)
     assert status["processed_events"] == len(events)
     assert status["written_events"] == len(events)
+    assert status["diagnostic_writer_mode"] == "normal"
+
+
+def test_deferred_deactivate_releases_gate_without_waiting_for_writer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    recorder = RequestEventRecorder(queue_capacity=8)
+    run_id = f"{DEFERRED_WRITER_RUN_ID_PREFIX}nonblocking-stop"
+    path = recorder.start(run_id=run_id, event_dir=str(tmp_path), stage="stage")
+    run_state = recorder.active_state
+    assert run_state is not None
+    assert run_state.writer_gate is not None
+
+    writer_wait_entered = threading.Event()
+    run_state.writer_gate = ObservedWriterGate(writer_wait_entered)
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+    original_write = recorder.write_queued_event
+
+    def stall_write(
+        queued_event: QueuedRequestEvent,
+        file_handle: TextIOWrapper | None,
+    ) -> TextIOWrapper | None:
+        writer_entered.set()
+        if not release_writer.wait(timeout=5):
+            raise AssertionError("test did not release the deferred writer")
+        else:
+            pass
+        return original_write(queued_event, file_handle)
+
+    monkeypatch.setattr(recorder, "write_queued_event", stall_write)
+    recorder.emit(request_id="request", stage="stage", event_name="event")
+    assert writer_wait_entered.wait(timeout=5)
+
+    finalization = recorder.deactivate(run_id=run_id)
+    assert finalization is not None
+    assert run_state.writer_gate.is_set()
+    assert writer_entered.wait(timeout=5)
+    assert finalization.completion_event.is_set() is False
+
+    release_writer.set()
+    assert finalization.wait(timeout_seconds=5)
+    assert read_events(path)[0]["request_id"] == "request"
 
 
 def test_retired_run_waits_for_events_accepted_during_idle_observation(
@@ -297,6 +447,84 @@ def test_idle_writer_does_not_open_new_run_ahead_of_queued_old_run(
     assert read_events(path_c) == []
 
 
+def test_deferred_to_normal_rotation_preserves_event_ownership(
+    tmp_path: Path,
+) -> None:
+    recorder = RequestEventRecorder(queue_capacity=8)
+    deferred_run_id = f"{DEFERRED_WRITER_RUN_ID_PREFIX}rotation-a"
+    path_a = recorder.start(
+        run_id=deferred_run_id,
+        event_dir=str(tmp_path / "deferred"),
+        stage="stage",
+    )
+    state_a = recorder.active_state
+    assert state_a is not None
+    assert state_a.writer_gate is not None
+    writer_wait_entered = threading.Event()
+    state_a.writer_gate = ObservedWriterGate(writer_wait_entered)
+    recorder.emit(request_id="request-a", stage="stage", event_name="event")
+    assert writer_wait_entered.wait(timeout=5)
+
+    path_b = recorder.start(
+        run_id="normal-rotation-b",
+        event_dir=str(tmp_path / "normal"),
+        stage="stage",
+    )
+    recorder.emit(request_id="request-b", stage="stage", event_name="event")
+    finalization_b = recorder.deactivate(run_id="normal-rotation-b")
+    assert finalization_b is not None
+    assert state_a.finalization.wait(timeout_seconds=5)
+    assert finalization_b.wait(timeout_seconds=5)
+
+    assert [event["request_id"] for event in read_events(path_a)] == ["request-a"]
+    assert [event["request_id"] for event in read_events(path_b)] == ["request-b"]
+    assert read_status(path_a)["diagnostic_writer_mode"] == "deferred"
+    assert read_status(path_b)["diagnostic_writer_mode"] == "normal"
+
+
+def test_deferred_to_deferred_rotation_preserves_event_ownership(
+    tmp_path: Path,
+) -> None:
+    recorder = RequestEventRecorder(queue_capacity=8)
+    run_id_a = f"{DEFERRED_WRITER_RUN_ID_PREFIX}rotation-a"
+    path_a = recorder.start(
+        run_id=run_id_a,
+        event_dir=str(tmp_path / "first"),
+        stage="stage",
+    )
+    state_a = recorder.active_state
+    assert state_a is not None
+    assert state_a.writer_gate is not None
+    wait_a = threading.Event()
+    state_a.writer_gate = ObservedWriterGate(wait_a)
+    recorder.emit(request_id="request-a", stage="stage", event_name="event")
+    assert wait_a.wait(timeout=5)
+
+    run_id_b = f"{DEFERRED_WRITER_RUN_ID_PREFIX}rotation-b"
+    path_b = recorder.start(
+        run_id=run_id_b,
+        event_dir=str(tmp_path / "second"),
+        stage="stage",
+    )
+    state_b = recorder.active_state
+    assert state_b is not None
+    assert state_b.writer_gate is not None
+    wait_b = threading.Event()
+    state_b.writer_gate = ObservedWriterGate(wait_b)
+    recorder.emit(request_id="request-b", stage="stage", event_name="event")
+    assert wait_b.wait(timeout=5)
+
+    finalization_b = recorder.deactivate(run_id=run_id_b)
+    assert finalization_b is not None
+    assert state_a.finalization.wait(timeout_seconds=5)
+    assert finalization_b.wait(timeout_seconds=5)
+
+    assert [event["request_id"] for event in read_events(path_a)] == ["request-a"]
+    assert [event["request_id"] for event in read_events(path_b)] == ["request-b"]
+    assert read_status(path_a)["diagnostic_writer_mode"] == "deferred"
+    assert read_status(path_b)["diagnostic_writer_mode"] == "deferred"
+
+
 def test_full_queue_drops_events_and_marks_status_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -324,6 +552,39 @@ def test_full_queue_drops_events_and_marks_status_incomplete(
     status = read_status(path)
     assert status["accepted_events"] == status["written_events"]
     assert status["dropped_events"] > 0
+    assert status["complete"] is False
+    assert "queue_overflow" in status["incomplete_reasons"]
+
+
+def test_deferred_queue_overflow_preserves_loss_accounting(
+    tmp_path: Path,
+) -> None:
+    recorder = RequestEventRecorder(queue_capacity=1)
+    path = recorder.start(
+        run_id=f"{DEFERRED_WRITER_RUN_ID_PREFIX}overflow",
+        event_dir=str(tmp_path),
+        stage="stage",
+    )
+    run_state = recorder.active_state
+    assert run_state is not None
+    assert run_state.writer_gate is not None
+    writer_wait_entered = threading.Event()
+    run_state.writer_gate = ObservedWriterGate(writer_wait_entered)
+
+    recorder.emit(request_id="first", stage="stage", event_name="event")
+    assert writer_wait_entered.wait(timeout=5)
+    recorder.emit(request_id="second", stage="stage", event_name="event")
+    recorder.emit(request_id="third", stage="stage", event_name="event")
+
+    finalization = recorder.deactivate()
+    assert finalization is not None
+    assert finalization.wait(timeout_seconds=5)
+    status = read_status(path)
+    assert status["accepted_events"] == 2
+    assert status["processed_events"] == 2
+    assert status["written_events"] == 2
+    assert status["dropped_events"] == 1
+    assert status["unwritten_events"] == 0
     assert status["complete"] is False
     assert "queue_overflow" in status["incomplete_reasons"]
 
@@ -524,6 +785,29 @@ def test_writer_failure_completes_active_and_retired_handles(
     assert "writer_thread_failure" in new_status["incomplete_reasons"]
     assert read_status(old_path)["unwritten_events"] >= 1
     assert read_status(new_path)["unwritten_events"] >= 1
+
+
+def test_deferred_gate_failure_releases_cleanup(
+    tmp_path: Path,
+) -> None:
+    recorder = RequestEventRecorder(queue_capacity=8)
+    path = recorder.start(
+        run_id=f"{DEFERRED_WRITER_RUN_ID_PREFIX}failure",
+        event_dir=str(tmp_path),
+        stage="stage",
+    )
+    run_state = recorder.active_state
+    assert run_state is not None
+    run_state.writer_gate = FailingWriterGate()
+    recorder.emit(request_id="request", stage="stage", event_name="event")
+
+    assert run_state.finalization.wait(timeout_seconds=5) is True
+    assert run_state.writer_gate.is_set()
+    assert recorder.is_active() is False
+    status = read_status(path)
+    assert status["diagnostic_writer_mode"] == "deferred"
+    assert "writer_thread_failure" in status["incomplete_reasons"]
+    assert status["complete"] is False
 
 
 def test_rotation_backlog_is_bounded(

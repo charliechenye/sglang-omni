@@ -13,6 +13,7 @@ from sglang_omni.profiler.event_recorder import (
     RequestEventSnapshot,
     get_recorder,
 )
+from sglang_omni.profiler.event_recorder_writer import DEFERRED_WRITER_RUN_ID_PREFIX
 from tests.unit_test.profiler.event_recorder_test_utils import (
     fail_status_replace,
     read_events,
@@ -35,7 +36,63 @@ def test_zero_event_retired_run_finalizes_complete(tmp_path: Path) -> None:
     assert status["written_events"] == 0
     assert status["unwritten_events"] == 0
     assert status["dropped_events"] == 0
+    assert status["diagnostic_writer_mode"] == "normal"
     assert status["complete"] is True
+
+
+def test_zero_event_deferred_run_finalizes_complete(tmp_path: Path) -> None:
+    recorder = RequestEventRecorder()
+    run_id = f"{DEFERRED_WRITER_RUN_ID_PREFIX}zero"
+    path = recorder.start(run_id, str(tmp_path), "stage")
+    run_state = recorder.active_state
+    assert run_state is not None
+    assert run_state.writer_gate is not None
+    assert run_state.writer_gate.is_set() is False
+
+    finalization = recorder.deactivate()
+
+    assert finalization is not None
+    assert finalization.wait(timeout_seconds=5) is True
+    status = read_status_file(finalization.status_path)
+    assert read_events(path) == []
+    assert status["accepted_events"] == 0
+    assert status["processed_events"] == 0
+    assert status["written_events"] == 0
+    assert status["unwritten_events"] == 0
+    assert status["dropped_events"] == 0
+    assert status["diagnostic_writer_mode"] == "deferred"
+    assert status["complete"] is True
+
+
+def test_deferred_shared_stages_release_gate_only_after_final_stage(
+    tmp_path: Path,
+) -> None:
+    recorder = RequestEventRecorder()
+    run_id = f"{DEFERRED_WRITER_RUN_ID_PREFIX}shared"
+    path = recorder.start(run_id, str(tmp_path), "first")
+    recorder.start(run_id, str(tmp_path), "second")
+    run_state = recorder.active_state
+    assert run_state is not None
+    assert run_state.writer_gate is not None
+    recorder.emit(request_id="first", stage="first", event_name="event")
+    recorder.emit(request_id="second", stage="second", event_name="event")
+
+    assert recorder.release_stage("first") is None
+    assert recorder.is_active() is True
+    assert run_state.writer_gate.is_set() is False
+    assert Path(path).exists() is False
+
+    finalization = recorder.release_stage("second")
+    assert finalization is not None
+    assert run_state.writer_gate.is_set()
+    assert finalization.wait(timeout_seconds=5)
+    status = read_status_file(finalization.status_path)
+    assert status["diagnostic_writer_mode"] == "deferred"
+    assert status["accepted_events"] == 2
+    assert status["processed_events"] == 2
+    assert status["written_events"] == 2
+    assert status["complete"] is True
+    assert {event["stage"] for event in read_events(path)} == {"first", "second"}
 
 
 def test_stale_expected_run_id_cannot_enter_a_later_run(tmp_path: Path) -> None:

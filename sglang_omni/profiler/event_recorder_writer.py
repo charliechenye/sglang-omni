@@ -28,6 +28,8 @@ from sglang_omni.profiler.event_recorder_types import (
 
 logger = logging.getLogger(__name__)
 
+DEFERRED_WRITER_RUN_ID_PREFIX = "diag_deferred_duplex_io_"
+
 
 class RequestEventRecorder:
     """Process-local bounded event queue with one asynchronous writer thread."""
@@ -226,6 +228,12 @@ class RequestEventRecorder:
                 status_path=str(status_path),
                 completion_event=threading.Event(),
             )
+            if run_id.startswith(DEFERRED_WRITER_RUN_ID_PREFIX):
+                diagnostic_writer_mode = "deferred"
+                writer_gate = threading.Event()
+            else:
+                diagnostic_writer_mode = "normal"
+                writer_gate = None
             run_state = RecorderRunState(
                 run_id=run_id,
                 stage=stage,
@@ -234,6 +242,8 @@ class RequestEventRecorder:
                 path=path,
                 status_path=status_path,
                 finalization=finalization,
+                diagnostic_writer_mode=diagnostic_writer_mode,
+                writer_gate=writer_gate,
             )
             self.active_state = run_state
             if self.writer_thread is None:
@@ -267,6 +277,10 @@ class RequestEventRecorder:
         run_state = self.active_state
         if run_state is None:
             return None
+        else:
+            pass
+        if run_state.writer_gate is not None:
+            run_state.writer_gate.set()
         else:
             pass
         self.active_state = None
@@ -403,6 +417,10 @@ class RequestEventRecorder:
 
                 try:
                     target_state = queued_event.run_state
+                    if target_state.writer_gate is not None:
+                        target_state.writer_gate.wait()
+                    else:
+                        pass
                     if open_state is not target_state:
                         if open_state is not None:
                             if not self.finalize_run(open_state, file_handle):
@@ -674,6 +692,7 @@ class RequestEventRecorder:
                     pass
                 status = {
                     "run_id": run_state.run_id,
+                    "diagnostic_writer_mode": run_state.diagnostic_writer_mode,
                     "pid": self.pid,
                     "event_path": str(run_state.path),
                     "accepted_events": run_state.accepted_events,
