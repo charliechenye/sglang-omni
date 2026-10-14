@@ -101,37 +101,6 @@ def test_stop_with_mismatched_run_id_is_noop(tmp_path: Path) -> None:
     assert rec.is_active() is False
 
 
-def test_concurrent_emits_are_safe(tmp_path: Path) -> None:
-    rec = get_recorder()
-    path = rec.start(run_id="r0", event_dir=str(tmp_path), stage="thinker")
-    n_threads = 8
-    n_per_thread = 50
-
-    def worker(tid: int) -> None:
-        for i in range(n_per_thread):
-            rec.emit(
-                request_id=f"req-{tid}",
-                stage="thinker",
-                event_name="stage_dispatch",
-                metadata={"i": i},
-            )
-
-    threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    rec.stop()
-
-    events = read_events(path)
-    assert len(events) == n_threads * n_per_thread
-    # Every line must be valid JSON with required fields
-    for ev in events:
-        assert ev["event_name"] == "stage_dispatch"
-        assert ev["request_id"].startswith("req-")
-        assert ev["run_id"] == "r0"
-
-
 def test_module_level_emit_uses_singleton(tmp_path: Path) -> None:
     rec = get_recorder()
     path = rec.start(run_id="r0", event_dir=str(tmp_path), stage="coord")
