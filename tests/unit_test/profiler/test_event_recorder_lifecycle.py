@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -14,11 +15,28 @@ from sglang_omni.profiler.event_recorder import (
     get_recorder,
 )
 from sglang_omni.profiler.event_recorder_writer import DEFERRED_WRITER_RUN_ID_PREFIX
+from sglang_omni.profiler.event_recorder_types import RecorderRunState
 from tests.unit_test.profiler.event_recorder_test_utils import (
     fail_status_replace,
     read_events,
     read_status_file,
 )
+
+
+class RetirementInspectingWriterGate(threading.Event):
+    def __init__(self, recorder: RequestEventRecorder, run_id: str) -> None:
+        super().__init__()
+        self.recorder = recorder
+        self.run_id = run_id
+        self.active_state_at_release: RecorderRunState | None = None
+        self.run_id_pending_at_release = False
+        self.pending_state_at_release: RecorderRunState | None = None
+
+    def set(self) -> None:
+        self.active_state_at_release = self.recorder.active_state
+        self.run_id_pending_at_release = self.run_id in self.recorder.pending_states
+        self.pending_state_at_release = self.recorder.pending_states.get(self.run_id)
+        super().set()
 
 
 def test_zero_event_retired_run_finalizes_complete(tmp_path: Path) -> None:
@@ -61,6 +79,36 @@ def test_zero_event_deferred_run_finalizes_complete(tmp_path: Path) -> None:
     assert status["unwritten_events"] == 0
     assert status["dropped_events"] == 0
     assert status["diagnostic_writer_mode"] == "deferred"
+    assert status["complete"] is True
+
+
+def test_deferred_gate_releases_after_retirement_registration(tmp_path: Path) -> None:
+    recorder = RequestEventRecorder()
+    run_id = f"{DEFERRED_WRITER_RUN_ID_PREFIX}retirement-order"
+    path = recorder.start(run_id, str(tmp_path), "stage")
+    run_state = recorder.active_state
+    assert run_state is not None
+    assert run_state.writer_gate is not None
+    retirement_gate = RetirementInspectingWriterGate(recorder, run_id)
+    run_state.writer_gate = retirement_gate
+
+    recorder.emit(request_id="first", stage="stage", event_name="event")
+    recorder.emit(request_id="second", stage="stage", event_name="event")
+    finalization = recorder.deactivate(run_id=run_id)
+
+    assert finalization is not None
+    assert retirement_gate.is_set()
+    assert retirement_gate.active_state_at_release is None
+    assert retirement_gate.run_id_pending_at_release is True
+    assert retirement_gate.pending_state_at_release is run_state
+    assert finalization.wait(timeout_seconds=5)
+
+    events = read_events(path)
+    status = read_status_file(finalization.status_path)
+    assert [event["request_id"] for event in events] == ["first", "second"]
+    assert status["accepted_events"] == 2
+    assert status["processed_events"] == 2
+    assert status["written_events"] == 2
     assert status["complete"] is True
 
 

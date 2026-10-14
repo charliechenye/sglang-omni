@@ -279,12 +279,12 @@ class RequestEventRecorder:
             return None
         else:
             pass
+        self.active_state = None
+        self.pending_states[run_state.run_id] = run_state
         if run_state.writer_gate is not None:
             run_state.writer_gate.set()
         else:
             pass
-        self.active_state = None
-        self.pending_states[run_state.run_id] = run_state
         return run_state
 
     def release_stage(self, stage: str) -> RequestEventFinalization | None:
