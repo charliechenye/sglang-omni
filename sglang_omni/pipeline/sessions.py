@@ -208,7 +208,6 @@ class CoordinatorSessions:
         *,
         ready_timestamp_ns: int | None = None,
         ready_run_id: str | None = None,
-        ready_generation_id: int | None = None,
     ) -> int:
         """Accept input in global seq order, independently of output consumption.
 
@@ -290,7 +289,6 @@ class CoordinatorSessions:
             input_chunk=chunk,
             ready_timestamp_ns=ready_timestamp_ns,
             ready_run_id=ready_run_id,
-            ready_generation_id=ready_generation_id,
         )
         emit_session_unit_event(
             request_id=request_id,

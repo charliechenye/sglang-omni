@@ -69,9 +69,7 @@ class SessionCoordinator:
         *,
         ready_timestamp_ns: int | None = None,
         ready_run_id: str | None = None,
-        ready_generation_id: int | None = None,
     ) -> int:
-        del ready_generation_id
         self.appended.append(chunk)
         self.ready_timestamps_ns.append(ready_timestamp_ns)
         self.ready_run_ids.append(ready_run_id)
