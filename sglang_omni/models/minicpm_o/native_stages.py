@@ -264,7 +264,7 @@ class SpeechState:
 
 class SpeechHooks(BatchedSessionHooks):
     # note (Junnan Li): Units that wait for another session's unit wait at most half the forward that unit would otherwise run alone.
-    gather_window_ms = FORWARD_FLOOR_MS / 2
+    gather_window_ms = 26.0
 
     def __init__(self, runtime: MiniCPMOVocoderRuntime, reference_audio: bytes) -> None:
         self.runtime, self.reference_audio = runtime, reference_audio
