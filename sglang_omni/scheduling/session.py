@@ -378,18 +378,17 @@ class SessionScheduler(SimpleScheduler[StagePayload, StagePayload]):
             if aborted and is_append_operation:
                 should_finish = self.fence_aborted_append_locked(request_id)
             elif aborted and is_open_operation:
+                self.mark_session_failed_locked(arrival.session_identity)
                 should_finish = True
+            else:
+                pass
+            if aborted and not is_close_operation and should_finish:
+                self.finish_operation_locked(request_id)
             else:
                 pass
         if aborted and is_close_operation:
             # Note (Junnan Li): A timed-out close is request-aborted; skipping it would leak the state.
             return False
-        elif aborted:
-            if should_finish:
-                self.finish_operation(request_id)
-            else:
-                pass
-            return aborted
         else:
             return aborted
 
