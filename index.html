@@ -60,7 +60,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.8" />
-    <meta name="docbuild:last-update" content="Oct 14, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 15, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -216,6 +216,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="cookbook/higgs_tts.html">Higgs TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cookbook/nemotron_diarization.html">Nemotron 3 Diarization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="cookbook/voxtral_tts.html">Voxtral TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="cookbook/fishaudio_s2_pro.html">Fish Audio S2-Pro</a></li>
 <li class="toctree-l1"><a class="reference internal" href="cookbook/fishaudio_drama3.html">Fish Audio Drama 3</a></li>
@@ -613,23 +614,27 @@
 <td><p>ASR</p></td>
 <td><p>Multi-speaker transcription + diarization + timestamps</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/openai/whisper-large-v3">openai/whisper-large-v3</a></p></td>
+<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/nvidia/Nemotron-3-Diarization">nvidia/Nemotron-3-Diarization</a></p></td>
+<td><p>Diarization</p></td>
+<td><p>Up to eight overlapping speakers for uploads and live audio (see <a class="reference external" href="cookbook/nemotron_diarization.html">cookbook</a>)</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/openai/whisper-large-v3">openai/whisper-large-v3</a></p></td>
 <td><p>ASR</p></td>
 <td><p>Experimental transcription and speech-to-English translation routes; see the <a class="reference external" href="basic_usage/audio_translations.html">audio translation support matrix</a></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct">Qwen/Qwen3-Omni-30B-A3B-Instruct</a></p></td>
+<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct">Qwen/Qwen3-Omni-30B-A3B-Instruct</a></p></td>
 <td><p>Omni</p></td>
 <td><p>Text, image, audio, video → text + audio</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/openbmb/MiniCPM-o-4_5">openbmb/MiniCPM-o-4_5</a></p></td>
+<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/openbmb/MiniCPM-o-4_5">openbmb/MiniCPM-o-4_5</a></p></td>
 <td><p>Omni</p></td>
 <td><p>Text, image, audio, video → text + audio</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/inclusionAI/Ming-flash-omni-2.0">inclusionAI/Ming-flash-omni-2.0</a></p></td>
+<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/inclusionAI/Ming-flash-omni-2.0">inclusionAI/Ming-flash-omni-2.0</a></p></td>
 <td><p>Omni</p></td>
 <td><p>Streaming TTS</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference external" href="https://huggingface.co/inclusionAI/LLaDA2.0-Uni">inclusionAI/LLaDA2.0-Uni</a></p></td>
+<tr class="row-even"><td><p><a class="reference external" href="https://huggingface.co/inclusionAI/LLaDA2.0-Uni">inclusionAI/LLaDA2.0-Uni</a></p></td>
 <td><p>Multimodal</p></td>
 <td><p>Text + image understanding and generation</p></td>
 </tr>
@@ -650,6 +655,7 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="cookbook/higgs_tts.html">Higgs TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="cookbook/nemotron_diarization.html">Nemotron 3 Diarization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="cookbook/voxtral_tts.html">Voxtral TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="cookbook/fishaudio_s2_pro.html">Fish Audio S2-Pro</a></li>
 <li class="toctree-l1"><a class="reference internal" href="cookbook/fishaudio_drama3.html">Fish Audio Drama 3</a></li>
@@ -796,7 +802,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 14, 2026.
+  Last updated on Oct 15, 2026.
   <br/>
 </p>
   </div>
