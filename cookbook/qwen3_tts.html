@@ -275,6 +275,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/omni_offline_bench.html">MiniCPM-o offline benchmark runbook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/rl_admin_control.html">RL Admin Control</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/mlx.html">MLX Path</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/ci_labels.html">CI Workflows and Labels</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/bump_version.html">Bumping the SGLang Pin</a></li>
 </ul>
 
@@ -514,6 +515,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ascend-npu-baseline">Ascend NPU baseline</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deterministic-inference">Deterministic Inference</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#overload-admission-policy">Overload / admission policy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#server-readiness">Server Readiness</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prefill-cuda-graphs">Prefill CUDA graphs</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prefill-admission-coalescing">Prefill Admission Coalescing</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#process-topology">Process topology</a></li>
@@ -703,6 +705,19 @@ event with <code class="docutils literal notranslate"><span class="pre">The</spa
 New requests are not refused because of the cap. <code class="docutils literal notranslate"><span class="pre">/health</span></code> reports the
 backlog under <code class="docutils literal notranslate"><span class="pre">stream_delivery</span></code>, including the held bytes, open streams and
 failed streams.</p>
+</section>
+<section id="server-readiness">
+<h3>Server Readiness<a class="headerlink" href="#server-readiness" title="Link to this heading">#</a></h3>
+<p>Before it reports ready, the server sends itself a streaming speech request in
+its checkpoint’s mode, once per replica of its most replicated process, one
+after another: CustomVoice uses its first built-in speaker, VoiceDesign a short
+voice description, and Base a one-second tone as its reference clip. <code class="docutils literal notranslate"><span class="pre">/health</span></code>
+returns 503 with status <code class="docutils literal notranslate"><span class="pre">starting</span></code> until these requests finish, so the first
+requests after that do not wait for the kernel loading and first-use setup of
+the speech path. The sampler is compiled for single and batched requests while
+the model loads, so the first concurrent requests need no warmup of their own.
+A failed warmup stops the server. <code class="docutils literal notranslate"><span class="pre">SGLANG_OMNI_WARMUP_TIMEOUT</span></code> (seconds, default
+600) bounds each request, and <code class="docutils literal notranslate"><span class="pre">--skip-server-warmup</span></code> reports ready without them.</p>
 </section>
 <section id="prefill-cuda-graphs">
 <h3>Prefill CUDA graphs<a class="headerlink" href="#prefill-cuda-graphs" title="Link to this heading">#</a></h3>
@@ -1450,6 +1465,7 @@ checkpoint is less prone.</p></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ascend-npu-baseline">Ascend NPU baseline</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deterministic-inference">Deterministic Inference</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#overload-admission-policy">Overload / admission policy</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#server-readiness">Server Readiness</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prefill-cuda-graphs">Prefill CUDA graphs</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prefill-admission-coalescing">Prefill Admission Coalescing</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#process-topology">Process topology</a></li>
