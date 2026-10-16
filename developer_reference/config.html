@@ -794,6 +794,11 @@ overrode. Both run the same merge as <code class="docutils literal notranslate">
 <td><p><code class="docutils literal notranslate"><span class="pre">None</span></code></p></td>
 <td><p>Per-stage communication pool and Mooncake options.</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">http_routes</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">list[str]</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">[]</span></code></p></td>
+<td><p>Path prefixes of HTTP routes this stage serves from its own process. The Omni server relays every request under them to the stage, so the routes start with the stage and the HTTP process never imports the runtime behind them. The stage’s scheduler provides the ASGI app through <code class="docutils literal notranslate"><span class="pre">http_app()</span></code>, and the stage must run as one instance.</p></td>
+</tr>
 </tbody>
 </table>
 </div>

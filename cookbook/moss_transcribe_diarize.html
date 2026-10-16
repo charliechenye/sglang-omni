@@ -513,11 +513,7 @@
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-usage">Model Usage</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launching-commands">Launching Commands</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-gpu">CUDA GPU</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#intel-gpu">Intel GPU</a></li>
-</ul>
-</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launching-commands">Launching Commands</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sending-requests">Sending Requests</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a></li>
 </ul>
@@ -735,8 +731,7 @@ decode, it continues coalescing until the target or deadline. Override the two
 limits with <code class="docutils literal notranslate"><span class="pre">--prefill-coalesce-requests</span></code> and <code class="docutils literal notranslate"><span class="pre">--prefill-coalesce-wait-ms</span></code>, or
 set the request target to <code class="docutils literal notranslate"><span class="pre">0</span></code> to disable coalescing.</p>
 <p>Serve the model:</p>
-<section id="cuda-gpu">
-<h4>CUDA GPU<a class="headerlink" href="#cuda-gpu" title="Link to this heading">#</a></h4>
+<p><strong>CUDA GPU</strong></p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--model-path<span class="w"> </span>OpenMOSS-Team/MOSS-Transcribe-Diarize<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
@@ -745,9 +740,7 @@ set the request target to <code class="docutils literal notranslate"><span class
 <span class="w">  </span>--mem-fraction-static<span class="w"> </span><span class="m">0</span>.80
 </pre></div>
 </div>
-</section>
-<section id="intel-gpu">
-<h4>Intel GPU<a class="headerlink" href="#intel-gpu" title="Link to this heading">#</a></h4>
+<p><strong>Intel GPU</strong></p>
 <p>MOSS-TD with LLM and Whisper encoder XPUGraph capture has been validated in
 BF16 on one Intel Arc Pro B60 with 24 GB of memory:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
@@ -770,7 +763,6 @@ the first user request. The first concurrent batch can still build batch-size
 kernel variants. A failed warmup stops the server. <code class="docutils literal notranslate"><span class="pre">SGLANG_OMNI_WARMUP_TIMEOUT</span></code>
 (seconds, default 600) bounds the request, and <code class="docutils literal notranslate"><span class="pre">--skip-server-warmup</span></code> reports
 ready without it.</p>
-</section>
 </section>
 <section id="sending-requests">
 <h3>Sending Requests<a class="headerlink" href="#sending-requests" title="Link to this heading">#</a></h3>
@@ -1085,11 +1077,7 @@ pass every worker serve URL with a comma-separated <code class="docutils literal
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-usage">Model Usage</a><ul class="pst-show_toc_level nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launching-commands">Launching Commands</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-gpu">CUDA GPU</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#intel-gpu">Intel GPU</a></li>
-</ul>
-</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launching-commands">Launching Commands</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#sending-requests">Sending Requests</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#request-parameters">Request Parameters</a></li>
 </ul>

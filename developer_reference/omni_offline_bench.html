@@ -514,12 +514,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-the-benchmark">Run the benchmark</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-shell-block">The shell block</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#one-run">One run</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#video-amme-talker">Video-AMME Talker</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#seed-tts-voice-clone">seed-tts voice clone</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#score">Score</a></li>
-</ul>
-</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#one-run">One run</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#check-coverage-and-collect-the-metrics">Check coverage and collect the metrics</a></li>
 </ul>
 </li>
@@ -745,8 +740,7 @@ mkdir<span class="w"> </span>-p<span class="w"> </span><span class="nv">$H</span
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">test</span><span class="w"> </span>!<span class="w"> </span>-e<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">"</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>!<span class="w"> </span>curl<span class="w"> </span>-s<span class="w"> </span>-o<span class="w"> </span>/dev/null<span class="w"> </span>localhost:8000/health<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>mkdir<span class="w"> </span>-p<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/videoamme"</span><span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/seedtts"</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>rev-parse<span class="w"> </span>HEAD<span class="w"> </span>&gt;<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/commit.txt"</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>git<span class="w"> </span>status<span class="w"> </span>--porcelain<span class="w"> </span>&gt;<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/dirty.txt"</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span>RUN_READY
 </pre></div>
 </div>
-<section id="video-amme-talker">
-<h4>Video-AMME Talker<a class="headerlink" href="#video-amme-talker" title="Link to this heading">#</a></h4>
+<p><strong>Video-AMME Talker</strong></p>
 <p>Start the server. It must print <code class="docutils literal notranslate"><span class="pre">READY</span></code>. <code class="docutils literal notranslate"><span class="pre">/tmp/omni_server.pid</span></code> holds the server’s process group, so the stop command stops all of it.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>setsid<span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">'echo $$ &gt; "$0"; exec "$@"'</span><span class="w"> </span>/tmp/omni_server.pid<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
@@ -775,9 +769,7 @@ timeout<span class="w"> </span><span class="m">1800</span><span class="w"> </spa
 timeout<span class="w"> </span><span class="m">600</span><span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">'until [ "$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits)" -lt 1024 ]; do sleep 5; done'</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span>GPU_FREE<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span>GPU_BUSY
 </pre></div>
 </div>
-</section>
-<section id="seed-tts-voice-clone">
-<h4>seed-tts voice clone<a class="headerlink" href="#seed-tts-voice-clone" title="Link to this heading">#</a></h4>
+<p><strong>seed-tts voice clone</strong></p>
 <p>Start the server. It must print <code class="docutils literal notranslate"><span class="pre">READY</span></code>.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>setsid<span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">'echo $$ &gt; "$0"; exec "$@"'</span><span class="w"> </span>/tmp/omni_server.pid<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
@@ -800,9 +792,7 @@ timeout<span class="w"> </span><span class="m">1800</span><span class="w"> </spa
 timeout<span class="w"> </span><span class="m">600</span><span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">'until [ "$(nvidia-smi -i 0 --query-gpu=memory.used --format=csv,noheader,nounits)" -lt 1024 ]; do sleep 5; done'</span><span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span>GPU_FREE<span class="w"> </span><span class="o">||</span><span class="w"> </span><span class="nb">echo</span><span class="w"> </span>GPU_BUSY
 </pre></div>
 </div>
-</section>
-<section id="score">
-<h4>Score<a class="headerlink" href="#score" title="Link to this heading">#</a></h4>
+<p><strong>Score</strong></p>
 <p>Start Qwen3-ASR. It must print <code class="docutils literal notranslate"><span class="pre">READY</span></code>.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>setsid<span class="w"> </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s1">'echo $$ &gt; "$0"; exec "$@"'</span><span class="w"> </span>/tmp/omni_server.pid<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\</span>
@@ -840,7 +830,6 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmar
 <span class="w">    </span>--meta<span class="w"> </span>zhaochenyang20/seed-tts-eval-arrow<span class="w"> </span>--model<span class="w"> </span>minicpmo<span class="w"> </span>--output-dir<span class="w"> </span><span class="s2">"</span><span class="nv">$OUT</span><span class="s2">/seedtts"</span>
 </pre></div>
 </div>
-</section>
 </section>
 <section id="check-coverage-and-collect-the-metrics">
 <h3>Check coverage and collect the metrics<a class="headerlink" href="#check-coverage-and-collect-the-metrics" title="Link to this heading">#</a></h3>
@@ -1050,12 +1039,7 @@ grep<span class="w"> </span>-H<span class="w"> </span>.<span class="w"> </span><
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-the-benchmark">Run the benchmark</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#the-shell-block">The shell block</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#one-run">One run</a><ul class="nav section-nav flex-column">
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#video-amme-talker">Video-AMME Talker</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#seed-tts-voice-clone">seed-tts voice clone</a></li>
-<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#score">Score</a></li>
-</ul>
-</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#one-run">One run</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#check-coverage-and-collect-the-metrics">Check coverage and collect the metrics</a></li>
 </ul>
 </li>

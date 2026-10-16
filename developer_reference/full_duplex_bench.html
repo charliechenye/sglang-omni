@@ -521,6 +521,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#results">Results</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#settings">Settings</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#running-jobs-in-parallel">Running jobs in parallel</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-metrics">Serving metrics</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#scoring-cli-reference">Scoring CLI reference</a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1071,6 +1072,63 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.duplex.fdb<sp
 </div>
 <p>The ports, the judge config and the compile caches follow the GPU index: the model port is <code class="docutils literal notranslate"><span class="pre">8097</span> <span class="pre">+</span> <span class="pre">10×GPU</span></code>, the judge port <code class="docutils literal notranslate"><span class="pre">30000</span> <span class="pre">+</span> <span class="pre">10×GPU</span></code>, the judge config is in <code class="docutils literal notranslate"><span class="pre">$FDB_WORK/judge/port-&lt;judge</span> <span class="pre">port&gt;/</span></code> and the caches in <code class="docutils literal notranslate"><span class="pre">$FDB_WORK/cache/gpu-&lt;index&gt;/</span></code>. The first line <code class="docutils literal notranslate"><span class="pre">generate</span></code> prints confirms them, for example <code class="docutils literal notranslate"><span class="pre">Job</span> <span class="pre">GPU</span> <span class="pre">1:</span> <span class="pre">model</span> <span class="pre">port</span> <span class="pre">8107,</span> <span class="pre">judge</span> <span class="pre">port</span> <span class="pre">30010</span> <span class="pre">(nccl</span> <span class="pre">30011),</span> <span class="pre">...</span></code>. The <code class="docutils literal notranslate"><span class="pre">unset</span></code> line matters when a shell profile sets <code class="docutils literal notranslate"><span class="pre">GPU</span></code> or a port. Never point two terminals at the same run name.</p>
 </section>
+<section id="serving-metrics">
+<h2>Serving metrics<a class="headerlink" href="#serving-metrics" title="Link to this heading">#</a></h2>
+<p>Serving metrics answer how well a server keeps up when several sessions share it. They are computed only from what the client records, which means any server that speaks the same realtime session protocol or the legacy turn-based protocol can be put in the same table.</p>
+<p>Start the server yourself, with <code class="docutils literal notranslate"><span class="pre">max_sessions</span></code> at least the largest level, then sweep:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_duplex_serving<span class="w"> </span>sweep<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset<span class="w"> </span>v1.5<span class="w"> </span>--concurrency<span class="w"> </span><span class="m">1</span>,2,4,8<span class="w"> </span>--output<span class="w"> </span><span class="s2">"</span><span class="nv">$FDB_WORK</span><span class="s2">/serving/minicpmo"</span><span class="w"> </span>--<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--url<span class="w"> </span>ws://127.0.0.1:8097/v1/realtime<span class="w"> </span>--profile<span class="w"> </span>minicpmo-native-pr2377<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--dataset-root<span class="w"> </span><span class="s2">"</span><span class="nv">$FDB_WORK</span><span class="s2">/dataset/v1.5"</span><span class="w"> </span>--dataset-revision<span class="w"> </span><span class="s2">"</span><span class="k">$(</span>cat<span class="w"> </span><span class="nv">$FDB_WORK</span>/dataset/v1.5.revision<span class="k">)</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--server-revision<span class="w"> </span><span class="s2">"</span><span class="k">$(</span>git<span class="w"> </span>rev-parse<span class="w"> </span>HEAD<span class="k">)</span><span class="s2">"</span><span class="w"> </span>--model<span class="w"> </span>openbmb/MiniCPM-o-4_5<span class="w"> </span>--model-revision<span class="w"> </span>503e754<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--max-per-subset<span class="w"> </span><span class="m">4</span>
+</pre></div>
+</div>
+<p>The options after <code class="docutils literal notranslate"><span class="pre">--</span></code> go unchanged to the <code class="docutils literal notranslate"><span class="pre">record</span></code> command of <code class="docutils literal notranslate"><span class="pre">benchmark_duplex_v15</span></code> (or <code class="docutils literal notranslate"><span class="pre">benchmark_duplex_v10</span></code> with <code class="docutils literal notranslate"><span class="pre">--dataset</span> <span class="pre">v1.0</span></code>); the sweep adds <code class="docutils literal notranslate"><span class="pre">--concurrency</span> <span class="pre">N</span></code> and <code class="docutils literal notranslate"><span class="pre">--output</span> <span class="pre">&lt;output&gt;/concurrency-N</span></code> for each level. It writes <code class="docutils literal notranslate"><span class="pre">serving.json</span></code>, <code class="docutils literal notranslate"><span class="pre">SERVING.md</span></code> and one run directory per level, and keeps going when a level has failed sessions, since those are part of the result. <code class="docutils literal notranslate"><span class="pre">report</span> <span class="pre">--run</span> <span class="pre">&lt;run&gt;</span> <span class="pre">--run</span> <span class="pre">&lt;run&gt;</span> <span class="pre">...</span> <span class="pre">--output</span> <span class="pre">serving.json</span></code> builds the same table from runs that are already recorded.</p>
+<p>Each level is one row:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Column</p></th>
+<th class="head"><p>Meaning</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mean</span> <span class="pre">open</span></code></p></td>
+<td><p>Sessions open at once, averaged over the level’s recording; the first and last sessions of a level have fewer neighbours</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">sessions</span> <span class="pre">failed</span></code></p></td>
+<td><p>Sessions whose protocol replay failed or that broke off</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">503</span></code>, <code class="docutils literal notranslate"><span class="pre">pacing</span> <span class="pre">violations</span></code></p></td>
+<td><p>Sessions denied admission, and sessions whose input drifted more than one 80 ms packet from its schedule. A pacing violation means the load generator fell behind, so the level does not measure the server</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">unit</span> <span class="pre">miss</span></code></p></td>
+<td><p>Native profiles only. Units whose lag exceeds one nominal unit (1000 ms for MiniCPM-o), plus every unit of a failed session</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">unit</span> <span class="pre">lag</span></code></p></td>
+<td><p>Native profiles only. Receipt of <code class="docutils literal notranslate"><span class="pre">sglang.unit.done</span></code> minus the time the client finished sending the packet holding the unit’s last audio; the short last unit, which the server fills with silence, starts at the input end instead. On MiniCPM-o it matches the server-side <code class="docutils literal notranslate"><span class="pre">ready_to_finished_ms</span></code> of the request event recorder within a few milliseconds</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">first</span> <span class="pre">audio</span></code></p></td>
+<td><p>Native: from the unit carrying a reply’s first audio being ready to that audio’s receipt. Turn-based: from <code class="docutils literal notranslate"><span class="pre">response.created</span></code>, which arrives when the server ends the user’s turn, to the first audio</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">buffer</span> <span class="pre">needed</span></code></p></td>
+<td><p>The smallest startup buffer with which a reply plays without a gap. It does not depend on <code class="docutils literal notranslate"><span class="pre">--playback-reserve-ms</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">underrun</span> <span class="pre">replies</span></code></p></td>
+<td><p>Replies that a player starting <code class="docutils literal notranslate"><span class="pre">--playback-reserve-ms</span></code> (80 ms by default) after their first audio would have to pause. This column depends on the reserve: at concurrency 8 on MiniCPM-o, 21 of 35 replies pause at 80 ms while <code class="docutils literal notranslate"><span class="pre">buffer</span> <span class="pre">needed</span></code> p90 is 251 ms</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">RTF</span> <span class="pre">p90</span></code></p></td>
+<td><p>Turn-based only. The time from a reply’s first to its last audio arrival over the audio before the last chunk. Native profiles show <code class="docutils literal notranslate"><span class="pre">-</span></code>, because a native reply comes out one unit per input unit and its factor stays near 1 whatever the load</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">meets</span> <span class="pre">targets</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">yes</span></code>, or the targets the level misses</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>A level meets the targets when no session failed, no session was denied admission, no input pacing was violated, and, for native profiles, the unit miss rate is at most 1%, or, for turn-based profiles, the reply RTF p90 is below 1. A turn-based server’s unit receipts track input intake, so it is judged by how fast its replies stream. The capacity is the highest level below the first one that misses; when every recorded level meets the targets, the capacity is at least the highest one and a higher level has to be recorded.</p>
+<p>These are client-side times on the client’s host: they include the network to the server and leave out the player’s device and the acoustics. Where the time goes inside SGLang-Omni comes from the request event recorder instead; see <a class="reference internal" href="profiler.html#full-duplex-session-unit-metrics"><span class="std std-ref">Full Duplex session Unit metrics</span></a>.</p>
+</section>
 <section id="notes">
 <h2>Notes<a class="headerlink" href="#notes" title="Link to this heading">#</a></h2>
 <ul class="simple">
@@ -1381,6 +1439,7 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmar
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#results">Results</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#settings">Settings</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#running-jobs-in-parallel">Running jobs in parallel</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-metrics">Serving metrics</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#notes">Notes</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#scoring-cli-reference">Scoring CLI reference</a><ul class="pst-show_toc_level nav section-nav flex-column">
