@@ -888,6 +888,7 @@ class FunCosyVoice3Flow:
     token_mel_ratio: int
     output_size: int
     decoder: CausalConditionalCFM
+    enable_buffered_packed_flow: bool
 
     def __init__(
         self,
@@ -899,6 +900,7 @@ class FunCosyVoice3Flow:
         # note(ratish): the eager DiT over packed rows; None with the TensorRT
         # estimator, whose fixed (2, 80, T) profile keeps the padded layout.
         self.packed_estimator = packed_estimator
+        self.enable_buffered_packed_flow = False
         self.prefix_pool: PrefixKVPool | None = None
         self.prefix_cuda_graph_runner: PrefixCudaGraphRunner | None = None
         self.whole_history_cuda_graph_runner: WholeHistoryCudaGraphRunner | None = None
@@ -943,7 +945,15 @@ class FunCosyVoice3Flow:
     @torch.inference_mode()
     def inference(self, inputs: Sequence[FlowBatchInput]) -> list[torch.Tensor]:
         packed = pack_flow_inputs(self.flow, inputs)
-        generated = generate_flow(self, packed)
+        if self.enable_buffered_packed_flow:
+            generated = generate_flow_packed(
+                self,
+                packed,
+                streaming=False,
+                finalize=True,
+            )
+        else:
+            generated = generate_flow(self, packed)
         return split_generated_mels(
             self.flow,
             packed,
@@ -956,9 +966,8 @@ class FunCosyVoice3Flow:
     def inference_leftover(
         self, inputs: Sequence[FlowBatchInput]
     ) -> list[torch.Tensor]:
-        """Non-streaming Flow over each row's whole token history, the rows
-        packed along the sequence; the buffered `inference` keeps the graphed
-        padded call."""
+        """Non-streaming Flow over each row's whole token history, using the
+        existing PackedDiT graph/eager path when the estimator is available."""
         if self.packed_estimator is None:
             return self.inference(inputs)
         else:
@@ -2252,6 +2261,7 @@ def create_vocoder_executor(
     flow_merge_max_gap_frames: int = 384,
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = True,
+    enable_buffered_packed_flow: bool = True,
     enable_flow_cuda_graph: bool = True,
     enable_flow_prefix_cuda_graph: bool,
     enable_flow_whole_history_cuda_graph: bool,
@@ -2477,5 +2487,35 @@ def create_vocoder_executor(
         flow.whole_history_cuda_graph_runner = whole_history_cuda_graph_runner
     else:
         pass
+    if not enable_buffered_packed_flow:
+        buffered_flow_route = "native"
+        buffered_flow_reason = "explicitly disabled"
+    elif device_obj.type != "cuda":
+        buffered_flow_route = "native"
+        buffered_flow_reason = f"device type {device_obj.type} is not CUDA"
+    elif enable_flow_estimator_trt:
+        buffered_flow_route = "native"
+        buffered_flow_reason = "TensorRT estimator enabled"
+    elif packed_estimator is None:
+        buffered_flow_route = "native"
+        buffered_flow_reason = "PackedDiT is unavailable"
+    elif not packed_estimator.is_ragged:
+        buffered_flow_route = "native"
+        buffered_flow_reason = "ragged FA3 is unavailable"
+    elif autocast_dtype not in FA3_DTYPES:
+        buffered_flow_route = "native"
+        buffered_flow_reason = f"dtype {autocast_dtype} is not FA3-compatible"
+    else:
+        buffered_flow_route = "packed"
+        whole_history_graph_available = flow.whole_history_cuda_graph_runner is not None
+        buffered_flow_reason = (
+            f"FA3 available, compile={packed_estimator.is_compiled}, "
+            f"whole_history_graph={whole_history_graph_available}"
+        )
+    flow.enable_buffered_packed_flow = buffered_flow_route == "packed"
+    logger.info(
+        f"Fun-CosyVoice3 buffered Flow: {buffered_flow_route} "
+        f"({buffered_flow_reason})"
+    )
     scheduler.warmup_now()
     return scheduler

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import sglang_omni.models.fun_cosyvoice3.stages as stages
 from sglang_omni.models.fun_cosyvoice3.packed_dit import PackedRows
 from sglang_omni.models.fun_cosyvoice3.stages import (
     FLOW_EULER_STEPS,
@@ -50,6 +51,7 @@ class RecordingPackedEstimator:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
         self.is_ragged = False
+        self.is_compiled = False
         self.build_modulations(
             torch.linspace(0, 1, FLOW_EULER_STEPS + 1), torch.float32
         )
@@ -255,6 +257,113 @@ def test_flow_batch_builds_variable_length_mel_masks_and_conditions() -> None:
     assert torch.count_nonzero(cond[0]) == 0
     torch.testing.assert_close(cond[1, :, :4], torch.full((4, 4), 7.0))
     assert torch.count_nonzero(cond[1, :, 4:]) == 0
+
+
+@pytest.mark.parametrize("enable_buffered_packed_flow", [False, True])
+def test_buffered_flow_route_is_explicit_and_preserves_split_order(
+    monkeypatch: pytest.MonkeyPatch,
+    enable_buffered_packed_flow: bool,
+) -> None:
+    flow = FakeFlow(max_frames=128)
+    packed_flow = FunCosyVoice3Flow(flow, packed_estimator=flow.packed_estimator)
+    assert packed_flow.enable_buffered_packed_flow is False
+    packed_flow.enable_buffered_packed_flow = enable_buffered_packed_flow
+    items = [
+        make_input([1], prompt_token=[2], prompt_value=0.5),
+        make_input([3, 4], prompt_token=[5, 6], prompt_value=1.5),
+    ]
+    native_calls: list[tuple[object, object]] = []
+    packed_calls: list[tuple[object, object, bool, bool]] = []
+    original_native = stages.generate_flow
+    original_packed = stages.generate_flow_packed
+
+    def record_native(flow_arg, packed_batch):
+        native_calls.append((flow_arg, packed_batch))
+        return original_native(flow_arg, packed_batch)
+
+    def record_packed(flow_arg, packed_batch, *, streaming, finalize):
+        packed_calls.append((flow_arg, packed_batch, streaming, finalize))
+        return original_packed(
+            flow_arg,
+            packed_batch,
+            streaming=streaming,
+            finalize=finalize,
+        )
+
+    monkeypatch.setattr(stages, "generate_flow", record_native)
+    monkeypatch.setattr(stages, "generate_flow_packed", record_packed)
+
+    generated = packed_flow.inference(items)
+
+    expected_shapes = [(1, 4, 2), (1, 4, 4)]
+    assert [tuple(mel.shape) for mel in generated] == expected_shapes
+    if enable_buffered_packed_flow:
+        assert len(packed_calls) == 1
+        assert packed_calls[0][2:] == (False, True)
+        assert native_calls == []
+    else:
+        assert packed_calls == []
+        assert len(native_calls) == 1
+
+
+@pytest.mark.parametrize("has_graph_runner", [False, True])
+def test_buffered_packed_flow_inference_uses_packed_eager_without_native_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    has_graph_runner: bool,
+) -> None:
+    flow = FakeFlow(max_frames=128)
+    packed_flow = FunCosyVoice3Flow(flow, packed_estimator=flow.packed_estimator)
+    packed_flow.enable_buffered_packed_flow = True
+    assert flow.packed_estimator.is_compiled is False
+
+    class GraphMiss:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, **kwargs):
+            del kwargs
+            self.calls += 1
+            return None
+
+    graph_runner: GraphMiss | None = None
+    if has_graph_runner:
+        graph_runner = GraphMiss()
+        packed_flow.whole_history_cuda_graph_runner = graph_runner
+    else:
+        pass
+    packed_calls: list[object] = []
+    original_packed_solve = stages.solve_flow_euler_packed
+
+    def record_packed_solve(*args, **kwargs):
+        packed_calls.append((args, kwargs))
+        return original_packed_solve(*args, **kwargs)
+
+    monkeypatch.setattr(stages, "solve_flow_euler_packed", record_packed_solve)
+    monkeypatch.setattr(
+        stages,
+        "solve_flow_euler",
+        lambda *args, **kwargs: pytest.fail("Packed graph miss retried native Flow"),
+    )
+
+    inputs = [
+        make_input([1], prompt_token=[2]),
+        make_input([3, 4], prompt_token=[5, 6]),
+    ]
+    generated = packed_flow.inference(inputs)
+
+    assert len(packed_calls) == 1
+    assert [tuple(mel.shape) for mel in generated] == [(1, 4, 2), (1, 4, 4)]
+    if graph_runner is not None:
+        assert graph_runner.calls == 1
+    else:
+        pass
+
+    def fail_packed_solve(*args, **kwargs):
+        raise RuntimeError("packed Flow failed")
+
+    monkeypatch.setattr(stages, "solve_flow_euler_packed", fail_packed_solve)
+    with pytest.raises(RuntimeError, match="packed Flow failed"):
+        packed_flow.inference(inputs)
 
 
 def test_flow_batch_cfg_uses_two_times_request_batch() -> None:

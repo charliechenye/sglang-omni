@@ -193,6 +193,29 @@ def test_fun_cosyvoice3_dit_compile_default_yields_to_tensorrt(
     assert kwargs["enable_dit_torch_compile"] is expected_compile
 
 
+@pytest.mark.parametrize(
+    ("raw_value", "expected_value"),
+    [("true", True), ("false", False)],
+)
+def test_fun_cosyvoice3_buffered_packed_flow_cli_value_is_typed_boolean(
+    raw_value: str,
+    expected_value: bool,
+) -> None:
+    merged = ConfigManager(
+        FunCosyVoice3PipelineConfig(model_path="model")
+    ).merge_config({"vocoder.factory.enable_buffered_packed_flow": raw_value})
+    vocoder = next(stage for stage in merged.stages if stage.name == "vocoder")
+
+    assert vocoder.factory.enable_buffered_packed_flow is expected_value
+    kwargs = apply_typed_stage_kwargs(
+        create_vocoder_executor,
+        resolve_stage_factory_kwargs(vocoder, merged),
+        resolve_stage_typed_kwargs(vocoder),
+        stage_name="vocoder",
+    )
+    assert kwargs["enable_buffered_packed_flow"] is expected_value
+
+
 def test_fun_cosyvoice3_rejects_explicit_tensorrt_and_dit_compile() -> None:
     manager = ConfigManager(FunCosyVoice3PipelineConfig(model_path="model"))
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import sys
 from collections.abc import Iterator
 from types import SimpleNamespace
@@ -105,11 +106,18 @@ class GraphRunnableFakeFlow(RunnableFakeFlow):
 
 
 class RecordingPackedDiT(PackedDiT):
-    def __init__(self) -> None:
-        self.is_ragged = True
+    def __init__(self, *, is_ragged: bool = True, is_compiled: bool = False) -> None:
+        self.is_ragged = is_ragged
+        self.is_compiled = is_compiled
+
+    def build_modulations(self, time_span: torch.Tensor, dtype: torch.dtype) -> None:
+        del time_span, dtype
+        self.block_modulations = ()
+        self.final_modulations = ()
 
     def compile(self, dtype: torch.dtype | None) -> bool:
         del dtype
+        self.is_compiled = True
         return True
 
 
@@ -973,14 +981,35 @@ def test_create_vocoder_executor_threads_trt_flag(monkeypatch) -> None:
 FLOW_GRAPH_CAPTURE_SHAPES = ((2, 16),)
 
 
+def record_packed_warmup(
+    packed_estimator: PackedDiT | None,
+    startup_events: list[str],
+) -> None:
+    startup_events.append("packed_warmup")
+    if packed_estimator is not None:
+        packed_estimator.is_compiled = True
+    else:
+        pass
+
+
 def prepare_vocoder_startup(
     monkeypatch: pytest.MonkeyPatch,
     startup_events: list[str],
     *,
     device_type: str,
     allow_native_compile: bool,
-) -> GraphRunnableFakeFlow:
-    fake_flow = GraphRunnableFakeFlow(startup_events)
+    packed_estimator: PackedDiT | None = None,
+) -> GraphRunnableFakeFlow | stages.FunCosyVoice3Flow:
+    loaded_flow: GraphRunnableFakeFlow | stages.FunCosyVoice3Flow = (
+        GraphRunnableFakeFlow(startup_events)
+    )
+    if packed_estimator is not None:
+        loaded_flow = stages.FunCosyVoice3Flow(
+            loaded_flow,
+            packed_estimator=packed_estimator,
+        )
+    else:
+        pass
     resolved_device = torch.device(device_type)
     monkeypatch.setattr(
         stages,
@@ -993,14 +1022,14 @@ def prepare_vocoder_startup(
         stages,
         "load_cosyvoice3_flow_hift",
         lambda checkpoint_dir, device, fp16, autocast_dtype, enable_flow_estimator_trt=False: (
-            fake_flow,
+            loaded_flow,
             FakeHiFT(),
         ),
     )
 
     def record_native_compile(flow, autocast_dtype: torch.dtype | None) -> None:
         if allow_native_compile:
-            assert flow is fake_flow
+            assert flow is loaded_flow
             assert autocast_dtype == torch.bfloat16
             startup_events.append("native_compile")
         else:
@@ -1015,7 +1044,7 @@ def prepare_vocoder_startup(
     monkeypatch.setattr(
         FunCosyVoice3StreamingVocoderScheduler,
         "warmup_packed_dit_compile",
-        lambda scheduler: startup_events.append("packed_warmup"),
+        lambda scheduler: record_packed_warmup(packed_estimator, startup_events),
     )
     if device_type in ("cuda", "xpu"):
         platform = CUDAOmniPlatform() if device_type == "cuda" else XPUOmniPlatform()
@@ -1035,7 +1064,7 @@ def prepare_vocoder_startup(
         monkeypatch.setattr(stages, "FlowCudaGraphRunner", RecordingFlowCudaGraphRunner)
     else:
         pass
-    return fake_flow
+    return loaded_flow
 
 
 @pytest.mark.parametrize("enable_dit_torch_compile", [False, True])
@@ -1097,6 +1126,109 @@ def test_create_vocoder_executor_on_xpu_captures_flow_graphs_only_for_an_eager_d
     )
 
     assert ("graph_capture" in startup_events) is not enable_dit_torch_compile
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "default-packed",
+        "explicit-opt-out",
+        "unsupported-device",
+        "unsupported-ragged-attention",
+        "unsupported-dtype",
+        "uncompiled-packed",
+        "missing-packed-estimator",
+        "tensorrt-estimator",
+    ],
+)
+def test_create_vocoder_executor_sets_effective_buffered_flow_route(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    case: str,
+) -> None:
+    startup_events: list[str] = []
+    device_type = "cuda"
+    dtype = "bfloat16"
+    enable_dit_torch_compile = False
+    enable_buffered_packed_flow = True
+    enable_flow_estimator_trt = False
+    packed_estimator: PackedDiT | None = None
+    expected_route = "native"
+    expected_reason = ""
+    if case == "default-packed":
+        enable_dit_torch_compile = True
+        packed_estimator = RecordingPackedDiT(is_ragged=True)
+        expected_route = "packed"
+        expected_reason = "compile=True"
+    elif case == "explicit-opt-out":
+        packed_estimator = RecordingPackedDiT(is_ragged=True, is_compiled=True)
+        enable_buffered_packed_flow = False
+        expected_reason = "explicitly disabled"
+    elif case == "unsupported-device":
+        device_type = "cpu"
+        packed_estimator = RecordingPackedDiT(is_ragged=True, is_compiled=True)
+        expected_reason = "device type cpu"
+    elif case == "unsupported-ragged-attention":
+        packed_estimator = RecordingPackedDiT(is_ragged=False, is_compiled=True)
+        expected_reason = "ragged FA3"
+    elif case == "unsupported-dtype":
+        dtype = "float32"
+        packed_estimator = RecordingPackedDiT(is_ragged=True, is_compiled=True)
+        expected_reason = "not FA3-compatible"
+    elif case == "uncompiled-packed":
+        packed_estimator = RecordingPackedDiT(is_ragged=True)
+        expected_route = "packed"
+        expected_reason = "compile=False"
+    elif case == "missing-packed-estimator":
+        expected_reason = "PackedDiT is unavailable"
+    elif case == "tensorrt-estimator":
+        enable_flow_estimator_trt = True
+        packed_estimator = RecordingPackedDiT(is_ragged=True, is_compiled=True)
+        expected_reason = "TensorRT estimator"
+    else:
+        raise AssertionError(f"unhandled test case {case}")
+
+    prepare_vocoder_startup(
+        monkeypatch,
+        startup_events,
+        device_type=device_type,
+        allow_native_compile=enable_dit_torch_compile,
+        packed_estimator=packed_estimator,
+    )
+    monkeypatch.setattr(
+        torch,
+        "autocast",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+    factory_options: dict[str, bool] = {
+        "enable_flow_estimator_trt": enable_flow_estimator_trt,
+    }
+    if case != "default-packed":
+        factory_options["enable_buffered_packed_flow"] = enable_buffered_packed_flow
+    else:
+        pass
+
+    with caplog.at_level(logging.INFO, logger=stages.__name__):
+        scheduler = stages.create_vocoder_executor(
+            "model",
+            device=device_type,
+            dtype=dtype,
+            flow_prefix_cache_gb=0.0,
+            enable_flow_cuda_graph=False,
+            enable_flow_prefix_cuda_graph=False,
+            enable_flow_whole_history_cuda_graph=False,
+            enable_dit_torch_compile=enable_dit_torch_compile,
+            **factory_options,
+        )
+
+    assert scheduler.vocoder.flow.enable_buffered_packed_flow is (
+        expected_route == "packed"
+    )
+    assert any(
+        f"Fun-CosyVoice3 buffered Flow: {expected_route}" in record.message
+        and expected_reason in record.message
+        for record in caplog.records
+    )
 
 
 def test_create_vocoder_executor_rejects_trt_and_compile() -> None:
