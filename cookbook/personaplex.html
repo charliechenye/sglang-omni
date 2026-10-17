@@ -541,6 +541,9 @@
 </div>
 <p>It ships the 7B weights, the Mimi codec, the SentencePiece text model and <code class="docutils literal notranslate"><span class="pre">voices.tgz</span></code>, which is unpacked into <code class="docutils literal notranslate"><span class="pre">voices/</span></code> next to the checkpoint on first use, or into the temp directory when that folder cannot be written. Recorded voice prompts (<code class="docutils literal notranslate"><span class="pre">--voice</span> <span class="pre">some.wav</span></code>) also need <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">pyloudnorm</span></code>; the packaged <code class="docutils literal notranslate"><span class="pre">.pt</span></code> voices do not.</p>
 <p>Everything runs on one GPU. On an H200 the LM engine reserves <code class="docutils literal notranslate"><span class="pre">mem_fraction_static=0.3</span></code> and the two Mimi instances stay under 1 GB each. This value is a fraction of total device memory, so a smaller-memory device can need a higher fraction to fit the model weights.</p>
+<p>The Mimi encoder stage loads only its encoding path, and Code2Wav loads only its
+decoding path. Both retain the codebooks and quantizer projections their path
+needs, reducing the combined FP32 codec weights and buffers by about 302 MiB.</p>
 </section>
 <section id="running-the-offline-example">
 <h2>Running the offline example<a class="headerlink" href="#running-the-offline-example" title="Link to this heading">#</a></h2>
