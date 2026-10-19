@@ -166,6 +166,8 @@ running phase work, and the request closes once with reason `shed`, just as a
 request that reaches its deadline fails with the `timeout_s` error (HTTP 500)
 and closes with reason `expired`.
 
+A step can also list phases in `dispatches` to run them at once, at most one per stage of a request. A step that starts no phase waits while others run, and `advance` reports each result as it returns, so an adapter whose phases finish out of order holds its outputs to publish them in model order.
+
 A pipeline config subclasses `UMMPipelineConfig` and declares an
 `orchestrator` stage (factory `create_umm_controller`, route_fn `route_umm`,
 stream_done_to_fn `umm_stream_done_targets`, `stream_to` and `next` naming
