@@ -237,7 +237,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/minicpm_o.html">MiniCPM-o</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/ming_omni.html">Ming-Omni</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/ming3_audio.html">Ming-3.0-audio-flash</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../cookbook/ming3_tts.html">Ming-3.0-tts-tiny</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/ming3_tts.html">Ming-3.0-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/ming3_asr.html">Ming-3.0-asr-tiny</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/nemotron_voicechat.html">NemotronLabs VoiceChat</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/personaplex.html">PersonaPlex</a></li>
@@ -682,15 +682,20 @@
 </tr>
 </thead>
 <tbody>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">unit-test</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">pytest</span> <span class="pre">tests/</span> <span class="pre">-m</span> <span class="pre">&quot;not</span> <span class="pre">benchmark</span> <span class="pre">and</span> <span class="pre">not</span> <span class="pre">accelerator&quot;</span></code>, with CUDA hidden from the process</p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">unit-test-a</span></code></p></td>
+<td><p>First runtime-balanced partition of <code class="docutils literal notranslate"><span class="pre">pytest</span> <span class="pre">tests/</span> <span class="pre">-m</span> <span class="pre">&quot;not</span> <span class="pre">benchmark</span> <span class="pre">and</span> <span class="pre">not</span> <span class="pre">accelerator&quot;</span></code>, with CUDA hidden</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">unit-test-accelerator</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">unit-test-b</span></code></p></td>
+<td><p>Second runtime-balanced partition of the same CPU unit-test suite, with CUDA hidden</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">unit-test-accelerator</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">pytest</span> <span class="pre">tests/</span> <span class="pre">-m</span> <span class="pre">&quot;accelerator</span> <span class="pre">and</span> <span class="pre">not</span> <span class="pre">benchmark&quot;</span></code>, the unit tests that need a GPU</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<p>The CPU partitions run as independent matrix jobs with fail-fast disabled. Files stay intact and are balanced using <code class="docutils literal notranslate"><span class="pre">.github/unit_test_durations.json</span></code>. Pytest discovers new tests automatically; files without a timing entry receive a one-second estimate, and new cases in an existing file stay in that file’s partition. Local pytest remains unpartitioned unless the CI plugin is explicitly loaded.</p>
+<p>The initial weights are per-file p90 elapsed estimates from three successful H100 CPU jobs: <a class="reference external" href="https://github.com/sgl-project/sglang-omni/actions/runs/39288752772/job/118185861718">118185861718</a>, <a class="reference external" href="https://github.com/sgl-project/sglang-omni/actions/runs/39292142439/job/118197139172">118197139172</a> and <a class="reference external" href="https://github.com/sgl-project/sglang-omni/actions/runs/39305977181/job/118244967308">118244967308</a>. Each file has three observations. The estimates aggregate timestamp intervals between completed pytest cases, excluding initial collection; they are not isolated setup/call/teardown measurements. These are PR runs with different revisions, not scheduled main-branch observations. The weights are a committed snapshot, not an automatically refreshed model.</p>
 <p><code class="docutils literal notranslate"><span class="pre">run-unit-test-ci-only</span></code> selects PR Test without selecting model or hardware stages. Other stage labels remain additive, so keep them and <code class="docutils literal notranslate"><span class="pre">run-all-ci</span></code> absent for unit tests only. Shared setup still runs, including model-weight provisioning. PR Test also runs whenever any other stage label selects a stage, the hardware stages included.</p>
 </section>
 <section id="asr">
