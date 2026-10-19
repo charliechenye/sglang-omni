@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.8" />
-    <meta name="docbuild:last-update" content="Oct 18, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 19, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -236,6 +236,9 @@
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/qwen3_omni.html">Qwen3-Omni</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/minicpm_o.html">MiniCPM-o</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/ming_omni.html">Ming-Omni</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/ming3_audio.html">Ming-3.0-audio-flash</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/ming3_tts.html">Ming-3.0-tts-tiny</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../cookbook/ming3_asr.html">Ming-3.0-asr-tiny</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/nemotron_voicechat.html">NemotronLabs VoiceChat</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/personaplex.html">PersonaPlex</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../cookbook/llada2_uni.html">LLaDA2.0-Uni</a></li>
@@ -600,6 +603,14 @@ for details.</p>
 <tr class="row-odd"><td><p><a class="reference internal" href="../cookbook/ming_tts.html"><span class="std std-doc">Ming-Omni-TTS</span></a></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">examples/configs/ming_omni_tts.yaml</span></code></p></td>
 <td><p>Text-only synthesis or one local reference clip with its transcript; streaming; the provided config uses TP1</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="../cookbook/ming3_audio.html"><span class="std std-doc">Ming 3 audio</span></a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--model-path</span></code> and <code class="docutils literal notranslate"><span class="pre">--thinker.tp_size</span></code></p></td>
+<td><p>Transcription, audio chat, and 44.1 kHz speech. Speech uses one reference clip and its transcript. Thinker tensor parallelism is set at launch</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="../cookbook/ming3_tts.html"><span class="std std-doc">Ming 3 TTS</span></a></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">--model-path</span></code> only</p></td>
+<td><p>44.1 kHz voice cloning from one reference recording. <code class="docutils literal notranslate"><span class="pre">ref_text</span></code> is accepted and unused. One GPU</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="../cookbook/fun_cosyvoice3.html"><span class="std std-doc">Fun-CosyVoice3</span></a></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">--model-path</span></code> only</p></td>
@@ -1487,7 +1498,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 18, 2026.
+  Last updated on Oct 19, 2026.
   <br/>
 </p>
   </div>
