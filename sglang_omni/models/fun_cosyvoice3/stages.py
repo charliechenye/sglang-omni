@@ -2387,6 +2387,49 @@ class CosyVoice3Vocoder(BatchVocoderBase[FunCosyVoice3State, torch.Tensor]):
         return payload
 
 
+def resolve_whole_history_graph_tiers(
+    source_tiers: Sequence[int],
+    override_csv: str | None,
+) -> tuple[int, ...]:
+    """Experiment-only selection of existing WholeHistory frame tiers.
+
+    Keep the source maximum so all previously graphed lengths remain covered;
+    enforce <=1.5x original physical frame tier capacity for ALL original
+    tiers. This is not a GPU latency or memory safety guarantee. Critically,
+    HiFT continues using the UNMODIFIED original source ladder.
+    """
+    source = tuple(source_tiers)
+    if override_csv is None:
+        return source
+    if not source or source != tuple(sorted(set(source))) or source[0] <= 0:
+        raise ValueError("WholeHistory source tier ladder is invalid")
+    if not isinstance(override_csv, str):
+        raise ValueError("flow_whole_history_tier_frames must be a CSV string")
+    fields = override_csv.split(",")
+    if not fields or any(
+        not field or field.strip() != field or not field.isascii()
+        or not field.isdecimal()
+        for field in fields
+    ):
+        raise ValueError("flow_whole_history_tier_frames expects positive comma-separated integers")
+    selected = tuple(int(field) for field in fields)
+    if (
+        selected != tuple(sorted(set(selected)))
+        or selected[0] <= 0
+        or any(tier not in source for tier in selected)
+        or selected[-1] != source[-1]
+    ):
+        raise ValueError("WholeHistory override must be sorted unique source tiers including source maximum")
+    for tier in source:
+        position = bisect.bisect_left(selected, tier)
+        if position >= len(selected) or selected[position] > tier * 1.5:
+            raise ValueError(
+                "WholeHistory override exceeds 1.5x original tier capacity "
+                f"at source tier {tier}"
+            )
+    return selected
+
+
 def create_vocoder_executor(
     model_path: str,
     *,
@@ -2405,6 +2448,7 @@ def create_vocoder_executor(
     enable_flow_whole_history_cuda_graph: bool,
     enable_hift_cuda_graph: bool,
     flow_cuda_graph_capture_shapes: tuple[tuple[int, int], ...] | None = None,
+    flow_whole_history_tier_frames: str | None = None,
     enable_flow_estimator_trt: bool = False,
     hift_dtype: str = "float32",
     hift_max_padding_waste: float = 1.5,
@@ -2425,6 +2469,16 @@ def create_vocoder_executor(
         raise ValueError("flow_prefix_cache_gb must be >= 0")
     else:
         pass
+
+    # Resolve and validate BEFORE loading checkpoints or initializing CUDA.
+    full_flow_tier_frames = generate_prefill_cuda_graph_batch_sizes(
+        flow_batch_admission_frames
+    )
+    if flow_whole_history_tier_frames is not None and not enable_flow_whole_history_cuda_graph:
+        raise ValueError("WholeHistory tier override requires enable_flow_whole_history_cuda_graph")
+    whole_history_tier_frames = resolve_whole_history_graph_tiers(
+        full_flow_tier_frames, flow_whole_history_tier_frames
+    )
 
     reject_conflicting_dit_accelerators(
         enable_dit_torch_compile=enable_dit_torch_compile,
@@ -2588,11 +2642,8 @@ def create_vocoder_executor(
     else:
         pass
     has_prefix_graphs = enable_flow_prefix_cuda_graph and flow.prefix_pool is not None
-    # note(ratish): sglang's ladder starts at 4 frames, so a smaller admission budget
-    # has no tier and every final keeps the eager solve.
-    whole_history_tier_frames = generate_prefill_cuda_graph_batch_sizes(
-        flow_batch_admission_frames
-    )
+    # The selected WholeHistory ladder was resolved before loading weights;
+    # HiFT continues to derive tiers from the original full ladder.
     has_whole_history_graphs = (
         enable_flow_whole_history_cuda_graph
         and packed_fa3_available
@@ -2612,9 +2663,15 @@ def create_vocoder_executor(
         + vocoder.hift_hold_frames
         + HIFT_DECODE_CONTEXT_FRAMES
     )
-    first_tier = bisect.bisect_left(whole_history_tier_frames, shortest_window_frames)
-    last_tier = bisect.bisect_left(whole_history_tier_frames, longest_window_frames)
-    hift_tier_frames = whole_history_tier_frames[first_tier : last_tier + 1]
+    first_tier = bisect.bisect_left(full_flow_tier_frames, shortest_window_frames)
+    last_tier = bisect.bisect_left(full_flow_tier_frames, longest_window_frames)
+    hift_tier_frames = full_flow_tier_frames[first_tier : last_tier + 1]
+    logger.info(
+        "Fun-CosyVoice3 WholeHistory tier family: source=%s selected=%s hift=%s",
+        list(full_flow_tier_frames),
+        list(whole_history_tier_frames),
+        list(hift_tier_frames),
+    )
     # note (ratish): torch.istft reads its window envelope on the host, so HiFT's decode
     # captures only with the vocoder's kernels.
     has_hift_graphs = (
