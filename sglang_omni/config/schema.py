@@ -225,6 +225,8 @@ class FactoryArgs(BaseModel):
     max_batch_size: int | None = Field(default=None, ge=1)
     max_batch_wait_ms: float | None = Field(default=None, ge=0)
     enable_buffered_packed_flow: bool | None = None
+    # Experimental Fun-CosyVoice3 HiFT SineGen2 harmonic cache; opt-in only.
+    enable_hift_sinegen_cache: bool | None = None
     enable_async_decode: bool | None = None
     async_decode_min_batch_size: int | None = Field(default=None, ge=1)
     prefill_coalesce_requests: int | None = Field(default=None, ge=0)
