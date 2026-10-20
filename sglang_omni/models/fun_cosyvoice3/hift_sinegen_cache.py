@@ -11,6 +11,7 @@ This patch is intentionally experimental and disabled by default.
 """
 from __future__ import annotations
 
+import inspect
 from types import MethodType
 from typing import TYPE_CHECKING
 
@@ -35,6 +36,16 @@ def patch_hift_sinegen_cache(
     from cosyvoice.hifigan.generator import SineGen2
 
     sine_gen = hift.m_source.l_sin_gen
+    pinned_source = inspect.getsource(SineGen2.forward)
+    if (
+        "torch.FloatTensor([[range(1, self.harmonic_num + 2)]])"
+        not in pinned_source
+        or "self.sine_waves[:, :sine_waves.shape[1]]" not in pinned_source
+    ):
+        raise RuntimeError(
+            "P3 CosyVoice SineGen2.forward source contract changed; "
+            "review copied inference semantics before enabling the cache"
+        )
     if type(sine_gen) is not SineGen2:
         raise RuntimeError(
             "P3 harmonic cache requires the exact pinned CosyVoice SineGen2 class"
