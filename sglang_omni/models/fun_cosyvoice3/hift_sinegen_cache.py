@@ -63,6 +63,12 @@ def patch_hift_sinegen_cache(
     if hasattr(sine_gen, HARMONIC_BUFFER):
         raise RuntimeError("P3 SineGen2 harmonic cache already installed")
     device = torch.device(device)
+    # torch.device("cuda") is an *unindexed* current-device selector,
+    # whereas CUDA tensors report an explicit index (e.g. cuda:0).
+    # Resolve that selector before the strict persistent-array check;
+    # do not relax the check across distinct physical CUDA devices.
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
     if (
         sine_gen.rand_ini.device != device
         or sine_gen.sine_waves.device != device
