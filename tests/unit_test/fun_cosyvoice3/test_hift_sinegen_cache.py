@@ -46,13 +46,17 @@ def _real_sinegen(device: torch.device):
 
 
 @pytest.mark.parametrize("rows", [1, 4])
-@pytest.mark.parametrize("device_kind", ["cpu", "cuda"])
+@pytest.mark.parametrize("device_kind", ["cpu", "cuda", "cuda-indexed"])
 def test_real_cosyvoice_sinegen_output_parity(
     device_kind: str, rows: int,
 ) -> None:
-    if device_kind == "cuda" and not torch.cuda.is_available():
+    if device_kind.startswith("cuda") and not torch.cuda.is_available():
         pytest.skip("CUDA optional for CPU-only conformance runs")
-    device = torch.device(device_kind)
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if device_kind == "cuda-indexed"
+        else torch.device(device_kind)
+    )
     sine = _real_sinegen(device)
     hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=sine))
     f0 = (
@@ -73,7 +77,9 @@ def test_real_cosyvoice_sinegen_output_parity(
     assert sorted(sine.state_dict()) == state_before
     assert HARMONIC_BUFFER not in sine.state_dict()
     assert HARMONIC_BUFFER in sine._buffers
-    assert sine._buffers[HARMONIC_BUFFER].device == device
+    # The input's concrete cuda:0 (or cuda:N) device is authoritative:
+    # torch.device("cuda") is intentionally unindexed in one test arm.
+    assert sine._buffers[HARMONIC_BUFFER].device == f0.device
     assert sine._buffers[HARMONIC_BUFFER].dtype == torch.float32
     torch.testing.assert_close(
         sine._buffers[HARMONIC_BUFFER],
@@ -116,6 +122,15 @@ def test_non_causal_or_wrong_device_fails_closed() -> None:
     sine.harmonic_num = 9
     with pytest.raises(RuntimeError, match="eval-mode causal"):
         patch_hift_sinegen_cache(hift, device=dev)
+
+
+def test_wrong_physical_array_device_remains_rejected() -> None:
+    # Never accept a different physical device just to make unindexed
+    # "cuda" work. This test runs without access to a physical GPU.
+    sine = _real_sinegen(torch.device("cpu"))
+    hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=sine))
+    with pytest.raises(RuntimeError, match="on the target device"):
+        patch_hift_sinegen_cache(hift, device=torch.device("meta"))
 
 
 def test_sinegen_pinned_forward_keeps_expected_h2d_source() -> None:
