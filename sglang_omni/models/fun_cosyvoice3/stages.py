@@ -2400,6 +2400,7 @@ def create_vocoder_executor(
     flow_merge_pad_budget_percent: float = 25.0,
     enable_dit_torch_compile: bool = True,
     enable_buffered_packed_flow: bool = True,
+    enable_hift_sinegen_cache: bool = False,
     enable_flow_cuda_graph: bool = True,
     enable_flow_prefix_cuda_graph: bool,
     enable_flow_whole_history_cuda_graph: bool,
@@ -2431,6 +2432,10 @@ def create_vocoder_executor(
         enable_flow_estimator_trt=enable_flow_estimator_trt,
     )
     device = str(resolve_concrete_device(device, gpu_id))
+    if enable_hift_sinegen_cache and torch.device(device).type != "cuda":
+        raise ValueError(
+            "Fun-CosyVoice3 experimental HiFT SineGen cache requires CUDA"
+        )
 
     max_batch_size = 16 if max_batch_size is None else int(max_batch_size)
     dtype = dtype or "bfloat16"
@@ -2461,6 +2466,16 @@ def create_vocoder_executor(
     )
 
     device_obj = torch.device(device)
+    if enable_hift_sinegen_cache:
+        from sglang_omni.models.fun_cosyvoice3.hift_sinegen_cache import (
+            patch_hift_sinegen_cache,
+        )
+
+        patch_hift_sinegen_cache(hift, device=device_obj)
+    logger.info(
+        "Fun-CosyVoice3 HiFT SineGen harmonic cache: %s",
+        "enabled" if enable_hift_sinegen_cache else "disabled",
+    )
     packed_estimator = flow.packed_estimator
     packed_fa3_reason = packed_fa3_unavailable_reason(
         packed_estimator,
