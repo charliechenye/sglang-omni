@@ -45,14 +45,20 @@ def _real_sinegen(device: torch.device):
     return sine
 
 
+@pytest.mark.parametrize("rows", [1, 4])
 @pytest.mark.parametrize("device_kind", ["cpu", "cuda"])
-def test_real_cosyvoice_sinegen_output_parity(device_kind: str) -> None:
+def test_real_cosyvoice_sinegen_output_parity(
+    device_kind: str, rows: int,
+) -> None:
     if device_kind == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA optional for CPU-only conformance runs")
     device = torch.device(device_kind)
     sine = _real_sinegen(device)
     hift = SimpleNamespace(m_source=SimpleNamespace(l_sin_gen=sine))
-    f0 = torch.linspace(0, 280, 80, device=device).view(1, 80, 1)
+    f0 = (
+        torch.linspace(0, 280, 80, device=device)
+        .view(1, 80, 1).expand(rows, -1, -1).contiguous()
+    )
 
     with torch.inference_mode():
         original = sine(f0)
