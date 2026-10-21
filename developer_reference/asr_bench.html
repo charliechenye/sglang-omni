@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.8" />
-    <meta name="docbuild:last-update" content="Oct 19, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 21, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -206,11 +206,12 @@
     <div class="bd-toc-item navbar-nav active">
         <p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">🚀 Installation</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_npu.html">🚀 Installation — Ascend NPU</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_xpu.html">🚀 Installation — Intel XPU</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_cpu.html">🚀 Installation — Intel CPU</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_musa.html">🚀 Installation — MUSA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">Installation — CUDA</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_apple_silicon.html">Installation — Apple Silicon</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_npu.html">Installation — Ascend NPU</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_xpu.html">Installation — Intel XPU</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_cpu.html">Installation — Intel CPU</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_musa.html">Installation — MUSA</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../get_started/troubleshooting.html">Troubleshooting</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
@@ -259,11 +260,16 @@
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/mps_dp.html">Same-GPU Data Parallelism with CUDA MPS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../basic_usage/native_media_routes.html">Native Media Routes</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">MLX</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../mlx/index.html">MLX Path</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Developer Reference</span></p>
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="main.html">Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="apiserver_design.html">API Server Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="pipeline.html">Pipeline Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="full_duplex_interactive_model.html">Full Duplex Interactive Model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="config.html">Config</a></li>
 <li class="toctree-l1"><a class="reference internal" href="adding_parameters.html">Adding a Parameter</a></li>
 <li class="toctree-l1"><a class="reference internal" href="communication.html">Communication</a></li>
@@ -276,7 +282,6 @@
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">ASR benchmark runbook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="omni_offline_bench.html">MiniCPM-o offline benchmark runbook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="rl_admin_control.html">RL Admin Control</a></li>
-<li class="toctree-l1"><a class="reference internal" href="mlx.html">MLX Path</a></li>
 <li class="toctree-l1"><a class="reference internal" href="ci_labels.html">CI Workflows and Labels</a></li>
 <li class="toctree-l1"><a class="reference internal" href="bump_version.html">Bumping the SGLang Pin</a></li>
 </ul>
@@ -571,7 +576,7 @@
 </tbody>
 </table>
 </div>
-<p>CI stage 1 also has <code class="docutils literal notranslate"><span class="pre">aishell4_long90</span></code>, one 90 minute sample stitched together from three <code class="docutils literal notranslate"><span class="pre">aishell4_long</span></code> clips. It only runs through pytest (see <a class="reference internal" href="#run-the-ci-tests"><span class="std std-ref">Run the CI tests</span></a>). CI stage 2 runs one of the three models per CI run, picked at random unless a <code class="docutils literal notranslate"><span class="pre">run-asr-fun-asr-nano-2512</span></code>, <code class="docutils literal notranslate"><span class="pre">run-asr-qwen3-asr-1.7b</span></code> or <code class="docutils literal notranslate"><span class="pre">run-asr-whisper-large-v3</span></code> label is set with <code class="docutils literal notranslate"><span class="pre">run-asr-ci</span></code> or <code class="docutils literal notranslate"><span class="pre">run-all-ci</span></code>.</p>
+<p>CI stage 1 also has <code class="docutils literal notranslate"><span class="pre">aishell4_long90</span></code>, one 90 minute sample stitched together from three <code class="docutils literal notranslate"><span class="pre">aishell4_long</span></code> clips. It only runs through pytest (see <a class="reference internal" href="#run-the-ci-tests"><span class="std std-ref">Run the CI tests</span></a>). CI stage 2 runs one of the three models per CI run, picked at random unless a <code class="docutils literal notranslate"><span class="pre">run-fun-asr-nano-2512</span></code>, <code class="docutils literal notranslate"><span class="pre">run-qwen3-asr-1.7b</span></code> or <code class="docutils literal notranslate"><span class="pre">run-whisper-large-v3</span></code> label is set with <code class="docutils literal notranslate"><span class="pre">run-asr-ci</span></code> or <code class="docutils literal notranslate"><span class="pre">run-all-ci</span></code>.</p>
 <p>This page uses one server on one GPU, with the same datasets, concurrency and request settings as CI.</p>
 </section>
 <section id="variables">
@@ -1085,7 +1090,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 19, 2026.
+  Last updated on Oct 21, 2026.
   <br/>
 </p>
   </div>
