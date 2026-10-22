@@ -42,7 +42,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
-    <script src="../_static/documentation_options.js?v=7ed07c24"></script>
+    <script src="../_static/documentation_options.js?v=c52cfe39"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -60,8 +60,8 @@
     <link rel="prev" title="RL Admin Control" href="rl_admin_control.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.1.8" />
-    <meta name="docbuild:last-update" content="Oct 21, 2026"/>
+  <meta name="docsearch:version" content="0.1.9" />
+    <meta name="docbuild:last-update" content="Oct 22, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -616,7 +616,7 @@
 </tr>
 <tr class="row-even"><td><p>CPU CI</p></td>
 <td><p>Intel Xeon (<code class="docutils literal notranslate"><span class="pre">intel-omni-spr</span></code>)</p></td>
-<td><p>Intel CPU unit tests</p></td>
+<td><p>Job <code class="docutils literal notranslate"><span class="pre">intel-cpu-ci</span> <span class="pre">(unit_test/cpu)</span></code>: <code class="docutils literal notranslate"><span class="pre">pytest</span> <span class="pre">tests/unit_test/cpu/</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">run-intel-cpu-ci</span></code> or <code class="docutils literal notranslate"><span class="pre">run-all-ci</span></code></p></td>
 </tr>
 <tr class="row-odd"><td><p>XPU CI</p></td>
@@ -701,7 +701,7 @@
 </div>
 <p>The CPU partitions run as independent matrix jobs with fail-fast disabled. Files stay intact and are balanced using <code class="docutils literal notranslate"><span class="pre">.github/unit_test_durations.json</span></code>. Pytest discovers new tests automatically; files without a timing entry receive a one-second estimate, and new cases in an existing file stay in that file’s partition. Local pytest remains unpartitioned unless the CI plugin is explicitly loaded.</p>
 <p>The initial weights are per-file p90 elapsed estimates from three successful H100 CPU jobs: <a class="reference external" href="https://github.com/sgl-project/sglang-omni/actions/runs/39288752772/job/118185861718">118185861718</a>, <a class="reference external" href="https://github.com/sgl-project/sglang-omni/actions/runs/39292142439/job/118197139172">118197139172</a> and <a class="reference external" href="https://github.com/sgl-project/sglang-omni/actions/runs/39305977181/job/118244967308">118244967308</a>. Each file has three observations. The estimates aggregate timestamp intervals between completed pytest cases, excluding initial collection; they are not isolated setup/call/teardown measurements. These are PR runs with different revisions, not scheduled main-branch observations. The weights are a committed snapshot, not an automatically refreshed model.</p>
-<p><code class="docutils literal notranslate"><span class="pre">run-unit-test-ci-only</span></code> selects PR Test without selecting model or hardware stages. Other stage labels remain additive, so keep them and <code class="docutils literal notranslate"><span class="pre">run-all-ci</span></code> absent for unit tests only. Shared setup still runs, including model-weight provisioning. PR Test also runs whenever any other stage label selects a stage, the hardware stages included. <code class="docutils literal notranslate"><span class="pre">run-lint-only</span></code> does not run PR Test or setup.</p>
+<p><code class="docutils literal notranslate"><span class="pre">run-unit-test-ci-only</span></code> selects PR Test on H100 without selecting model or hardware stages. It does not run the Intel Xeon job <code class="docutils literal notranslate"><span class="pre">intel-cpu-ci</span> <span class="pre">(unit_test/cpu)</span></code>; that job needs <code class="docutils literal notranslate"><span class="pre">run-intel-cpu-ci</span></code> or <code class="docutils literal notranslate"><span class="pre">run-all-ci</span></code>, and the CPU path filter. Other stage labels remain additive, so keep them and <code class="docutils literal notranslate"><span class="pre">run-all-ci</span></code> absent for unit tests only. Shared setup still runs, including model-weight provisioning. PR Test also runs whenever any other stage label selects a stage, the hardware stages included. <code class="docutils literal notranslate"><span class="pre">run-lint-only</span></code> does not run PR Test or setup.</p>
 </section>
 <section id="asr">
 <h3>ASR<a class="headerlink" href="#asr" title="Link to this heading">#</a></h3>
@@ -898,8 +898,8 @@
 <p>Each hardware stage is its own workflow, with a gate job that waits for lint and resolves the labels. None of them has model labels. Each keeps a path filter, so a stage label alone does not force a run: a pull request that changes none of the stage’s paths skips its tests.</p>
 <section id="cpu-ci">
 <h3>CPU CI<a class="headerlink" href="#cpu-ci" title="Link to this heading">#</a></h3>
-<p>CPU CI builds the Intel Xeon image from <code class="docutils literal notranslate"><span class="pre">docker/cpu.Dockerfile</span></code> and runs <code class="docutils literal notranslate"><span class="pre">pytest</span> <span class="pre">tests/unit_test/cpu/</span></code>. Its tests run when the pull request touches <code class="docutils literal notranslate"><span class="pre">sglang_omni/</span></code> (except Markdown files), <code class="docutils literal notranslate"><span class="pre">tests/unit_test/cpu/</span></code>, <code class="docutils literal notranslate"><span class="pre">pyproject_cpu.toml</span></code>, <code class="docutils literal notranslate"><span class="pre">scripts/cpu/</span></code>, <code class="docutils literal notranslate"><span class="pre">docker/cpu.Dockerfile</span></code> or the workflow itself.</p>
-<p>The stage label is <code class="docutils literal notranslate"><span class="pre">run-intel-cpu-ci</span></code>. When the paths are untouched, or when the pull request selects other stages but not Intel CPU, the test job is skipped and the <code class="docutils literal notranslate"><span class="pre">CPU</span> <span class="pre">CI</span> <span class="pre">Status</span></code> check still reports success.</p>
+<p>CPU CI builds the Intel Xeon image from <code class="docutils literal notranslate"><span class="pre">docker/cpu.Dockerfile</span></code> and runs <code class="docutils literal notranslate"><span class="pre">pytest</span> <span class="pre">tests/unit_test/cpu/</span></code> in the job <code class="docutils literal notranslate"><span class="pre">intel-cpu-ci</span> <span class="pre">(unit_test/cpu)</span></code>. Its tests run when the pull request touches <code class="docutils literal notranslate"><span class="pre">sglang_omni/</span></code> (except Markdown files), <code class="docutils literal notranslate"><span class="pre">tests/unit_test/cpu/</span></code>, <code class="docutils literal notranslate"><span class="pre">pyproject_cpu.toml</span></code>, <code class="docutils literal notranslate"><span class="pre">scripts/cpu/</span></code>, <code class="docutils literal notranslate"><span class="pre">docker/cpu.Dockerfile</span></code> or the workflow itself.</p>
+<p>The stage label is <code class="docutils literal notranslate"><span class="pre">run-intel-cpu-ci</span></code>. <code class="docutils literal notranslate"><span class="pre">run-unit-test-ci-only</span></code> does not select this job. When the paths are untouched, or when the pull request selects other stages but not Intel CPU, the test job is skipped and the <code class="docutils literal notranslate"><span class="pre">CPU</span> <span class="pre">CI</span> <span class="pre">Status</span></code> check still reports success.</p>
 </section>
 <section id="xpu-ci">
 <h3>XPU CI<a class="headerlink" href="#xpu-ci" title="Link to this heading">#</a></h3>
@@ -937,7 +937,7 @@
 <td><p>No self-hosted job. The gates succeed.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">run-unit-test-ci-only</span></code></p></td>
-<td><p>PR Test in Omni CI</p></td>
+<td><p>PR Test on H100. Not <code class="docutils literal notranslate"><span class="pre">intel-cpu-ci</span> <span class="pre">(unit_test/cpu)</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">run-asr-ci</span></code></p></td>
 <td><p>ASR in Omni CI</p></td>
@@ -952,7 +952,7 @@
 <td><p>Omni in Omni CI</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">run-intel-cpu-ci</span></code></p></td>
-<td><p>CPU CI</p></td>
+<td><p>Intel Xeon job <code class="docutils literal notranslate"><span class="pre">intel-cpu-ci</span> <span class="pre">(unit_test/cpu)</span></code>, when the CPU paths match</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">run-intel-xpu-ci</span></code></p></td>
 <td><p>XPU CI</p></td>
@@ -1177,7 +1177,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 21, 2026.
+  Last updated on Oct 22, 2026.
   <br/>
 </p>
   </div>
