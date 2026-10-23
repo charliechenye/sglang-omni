@@ -125,13 +125,9 @@ def clean_markdown_line(line: str) -> str:
     line = replace_autolinks(line)
     if AUTOLINK_START_PATTERN.search(line) is not None:
         raise UnsupportedTextError("malformed HTTP(S) autolink")
-    else:
-        pass
-    if HTML_TAG_PATTERN.search(line) is not None:
+    elif HTML_TAG_PATTERN.search(line) is not None:
         raise UnsupportedTextError("HTML markup is not supported")
-    else:
-        pass
-    if REFERENCE_LINK_PATTERN.search(line) is not None:
+    elif REFERENCE_LINK_PATTERN.search(line) is not None:
         raise UnsupportedTextError("reference-style links are not supported")
     else:
         pass
@@ -193,9 +189,7 @@ def replace_links(line: str) -> str:
         replacement_line = "".join(replacement_parts)
     if re.search(r"!\[|\[[^\]\n]*\]\(", replacement_line) is not None:
         raise UnsupportedTextError("malformed Markdown link")
-    else:
-        pass
-    if LINK_DESTINATION_START_PATTERN.search(replacement_line) is not None:
+    elif LINK_DESTINATION_START_PATTERN.search(replacement_line) is not None:
         raise UnsupportedTextError("malformed Markdown link")
     else:
         pass
@@ -244,9 +238,7 @@ def validate_link_target(target_text: str) -> None:
     title = target_match.group("title")
     if title is not None and not has_valid_markdown_title(title):
         raise UnsupportedTextError("malformed Markdown link title")
-    else:
-        pass
-    if not destination:
+    elif not destination:
         raise UnsupportedTextError("link target is empty")
     elif URL_PATTERN.fullmatch(destination) is None:
         raise UnsupportedTextError("only HTTP(S) Markdown links are supported")
