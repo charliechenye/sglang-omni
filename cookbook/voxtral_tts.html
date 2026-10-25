@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.9" />
-    <meta name="docbuild:last-update" content="Oct 24, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -216,7 +216,7 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Cookbook</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="qwen3_tts.html">Qwen3 TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="qwen3_tts.html">Qwen3-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="moss_tts.html">MOSS-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="nemotron3_5_asr.html">Nemotron 3.5 ASR</a></li>
@@ -767,6 +767,7 @@ is ignored, as on CUDA.</p></li>
 503, and <code class="docutils literal notranslate"><span class="pre">/health</span></code> shows the queue.</p></li>
 <li><p>A request not finished <code class="docutils literal notranslate"><span class="pre">--request-timeout-s</span></code> (default 600) seconds after it arrives, time in
 the queue included, is cancelled: it returns 504, or its stream ends early.</p></li>
+<li><p>A request body over 1 MiB returns 413.</p></li>
 <li><p>Output varies between requests: the acoustic head samples flow-matching noise.</p></li>
 </ul>
 <p>Measured on an M4 MacBook Air (16 GB), warm: 3.3 s load, 0.55–0.85 s to the first streamed
@@ -885,7 +886,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 24, 2026.
+  Last updated on Oct 25, 2026.
   <br/>
 </p>
   </div>
