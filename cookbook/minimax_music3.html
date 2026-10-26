@@ -61,7 +61,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.9" />
-    <meta name="docbuild:last-update" content="Oct 25, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 26, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -520,6 +520,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#apple-silicon-native-mlx">Apple Silicon: native MLX</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#native-mlx-stage-offload">Native MLX stage offload</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-parity-and-mac-ci">Reference parity and Mac CI</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#serial-weight-offload">Serial weight offload</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#validation-record">Validation Record</a></li>
@@ -631,12 +632,7 @@ sglang_omni_mlx/native/scripts/build_runtime.sh<span class="w"> </span><span cla
 <span class="w">  </span>--model-name<span class="w"> </span>MiniMaxAI/MiniMax-Music3<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span>
 </pre></div>
 </div>
-<p>Set <code class="docutils literal notranslate"><span class="pre">MUSIC3_DATA</span></code>, <code class="docutils literal notranslate"><span class="pre">MUSIC3_RUNTIME</span></code> and <code class="docutils literal notranslate"><span class="pre">MUSIC3_BUILD</span></code> to separate local
-directories. Serving needs neither Python nor SGLang’s CUDA package. Model
-provisioning uses the existing CI Python requirements. The converted weights
-occupy about 14 GB; allow additional unified memory for the KV cache and
-acoustic activations. Both stages stay resident, with MLX’s free buffer cache
-limited to 1 GiB.</p>
+<p>Set <code class="docutils literal notranslate"><span class="pre">MUSIC3_DATA</span></code>, <code class="docutils literal notranslate"><span class="pre">MUSIC3_RUNTIME</span></code> and <code class="docutils literal notranslate"><span class="pre">MUSIC3_BUILD</span></code> to separate local directories. Serving needs neither Python nor SGLang’s CUDA package. Model provisioning uses the existing CI Python requirements. The converted weights occupy about 14 GB; allow additional unified memory for the KV cache and acoustic activations. Both stages stay resident by default, with MLX’s free buffer cache limited to 1 GiB.</p>
 <p>This path includes Qwen3/RVQ decoding, condition fusion, Euler Flow/DiT,
 stereo DAV decoding, overlap crops, and Hann sinc conversion from 44.1 to
 32 kHz. AR guidance is fixed at 1.5 and top-k at 50. <code class="docutils literal notranslate"><span class="pre">max_new_tokens</span></code> defaults
@@ -652,6 +648,20 @@ client’s generation releases the worker when computation finishes. Supervisor
 shutdown cancels between frames, acoustic windows and Euler steps. Voxt’s
 <code class="docutils literal notranslate"><span class="pre">--supervised</span></code> lifecycle, <code class="docutils literal notranslate"><span class="pre">/health</span></code> and <code class="docutils literal notranslate"><span class="pre">/v1/models</span></code> are supported; this does
 not add a Music3 interface to Voxt.</p>
+<section id="native-mlx-stage-offload">
+<h3>Native MLX stage offload<a class="headerlink" href="#native-mlx-stage-offload" title="Link to this heading">#</a></h3>
+<p>Pass both components to the native server to load one stage at a time:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="s2">"</span><span class="nv">$MUSIC3_RUNTIME</span><span class="s2">/bin/music3_server"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-path<span class="w"> </span><span class="s2">"</span><span class="nv">$MUSIC3_DATA</span><span class="s2">/models/mlx-community_MiniMax-Music3-mxfp8"</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--model-name<span class="w"> </span>MiniMaxAI/MiniMax-Music3<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--stage-offload-components<span class="w"> </span>ar,dit
+</pre></div>
+</div>
+<p>Startup loads configuration and the tokenizer and validates checkpoint shapes and stage ownership without evaluating the weights. Every tensor must belong to exactly one stage: AR/RVQ uses language_model and rvq_depth_decoder; the acoustic stage uses condition_encoder, transformer and vocoder. Each accepted request loads AR/RVQ weights, evaluates the hidden-state handoff, synchronizes and releases AR, then loads the acoustic weights. Acoustic weights stay loaded across all windows and are released after completion, cancellation or failure.</p>
+<p>The checkpoint directory is resolved once at startup; keep its contents unchanged while the server runs. No second host weight copy is retained. Reloading weights adds disk I/O and latency; file-backed pages can remain in the operating system’s cache.</p>
+<p>The existing single-request worker owns both stages and returns 429 for concurrent submissions. Omitting the flag keeps both stages resident. Component names accept either order, surrounding whitespace and mixed case, matching the CUDA CLI. This option belongs to the native executable; CUDA continues to use the <code class="docutils literal notranslate"><span class="pre">sgl-omni</span> <span class="pre">serve</span></code> option described below.</p>
+<p><code class="docutils literal notranslate"><span class="pre">music3_synthesize</span></code> accepts the same flag and reports per-request elapsed time, AR elapsed time and peak active MLX allocation in bytes. Its diagnostic <code class="docutils literal notranslate"><span class="pre">--check-cancellation</span></code> flag cancels at the fully evaluated AR handoff before synthesizing a retry, and reports active MLX allocation before and after cancellation. The Mac golden harness runs short and cross-window cases in separate resident and offload processes and requires identical waveform digests and metadata. HTTP seeded-repeat and busy cases run in both modes; the remaining HTTP cases run resident. CI uploads WAVs from both modes for review. The earlier resident validation record below does not establish offload memory or latency results.</p>
+</section>
 <section id="reference-parity-and-mac-ci">
 <h3>Reference parity and Mac CI<a class="headerlink" href="#reference-parity-and-mac-ci" title="Link to this heading">#</a></h3>
 <p>The numerical reference is <a class="reference external" href="https://github.com/sgl-project/sglang-omni/pull/1990">PR #1990</a>
@@ -1299,6 +1309,7 @@ curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </spa
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#apple-silicon-native-mlx">Apple Silicon: native MLX</a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#native-mlx-stage-offload">Native MLX stage offload</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#reference-parity-and-mac-ci">Reference parity and Mac CI</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#serial-weight-offload">Serial weight offload</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#validation-record">Validation Record</a></li>
@@ -1350,7 +1361,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 25, 2026.
+  Last updated on Oct 26, 2026.
   <br/>
 </p>
   </div>
