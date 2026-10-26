@@ -729,6 +729,7 @@ eager, so a transcript is never at stake.</p>
 </section>
 <section id="qwen3-tts-text-to-speech-single-xpu">
 <h3>Qwen3-TTS (text-to-speech, single XPU)<a class="headerlink" href="#qwen3-tts-text-to-speech-single-xpu" title="Link to this heading">#</a></h3>
+<p>Qwen3-TTS automatically selects the <code class="docutils literal notranslate"><span class="pre">intel_xpu</span></code> attention backend when the platform and the engine stage device are both XPU. Setting any of <code class="docutils literal notranslate"><span class="pre">attention_backend</span></code>, <code class="docutils literal notranslate"><span class="pre">prefill_attention_backend</span></code>, or <code class="docutils literal notranslate"><span class="pre">decode_attention_backend</span></code> in <code class="docutils literal notranslate"><span class="pre">server_args_overrides</span></code> takes precedence over this default. CPU stages on an XPU host are unaffected.</p>
 <p>Qwen3-TTS needs the upstream <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> package. Option A already includes it; for
 Option B install it here, because <code class="docutils literal notranslate"><span class="pre">pyproject_xpu.toml</span></code> deliberately does not pin it.
 <code class="docutils literal notranslate"><span class="pre">--no-deps</span></code> is required on both lines: <code class="docutils literal notranslate"><span class="pre">qwen-tts</span></code> pins Transformers 4.57.3, which

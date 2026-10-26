@@ -530,6 +530,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#torchcodec-installation-for-tts-models">TorchCodec installation for TTS models</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-asr-graph-execution">Qwen3-ASR graph execution</a></li>
 </ul>
             </nav>
         </div>
@@ -778,6 +779,13 @@ bash<span class="w"> </span>scripts/npu/install_npu_torchcodec.sh<span class="w"
 </div>
 </section>
 </section>
+<section id="qwen3-asr-graph-execution">
+<h2>Qwen3-ASR graph execution<a class="headerlink" href="#qwen3-asr-graph-execution" title="Link to this heading">#</a></h2>
+<p>Qwen3-ASR pre-LM encoding and language-model execution submit work on separate NPU streams. With encoder, decode, or prefill graphs enabled, a shared Host task queue can couple those submission paths and cause stalls. Per-stream Host queues let each stream submit work independently; they do not replace device-stream synchronization.</p>
+<p>For normal pipeline launches, <code class="docutils literal notranslate"><span class="pre">PER_STREAM_QUEUE=1</span></code> is set by default before spawning the worker process. Leave <code class="docutils literal notranslate"><span class="pre">TASK_QUEUE_ENABLE</span></code> unset (its runtime default is <code class="docutils literal notranslate"><span class="pre">1</span></code>) or explicitly set it to <code class="docutils literal notranslate"><span class="pre">1</span></code>, and leave <code class="docutils literal notranslate"><span class="pre">ASCEND_LAUNCH_BLOCKING</span></code> unset or set it to <code class="docutils literal notranslate"><span class="pre">0</span></code> to retain asynchronous launches. Existing shell and pipeline environment settings take precedence over the default.</p>
+<p>When pre-LM encoding and any encoder, decode, or prefill graph backend are enabled on NPU, startup rejects incompatible queue or launch-blocking settings instead of silently overriding them. This check does not apply when pre-LM encoding is disabled or all three graph paths are disabled. For direct engine construction outside the pipeline launcher, configure these variables before initializing the NPU runtime; the engine validates them but does not supply the pipeline’s default.</p>
+<p>Use a torch_npu build that supports per-stream Host task queues. The feature is experimental and does not support process-level online recovery. Although per-stream queues support TaskQueue modes <code class="docutils literal notranslate"><span class="pre">1</span></code> and <code class="docutils literal notranslate"><span class="pre">2</span></code>, NPU graph capture rejects mode <code class="docutils literal notranslate"><span class="pre">2</span></code>; this graph configuration therefore requires mode <code class="docutils literal notranslate"><span class="pre">1</span></code>. Mode <code class="docutils literal notranslate"><span class="pre">0</span></code> disables the per-stream queues required by this path. Additional queue threads and cross-stream event ordering may add overhead. See the <a class="reference external" href="https://www.hiascend.com/document/detail/en/Pytorch/2610/devguide/fwfeatures/docs/en/framework_feature_guide_pytorch/stream_taskqueue_parallel_delivery.md">TorchNPU stream-level TaskQueue documentation</a> for runtime constraints.</p>
+</section>
 </section>
 
 
@@ -839,6 +847,7 @@ bash<span class="w"> </span>scripts/npu/install_npu_torchcodec.sh<span class="w"
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#torchcodec-installation-for-tts-models">TorchCodec installation for TTS models</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#qwen3-asr-graph-execution">Qwen3-ASR graph execution</a></li>
 </ul>
   </nav></div>
 
