@@ -542,6 +542,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark-results">Benchmark Results</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#b-base">0.6B Base</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#b-customvoice">1.7B CustomVoice</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runaway-regression">Runaway Regression</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#known-limitations">Known Limitations</a></li>
@@ -1386,6 +1387,32 @@ latency for quality.</p>
 <p>Corpus WER (EN) / CER (ZH) is total edit distance divided by total reference words / characters and includes every sample. The filtered row excludes samples whose own WER/CER exceeds 50% and recomputes the corpus rate. UTMOS is the mean predicted audio-quality score, not a listening-test score. These independently sampled runs are not a paired comparison of streaming and non-streaming quality; the Base result also uses different conditioning and a different ASR evaluator.</p>
 <p>TTFA measures arrival of the first PCM payload, not the first audible speech; its mean payload duration was 80 ms in both languages. All 3,108 streaming requests were continuity-scored: 98.99% EN and 93.76% ZH had no playback underrun longer than 50 ms. Maximum underrun was 396.1 ms EN and 2072.0 ms ZH. The default ramp therefore does not guarantee uninterrupted playback at concurrency 16; see First-audio chunk ramp for the buffering tradeoff.</p>
 </section>
+<section id="runaway-regression">
+<h3>Runaway Regression<a class="headerlink" href="#runaway-regression" title="Link to this heading">#</a></h3>
+<p><code class="docutils literal notranslate"><span class="pre">benchmarks.eval.benchmark_tts_generation_budget</span></code> sends each case twice with the same text, voice, and seed: once with the legacy 2048-frame limit and once with the server default. It saves the audio, finish reasons, codec frame counts, and chunk timings. The text request fails only when it stops on <code class="docutils literal notranslate"><span class="pre">length</span></code> before its paired baseline stopped naturally.</p>
+<p>Create a request template, for example <code class="docutils literal notranslate"><span class="pre">request.json</span></code>:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span>
+<span class="w">  </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"input"</span><span class="p">:</span><span class="w"> </span><span class="s2">"replaced by each case"</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"voice"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Ryan"</span>
+<span class="p">}</span>
+</pre></div>
+</div>
+<p>For Base, use a fixed <code class="docutils literal notranslate"><span class="pre">references</span></code> entry instead of a built-in voice. <code class="docutils literal notranslate"><span class="pre">--seedtts-samples</span></code> replaces the bundled cases with prompts that missed codec EOS on 0.6B Base in #1179.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_tts_generation_budget<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--base-url<span class="w"> </span>http://127.0.0.1:8000/v1<span class="w"> </span>--request<span class="w"> </span>request.json<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--server-revision<span class="w"> </span>&lt;server-git-sha&gt;<span class="w"> </span>--model-revision<span class="w"> </span>&lt;checkpoint-sha&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--repeats<span class="w"> </span><span class="m">8</span><span class="w"> </span>--seed<span class="w"> </span><span class="m">0</span><span class="w"> </span>--output-dir<span class="w"> </span>results/budget-nonstream
+
+python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_tts_generation_budget<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--base-url<span class="w"> </span>http://127.0.0.1:8000/v1<span class="w"> </span>--request<span class="w"> </span>base-request.json<span class="w"> </span>--seedtts-samples<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--server-revision<span class="w"> </span>&lt;server-git-sha&gt;<span class="w"> </span>--model-revision<span class="w"> </span>&lt;checkpoint-sha&gt;<span class="w"> </span><span class="se">\</span>
+<span class="w">  </span>--repeats<span class="w"> </span><span class="m">8</span><span class="w"> </span>--seed<span class="w"> </span><span class="m">123</span><span class="w"> </span>--output-dir<span class="w"> </span>results/budget-runaway
+</pre></div>
+</div>
+<p>Add <code class="docutils literal notranslate"><span class="pre">--stream</span></code> to check raw PCM streams. Output directories must be new. A fixed seed does not make waveforms bitwise identical because prefix-cache state and batch composition can change between requests.</p>
+<p>The TTS CI non-streaming and streaming stages run this probe for Qwen3-TTS on four short cases with eight seeds, 64 requests per stage, and upload the evidence.</p>
+</section>
 </section>
 <section id="known-limitations">
 <h2>Known Limitations<a class="headerlink" href="#known-limitations" title="Link to this heading">#</a></h2>
@@ -1475,6 +1502,7 @@ finish reason <code class="docutils literal notranslate"><span class="pre">lengt
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark-results">Benchmark Results</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#b-base">0.6B Base</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#b-customvoice">1.7B CustomVoice</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#runaway-regression">Runaway Regression</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#known-limitations">Known Limitations</a></li>

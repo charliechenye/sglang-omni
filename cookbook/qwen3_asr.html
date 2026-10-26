@@ -751,6 +751,7 @@ WebSocket session open for new audio.</p>
 <span class="w">  </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"session.update"</span><span class="p">,</span>
 <span class="w">  </span><span class="nt">"session"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
 <span class="w">    </span><span class="nt">"language"</span><span class="p">:</span><span class="w"> </span><span class="s2">"English"</span><span class="p">,</span>
+<span class="w">    </span><span class="nt">"decode_interval_ms"</span><span class="p">:</span><span class="w"> </span><span class="mi">1000</span><span class="p">,</span>
 <span class="w">    </span><span class="nt">"turn_detection"</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
 <span class="w">      </span><span class="nt">"type"</span><span class="p">:</span><span class="w"> </span><span class="s2">"server_vad"</span><span class="p">,</span>
 <span class="w">      </span><span class="nt">"threshold"</span><span class="p">:</span><span class="w"> </span><span class="mf">0.5</span><span class="p">,</span>
@@ -761,6 +762,7 @@ WebSocket session open for new audio.</p>
 <span class="p">}</span>
 </pre></div>
 </div>
+<p><code class="docutils literal notranslate"><span class="pre">decode_interval_ms</span></code> is how much new audio arrives between partial decodes. It defaults to 2000 ms, must be at least 200 ms, and <code class="docutils literal notranslate"><span class="pre">null</span></code> restores the default. Like <code class="docutils literal notranslate"><span class="pre">language</span></code> and <code class="docutils literal notranslate"><span class="pre">turn_detection</span></code>, it can change only while no uncommitted audio is buffered; with server VAD that means before the first audio packet.</p>
 <p>Each periodic decode is an ordinary stateless Qwen3-ASR request over all audio
 in the active segment. After the first two refreshes, the server rolls five
 tokens back from the prior hypothesis and uses the retained text as the next
@@ -775,7 +777,8 @@ also finalized at the configured <code class="docutils literal notranslate"><spa
 <span class="w">  </span><span class="nt">"audio_start_ms"</span><span class="p">:</span><span class="w"> </span><span class="mi">0</span><span class="p">,</span>
 <span class="w">  </span><span class="nt">"audio_end_ms"</span><span class="p">:</span><span class="w"> </span><span class="mi">2000</span><span class="p">,</span>
 <span class="w">  </span><span class="nt">"text"</span><span class="p">:</span><span class="w"> </span><span class="s2">"hello wor"</span><span class="p">,</span>
-<span class="w">  </span><span class="nt">"is_final"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
+<span class="w">  </span><span class="nt">"is_final"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span>
+<span class="w">  </span><span class="nt">"language"</span><span class="p">:</span><span class="w"> </span><span class="s2">"English"</span>
 <span class="p">}</span>
 </pre></div>
 </div>
@@ -787,6 +790,7 @@ segment, including segments opened by the 30 second boundary, which have no
 <code class="docutils literal notranslate"><span class="pre">input_audio_buffer.speech_started</span></code> event. An event with
 <code class="docutils literal notranslate"><span class="pre">is_final=true</span></code> is immutable. <code class="docutils literal notranslate"><span class="pre">transcription.completed</span></code> contains the joined
 text from all final segments.</p>
+<p><code class="docutils literal notranslate"><span class="pre">language</span></code> is the language the segment was transcribed in, as Qwen3-ASR names it (for example <code class="docutils literal notranslate"><span class="pre">English</span></code>): the detected language, or the <code class="docutils literal notranslate"><span class="pre">language</span></code> hint when the session set one. <code class="docutils literal notranslate"><span class="pre">transcription.completed</span></code> carries the language of its last non-empty final segment. Both fields are <code class="docutils literal notranslate"><span class="pre">null</span></code> when the language is unknown.</p>
 <p>Append events are not idempotent. After a transport failure, reconnect and
 restart the transcription rather than retrying packets on the old session.
 Reconnecting resets uncommitted audio, partial hypotheses, VAD state, and Qwen
