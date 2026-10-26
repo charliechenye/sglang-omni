@@ -19,7 +19,7 @@ MINIMUM_BF16_COMPUTE_CAPABILITY = (8, 0)
 if HAS_TRITON:
 
     @triton.jit
-    def _upsample_linear_bth_kernel(  # noqa: leading-underscore
+    def upsample_linear_bth_kernel(
         timeline,
         upsampled_timeline,
         batch_size: tl.constexpr,
@@ -41,7 +41,7 @@ if HAS_TRITON:
         output_time_index = (output_element_offsets // hidden_size) % output_time_steps
         batch_index = output_element_offsets // (hidden_size * output_time_steps)
 
-        # Match align_corners=False by sampling at half-pixel coordinates.
+        # note(chenye): Match align_corners=False by sampling at half pixel coordinates.
         input_position_time_steps = tl.maximum(
             (output_time_index.to(tl.float32) + 0.5) / scale_factor - 0.5,
             0.0,
@@ -77,7 +77,7 @@ if HAS_TRITON:
         )
 
 else:
-    _upsample_linear_bth_kernel = None
+    upsample_linear_bth_kernel = None
 
 
 def can_upsample_linear_bth(timeline: torch.Tensor) -> bool:
@@ -106,7 +106,7 @@ def upsample_linear_bth(timeline: torch.Tensor, *, scale_factor: int) -> torch.T
         device=timeline.device,
     )
     output_element_count = upsampled_timeline.numel()
-    _upsample_linear_bth_kernel[
+    upsample_linear_bth_kernel[
         (triton.cdiv(output_element_count, UPSAMPLE_BLOCK_ELEMENTS),)
     ](
         timeline,

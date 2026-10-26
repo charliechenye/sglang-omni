@@ -26,7 +26,7 @@ def make_upsample_transition(
     transition = AudioVAEFixedStreamingTransition.__new__(
         AudioVAEFixedStreamingTransition
     )
-    # Set backing fields directly so the fixture avoids loading an AudioVAE.
+    # note(chenye): Set backing fields directly so the fixture avoids loading an AudioVAE.
     transition._capacity = capacity  # noqa: leading-underscore
     transition._max_step_latents = max_step_latents  # noqa: leading-underscore
     transition._device = cuda_device  # noqa: leading-underscore
