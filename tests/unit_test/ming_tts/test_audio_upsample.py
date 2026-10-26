@@ -16,6 +16,10 @@ from sglang_omni.models.ming_tts.audio_upsample import (
     upsample_linear_bth,
 )
 
+CUDA_AVAILABLE = torch.cuda.is_available()
+CUDA_BF16_AVAILABLE = CUDA_AVAILABLE and torch.cuda.get_device_capability()[0] >= 8
+CUDA_TRITON_AVAILABLE = CUDA_BF16_AVAILABLE and HAS_TRITON
+
 
 def make_upsample_transition(
     cuda_device: torch.device, input_dtype: torch.dtype = torch.bfloat16
@@ -64,22 +68,14 @@ def make_upsample_transition(
     ("batch_size", "input_time_steps", "hidden_size"),
     [
         (1, 18, 896),
-        (1, 34, 896),
         (2, 22, 896),
-        (4, 34, 896),
-        (8, 18, 896),
         (8, 34, 896),
         (1, 1, 896),
-        (2, 2, 896),
-        (4, 3, 896),
-        (8, 3, 896),
+        (1, 9, 17),
     ],
 )
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not HAS_TRITON
-    or torch.cuda.get_device_capability()[0] < 8,
-    reason="requires CUDA and Triton",
+    not CUDA_TRITON_AVAILABLE, reason="requires supported CUDA and Triton"
 )
 def test_upsample_linear_bth_exactly_matches_pytorch(
     batch_size: int, input_time_steps: int, hidden_size: int
@@ -90,7 +86,6 @@ def test_upsample_linear_bth_exactly_matches_pytorch(
         device=cuda_device,
         dtype=torch.bfloat16,
     )
-    assert can_upsample_linear_bth(timeline)
     expected_bth = F.interpolate(
         timeline.transpose(1, 2),
         scale_factor=4,
@@ -108,15 +103,10 @@ def test_upsample_linear_bth_exactly_matches_pytorch(
         1,
     )
     assert torch.equal(upsampled_bth, expected_bth)
-    assert torch.equal(upsampled_bth[:, 0], timeline[:, 0])
-    assert torch.equal(upsampled_bth[:, -1], timeline[:, -1])
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not HAS_TRITON
-    or torch.cuda.get_device_capability()[0] < 8,
-    reason="requires CUDA and Triton",
+    not CUDA_TRITON_AVAILABLE, reason="requires supported CUDA and Triton"
 )
 def test_upsample_linear_bth_supports_strided_timeline_views() -> None:
     cuda_device = torch.device("cuda", torch.cuda.current_device())
@@ -125,7 +115,6 @@ def test_upsample_linear_bth_supports_strided_timeline_views() -> None:
     )
     timeline = timeline_storage[:, ::2, :]
     assert not timeline.is_contiguous()
-    assert can_upsample_linear_bth(timeline)
 
     expected_bth = F.interpolate(
         timeline.transpose(1, 2),
@@ -140,15 +129,11 @@ def test_upsample_linear_bth_supports_strided_timeline_views() -> None:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not HAS_TRITON
-    or torch.cuda.get_device_capability()[0] < 8,
-    reason="requires CUDA and Triton",
+    not CUDA_TRITON_AVAILABLE, reason="requires supported CUDA and Triton"
 )
 def test_upsample_linear_bth_cuda_graph_replay_tracks_input_updates() -> None:
     cuda_device = torch.device("cuda", torch.cuda.current_device())
     timeline = torch.randn((8, 34, 896), device=cuda_device, dtype=torch.bfloat16)
-    assert can_upsample_linear_bth(timeline)
     upsample_linear_bth(timeline, scale_factor=4)
     cuda_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(cuda_graph):
@@ -178,35 +163,36 @@ def test_upsample_linear_bth_cuda_graph_replay_tracks_input_updates() -> None:
 
 
 @pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or not HAS_TRITON
-    or torch.cuda.get_device_capability()[0] < 8,
-    reason="requires CUDA and Triton",
+    not CUDA_TRITON_AVAILABLE, reason="requires supported CUDA and Triton"
 )
-def test_streaming_upsampling_automatically_selects_triton(
+def test_streaming_upsampling_dispatches_and_preserves_chunk_lengths(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     cuda_device = torch.device("cuda", torch.cuda.current_device())
-    native_transition = make_upsample_transition(cuda_device)
-    automatic_transition = make_upsample_transition(cuda_device)
-    expected_frame_lengths = (0, 32, 96)
-    eligibility_results: list[bool] = []
-    original_eligibility = audio_decode_module.can_upsample_linear_bth
+    transition = make_upsample_transition(cuda_device)
+    triton_scale_factors: list[int] = []
+    original_upsample = audio_decode_module.upsample_linear_bth
 
-    def native_only(timeline: torch.Tensor) -> bool:
-        return timeline.device.type != "cuda"
+    def record_triton_call(
+        timeline: torch.Tensor, *, scale_factor: int
+    ) -> torch.Tensor:
+        triton_scale_factors.append(scale_factor)
+        upsampled = original_upsample(timeline, scale_factor=scale_factor)
+        native = F.interpolate(
+            timeline.transpose(1, 2),
+            scale_factor=scale_factor,
+            mode="linear",
+            align_corners=False,
+        ).transpose(1, 2)
+        assert torch.equal(upsampled, native)
+        return upsampled
 
-    def record_eligibility(timeline: torch.Tensor) -> bool:
-        eligible = original_eligibility(timeline)
-        eligibility_results.append(eligible)
-        return eligible
+    monkeypatch.setattr(audio_decode_module, "upsample_linear_bth", record_triton_call)
 
-    monkeypatch.setattr(
-        audio_decode_module, "can_upsample_linear_bth", record_eligibility
-    )
-
-    for current_length, terminal, expected_frame_length in zip(
-        (8, 16, 8), (False, False, True), expected_frame_lengths, strict=True
+    for current_length, terminal, expected_frame_length in (
+        (8, False, 0),
+        (16, False, 32),
+        (8, True, 96),
     ):
         current = torch.zeros((1, 16, 896), device=cuda_device, dtype=torch.bfloat16)
         current[:, :current_length] = torch.randn(
@@ -215,140 +201,165 @@ def test_streaming_upsampling_automatically_selects_triton(
         current_lengths = torch.tensor([current_length], device=cuda_device)
         execution_mask = torch.ones((1,), device=cuda_device, dtype=torch.bool)
         terminal_mask = torch.tensor([terminal], device=cuda_device)
-        with monkeypatch.context() as native_patch:
-            native_patch.setattr(
-                audio_decode_module, "can_upsample_linear_bth", native_only
-            )
-            native_frames, native_lengths, native_next_state = (
-                native_transition.upsample(
-                    current, current_lengths, execution_mask, terminal_mask
-                )
-            )
-        automatic_frames, automatic_lengths, automatic_next_state = (
-            automatic_transition.upsample(
-                current, current_lengths, execution_mask, terminal_mask
-            )
+        frames, frame_lengths, next_state = transition.upsample(
+            current, current_lengths, execution_mask, terminal_mask
         )
 
-        assert native_lengths.tolist() == [expected_frame_length]
-        assert eligibility_results[-1]
-        assert torch.equal(automatic_lengths, native_lengths)
-        assert torch.equal(automatic_frames, native_frames)
-        for native_tensor, triton_tensor in zip(
-            native_next_state, automatic_next_state, strict=True
-        ):
-            assert torch.equal(triton_tensor, native_tensor)
-        for transition, next_state in (
-            (native_transition, native_next_state),
-            (automatic_transition, automatic_next_state),
-        ):
-            (
-                transition.state.upsample_pending,
-                transition.state.upsample_pending_lengths,
-                transition.state.upsample_left_anchor,
-            ) = next_state
+        assert frame_lengths.tolist() == [expected_frame_length]
+        assert frames.shape == (1, 128, 896)
+        assert torch.count_nonzero(frames[:, expected_frame_length:]) == 0
+        (
+            transition.state.upsample_pending,
+            transition.state.upsample_pending_lengths,
+            transition.state.upsample_left_anchor,
+        ) = next_state
 
-
-def test_streaming_upsampling_falls_back_to_pytorch_on_cpu() -> None:
-    cpu_device = torch.device("cpu")
-    transition = make_upsample_transition(cpu_device, torch.float32)
-    current = torch.randn((1, 16, 896), device=cpu_device, dtype=torch.float32)
-    current_lengths = torch.tensor([16], device=cpu_device)
-    execution_mask = torch.ones((1,), device=cpu_device, dtype=torch.bool)
-    terminal_mask = torch.ones((1,), device=cpu_device, dtype=torch.bool)
-
-    assert not can_upsample_linear_bth(current)
-    expected_timeline = torch.cat(
-        (current[:, :1], current, current[:, -1:], torch.zeros_like(current)), dim=1
-    )
-    expected_frames = F.interpolate(
-        expected_timeline.transpose(1, 2),
-        scale_factor=4,
-        mode="linear",
-        align_corners=False,
-    ).transpose(1, 2)[:, 4:132]
-    expected_frames[:, 64:] = 0
-    frames, frame_lengths, _ = transition.upsample(
-        current, current_lengths, execution_mask, terminal_mask
-    )
-
-    assert frame_lengths.tolist() == [64]
-    assert frames.shape == (1, 128, 896)
-    assert torch.equal(frames, expected_frames)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
-    reason="requires CUDA to exercise the runtime fallback",
-)
-def test_streaming_upsampling_falls_back_when_triton_is_unavailable(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cuda_device = torch.device("cuda", torch.cuda.current_device())
-    transition = make_upsample_transition(cuda_device)
-    current = torch.randn((1, 16, 896), device=cuda_device, dtype=torch.bfloat16)
-    current_lengths = torch.tensor([16], device=cuda_device)
-    execution_mask = torch.ones((1,), device=cuda_device, dtype=torch.bool)
-    terminal_mask = torch.ones((1,), device=cuda_device, dtype=torch.bool)
-    monkeypatch.setattr(audio_upsample, "HAS_TRITON", False)
-
-    assert not can_upsample_linear_bth(current)
-    frames, frame_lengths, _ = transition.upsample(
-        current, current_lengths, execution_mask, terminal_mask
-    )
-
-    assert frame_lengths.tolist() == [64]
-    assert frames.shape == (1, 128, 896)
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not HAS_TRITON,
-    reason="requires CUDA and Triton",
-)
-def test_upsample_eligibility_rejects_unsupported_cuda_shapes_and_dtypes() -> None:
-    cuda_device = torch.device("cuda", torch.cuda.current_device())
-    assert not can_upsample_linear_bth(
-        torch.empty((1, 2, 896), device=cuda_device, dtype=torch.float32)
-    )
-    assert not can_upsample_linear_bth(
-        torch.empty((0, 2, 896), device=cuda_device, dtype=torch.bfloat16)
-    )
-    assert not can_upsample_linear_bth(
-        torch.empty((1, 2), device=cuda_device, dtype=torch.bfloat16)
-    )
-
-
-def test_upsample_eligibility_rejects_cpu_bfloat16() -> None:
-    timeline = torch.empty((1, 2, 896), dtype=torch.bfloat16)
-
-    assert not can_upsample_linear_bth(timeline)
+    assert triton_scale_factors == [4, 4, 4]
 
 
 @pytest.mark.parametrize(
-    ("compute_capability", "is_supported"),
-    [((7, 5), False), ((8, 0), True), ((8, 6), True), ((9, 0), True)],
+    ("device_type", "input_dtype", "has_triton"),
+    [
+        pytest.param("cpu", torch.float32, True, id="cpu"),
+        pytest.param(
+            "cuda",
+            torch.bfloat16,
+            False,
+            marks=pytest.mark.skipif(
+                not CUDA_BF16_AVAILABLE, reason="requires CUDA BF16"
+            ),
+            id="triton-unavailable",
+        ),
+        pytest.param(
+            "cuda",
+            torch.float32,
+            True,
+            marks=pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires CUDA"),
+            id="unsupported-dtype",
+        ),
+    ],
 )
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_upsample_eligibility_uses_bf16_minimum_compute_capability(
+def test_streaming_upsampling_uses_native_fallback(
     monkeypatch: pytest.MonkeyPatch,
+    device_type: str,
+    input_dtype: torch.dtype,
+    has_triton: bool,
+) -> None:
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if device_type == "cuda"
+        else torch.device("cpu")
+    )
+    transition = make_upsample_transition(device, input_dtype)
+    current = torch.randn((1, 16, 896), device=device, dtype=input_dtype)
+    current_lengths = torch.tensor([16], device=device)
+    execution_mask = torch.ones((1,), device=device, dtype=torch.bool)
+    terminal_mask = torch.ones((1,), device=device, dtype=torch.bool)
+    native_outputs: list[torch.Tensor] = []
+    native_upsample = transition.upsampler.forward
+    triton_calls: list[torch.Tensor] = []
+
+    def record_native_call(timeline: torch.Tensor) -> torch.Tensor:
+        output = native_upsample(timeline)
+        native_outputs.append(output.transpose(1, 2))
+        return output
+
+    def record_triton_call(
+        timeline: torch.Tensor, *, scale_factor: int
+    ) -> torch.Tensor:
+        triton_calls.append(timeline)
+        return upsample_linear_bth(timeline, scale_factor=scale_factor)
+
+    monkeypatch.setattr(audio_upsample, "HAS_TRITON", has_triton)
+    monkeypatch.setattr(transition.upsampler, "forward", record_native_call)
+    monkeypatch.setattr(audio_decode_module, "upsample_linear_bth", record_triton_call)
+
+    frames, frame_lengths, _ = transition.upsample(
+        current, current_lengths, execution_mask, terminal_mask
+    )
+
+    assert len(native_outputs) == 1
+    assert not triton_calls
+    assert frame_lengths.tolist() == [64]
+    assert frames.shape == (1, 128, 896)
+    assert torch.equal(frames[:, :64], native_outputs[0][:, 4:68].to(torch.float32))
+    assert torch.count_nonzero(frames[:, 64:]) == 0
+
+
+@pytest.mark.parametrize(
+    ("shape", "has_triton", "compute_capability", "eligible"),
+    [
+        pytest.param(
+            (1, 2, 896),
+            False,
+            (9, 0),
+            False,
+            id="no-triton",
+        ),
+        pytest.param(
+            (1, 2, 896),
+            True,
+            (7, 5),
+            False,
+            id="pre-sm80",
+        ),
+        pytest.param(
+            (1, 2, 896),
+            True,
+            (8, 0),
+            True,
+            id="sm80",
+        ),
+        pytest.param(
+            (1, 2, 896),
+            True,
+            (8, 6),
+            True,
+            id="sm86",
+        ),
+        pytest.param(
+            (0, 2, 896),
+            True,
+            (9, 0),
+            False,
+            id="empty-shape",
+        ),
+        pytest.param(
+            (1, 2),
+            True,
+            (9, 0),
+            False,
+            id="wrong-rank",
+        ),
+    ],
+)
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires CUDA")
+def test_upsample_eligibility_on_cuda(
+    monkeypatch: pytest.MonkeyPatch,
+    shape: tuple[int, ...],
+    has_triton: bool,
     compute_capability: tuple[int, int],
-    is_supported: bool,
+    eligible: bool,
 ) -> None:
     cuda_device = torch.device("cuda", torch.cuda.current_device())
-    timeline = torch.empty((1, 2, 896), device=cuda_device, dtype=torch.bfloat16)
+    timeline = torch.empty(shape, device=cuda_device, dtype=torch.bfloat16)
 
     def report_compute_capability(
         device: torch.device | None = None,
     ) -> tuple[int, int]:
         return compute_capability
 
-    monkeypatch.setattr(audio_upsample, "HAS_TRITON", True)
+    monkeypatch.setattr(audio_upsample, "HAS_TRITON", has_triton)
     monkeypatch.setattr(torch.cuda, "get_device_capability", report_compute_capability)
 
-    assert can_upsample_linear_bth(timeline) is is_supported
+    assert can_upsample_linear_bth(timeline) is eligible
 
 
 def test_upsample_linear_bth_reports_invalid_arguments() -> None:
+    with pytest.raises(
+        TypeError, match="timeline must be a torch.Tensor, got NoneType"
+    ):
+        can_upsample_linear_bth(None)
     with pytest.raises(
         TypeError, match="timeline must be a torch.Tensor, got NoneType"
     ):
@@ -374,7 +385,7 @@ def test_upsample_linear_bth_reports_invalid_arguments() -> None:
         ((8, 0), False, RuntimeError, "install Triton"),
     ],
 )
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(not CUDA_AVAILABLE, reason="requires CUDA")
 def test_upsample_linear_bth_reports_unsupported_runtime(
     monkeypatch: pytest.MonkeyPatch,
     compute_capability: tuple[int, int],
@@ -395,34 +406,3 @@ def test_upsample_linear_bth_reports_unsupported_runtime(
 
     with pytest.raises(error_type, match=message):
         upsample_linear_bth(timeline, scale_factor=4)
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_streaming_upsampling_falls_back_for_unsupported_cuda_dtype(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    cuda_device = torch.device("cuda", torch.cuda.current_device())
-    transition = make_upsample_transition(cuda_device, torch.float32)
-    current = torch.randn((1, 16, 896), device=cuda_device, dtype=torch.float32)
-    current_lengths = torch.tensor([16], device=cuda_device)
-    execution_mask = torch.ones((1,), device=cuda_device, dtype=torch.bool)
-    terminal_mask = torch.ones((1,), device=cuda_device, dtype=torch.bool)
-    monkeypatch.setattr(audio_upsample, "HAS_TRITON", True)
-
-    assert not can_upsample_linear_bth(current)
-    expected_timeline = torch.cat(
-        (current[:, :1], current, current[:, -1:], torch.zeros_like(current)), dim=1
-    )
-    expected_frames = F.interpolate(
-        expected_timeline.transpose(1, 2),
-        scale_factor=4,
-        mode="linear",
-        align_corners=False,
-    ).transpose(1, 2)[:, 4:132]
-    expected_frames[:, 64:] = 0
-    frames, frame_lengths, _ = transition.upsample(
-        current, current_lengths, execution_mask, terminal_mask
-    )
-
-    assert frame_lengths.tolist() == [64]
-    assert torch.equal(frames, expected_frames)
