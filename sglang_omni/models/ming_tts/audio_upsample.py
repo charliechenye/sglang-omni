@@ -14,6 +14,7 @@ except ImportError:
 
 HAS_TRITON = triton is not None
 UPSAMPLE_BLOCK_ELEMENTS = 512
+MINIMUM_BF16_COMPUTE_CAPABILITY = (8, 0)
 
 if HAS_TRITON:
 
@@ -82,6 +83,11 @@ else:
 def can_upsample_linear_bth(timeline: torch.Tensor) -> bool:
     """Return whether Triton supports this non-empty CUDA BF16 BTH tensor."""
 
+    if not isinstance(timeline, torch.Tensor):
+        raise TypeError(
+            f"timeline must be a torch.Tensor, got {type(timeline).__name__}"
+        )
+
     return (
         HAS_TRITON
         and timeline.device.type == "cuda"
@@ -89,18 +95,54 @@ def can_upsample_linear_bth(timeline: torch.Tensor) -> bool:
         and timeline.ndim == 3
         and all(size > 0 for size in timeline.shape)
         and all(stride >= 0 for stride in timeline.stride())
+        and torch.cuda.get_device_capability(timeline.device)
+        >= MINIMUM_BF16_COMPUTE_CAPABILITY
     )
 
 
 def upsample_linear_bth(timeline: torch.Tensor, *, scale_factor: int) -> torch.Tensor:
     """Upsample a CUDA BF16 BTH tensor into a fresh contiguous BTH tensor."""
 
-    assert (
-        not isinstance(scale_factor, bool)
-        and isinstance(scale_factor, int)
-        and scale_factor > 0
-    )
-    assert can_upsample_linear_bth(timeline)
+    if not isinstance(timeline, torch.Tensor):
+        raise TypeError(
+            f"timeline must be a torch.Tensor, got {type(timeline).__name__}"
+        )
+    if isinstance(scale_factor, bool) or not isinstance(scale_factor, int):
+        raise TypeError(
+            f"scale_factor must be an int, got {type(scale_factor).__name__}"
+        )
+    if scale_factor <= 0:
+        raise ValueError(f"scale_factor must be positive, got {scale_factor}")
+    if timeline.ndim != 3:
+        raise ValueError(
+            f"timeline must have BTH rank 3, got shape {tuple(timeline.shape)}"
+        )
+    if any(size <= 0 for size in timeline.shape):
+        raise ValueError(
+            f"timeline dimensions must be positive, got shape {tuple(timeline.shape)}"
+        )
+    if timeline.dtype != torch.bfloat16:
+        raise ValueError(
+            f"timeline must have dtype torch.bfloat16, got {timeline.dtype}"
+        )
+    if timeline.device.type != "cuda":
+        raise ValueError(f"timeline must be on CUDA, got device {timeline.device}")
+    if any(stride < 0 for stride in timeline.stride()):
+        raise ValueError(
+            f"timeline strides must be non-negative, got {timeline.stride()}"
+        )
+
+    compute_capability = torch.cuda.get_device_capability(timeline.device)
+    if compute_capability < MINIMUM_BF16_COMPUTE_CAPABILITY:
+        raise ValueError(
+            "timeline device must have compute capability 8.0 or newer for BF16 "
+            f"conversion, got {compute_capability[0]}.{compute_capability[1]}"
+        )
+    if not HAS_TRITON:
+        raise RuntimeError(
+            "Triton is unavailable; install Triton before calling "
+            "upsample_linear_bth directly"
+        )
 
     batch_size, input_time_steps, hidden_size = timeline.shape
     output_time_steps = input_time_steps * scale_factor
