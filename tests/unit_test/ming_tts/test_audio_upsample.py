@@ -4,17 +4,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang_omni.models.ming_tts import audio_decode as audio_decode_module
-from sglang_omni.models.ming_tts import audio_upsample
+from sglang_omni.models.ming_tts import audio_decode, audio_upsample
 from sglang_omni.models.ming_tts.audio_decode import (
     AudioVAEFixedStreamingStateBank,
     AudioVAEFixedStreamingTransition,
 )
-from sglang_omni.models.ming_tts.audio_upsample import HAS_TRITON, upsample_linear_bth
 
 CUDA_AVAILABLE = torch.cuda.is_available()
 CUDA_BF16_AVAILABLE = CUDA_AVAILABLE and torch.cuda.get_device_capability()[0] >= 8
-CUDA_TRITON_AVAILABLE = CUDA_BF16_AVAILABLE and HAS_TRITON
+CUDA_TRITON_AVAILABLE = CUDA_BF16_AVAILABLE and audio_upsample.HAS_TRITON
 
 
 def make_upsample_transition(
@@ -94,7 +92,7 @@ def test_upsample_linear_bth_exactly_matches_pytorch(
         align_corners=False,
     ).transpose(1, 2)
 
-    upsampled_bth = upsample_linear_bth(timeline, scale_factor=4)
+    upsampled_bth = audio_upsample.upsample_linear_bth(timeline, scale_factor=4)
 
     assert upsampled_bth.shape == expected_bth.shape
     assert upsampled_bth.is_contiguous()
@@ -113,10 +111,10 @@ def test_upsample_linear_bth_exactly_matches_pytorch(
 def test_upsample_linear_bth_cuda_graph_replay_tracks_input_updates() -> None:
     cuda_device = torch.device("cuda", torch.cuda.current_device())
     timeline = torch.randn((8, 34, 896), device=cuda_device, dtype=torch.bfloat16)
-    upsample_linear_bth(timeline, scale_factor=4)
+    audio_upsample.upsample_linear_bth(timeline, scale_factor=4)
     cuda_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(cuda_graph):
-        graph_output_bth = upsample_linear_bth(timeline, scale_factor=4)
+        graph_output_bth = audio_upsample.upsample_linear_bth(timeline, scale_factor=4)
 
     cuda_graph.replay()
     torch.cuda.synchronize(cuda_device)
@@ -151,7 +149,7 @@ def test_streaming_upsampling_dispatches_and_preserves_chunk_lengths(
     cuda_device = torch.device("cuda", torch.cuda.current_device())
     transition = make_upsample_transition(cuda_device)
     triton_scale_factors: list[int] = []
-    original_upsample = audio_decode_module.upsample_linear_bth
+    original_upsample = audio_decode.upsample_linear_bth
 
     def record_triton_call(
         timeline: torch.Tensor, *, scale_factor: int
@@ -167,7 +165,7 @@ def test_streaming_upsampling_dispatches_and_preserves_chunk_lengths(
         assert torch.equal(upsampled, native)
         return upsampled
 
-    monkeypatch.setattr(audio_decode_module, "upsample_linear_bth", record_triton_call)
+    monkeypatch.setattr(audio_decode, "upsample_linear_bth", record_triton_call)
 
     for current_length, terminal, expected_frame_length in (
         (8, False, 0),
@@ -200,7 +198,7 @@ def test_streaming_upsampling_dispatches_and_preserves_chunk_lengths(
 @pytest.mark.parametrize(
     ("device_type", "input_dtype", "has_triton"),
     [
-        pytest.param("cpu", torch.float32, HAS_TRITON, id="cpu"),
+        pytest.param("cpu", torch.float32, audio_upsample.HAS_TRITON, id="cpu"),
         pytest.param(
             "cuda",
             torch.bfloat16,
@@ -254,11 +252,11 @@ def test_streaming_upsampling_uses_native_fallback(
         timeline: torch.Tensor, *, scale_factor: int
     ) -> torch.Tensor:
         triton_calls.append(timeline)
-        return upsample_linear_bth(timeline, scale_factor=scale_factor)
+        return audio_upsample.upsample_linear_bth(timeline, scale_factor=scale_factor)
 
     monkeypatch.setattr(audio_upsample, "HAS_TRITON", has_triton)
     monkeypatch.setattr(transition.upsampler, "forward", record_native_call)
-    monkeypatch.setattr(audio_decode_module, "upsample_linear_bth", record_triton_call)
+    monkeypatch.setattr(audio_decode, "upsample_linear_bth", record_triton_call)
 
     frames, frame_lengths, _ = transition.upsample(
         current, current_lengths, execution_mask, terminal_mask
