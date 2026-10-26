@@ -48,7 +48,6 @@ stages:
     gpu_memory_fraction: 0.12
     factory:
       dtype: bfloat16
-      upsample_backend: native
       initial_chunk_patches: 2
       steady_chunk_patches: 4
       streaming_cuda_graph: true

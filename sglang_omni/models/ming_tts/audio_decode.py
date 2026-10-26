@@ -7,7 +7,7 @@ from collections.abc import Sequence
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
 from numbers import Integral
-from typing import Literal, cast
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from transformers.cache_utils import Cache, CacheLayerMixin
 
 from sglang_omni.models.ming_tts.audio_upsample import (
-    HAS_TRITON,
+    can_upsample_linear_bth,
     upsample_linear_bth,
 )
 from sglang_omni.models.ming_tts.payload_types import (
@@ -43,14 +43,12 @@ class MingAudioDecoder:
         stream_capacity: int,
         max_stream_step_latents: int,
         streaming_cuda_graph_required: bool,
-        upsample_backend: Literal["native", "triton_bth"] = "native",
     ) -> None:
         self.audio_vae = audio_vae
         self.streaming_transition = AudioVAEFixedStreamingTransition(
             audio_vae.decoder,
             capacity=stream_capacity,
             max_step_latents=max_stream_step_latents,
-            upsample_backend=upsample_backend,
         )
         self.streaming_runner = MingAudioStreamingRunner(
             self.streaming_transition, cuda_graph_required=streaming_cuda_graph_required
@@ -200,7 +198,6 @@ class AudioVAEFixedStreamingTransition:
         *,
         capacity: int,
         max_step_latents: int,
-        upsample_backend: Literal["native", "triton_bth"] = "native",
     ) -> None:
         if (
             isinstance(capacity, bool)
@@ -306,24 +303,6 @@ class AudioVAEFixedStreamingTransition:
         self._device = device  # noqa: leading-underscore
         self.device_module = torch.get_device_module(device)
         self._input_dtype = input_dtype  # noqa: leading-underscore
-        if upsample_backend == "triton_bth":
-            if not HAS_TRITON:
-                raise RuntimeError(
-                    "Triton AudioVAE upsampling was selected but Triton is unavailable"
-                )
-            elif device.type != "cuda" or input_dtype != torch.bfloat16:
-                raise ValueError(
-                    "Triton AudioVAE upsampling requires a CUDA BF16 decoder"
-                )
-            else:
-                pass
-        elif upsample_backend == "native":
-            pass
-        else:
-            raise ValueError(
-                f"unsupported AudioVAE upsample_backend={upsample_backend!r}"
-            )
-        self.upsample_backend = upsample_backend
         self.decoder = decoder
         self.upsampler = upsampler
         self.scale_factor = patch_size
@@ -582,14 +561,10 @@ class AudioVAEFixedStreamingTransition:
             ),
             current_last,
         )
-        if self.upsample_backend == "triton_bth":
+        if can_upsample_linear_bth(timeline):
             upsampled = upsample_linear_bth(timeline, scale_factor=self.scale_factor)
-        elif self.upsample_backend == "native":
-            upsampled = self.upsampler(timeline.transpose(1, 2)).transpose(1, 2)
         else:
-            raise RuntimeError(
-                f"unsupported AudioVAE upsample_backend={self.upsample_backend!r}"
-            )
+            upsampled = self.upsampler(timeline.transpose(1, 2)).transpose(1, 2)
         frames = upsampled[
             :, self.scale_factor : self.scale_factor + self.max_frames
         ].to(torch.float32)

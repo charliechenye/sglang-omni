@@ -11,8 +11,6 @@ try:
 except ImportError:
     triton = None
     tl = None
-else:
-    pass
 
 HAS_TRITON = triton is not None
 UPSAMPLE_BLOCK_ELEMENTS = 512
@@ -20,7 +18,7 @@ UPSAMPLE_BLOCK_ELEMENTS = 512
 if HAS_TRITON:
 
     @triton.jit
-    def _upsample_linear_bth_kernel(
+    def _upsample_linear_bth_kernel(  # noqa: leading-underscore
         timeline,
         upsampled_timeline,
         batch_size: tl.constexpr,
@@ -78,47 +76,33 @@ if HAS_TRITON:
         )
 
 else:
-    pass
+    _upsample_linear_bth_kernel = None
 
 
-def upsample_linear_bth(
-    timeline: torch.Tensor, *, scale_factor: int
-) -> torch.Tensor:
+def can_upsample_linear_bth(timeline: torch.Tensor) -> bool:
+    """Return whether Triton supports this non-empty CUDA BF16 BTH tensor."""
+
+    return (
+        HAS_TRITON
+        and timeline.device.type == "cuda"
+        and timeline.dtype == torch.bfloat16
+        and timeline.ndim == 3
+        and all(size > 0 for size in timeline.shape)
+        and all(stride >= 0 for stride in timeline.stride())
+    )
+
+
+def upsample_linear_bth(timeline: torch.Tensor, *, scale_factor: int) -> torch.Tensor:
     """Upsample a CUDA BF16 BTH tensor into a fresh contiguous BTH tensor."""
 
-    if timeline.ndim != 3:
-        raise ValueError("Triton AudioVAE upsampling requires a BTH tensor")
-    else:
-        pass
-    if (
-        isinstance(scale_factor, bool)
-        or not isinstance(scale_factor, int)
-        or scale_factor <= 0
-    ):
-        raise ValueError("scale_factor must be a positive integer")
-    else:
-        pass
-    if timeline.dtype != torch.bfloat16:
-        raise ValueError("Triton AudioVAE upsampling requires BF16 input")
-    else:
-        pass
-    if timeline.device.type != "cuda":
-        raise ValueError("Triton AudioVAE upsampling requires a CUDA tensor")
-    else:
-        pass
-    if not HAS_TRITON:
-        raise RuntimeError(
-            "Triton AudioVAE upsampling was selected but Triton is unavailable"
-        )
-    else:
-        pass
+    assert (
+        not isinstance(scale_factor, bool)
+        and isinstance(scale_factor, int)
+        and scale_factor > 0
+    )
+    assert can_upsample_linear_bth(timeline)
 
     batch_size, input_time_steps, hidden_size = timeline.shape
-    if min(batch_size, input_time_steps, hidden_size) <= 0:
-        raise ValueError("Triton AudioVAE upsampling requires non-empty dimensions")
-    else:
-        pass
-
     output_time_steps = input_time_steps * scale_factor
     upsampled_timeline = torch.empty(
         (batch_size, output_time_steps, hidden_size),
@@ -126,9 +110,9 @@ def upsample_linear_bth(
         device=timeline.device,
     )
     output_element_count = upsampled_timeline.numel()
-    _upsample_linear_bth_kernel[(
-        triton.cdiv(output_element_count, UPSAMPLE_BLOCK_ELEMENTS),
-    )](
+    _upsample_linear_bth_kernel[
+        (triton.cdiv(output_element_count, UPSAMPLE_BLOCK_ELEMENTS),)
+    ](
         timeline,
         upsampled_timeline,
         batch_size,

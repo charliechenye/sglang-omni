@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any, Literal
+from typing import Any
 
 import pytest
 
@@ -248,25 +248,22 @@ def test_ming_tts_audio_decode_factory_resolves_the_streaming_graph_to_eager(
 
 
 @pytest.mark.parametrize(
-    ("streaming_cuda_graph", "process_fraction", "upsample_backend"),
-    [(False, None, "native"), (True, 1.0, "triton_bth")],
+    ("streaming_cuda_graph", "process_fraction"),
+    [(False, None), (True, 1.0)],
 )
-def test_ming_tts_audio_decode_factory_forwards_backend_and_warms_up(
+def test_ming_tts_audio_decode_factory_warms_up(
     monkeypatch: pytest.MonkeyPatch,
     streaming_cuda_graph: bool,
     process_fraction: float | None,
-    upsample_backend: Literal["native", "triton_bth"],
 ) -> None:
     stages, decoder_calls, schedulers = patch_audio_decode_factory_dependencies(
         monkeypatch
     )
-    monkeypatch.setattr(stages, "HAS_TRITON", True)
 
     result = stages.create_audio_decode_executor(
         "unused",
         stream_slots=3,
         streaming_cuda_graph=streaming_cuda_graph,
-        upsample_backend=upsample_backend,
         process_total_gpu_memory_fraction=process_fraction,
     )
 
@@ -274,25 +271,9 @@ def test_ming_tts_audio_decode_factory_forwards_backend_and_warms_up(
     assert decoder_calls[0]["stream_capacity"] == 3
     assert decoder_calls[0]["max_stream_step_latents"] == 8
     assert decoder_calls[0]["streaming_cuda_graph_required"] is streaming_cuda_graph
-    assert decoder_calls[0]["upsample_backend"] == upsample_backend
     assert result is schedulers[0]
     assert schedulers[0].warmup_calls == 1
     assert schedulers[0].stop_calls == 0
-
-
-def test_ming_tts_audio_decode_factory_rejects_missing_triton_before_checkpoint(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stages, decoder_calls, schedulers = patch_audio_decode_factory_dependencies(
-        monkeypatch
-    )
-    monkeypatch.setattr(stages, "HAS_TRITON", False)
-
-    with pytest.raises(RuntimeError, match="Triton is unavailable"):
-        stages.create_audio_decode_executor("unused", upsample_backend="triton_bth")
-
-    assert decoder_calls == []
-    assert schedulers == []
 
 
 def test_ming_tts_audio_decode_factory_stops_scheduler_when_warmup_fails(

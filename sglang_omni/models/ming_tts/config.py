@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar, Literal
+from typing import ClassVar
 
 from pydantic import Field
 
@@ -214,7 +214,6 @@ class MingTTSPreprocessingStageConfig(StageConfig):
 
 
 class MingTTSAudioDecodeFactoryArgs(FactoryArgs):
-    upsample_backend: Literal["native", "triton_bth"] = "native"
     streaming_cuda_graph: bool | None = Field(default=None, strict=True)
     initial_chunk_patches: int | None = Field(default=None, gt=0, strict=True)
     steady_chunk_patches: int | None = Field(default=None, gt=0, strict=True)
@@ -298,7 +297,6 @@ class MingTTSPipelineConfig(PipelineConfig):
             factory_path=f"{_PKG}.stages.create_audio_decode_executor",
             factory=MingTTSAudioDecodeFactoryArgs(
                 dtype="bfloat16",
-                upsample_backend="native",
                 initial_chunk_patches=MING_TTS_DEFAULT_INITIAL_CHUNK_PATCHES,
                 steady_chunk_patches=MING_TTS_DEFAULT_STEADY_CHUNK_PATCHES,
                 streaming_cuda_graph=MING_TTS_DEFAULT_STREAMING_CUDA_GRAPH,
