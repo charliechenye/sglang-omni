@@ -8,11 +8,12 @@ import math
 from collections.abc import Mapping
 from numbers import Real
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from transformers import PretrainedConfig
 
 from sglang_omni.models.ming_tts.audio_config import resolve_ming_tts_audio_vae_config
+from sglang_omni.models.ming_tts.audio_upsample import HAS_TRITON
 from sglang_omni.models.ming_tts.config import (
     MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
     MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
@@ -261,6 +262,7 @@ def create_audio_decode_executor(
     stream_slots: int = MING_TTS_DEFAULT_STREAM_SLOTS,
     max_batch_size: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_SIZE,
     max_batch_wait_ms: int = MING_TTS_AUDIO_DECODE_MAX_BATCH_WAIT_MS,
+    upsample_backend: Literal["native", "triton_bth"] = "native",
     total_gpu_memory_fraction: float | None = None,
     process_total_gpu_memory_fraction: float | None = None,
 ) -> MingTTSStreamingVocoderScheduler:
@@ -273,6 +275,10 @@ def create_audio_decode_executor(
         max_batch_wait_ms=max_batch_wait_ms,
     )
     validate_ming_tts_audio_decode_stream_slots(stream_slots)
+    if upsample_backend not in ("native", "triton_bth"):
+        raise ValueError(f"unsupported AudioVAE upsample_backend={upsample_backend!r}")
+    else:
+        pass
     if not isinstance(streaming_cuda_graph, bool):
         raise ValueError("Ming-Omni-TTS streaming_cuda_graph must be a boolean")
     else:
@@ -375,6 +381,17 @@ def create_audio_decode_executor(
         )
     else:
         pass
+    if upsample_backend == "triton_bth":
+        if not HAS_TRITON:
+            raise RuntimeError(
+                "Triton AudioVAE upsampling was selected but Triton is unavailable"
+            )
+        elif resolved_device.type != "cuda":
+            raise ValueError("Triton AudioVAE upsampling requires a CUDA device")
+        else:
+            pass
+    else:
+        pass
 
     device_info = get_gpu_device_info(logical_gpu_id)
     pre_process_bytes = process_memory_bytes(resolved_device)
@@ -426,6 +443,7 @@ def create_audio_decode_executor(
         stream_capacity=stream_slots,
         max_stream_step_latents=max_step_latents,
         streaming_cuda_graph_required=streaming_cuda_graph,
+        upsample_backend=upsample_backend,
     )
 
     try:
@@ -482,7 +500,7 @@ def create_audio_decode_executor(
 
         logger.info(
             "ming_tts_audio_decode_ready stage=audio_decode device=%s dtype=%s "
-            "attention_backend=%s streaming_backend=%s "
+            "attention_backend=%s streaming_backend=%s upsample_backend=%s "
             "streaming_cuda_graph_required=%s stream_slots=%d "
             "initial_chunk_patches=%d steady_chunk_patches=%d "
             "audio_patch_size=%d max_step_latents=%d latent_dim=%d "
@@ -494,6 +512,7 @@ def create_audio_decode_executor(
             str(resolved_dtype).removeprefix("torch."),
             MING_TTS_AUDIO_VAE_ATTN_IMPLEMENTATION,
             "cuda_graph" if streaming_cuda_graph else "eager",
+            upsample_backend,
             streaming_cuda_graph,
             stream_slots,
             initial_chunk_patches,

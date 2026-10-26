@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import pytest
@@ -49,10 +49,12 @@ class BaseFakeTransition:
         *,
         capacity: int,
         max_step_latents: int,
+        upsample_backend: Literal["native", "triton_bth"] = "native",
     ) -> None:
         self.decoder = decoder
         self.capacity = capacity
         self.max_step_latents = max_step_latents
+        self.upsample_backend = upsample_backend
 
 
 class BaseFakeRunner:
@@ -117,6 +119,7 @@ def test_full_empty_latents_skip_audio_vae(
     assert waveform.dtype == torch.float32
     assert waveform.device.type == "cpu"
     assert audio_vae.decode_calls == []
+    assert transition.upsample_backend == "native"
 
 
 class ScriptedGraph:

@@ -58,6 +58,28 @@ def test_ming_tts_accepts_initial_cadence_larger_than_steady() -> None:
     assert factory.steady_chunk_patches == 2
 
 
+def test_ming_tts_audio_upsample_backend_defaults_to_native_and_is_selectable() -> None:
+    raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
+    factory = audio_decode_stage(raw)["factory"]
+    assert factory["upsample_backend"] == "native"
+
+    factory["upsample_backend"] = "triton_bth"
+    config = MingTTSPipelineConfig.model_validate(raw)
+
+    assert (
+        config.stage_named(AUDIO_DECODE_STAGE).factory.upsample_backend
+        == "triton_bth"
+    )
+
+
+def test_ming_tts_audio_upsample_backend_rejects_unknown_values() -> None:
+    raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
+    audio_decode_stage(raw)["factory"]["upsample_backend"] = "experimental"
+
+    with pytest.raises(ValueError, match="upsample_backend"):
+        MingTTSPipelineConfig.model_validate(raw)
+
+
 def test_ming_tts_rejects_legacy_audio_decode_mode() -> None:
     raw = MingTTSPipelineConfig(model_path="fake-model").model_dump()
     audio_decode_stage(raw)["factory"]["decode_mode"] = "chunked"
