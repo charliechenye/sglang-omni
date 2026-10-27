@@ -269,15 +269,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/main.html">Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/apiserver_design.html">API Server Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/pipeline.html">Pipeline Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_interactive_model.html">Full Duplex Interactive Model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/config.html">Config</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/adding_parameters.html">Adding a Parameter</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/reference_encode_service.html">Reference Encode Service</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/qwen3_asr_concurrency_profile.html">Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_bench.html">Full-Duplex-Bench runbook</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_metrics.html">Full-Duplex-Bench v1.0 unified metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_guide.html">Full-Duplex Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/tts_bench.html">TTS benchmark runbook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/tts_model_integration.html">TTS Model Integration</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/asr_bench.html">ASR benchmark runbook</a></li>
@@ -804,7 +802,8 @@ actual stream sample rate, channel count, and bit depth. Higgs defaults
 flushes the corresponding delayed-code rows at row 27. Clients can still set
 another value, including <code class="docutils literal notranslate"><span class="pre">0</span></code> to use the steady chunk size from the start. The
 producer and vocoder share the effective value, and it controls only the first
-chunk. Follow-up chunks return to the normal Higgs streaming window.</p>
+chunk.</p>
+<p>After the first flush, both the producer and vocoder advance by <code class="docutils literal notranslate"><span class="pre">stream_followup_stride</span></code> delayed-code rows (75 by default). The default non-final flush positions are rows 27, 102, and 177. With four holdback frames, the corresponding audio chunks contain 20, 71, and 75 new codec frames; the second audio chunk is shorter because holdback starts after the first chunk. A final flush emits the remaining audio.</p>
 <ol class="arabic simple" start="2">
 <li><p>Use Python</p></li>
 </ol>

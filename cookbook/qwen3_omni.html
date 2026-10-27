@@ -269,15 +269,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/main.html">Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/apiserver_design.html">API Server Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/pipeline.html">Pipeline Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_interactive_model.html">Full Duplex Interactive Model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/config.html">Config</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/adding_parameters.html">Adding a Parameter</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/reference_encode_service.html">Reference Encode Service</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/qwen3_asr_concurrency_profile.html">Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_bench.html">Full-Duplex-Bench runbook</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_metrics.html">Full-Duplex-Bench v1.0 unified metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_guide.html">Full-Duplex Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/tts_bench.html">TTS benchmark runbook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/tts_model_integration.html">TTS Model Integration</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/asr_bench.html">ASR benchmark runbook</a></li>
@@ -928,7 +926,7 @@ must check for an <code class="docutils literal notranslate"><span class="pre">e
 <li><p>After an interruption, send <code class="docutils literal notranslate"><span class="pre">truncate</span></code> with the milliseconds of reply audio the listener heard (<code class="docutils literal notranslate"><span class="pre">conversation.item.truncate</span></code>); the model’s history then keeps only that much of the reply. Without it, the whole reply generated so far stays in the history.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">instructions</span></code> cannot change after the first user turn is processed; open a new session instead.</p></li>
 </ul>
-<p>See <a class="reference internal" href="../developer_reference/full_duplex_interactive_model.html#session-graph"><span class="std std-ref">Session Graph</span></a> for the shared routing and delivery contracts.</p>
+<p>See <a class="reference internal" href="../developer_reference/full_duplex_guide.html#session-graph"><span class="std std-ref">Session Graph</span></a> for the shared routing and delivery contracts.</p>
 </section>
 <section id="speculative-decoding">
 <h2>Speculative Decoding<a class="headerlink" href="#speculative-decoding" title="Link to this heading">#</a></h2>

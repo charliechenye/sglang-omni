@@ -269,15 +269,13 @@
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/main.html">Architecture</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/apiserver_design.html">API Server Design</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/pipeline.html">Pipeline Overview</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_interactive_model.html">Full Duplex Interactive Model</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/config.html">Config</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/adding_parameters.html">Adding a Parameter</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/communication.html">Communication</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/reference_encode_service.html">Reference Encode Service</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/profiler.html">Request-level profiler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/qwen3_asr_concurrency_profile.html">Qwen3-ASR High-Concurrency Benchmark and Bottleneck Profile</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_bench.html">Full-Duplex-Bench runbook</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_metrics.html">Full-Duplex-Bench v1.0 unified metrics</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../developer_reference/full_duplex_guide.html">Full-Duplex Guide</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/tts_bench.html">TTS benchmark runbook</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/tts_model_integration.html">TTS Model Integration</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../developer_reference/asr_bench.html">ASR benchmark runbook</a></li>
@@ -1398,7 +1396,7 @@ latency for quality.</p>
 <span class="p">}</span>
 </pre></div>
 </div>
-<p>For Base, use a fixed <code class="docutils literal notranslate"><span class="pre">references</span></code> entry instead of a built-in voice. <code class="docutils literal notranslate"><span class="pre">--seedtts-samples</span></code> replaces the bundled cases with prompts that missed codec EOS on 0.6B Base in #1179.</p>
+<p>For Base, use a fixed <code class="docutils literal notranslate"><span class="pre">references</span></code> entry instead of a built-in voice. The probe sends four built-in short lines in English and Chinese; <code class="docutils literal notranslate"><span class="pre">--cases</span></code> takes a JSON list of your own, and <code class="docutils literal notranslate"><span class="pre">--seedtts-samples</span></code> probes the SeedTTS prompts that missed codec EOS on 0.6B Base in #1179.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmark_tts_generation_budget<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--base-url<span class="w"> </span>http://127.0.0.1:8000/v1<span class="w"> </span>--request<span class="w"> </span>request.json<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--server-revision<span class="w"> </span>&lt;server-git-sha&gt;<span class="w"> </span>--model-revision<span class="w"> </span>&lt;checkpoint-sha&gt;<span class="w"> </span><span class="se">\</span>
@@ -1411,7 +1409,7 @@ python<span class="w"> </span>-m<span class="w"> </span>benchmarks.eval.benchmar
 </pre></div>
 </div>
 <p>Add <code class="docutils literal notranslate"><span class="pre">--stream</span></code> to check raw PCM streams. Output directories must be new. A fixed seed does not make waveforms bitwise identical because prefix-cache state and batch composition can change between requests.</p>
-<p>The TTS CI non-streaming and streaming stages run this probe for Qwen3-TTS on four short cases with eight seeds, 64 requests per stage, and upload the evidence.</p>
+<p>The TTS CI non-streaming and streaming stages run this probe for Qwen3-TTS on four short cases with eight seeds, 64 requests per stage, and upload <code class="docutils literal notranslate"><span class="pre">results.jsonl</span></code> with the audio of the pairs that failed.</p>
 </section>
 </section>
 <section id="known-limitations">
