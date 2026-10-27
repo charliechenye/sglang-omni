@@ -60,7 +60,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.1.9" />
-    <meta name="docbuild:last-update" content="Oct 26, 2026"/>
+    <meta name="docbuild:last-update" content="Oct 27, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -682,9 +682,11 @@ inside that cache and are read through <code class="docutils literal notranslate
 that upstream no longer builds for its own models is a surface to re-check at
 every bump: its base-class contract moves with the one upstream does build.</p>
 <p><strong>The vendor layer.</strong> <code class="docutils literal notranslate"><span class="pre">sglang_omni/vendor/sglang/layers.py</span></code> patches
-<code class="docutils literal notranslate"><span class="pre">RMSNorm.forward_cuda</span></code> and <code class="docutils literal notranslate"><span class="pre">models.py</span></code> patches <code class="docutils literal notranslate"><span class="pre">apply_qk_norm</span></code>; the module
-docstrings state what each patch does, and <code class="docutils literal notranslate"><span class="pre">models.py</span></code> the condition for
-removing it. Check that the wrapped upstream body still has the shape the
+<code class="docutils literal notranslate"><span class="pre">RMSNorm.forward_cuda</span></code>, <code class="docutils literal notranslate"><span class="pre">models.py</span></code> patches <code class="docutils literal notranslate"><span class="pre">apply_qk_norm</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">flashattention_backend.py</span></code> patches <code class="docutils literal notranslate"><span class="pre">FlashAttentionBackend.__init__</span></code> for
+DSpark drafts, installed by the bootstrap only when a DSpark draft is set;
+the module docstrings state what each patch does, and <code class="docutils literal notranslate"><span class="pre">models.py</span></code> and
+<code class="docutils literal notranslate"><span class="pre">flashattention_backend.py</span></code> the condition for removing it. Check that the wrapped upstream body still has the shape the
 patch assumes (a dispatch rewrite upstream can route around a patched method
 without an error) and that <code class="docutils literal notranslate"><span class="pre">tests/unit_test/vendor/</span></code> still pins it.</p>
 <p><strong><code class="docutils literal notranslate"><span class="pre">ServerArgs</span></code> mutation.</strong> <code class="docutils literal notranslate"><span class="pre">build_sglang_server_args</span></code> constructs the record
@@ -980,7 +982,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 26, 2026.
+  Last updated on Oct 27, 2026.
   <br/>
 </p>
   </div>
