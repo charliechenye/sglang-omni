@@ -12,6 +12,41 @@ from transformers.models.qwen2.modeling_qwen2 import Qwen2RMSNorm
 
 logger = logging.getLogger(__name__)
 
+def _install_p9_once_diagnostic(module: torch.nn.Module) -> None:
+    """Log one real forward's input and dispatch, then remove the hook.
+
+    Only used when MING_AUDIOVAE_RMSNORM_P9_DIAG=1. No tensor copies, no CUDA
+    synchronization, no persistent hooks in normal serving.
+    """
+    import sglang.srt.layers.layernorm as ln
+    from sglang.kernels.ops.layernorm.rmsnorm_hf import (
+        is_supported_rmsnorm_hf_hidden_size,
+    )
+
+    handle = None
+
+    def before(mod, args):
+        nonlocal handle
+        if handle is not None:
+            handle.remove()
+            handle = None
+        x = args[0]
+        method = getattr(mod, "_forward_method", None)
+        logger.warning(
+            "P9_NORM_DIAG shape=%s input_dtype=%s weight_dtype=%s "
+            "contiguous=%s hidden=%s method=%s jit_available=%s "
+            "width_supported=%s dtype_eligible=%s",
+            tuple(x.shape), x.dtype, mod.weight.dtype,
+            x.is_contiguous(), x.shape[-1],
+            getattr(method, "__name__", repr(method)),
+            getattr(ln, "_jit_rmsnorm_hf_available", None),
+            is_supported_rmsnorm_hf_hidden_size(x.shape[-1]),
+            x.dtype in (torch.float16, torch.bfloat16)
+            and x.dtype == mod.weight.dtype,
+        )
+
+    handle = module.register_forward_pre_hook(before)
+
 
 def maybe_replace_audio_vae_qwen_norms(audio_vae: torch.nn.Module) -> int:
     mode = os.environ.get("MING_AUDIOVAE_RMSNORM_P6", "hf")
@@ -45,5 +80,7 @@ def maybe_replace_audio_vae_qwen_norms(audio_vae: torch.nn.Module) -> int:
         # Reuse the EXACT loaded parameter rather than constructing a new value.
         fused.weight = w
         setattr(parent, name, fused)
+    if os.environ.get("MING_AUDIOVAE_RMSNORM_P9_DIAG") == "1":
+        _install_p9_once_diagnostic(getattr(targets[0][0], targets[0][1]))
     logger.warning("P6 experimental Ming AudioVAE HF-semantics fused RMSNorm enabled: %d modules",len(targets))
     return len(targets)
