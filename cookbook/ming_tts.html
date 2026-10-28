@@ -218,6 +218,7 @@
 <ul class="current nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="qwen3_tts.html">Qwen3-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="moss_tts.html">MOSS-TTS</a></li>
+<li class="toctree-l1"><a class="reference internal" href="moss_tts_local.html">MOSS-TTS-Local</a></li>
 <li class="toctree-l1"><a class="reference internal" href="whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="nemotron3_5_asr.html">Nemotron 3.5 ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="nemotron_transcribe.html">Nemotron Transcribe</a></li>
@@ -232,7 +233,6 @@
 <li class="toctree-l1"><a class="reference internal" href="minicpm_o.html">MiniCPM-o</a></li>
 <li class="toctree-l1"><a class="reference internal" href="fun_asr.html">Fun-ASR-Nano</a></li>
 <li class="toctree-l1"><a class="reference internal" href="higgs_tts.html">Higgs TTS</a></li>
-<li class="toctree-l1"><a class="reference internal" href="moss_tts_local.html">MOSS-TTS-Local</a></li>
 <li class="toctree-l1"><a class="reference internal" href="nemotron_diarization.html">Nemotron 3 Diarization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="fishaudio_drama3.html">Fish Audio Drama 3</a></li>
 <li class="toctree-l1"><a class="reference internal" href="minimax_music3.html">MiniMax Music 3</a></li>
@@ -648,6 +648,7 @@ later call supplies the right-hand context needed to emit that initial group. Su
 consume <code class="docutils literal notranslate"><span class="pre">steady_chunk_patches</span></code> at a time. The provided configuration uses two initial patches and
 four steady patches, and the terminal step flushes any remainder. Pipe the response to <code class="docutils literal notranslate"><span class="pre">ffplay</span></code>
 to play it during generation:</p>
+<p>Streaming AudioVAE automatically uses Triton BTH upsampling when Triton is available and the input is a non-empty CUDA BF16 BTH tensor with non-negative strides; other streaming inputs use the existing PyTorch upsampler, and non-streaming AudioVAE decode is unchanged.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-sS<span class="w"> </span>--fail<span class="w"> </span>--no-buffer<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/audio/speech<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>-d<span class="w"> </span><span class="s1">'{</span>
