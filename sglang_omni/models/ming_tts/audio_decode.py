@@ -45,6 +45,11 @@ class MingAudioDecoder:
         streaming_cuda_graph_required: bool,
     ) -> None:
         self.audio_vae = audio_vae
+        # P6 experimental swap: checkpoint has already been loaded; no graph captured yet.
+        from sglang_omni.models.ming_tts.rmsnorm_p6 import (
+            maybe_replace_audio_vae_qwen_norms,
+        )
+        maybe_replace_audio_vae_qwen_norms(audio_vae)
         self.streaming_transition = AudioVAEFixedStreamingTransition(
             audio_vae.decoder,
             capacity=stream_capacity,
