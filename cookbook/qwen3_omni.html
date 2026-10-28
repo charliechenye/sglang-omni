@@ -42,7 +42,7 @@
   <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
 <link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
 
-    <script src="../_static/documentation_options.js?v=c52cfe39"></script>
+    <script src="../_static/documentation_options.js?v=7f7c277e"></script>
     <script src="../_static/doctools.js?v=fd6eb6e6"></script>
     <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
@@ -60,8 +60,8 @@
     <link rel="prev" title="Cosmos3 Nano serving" href="cosmos3_nano.html" />
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="0.1.9" />
-    <meta name="docbuild:last-update" content="Oct 27, 2026"/>
+  <meta name="docsearch:version" content="0.2.0" />
+    <meta name="docbuild:last-update" content="Oct 28, 2026"/>
   
     
     <script src="../_static/searchtools.js"></script>
@@ -208,7 +208,7 @@
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation.html">Installation — CUDA</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation_apple_silicon.html">Installation — Apple Silicon</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_npu.html">Installation — Ascend NPU</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../get_started/installation_npu.html">Installation — NPU</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation_xpu.html">Installation — Intel XPU</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation_cpu.html">Installation — Intel CPU</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../get_started/installation_musa.html">Installation — MUSA</a></li>
@@ -220,6 +220,7 @@
 <li class="toctree-l1"><a class="reference internal" href="moss_tts.html">MOSS-TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="whisper_asr.html">Whisper ASR</a></li>
 <li class="toctree-l1"><a class="reference internal" href="nemotron3_5_asr.html">Nemotron 3.5 ASR</a></li>
+<li class="toctree-l1"><a class="reference internal" href="nemotron_transcribe.html">Nemotron Transcribe</a></li>
 <li class="toctree-l1"><a class="reference internal" href="moss_transcribe_diarize.html">MOSS-Transcribe-Diarize</a></li>
 <li class="toctree-l1"><a class="reference internal" href="fishaudio_s2_pro.html">Fish Audio S2-Pro</a></li>
 <li class="toctree-l1"><a class="reference internal" href="fun_cosyvoice3.html">Fun-CosyVoice3</a></li>
@@ -239,6 +240,7 @@
 <li class="toctree-l1"><a class="reference internal" href="auk.html">AuK</a></li>
 <li class="toctree-l1"><a class="reference internal" href="zonos2.html">ZONOS2</a></li>
 <li class="toctree-l1"><a class="reference internal" href="arkasr.html">ARK-ASR-3B</a></li>
+<li class="toctree-l1"><a class="reference internal" href="hy_simulmt.html">Hy-SimulMT</a></li>
 <li class="toctree-l1"><a class="reference internal" href="voxtral_tts.html">Voxtral TTS</a></li>
 <li class="toctree-l1"><a class="reference internal" href="dots_tts.html">dots.tts</a></li>
 <li class="toctree-l1"><a class="reference internal" href="llada2_uni.html">LLaDA2.0-Uni</a></li>
@@ -553,7 +555,7 @@ docker<span class="w"> </span>run<span class="w"> </span>-it<span class="w"> </s
 pip<span class="w"> </span>install<span class="w"> </span>uv
 
 uv<span class="w"> </span>venv<span class="w"> </span>.venv<span class="w"> </span>-p<span class="w"> </span><span class="m">3</span>.12<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span><span class="nb">source</span><span class="w"> </span>.venv/bin/activate
-uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--prerelease<span class="o">=</span>allow<span class="w"> </span><span class="s2">"sglang-omni==0.1.9"</span>
+uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>--prerelease<span class="o">=</span>allow<span class="w"> </span><span class="s2">"sglang-omni==0.2.0"</span>
 </pre></div>
 </div>
 <p>See <a class="reference internal" href="../get_started/installation.html"><span class="std std-doc">Installation</span></a> for Docker digests and source installs.</p>
@@ -955,7 +957,7 @@ sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\<
 <ul class="simple">
 <li><p><strong>Context.</strong> The thinker serves within the draft’s context (8,192 tokens for both drafts), and a request whose prompt plus <code class="docutils literal notranslate"><span class="pre">max_tokens</span></code> exceeds it, less a few tokens each step reserves, is rejected with an error. Setting <code class="docutils literal notranslate"><span class="pre">--preprocessing.factory.max_seq_len</span> <span class="pre">8192</span></code> rejects most of them before the thinker.</p></li>
 <li><p><strong>Sampling.</strong> Requests with <code class="docutils literal notranslate"><span class="pre">repetition_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">frequency_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">presence_penalty</span></code>, <code class="docutils literal notranslate"><span class="pre">min_p</span></code> or logprobs are rejected, because the draft workers apply penalties once per verify block, drop <code class="docutils literal notranslate"><span class="pre">min_p</span></code>, and skip the sampler that records logprobs. Rollout <code class="docutils literal notranslate"><span class="pre">/generate</span></code> requests default to <code class="docutils literal notranslate"><span class="pre">return_logprob:</span> <span class="pre">true</span></code>, so they must send <code class="docutils literal notranslate"><span class="pre">false</span></code>.</p></li>
-<li><p><strong>Scheduling.</strong> Async decode is turned off, and setting <code class="docutils literal notranslate"><span class="pre">enable_mixed_chunk</span></code> is rejected. EAGLE3 also runs prefill without CUDA graphs, since its draft extends on the composed multimodal embeddings. Sessions and weight updates are refused while a draft is loaded.</p></li>
+<li><p><strong>Scheduling.</strong> Async decode is turned off, and setting <code class="docutils literal notranslate"><span class="pre">enable_mixed_chunk</span></code> is rejected. Sessions and weight updates are refused while a draft is loaded.</p></li>
 <li><p><strong>Speech output.</strong> A draft is refused on a speech server for now. The thinker captures the layer the talker reads through the same hidden-state capture the drafts use, and the speculative prefill does not store the talker’s prompt rows, so serve with <code class="docutils literal notranslate"><span class="pre">--text-only</span></code>.</p></li>
 </ul>
 <p>Text-only ASR on LibriSpeech test-clean (<code class="docutils literal notranslate"><span class="pre">--text-only</span></code>, thinker on one H200 141GB with FA3 and SGLang 0.5.22, greedy, <code class="docutils literal notranslate"><span class="pre">max_tokens</span> <span class="pre">200</span></code>), in requests per second; concurrency 1 over all 2,620 utterances, concurrency 4 and 8 over the two halves, each on a server that has not seen them:</p>
@@ -969,24 +971,24 @@ sgl-omni<span class="w"> </span>serve<span class="w"> </span><span class="se">\<
 </thead>
 <tbody>
 <tr class="row-even"><td><p>1</p></td>
-<td><p>7.56</p></td>
-<td><p>12.56 (1.66x)</p></td>
-<td><p>7.69 (1.02x)</p></td>
+<td><p>7.78</p></td>
+<td><p>12.95 (1.66x)</p></td>
+<td><p>11.57 (1.49x)</p></td>
 </tr>
 <tr class="row-odd"><td><p>4</p></td>
-<td><p>16.45</p></td>
-<td><p>24.41 (1.48x)</p></td>
-<td><p>12.06 (0.73x)</p></td>
+<td><p>16.54</p></td>
+<td><p>24.23 (1.46x)</p></td>
+<td><p>21.43 (1.30x)</p></td>
 </tr>
 <tr class="row-even"><td><p>8</p></td>
-<td><p>24.00</p></td>
-<td><p>36.17 (1.51x)</p></td>
-<td><p>18.05 (0.75x)</p></td>
+<td><p>23.94</p></td>
+<td><p>37.19 (1.55x)</p></td>
+<td><p>31.80 (1.33x)</p></td>
 </tr>
 </tbody>
 </table>
 </div>
-<p>DFlash accepts 4.7 tokens per verify and EAGLE3 3.4, with WER unchanged. EAGLE3 trails at concurrency 4 and 8 because its draft runs prefill without CUDA graphs. Requests that repeat earlier audio hit the prefix cache, which speeds the baseline up and slows DFlash down, so benchmark each pass on utterances its server has not seen.</p>
+<p>DFlash accepts 4.7 tokens per verify and EAGLE3 3.4, with WER unchanged. Requests that repeat earlier audio hit the prefix cache, which speeds the baseline up and slows DFlash down, so benchmark each pass on utterances its server has not seen.</p>
 </section>
 </section>
 
@@ -1080,7 +1082,7 @@ By SGLang-Omni Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Oct 27, 2026.
+  Last updated on Oct 28, 2026.
   <br/>
 </p>
   </div>
