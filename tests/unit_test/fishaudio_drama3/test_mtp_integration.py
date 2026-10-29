@@ -1415,7 +1415,7 @@ def decode_runner(
     )
 
 
-def test_fused_decode_state_flag_defaults_off_and_is_read_once(
+def test_fused_decode_state_flag_defaults_off_and_rejects_unsupported_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("SGLANG_OMNI_DRAMA3_FUSED_DECODE_STATE", raising=False)
@@ -1432,10 +1432,12 @@ def test_fused_decode_state_flag_defaults_off_and_is_read_once(
     with patch(
         "sglang_omni.models.fishaudio_drama3.model_runner.importlib"
     ) as importlib_module:
-        cpu_decode = decode_runner(row_count=2)
+        with pytest.raises(
+            RuntimeError,
+            match="requires contiguous CUDA tensors on the same device",
+        ):
+            decode_runner(row_count=2)
     importlib_module.import_module.assert_not_called()
-    assert not cpu_decode.runner.fused_decode_state
-    assert cpu_decode.runner.decode_state_kernels is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")

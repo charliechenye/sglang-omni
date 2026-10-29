@@ -144,75 +144,42 @@ class Drama3ModelRunner(ModelRunner[Drama3RequestData]):
         self.row_upload_buffers: list[torch.Tensor] = []
         self.row_upload_slot = 0
         self.prefill_inputs: Drama3StepInputs | None = None
-        decode_state_tensors = (
-            self.state_pool.frames,
-            self.state_pool.ras_windows,
-            self.state_pool.temperature,
-            self.state_pool.top_k,
-            self.state_pool.top_p,
-            self.state_pool.row_indices,
-            self.decode_buffers.frames,
-            self.decode_buffers.ras_windows,
-            self.decode_buffers.temperature,
-            self.decode_buffers.top_k,
-            self.decode_buffers.top_p,
-            self.decode_buffers.sampled_frames,
-        )
-        state_device = self.state_pool.frames.device
-        fused_layout_supported = (
-            state_device.type == "cuda"
-            and all(
-                tensor.is_contiguous() and tensor.device == state_device
-                for tensor in decode_state_tensors
-            )
-            and self.state_pool.frames.dtype == torch.int64
-            and self.state_pool.frames.ndim == 2
-            and self.state_pool.ras_windows.dtype == torch.int64
-            and self.state_pool.ras_windows.shape
-            == (self.state_pool.frames.shape[0], RAS_WINDOW_FRAMES)
-            and self.state_pool.temperature.dtype == torch.float32
-            and self.state_pool.temperature.shape == (self.state_pool.frames.shape[0],)
-            and self.state_pool.top_k.dtype == torch.int64
-            and self.state_pool.top_k.shape == (self.state_pool.frames.shape[0],)
-            and self.state_pool.top_p.dtype == torch.float32
-            and self.state_pool.top_p.shape == (self.state_pool.frames.shape[0],)
-            and self.state_pool.row_indices.dtype == torch.int64
-            and self.state_pool.row_indices.ndim == 1
-            and self.decode_buffers.frames.dtype == torch.int64
-            and self.decode_buffers.frames.ndim == 2
-            and self.decode_buffers.frames.shape[1] == self.state_pool.frames.shape[1]
-            and self.decode_buffers.ras_windows.dtype == torch.int64
-            and self.decode_buffers.ras_windows.shape
-            == (self.decode_buffers.frames.shape[0], RAS_WINDOW_FRAMES)
-            and self.decode_buffers.temperature.dtype == torch.float32
-            and self.decode_buffers.temperature.shape
-            == (self.decode_buffers.frames.shape[0],)
-            and self.decode_buffers.top_k.dtype == torch.int64
-            and self.decode_buffers.top_k.shape
-            == (self.decode_buffers.frames.shape[0],)
-            and self.decode_buffers.top_p.dtype == torch.float32
-            and self.decode_buffers.top_p.shape
-            == (self.decode_buffers.frames.shape[0],)
-            and self.decode_buffers.sampled_frames.dtype == torch.int64
-            and self.decode_buffers.sampled_frames.shape
-            == self.decode_buffers.frames.shape
-            and self.state_pool.frames.shape[0] == self.request_slot_count + 1
-            and self.state_pool.row_indices.shape == (self.request_slot_count,)
-        )
         self.decode_state_kernels: ModuleType | None = None
-        if (
-            os.environ.get("SGLANG_OMNI_DRAMA3_FUSED_DECODE_STATE") == "1"
-            and fused_layout_supported
-        ):
-            self.fused_decode_state = True
-            self.decode_state_kernels = importlib.import_module(
-                "sglang_omni.models.fishaudio_drama3.decode_state_kernels"
+        self.fused_decode_state = False
+        if os.environ.get("SGLANG_OMNI_DRAMA3_FUSED_DECODE_STATE") == "1":
+            decode_state_tensors = (
+                self.state_pool.frames,
+                self.state_pool.ras_windows,
+                self.state_pool.temperature,
+                self.state_pool.top_k,
+                self.state_pool.top_p,
+                self.state_pool.row_indices,
+                self.decode_buffers.frames,
+                self.decode_buffers.ras_windows,
+                self.decode_buffers.temperature,
+                self.decode_buffers.top_k,
+                self.decode_buffers.top_p,
+                self.decode_buffers.sampled_frames,
             )
+            state_device = self.state_pool.frames.device
+            if state_device.type != "cuda" or any(
+                tensor.device != state_device or not tensor.is_contiguous()
+                for tensor in decode_state_tensors
+            ):
+                raise RuntimeError(
+                    "Drama3 fused decode-state mode requires contiguous CUDA "
+                    "tensors on the same device"
+                )
+            else:
+                self.decode_state_kernels = importlib.import_module(
+                    "sglang_omni.models.fishaudio_drama3.decode_state_kernels"
+                )
+                self.fused_decode_state = True
         else:
-            self.fused_decode_state = False
+            pass
         logger.info(
-            "Drama 3 fused decode-state mode: %s",
-            "Triton" if self.fused_decode_state else "baseline",
+            f"Drama 3 fused decode-state mode: "
+            f"{'Triton' if self.fused_decode_state else 'baseline'}"
         )
 
     def lookahead_eligible(self, batch: ScheduleBatch) -> bool:
