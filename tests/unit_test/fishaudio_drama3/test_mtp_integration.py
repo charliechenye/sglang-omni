@@ -1345,12 +1345,14 @@ def unpinned_buffer_pair(shape: tuple[int, ...]) -> list[torch.Tensor]:
     return [torch.empty(shape, dtype=torch.int64) for _ in range(2)]
 
 
-def decode_runner(row_count: int) -> DecodeRunner:
+def decode_runner(
+    row_count: int, *, device: torch.device = torch.device("cpu")
+) -> DecodeRunner:
     """The real runner on stubbed SGLang infrastructure and a fake GPU forward."""
     config = FishOmniConfig(**fish_config_dict())
     text_config = config.text_config
     buffers = Drama3DecodeBuffers.allocate(
-        row_count=row_count, frame_width=FRAME_WIDTH, device=torch.device("cpu")
+        row_count=row_count, frame_width=FRAME_WIDTH, device=device
     )
     model = Mock(spec=Drama3ForCausalLM)
     model.config = config
@@ -1395,7 +1397,7 @@ def decode_runner(row_count: int) -> DecodeRunner:
         ModelWorker.forward_batch_generation, worker
     )
     # A host without an accelerator has no platform device to resolve.
-    with patch.object(current_platform, "get_device", return_value=torch.device("cpu")):
+    with patch.object(current_platform, "get_device", return_value=device):
         runner = SuppliedBatchRunner(worker, SGLangOutputProcessor())
     runner.row_upload_buffers = unpinned_buffer_pair((row_count,))
     runner.host_staging_buffers = unpinned_buffer_pair((row_count, FRAME_WIDTH))
@@ -1411,6 +1413,43 @@ def decode_runner(row_count: int) -> DecodeRunner:
         worker=worker,
         execution_bridge=execution_bridge,
     )
+
+
+def test_fused_decode_state_flag_defaults_off_and_is_read_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("SGLANG_OMNI_DRAMA3_FUSED_DECODE_STATE", raising=False)
+    with patch(
+        "sglang_omni.models.fishaudio_drama3.model_runner.importlib"
+    ) as importlib_module:
+        decode = decode_runner(row_count=2)
+    importlib_module.import_module.assert_not_called()
+    assert not decode.runner.fused_decode_state
+    assert decode.runner.decode_state_kernels is None
+
+    monkeypatch.setenv("SGLANG_OMNI_DRAMA3_FUSED_DECODE_STATE", "1")
+    assert not decode.runner.fused_decode_state
+    with patch(
+        "sglang_omni.models.fishaudio_drama3.model_runner.importlib"
+    ) as importlib_module:
+        cpu_decode = decode_runner(row_count=2)
+    importlib_module.import_module.assert_not_called()
+    assert not cpu_decode.runner.fused_decode_state
+    assert cpu_decode.runner.decode_state_kernels is None
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+def test_fused_decode_state_flag_enables_kernels_at_runner_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("triton")
+    monkeypatch.setenv("SGLANG_OMNI_DRAMA3_FUSED_DECODE_STATE", "1")
+    decode = decode_runner(row_count=2, device=torch.device("cuda:0"))
+    assert decode.runner.fused_decode_state
+    assert decode.runner.decode_state_kernels is not None
+
+    monkeypatch.setenv("SGLANG_OMNI_DRAMA3_FUSED_DECODE_STATE", "0")
+    assert decode.runner.fused_decode_state
 
 
 def schedule_batch_of(forward_mode: ForwardMode) -> ScheduleBatch:
