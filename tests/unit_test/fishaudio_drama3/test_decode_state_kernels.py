@@ -18,13 +18,13 @@ from sglang_omni.models.fishaudio_drama3.sampling import RAS_WINDOW_FRAMES
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
+@pytest.mark.parametrize("frame_width", [5, 11])
 @pytest.mark.parametrize("row_count", [1, 8, 16, 32])
 @pytest.mark.parametrize("arrangement", ["ordered", "permuted", "sparse"])
 def test_fused_decode_state_matches_baseline(
-    row_count: int, arrangement: str
+    row_count: int, arrangement: str, frame_width: int
 ) -> None:
     device = torch.device("cuda")
-    frame_width = 5
     request_slot_count = 64
     generator = torch.Generator(device=device).manual_seed(20261029 + row_count)
     baseline_state = Drama3DecodeStatePool.allocate(

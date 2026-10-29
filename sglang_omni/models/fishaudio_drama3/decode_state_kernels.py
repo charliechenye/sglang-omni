@@ -27,6 +27,7 @@ def _gather(
     output_top_p,
     FRAME_WIDTH: tl.constexpr,
     FRAME_BLOCK: tl.constexpr,
+    RAS_WINDOW_FRAMES: tl.constexpr,
 ):
     batch_row = tl.program_id(0)
     slot = tl.load(row_indices + batch_row)
@@ -61,6 +62,7 @@ def _publish(
     snapshot,
     FRAME_WIDTH: tl.constexpr,
     FRAME_BLOCK: tl.constexpr,
+    RAS_WINDOW_FRAMES: tl.constexpr,
 ):
     batch_row = tl.program_id(0)
     slot = tl.load(row_indices + batch_row)
@@ -113,6 +115,7 @@ def gather(
         decode_buffers.top_p,
         frame_width,
         triton.next_power_of_2(frame_width),
+        RAS_WINDOW_FRAMES,
         num_warps=4,
     )
 
@@ -132,6 +135,7 @@ def publish(
         snapshot,
         frame_width,
         triton.next_power_of_2(frame_width),
+        RAS_WINDOW_FRAMES,
         num_warps=4,
     )
     return snapshot
