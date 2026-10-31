@@ -57,6 +57,21 @@ curl -X POST http://localhost:8000/v1/audio/speech \
   --output output_voice_cloning.wav
 ```
 
+For multi-speaker dialogue, tag each utterance and the matching reference transcript. Replace the example audio paths with clips for the corresponding speakers:
+
+```bash
+curl -X POST http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "<|speaker:0|> Are we ready? <|speaker:1|> We are.",
+    "references": [
+      {"audio_path": "speaker-0.wav", "text": "<|speaker:0|> Ready when you are."},
+      {"audio_path": "speaker-1.wav", "text": "<|speaker:1|> Let us begin."}
+    ]
+  }' \
+  --output output_multi_speaker.wav
+```
+
 Streaming:
 
 ```bash
