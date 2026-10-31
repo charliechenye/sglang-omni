@@ -59,6 +59,8 @@ curl -X POST http://localhost:8000/v1/audio/speech \
 
 For multi-speaker dialogue, tag each utterance and the matching reference transcript. Replace the example audio paths with clips for the corresponding speakers:
 
+The example paths are placeholders. Local paths are resolved by the serving process and must be accessible to it and permitted by its resource allowlist; accessible HTTP(S) URLs can be used instead.
+
 ```bash
 curl -X POST http://localhost:8000/v1/audio/speech \
   -H "Content-Type: application/json" \

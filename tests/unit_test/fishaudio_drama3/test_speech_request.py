@@ -433,6 +433,18 @@ REFUSED_REQUESTS = [
         id="malformed-speaker-tag-in-input",
     ),
     pytest.param(
+        {
+            "references": [
+                {
+                    "text": "<|speaker:16|> take",
+                    "vq_codes": TWO_FRAME_CODES,
+                }
+            ]
+        },
+        "speaker tags must be written",
+        id="speaker-sixteen-in-reference",
+    ),
+    pytest.param(
         {"references": [{"text": "take"}]},
         "references.0 needs audio or vq_codes",
         id="reference-without-audio",
