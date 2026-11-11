@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import threading
 import time
 from collections.abc import Iterator
 from types import SimpleNamespace
 
+import msgspec
 import pytest
 import torch
 from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
 
+from sglang_omni.models.qwen3_asr import encoder_service
 from sglang_omni.models.qwen3_asr.encoder_service import (
     Qwen3ASRPreLMEncoderService,
     build_cache_namespace,
     expected_audio_tokens,
 )
+from sglang_omni.scheduling.pre_lm_encoder import QueueEntry
 
 HIDDEN_SIZE = 4
 if torch.cuda.is_available():
@@ -62,6 +66,8 @@ class StubModel(torch.nn.Module):
         self.row_offset = 0
         self.encode_delay_s = 0.0
         self.grad_enabled_during_encode: bool | None = None
+        self.pre_lm_events: dict[int, tuple[torch.Tensor, torch.cuda.Event]] = {}
+        self.encoder_graph_runner = None
 
     def get_audio_feature(self, items):  # noqa: ANN001
         self.grad_enabled_during_encode = torch.is_grad_enabled()
@@ -93,6 +99,14 @@ class StubModel(torch.nn.Module):
             return packed.unsqueeze(0)
         return packed
 
+    def register_pre_lm_ready_event(
+        self, embedding: torch.Tensor, event: torch.cuda.Event
+    ) -> None:
+        self.pre_lm_events[id(embedding)] = (embedding, event)
+
+    def remove_pre_lm_ready_event(self, embedding: torch.Tensor) -> None:
+        self.pre_lm_events.pop(id(embedding), None)
+
 
 def make_service(
     model: StubModel | None = None,
@@ -100,6 +114,7 @@ def make_service(
     cache_max_entries: int = 16,
     cache_max_bytes: int = 1 << 20,
     max_batch_size: int = 8,
+    enable_event_handoff: bool = False,
 ) -> Qwen3ASRPreLMEncoderService:
     service = Qwen3ASRPreLMEncoderService(
         model or StubModel(),
@@ -107,9 +122,199 @@ def make_service(
         cache_max_entries=cache_max_entries,
         cache_max_bytes=cache_max_bytes,
         max_batch_size=max_batch_size,
+        enable_event_handoff=enable_event_handoff,
     )
     SERVICES.append(service)
     return service
+
+
+class RecordingStream:
+    def __init__(self) -> None:
+        self.synchronize_calls = 0
+
+    def synchronize(self) -> None:
+        self.synchronize_calls += 1
+
+
+class RecordingEvent:
+    def __init__(self) -> None:
+        self.recorded_stream: RecordingStream | None = None
+        self.synchronize_calls = 0
+
+    def record(self, stream: RecordingStream) -> None:
+        self.recorded_stream = stream
+
+    def synchronize(self) -> None:
+        self.synchronize_calls += 1
+
+
+class FakeCudaParameter:
+    device: torch.device = torch.device("cuda:0")
+    dtype: torch.dtype = torch.float32
+
+
+class FakeAudioTower(torch.nn.Module):
+    def parameters(self, recurse: bool = True) -> Iterator[FakeCudaParameter]:
+        del recurse
+        yield FakeCudaParameter()
+
+
+def test_event_handoff_records_after_attach_and_keeps_events_out_of_item_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = StubModel()
+    service = make_service(model)
+    service.enable_event_handoff = True
+    stream = RecordingStream()
+    event = RecordingEvent()
+    service.stream = stream
+    monkeypatch.setattr(torch.cuda, "Event", lambda: event)
+    item = make_item(7, 3)
+    embedding = torch.ones((3, HIDDEN_SIZE))
+
+    item.precomputed_embeddings = embedding
+    service.after_batch_embeddings_attached([item], [embedding])
+    service.synchronize_batch()
+    encoded_metadata = msgspec.msgpack.encode(item.model_specific_data)
+
+    assert event.recorded_stream is stream
+    assert model.pre_lm_events[id(embedding)] == (embedding, event)
+    assert stream.synchronize_calls == 0
+    assert "producer_event" not in item.model_specific_data
+    assert all(value is not event for value in item.model_specific_data.values())
+    assert b"producer_event" not in encoded_metadata
+
+
+def test_event_handoff_disabled_keeps_encoder_stream_synchronization() -> None:
+    service = make_service()
+    stream = RecordingStream()
+    service.stream = stream
+
+    service.synchronize_batch()
+
+    assert not service.enable_event_handoff
+    assert stream.synchronize_calls == 1
+
+
+def test_event_handoff_falls_back_when_encoder_graphs_are_initialized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = StubModel()
+    model.audio_tower = FakeAudioTower()
+    model.encoder_graph_runner = object()
+    monkeypatch.setattr(
+        encoder_service,
+        "create_device_stream",
+        lambda _device: RecordingStream(),
+    )
+
+    service = Qwen3ASRPreLMEncoderService(
+        model,
+        cache_namespace=NAMESPACE,
+        enable_event_handoff=True,
+    )
+    SERVICES.append(service)
+
+    assert not service.enable_event_handoff
+    assert not model.pre_lm_event_handoff_enabled
+
+
+def test_event_handoff_defers_cpu_cache_until_producer_stream_is_ready(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = make_service()
+    service.enable_event_handoff = True
+    stream = RecordingStream()
+    service.stream = stream
+    item = make_item(81, 3)
+    embedding = torch.ones((3, HIDDEN_SIZE))
+    cache_key = service.cache_key(item)
+    assert cache_key is not None
+    future: concurrent.futures.Future[torch.Tensor] = concurrent.futures.Future()
+    queue_entry = QueueEntry(item=item, future=future)
+    service.inflight[cache_key] = future
+    future.add_done_callback(
+        lambda completed: service.clear_inflight(cache_key, completed)
+    )
+    original_put = service.cache.put
+
+    def put_after_stream_sync(cache_key: str, cache_value: torch.Tensor) -> None:
+        assert stream.synchronize_calls == 1
+        original_put(cache_key, cache_value)
+
+    monkeypatch.setattr(service.cache, "put", put_after_stream_sync)
+
+    service.cache_embedding(item, embedding)
+
+    assert service.cache.get(cache_key) is None
+    future.set_result(embedding)
+    assert service.inflight[cache_key] is future
+    service.on_batch_finished([queue_entry], None, None, 0.0)
+
+    cached = service.cache.get(cache_key)
+    assert cached is not None
+    assert torch.equal(cached, embedding)
+    assert stream.synchronize_calls == 1
+    assert cache_key not in service.inflight
+
+
+def test_cancelled_event_handoff_drops_pending_cache_and_inflight_state() -> None:
+    service = make_service()
+    service.enable_event_handoff = True
+    stream = RecordingStream()
+    service.stream = stream
+    item = make_item(82, 3)
+    embedding = torch.ones((3, HIDDEN_SIZE))
+    cache_key = service.cache_key(item)
+    assert cache_key is not None
+    future: concurrent.futures.Future[torch.Tensor] = concurrent.futures.Future()
+    queue_entry = QueueEntry(item=item, future=future)
+    service.inflight[cache_key] = future
+    future.add_done_callback(
+        lambda completed: service.clear_inflight(cache_key, completed)
+    )
+    service.cache_embedding(item, embedding)
+
+    assert future.cancel()
+    service.on_batch_finished([queue_entry], None, None, 0.0)
+
+    assert service.cache.get(cache_key) is None
+    assert cache_key not in service.inflight
+    assert cache_key not in service.pending_cache_publication_keys
+    assert service.pending_cache_publications == {}
+    assert stream.synchronize_calls == 0
+
+
+def test_failed_event_handoff_releases_registered_event_and_pending_cache() -> None:
+    model = StubModel()
+    service = make_service(model)
+    service.enable_event_handoff = True
+    service.stream = RecordingStream()
+    item = make_item(83, 3)
+    embedding = torch.ones((3, HIDDEN_SIZE))
+    event = RecordingEvent()
+    model.register_pre_lm_ready_event(embedding, event)
+    item.precomputed_embeddings = embedding
+    cache_key = service.cache_key(item)
+    assert cache_key is not None
+    future: concurrent.futures.Future[torch.Tensor] = concurrent.futures.Future()
+    queue_entry = QueueEntry(item=item, future=future)
+    service.inflight[cache_key] = future
+    future.add_done_callback(
+        lambda completed: service.clear_inflight(cache_key, completed)
+    )
+    service.cache_embedding(item, embedding)
+
+    future.set_exception(RuntimeError("encode failed"))
+    service.on_batch_finished(
+        [queue_entry], RuntimeError("encode failed"), None, 0.0
+    )
+
+    assert service.cache.get(cache_key) is None
+    assert cache_key not in service.inflight
+    assert cache_key not in service.pending_cache_publication_keys
+    assert id(embedding) not in model.pre_lm_events
+    assert service.stream.synchronize_calls == 0
 
 
 def make_item(

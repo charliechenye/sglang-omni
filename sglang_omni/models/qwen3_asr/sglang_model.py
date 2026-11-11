@@ -1,6 +1,10 @@
-"""Qwen3-ASR model compatible with HuggingFace weights"""
+"""Qwen3-ASR model compatible with HuggingFace weights."""
+
+from __future__ import annotations
 
 import logging
+import threading
+import weakref
 from types import MethodType
 from typing import Iterable, List, Optional, Tuple
 
@@ -155,6 +159,132 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         enable_fused_asr_qk_norm_rope(self.language_model)
         self.pattern = MultiModalityDataPaddingPatternMultimodalTokens()
         self.encoder_graph_runner: Qwen3ASREncoderLayerStackGraphRunner | None = None
+        self.pre_lm_ready_event_lock = threading.Lock()
+        self.pre_lm_ready_events: dict[
+            int,
+            tuple[
+                weakref.ReferenceType[torch.Tensor],
+                torch.cuda.Event,
+            ],
+        ] = {}
+        self.pre_lm_event_handoff_enabled = False
+        self.pre_lm_event_marker_emitted = False
+
+    def register_pre_lm_ready_event(
+        self, embedding: torch.Tensor, event: torch.cuda.Event
+    ) -> None:
+        """Associate a process-local producer event with its exact output tensor."""
+        embedding_identity = id(embedding)
+        model_reference = weakref.ref(self)
+
+        def remove_released_embedding(
+            released_reference: weakref.ReferenceType[torch.Tensor],
+        ) -> None:
+            owner_model = model_reference()
+            if owner_model is None:
+                return
+            else:
+                pass
+            with owner_model.pre_lm_ready_event_lock:
+                ready_event_entry = owner_model.pre_lm_ready_events.get(
+                    embedding_identity
+                )
+                if (
+                    ready_event_entry is not None
+                    and ready_event_entry[0] is released_reference
+                ):
+                    del owner_model.pre_lm_ready_events[embedding_identity]
+                else:
+                    pass
+
+        embedding_reference = weakref.ref(embedding, remove_released_embedding)
+        with self.pre_lm_ready_event_lock:
+            self.pre_lm_ready_events[embedding_identity] = (
+                embedding_reference,
+                event,
+            )
+
+    def remove_pre_lm_ready_event(self, embedding: torch.Tensor) -> None:
+        """Forget an output whose request failed or was cancelled."""
+        embedding_identity = id(embedding)
+        with self.pre_lm_ready_event_lock:
+            ready_event_entry = self.pre_lm_ready_events.get(embedding_identity)
+            if (
+                ready_event_entry is not None
+                and ready_event_entry[0]() is embedding
+            ):
+                del self.pre_lm_ready_events[embedding_identity]
+            else:
+                pass
+
+    def wait_for_pre_lm_embeddings(self, forward_batch: ForwardBatch) -> None:
+        """Order this forward's actual stream before reading encoder outputs."""
+        if not self.pre_lm_event_handoff_enabled or not forward_batch.mm_inputs:
+            return
+        else:
+            pass
+
+        embeddings: list[torch.Tensor] = []
+        producer_events: list[torch.cuda.Event] = []
+        seen_events: set[int] = set()
+        with self.pre_lm_ready_event_lock:
+            for multimodal_input in forward_batch.mm_inputs:
+                for multimodal_item in multimodal_input.mm_items:
+                    if multimodal_item is None:
+                        continue
+                    else:
+                        pass
+                    embedding = multimodal_item.precomputed_embeddings
+                    if not isinstance(embedding, torch.Tensor):
+                        continue
+                    else:
+                        pass
+                    ready_event_entry = self.pre_lm_ready_events.get(id(embedding))
+                    if (
+                        ready_event_entry is None
+                        or ready_event_entry[0]() is not embedding
+                    ):
+                        continue
+                    else:
+                        pass
+                    event = ready_event_entry[1]
+                    if id(event) not in seen_events:
+                        producer_events.append(event)
+                        seen_events.add(id(event))
+                    else:
+                        pass
+                    embeddings.append(embedding)
+
+        if not producer_events:
+            return
+        else:
+            pass
+        consumer_stream = torch.cuda.current_stream(embeddings[0].device)
+        uses_event_wait = not torch.cuda.is_current_stream_capturing()
+        if uses_event_wait:
+            for event in producer_events:
+                consumer_stream.wait_event(event)
+            else:
+                pass
+        else:
+            for event in producer_events:
+                event.synchronize()
+            else:
+                pass
+        for embedding in embeddings:
+            if embedding.device.type == "cuda":
+                embedding.record_stream(consumer_stream)
+            else:
+                pass
+        if uses_event_wait:
+            with self.pre_lm_ready_event_lock:
+                if not self.pre_lm_event_marker_emitted:
+                    logger.info("QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED")
+                    self.pre_lm_event_marker_emitted = True
+                else:
+                    pass
+        else:
+            pass
 
     def init_encoder_graphs(
         self, *, max_batch_size: int, max_tokens_per_clip: int
@@ -372,6 +502,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs: object,
     ) -> torch.Tensor:
+        self.wait_for_pre_lm_embeddings(forward_batch)
         if forward_batch.mrope_positions is not None:
             positions = forward_batch.mrope_positions[0]
         else:

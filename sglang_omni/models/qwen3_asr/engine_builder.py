@@ -46,6 +46,7 @@ from sglang_omni.scheduling.engine_factory import (
 from sglang_omni.scheduling.generation_batch_policy import (
     CudaGraphBackend,
     get_decode_cuda_graph_bs,
+    get_prefill_cuda_graph_backend,
 )
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import DeferredAdmission
@@ -536,6 +537,14 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
                 cache_max_bytes=self.pre_lm_cache_size_bytes,
                 max_batch_size=self.pre_lm_max_batch_size,
                 max_batch_wait_ms=self.pre_lm_max_batch_wait_ms,
+                enable_event_handoff=(
+                    os.environ.get("QWEN3_ASR_P5_EVENT_HANDOFF") == "1"
+                    and current_platform.is_cuda()
+                    and server_args.tp_size == 1
+                    and get_prefill_cuda_graph_backend(server_args)
+                    == CudaGraphBackend.DISABLED
+                    and model.encoder_graph_runner is None
+                ),
             )
         else:
             pass

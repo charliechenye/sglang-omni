@@ -1,3 +1,7 @@
+import gc
+import logging
+import threading
+import weakref
 from types import SimpleNamespace
 
 import pytest
@@ -35,6 +39,39 @@ class AudioFeatureModel(Qwen3ASRForConditionalGeneration):
         self.encoder_graph_runner = None
 
 
+class EventHandoffModel(Qwen3ASRForConditionalGeneration):
+    def __init__(self) -> None:
+        nn.Module.__init__(self)
+        self.language_model = nn.Identity()
+        self.encoder_graph_runner = None
+        self.pre_lm_ready_event_lock = threading.Lock()
+        self.pre_lm_ready_events: dict[
+            int,
+            tuple[
+                weakref.ReferenceType[torch.Tensor],
+                torch.cuda.Event,
+            ],
+        ] = {}
+        self.pre_lm_event_marker_emitted = False
+        self.pre_lm_event_handoff_enabled = True
+
+
+class RecordingStream:
+    def __init__(self) -> None:
+        self.waited_events: list[torch.cuda.Event] = []
+
+    def wait_event(self, event: torch.cuda.Event) -> None:
+        self.waited_events.append(event)
+
+
+class RecordingEvent:
+    def __init__(self) -> None:
+        self.synchronize_calls = 0
+
+    def synchronize(self) -> None:
+        self.synchronize_calls += 1
+
+
 @pytest.mark.parametrize("use_mrope_positions", [True, False])
 def test_forward_uses_available_mrope_positions(
     monkeypatch: pytest.MonkeyPatch,
@@ -59,7 +96,11 @@ def test_forward_uses_available_mrope_positions(
         "general_mm_embed_routine",
         fake_general_mm_embed_routine,
     )
-    model = SimpleNamespace(language_model=object(), get_audio_feature=object())
+    model = SimpleNamespace(
+        language_model=object(),
+        get_audio_feature=object(),
+        wait_for_pre_lm_embeddings=lambda _batch: None,
+    )
 
     actual = Qwen3ASRForConditionalGeneration.forward(
         model,
@@ -90,7 +131,11 @@ def test_forward_keeps_long_positions_for_native_rope(
         "general_mm_embed_routine",
         fake_general_mm_embed_routine,
     )
-    model = SimpleNamespace(language_model=object(), get_audio_feature=object())
+    model = SimpleNamespace(
+        language_model=object(),
+        get_audio_feature=object(),
+        wait_for_pre_lm_embeddings=lambda _batch: None,
+    )
 
     Qwen3ASRForConditionalGeneration.forward(
         model,
@@ -100,6 +145,96 @@ def test_forward_keeps_long_positions_for_native_rope(
     )
 
     assert seen_positions.dtype == torch.long
+
+
+def test_event_handoff_waits_for_every_producer_before_multimodal_consumption(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    stream = RecordingStream()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
+    monkeypatch.setattr(sglang_model, "fused_qk_norm_rope", None)
+    model = EventHandoffModel()
+    first_embedding = torch.ones((2, 4))
+    second_embedding = torch.ones((3, 4))
+    repeated_batch_embedding = torch.ones((1, 4))
+    first_event = RecordingEvent()
+    second_event = RecordingEvent()
+    model.register_pre_lm_ready_event(first_embedding, first_event)
+    model.register_pre_lm_ready_event(second_embedding, second_event)
+    model.register_pre_lm_ready_event(repeated_batch_embedding, first_event)
+    item_values = [
+        None,
+        SimpleNamespace(precomputed_embeddings=first_embedding),
+        SimpleNamespace(precomputed_embeddings=second_embedding),
+        SimpleNamespace(precomputed_embeddings=repeated_batch_embedding),
+    ]
+    forward_batch = SimpleNamespace(
+        mm_inputs=[SimpleNamespace(mm_items=item_values)],
+        mrope_positions=None,
+    )
+    expected_output = torch.zeros(1)
+
+    def consume_embeddings(**_kwargs):  # noqa: ANN003
+        assert stream.waited_events == [first_event, second_event]
+        return expected_output
+
+    monkeypatch.setattr(
+        sglang_model,
+        "general_mm_embed_routine",
+        consume_embeddings,
+    )
+
+    output = model.forward(
+        input_ids=torch.tensor([1]),
+        positions=torch.tensor([0]),
+        forward_batch=forward_batch,
+    )
+
+    assert output is expected_output
+    assert "QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED" in caplog.text
+
+
+def test_event_handoff_graph_capture_falls_back_to_host_wait(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO)
+    stream = RecordingStream()
+    event = RecordingEvent()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: stream)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    model = EventHandoffModel()
+    embedding = torch.ones((2, 4))
+    model.register_pre_lm_ready_event(embedding, event)
+    forward_batch = SimpleNamespace(
+        mm_inputs=[
+            SimpleNamespace(
+                mm_items=[SimpleNamespace(precomputed_embeddings=embedding)]
+            )
+        ],
+        mrope_positions=None,
+    )
+
+    model.wait_for_pre_lm_embeddings(forward_batch)
+
+    assert stream.waited_events == []
+    assert event.synchronize_calls == 1
+    assert "QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED" not in caplog.text
+
+
+def test_event_registry_releases_events_with_their_output_tensor() -> None:
+    model = EventHandoffModel()
+    embedding = torch.ones((2, 4))
+    embedding_identity = id(embedding)
+    model.register_pre_lm_ready_event(embedding, RecordingEvent())
+
+    del embedding
+    gc.collect()
+
+    assert embedding_identity not in model.pre_lm_ready_events
 
 
 def test_fused_asr_qk_norm_rope_is_bound_per_attention(

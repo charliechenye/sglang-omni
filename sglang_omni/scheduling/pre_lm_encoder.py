@@ -128,6 +128,11 @@ class PreLMEncoderServiceBase(ABC, Generic[ItemT, EncodedT, EmbeddingT, ResultT]
     def attach_embedding(self, item: ItemT, embedding: EmbeddingT) -> None:
         raise NotImplementedError
 
+    def after_batch_embeddings_attached(
+        self, items: list[ItemT], embeddings: list[EmbeddingT]
+    ) -> None:
+        pass
+
     def attach_before_synchronize(self) -> bool:
         return True
 
@@ -180,12 +185,14 @@ class PreLMEncoderServiceBase(ABC, Generic[ItemT, EncodedT, EmbeddingT, ResultT]
             if attach_before_synchronize:
                 for item, embedding in zip(items, embeddings):
                     self.attach_embedding(item, embedding)
+                self.after_batch_embeddings_attached(items, embeddings)
             else:
                 pass
         self.synchronize_batch()
         if not attach_before_synchronize:
             for item, embedding in zip(items, embeddings):
                 self.attach_embedding(item, embedding)
+            self.after_batch_embeddings_attached(items, embeddings)
         else:
             pass
         for item, embedding, host_copy in zip(items, embeddings, host_copies):
