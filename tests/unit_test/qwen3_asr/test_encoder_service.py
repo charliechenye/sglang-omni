@@ -196,7 +196,7 @@ def test_event_handoff_disabled_keeps_encoder_stream_synchronization() -> None:
     assert stream.synchronize_calls == 1
 
 
-def test_event_handoff_falls_back_when_encoder_graphs_are_initialized(
+def test_event_handoff_stays_disabled_on_cpu_with_encoder_graphs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = StubModel()
@@ -215,8 +215,26 @@ def test_event_handoff_falls_back_when_encoder_graphs_are_initialized(
     )
     SERVICES.append(service)
 
+    assert service.device.type == "cpu"
     assert not service.enable_event_handoff
     assert not model.pre_lm_event_handoff_enabled
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_event_handoff_supports_encoder_graphs_on_cuda() -> None:
+    model = StubModel().to("cuda")
+    model.encoder_graph_runner = object()
+
+    service = Qwen3ASRPreLMEncoderService(
+        model,
+        cache_namespace=NAMESPACE,
+        enable_event_handoff=True,
+    )
+    SERVICES.append(service)
+
+    assert service.enable_event_handoff
+    assert model.pre_lm_event_handoff_enabled
 
 
 def test_event_handoff_defers_cpu_cache_until_producer_stream_is_ready(

@@ -156,7 +156,6 @@ class Qwen3ASRPreLMEncoderService(
             enable_event_handoff
             and self.device.type == "cuda"
             and self.stream is not None
-            and getattr(model, "encoder_graph_runner", None) is None
         )
         model.pre_lm_event_handoff_enabled = self.enable_event_handoff
         self.cache = StageOutputCache(

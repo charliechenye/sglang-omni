@@ -614,6 +614,63 @@ def patch_engine_dependencies(
     return recorded
 
 
+@pytest.mark.parametrize(
+    ("env_value", "prefill_backend", "tensor_parallel_size", "expected_enabled"),
+    [
+        (None, CudaGraphBackend.FULL, 1, False),
+        ("1", CudaGraphBackend.FULL, 1, True),
+        ("1", CudaGraphBackend.DISABLED, 1, True),
+        ("1", CudaGraphBackend.BREAKABLE, 1, False),
+        ("1", "tc_piecewise", 1, False),
+        ("1", CudaGraphBackend.FULL, 2, False),
+    ],
+)
+def test_qwen3_asr_event_handoff_gate_supports_full_prefill_graph(
+    monkeypatch: pytest.MonkeyPatch,
+    env_value: str | None,
+    prefill_backend: str,
+    tensor_parallel_size: int,
+    expected_enabled: bool,
+) -> None:
+    if env_value is None:
+        monkeypatch.delenv("QWEN3_ASR_P5_EVENT_HANDOFF", raising=False)
+    else:
+        monkeypatch.setenv("QWEN3_ASR_P5_EVENT_HANDOFF", env_value)
+    monkeypatch.setattr(qwen3_asr_builder.current_platform, "is_cuda", lambda: True)
+    monkeypatch.setattr(
+        qwen3_asr_builder,
+        "get_prefill_cuda_graph_backend",
+        lambda _server_args: prefill_backend,
+    )
+    monkeypatch.setattr(
+        qwen3_asr_builder,
+        "build_cache_namespace",
+        lambda *args, **kwargs: "testns",
+    )
+    monkeypatch.setattr(
+        qwen3_asr_builder, "init_mm_embedding_cache", lambda _size: None
+    )
+    service_factory = Mock(return_value=object())
+    monkeypatch.setattr(
+        qwen3_asr_builder,
+        "Qwen3ASRPreLMEncoderService",
+        service_factory,
+    )
+    builder = make_engine_builder()
+    builder.enable_encoder_cuda_graph = True
+    monkeypatch.setattr(builder, "log_memory_checkpoint", lambda _checkpoint: None)
+
+    model = SimpleNamespace(encoder_graph_runner=object(), init_encoder_graphs=Mock())
+    builder.setup_model_resources(
+        model,
+        SimpleNamespace(tp_size=tensor_parallel_size, mm_attention_backend="fa3"),
+        generation_cuda_graph_enabled=False,
+    )
+
+    assert service_factory.call_args is not None
+    assert service_factory.call_args.kwargs["enable_event_handoff"] is expected_enabled
+
+
 def test_qwen3_asr_threads_explicit_cuda_graph_bs(monkeypatch, caplog) -> None:
     recorded = patch_engine_dependencies(monkeypatch)
     build_kwargs = recorded.build_kwargs

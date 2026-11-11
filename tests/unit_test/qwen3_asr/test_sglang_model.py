@@ -6,7 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.managers.mm_schedule import DataEmbeddingFunc
+from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from torch import nn
 
 from sglang_omni.models.qwen3_asr import sglang_model
@@ -245,7 +247,7 @@ def test_cuda_event_handoff_orders_streams_and_retains_the_output_tensor(
             super().wait_event(event)
 
     model = EventHandoffModel()
-    output_shape = (1024 * 1024,)
+    output_shape = (32, 32)
     output_device = torch.device("cuda")
     producer_workload_iterations = 32
     producer_stream = torch.cuda.Stream(device=output_device)
@@ -287,6 +289,90 @@ def test_cuda_event_handoff_orders_streams_and_retains_the_output_tensor(
         consumed_output.cpu(),
         torch.full(output_shape, float(3 + producer_workload_iterations)),
     )
+    producer_stream.synchronize()
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_event_handoff_orders_two_full_prefill_graph_replays(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class RecordingCudaStream(torch.cuda.Stream):
+        def __init__(self, device: torch.device) -> None:
+            self.waited_events: list[torch.cuda.Event] = []
+
+        def wait_event(self, event: torch.cuda.Event) -> None:
+            self.waited_events.append(event)
+            super().wait_event(event)
+
+    output_device = torch.device("cuda")
+    producer_stream = torch.cuda.Stream(device=output_device)
+    consumer_stream = RecordingCudaStream(device=output_device)
+    caplog.set_level(logging.INFO)
+    with torch.cuda.stream(consumer_stream):
+        static_input_embeddings = torch.zeros((2, 4), device=output_device)
+        static_output_embeddings = torch.empty_like(static_input_embeddings)
+        cuda_graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(cuda_graph, stream=consumer_stream):
+            static_output_embeddings.copy_(static_input_embeddings * 2)
+        consumer_stream.synchronize()
+
+    model = EventHandoffModel()
+    graph_outputs: list[torch.Tensor] = []
+    producer_events: list[torch.cuda.Event] = []
+
+    def replay_graph(
+        input_ids: torch.Tensor,
+        forward_batch: ForwardBatch,
+        language_model: nn.Module,
+        data_embedding_funcs: dict[Modality, DataEmbeddingFunc],
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        del input_ids, language_model, data_embedding_funcs, positions
+        audio_embedding = forward_batch.mm_inputs[0].mm_items[0].precomputed_embeddings
+        assert isinstance(audio_embedding, torch.Tensor)
+        static_input_embeddings.copy_(audio_embedding)
+        cuda_graph.replay()
+        return static_output_embeddings.clone()
+
+    monkeypatch.setattr(sglang_model, "general_mm_embed_routine", replay_graph)
+    monkeypatch.setattr(
+        torch.cuda,
+        "current_stream",
+        lambda _device=None: consumer_stream,
+    )
+    monkeypatch.setattr(sglang_model, "fused_qk_norm_rope", None)
+    for embedding_value in (2.0, 7.0):
+        with torch.cuda.stream(producer_stream):
+            audio_embedding = torch.full((2, 4), embedding_value, device=output_device)
+            producer_event = torch.cuda.Event()
+            producer_event.record(producer_stream)
+        producer_events.append(producer_event)
+        model.register_pre_lm_ready_event(audio_embedding, producer_event)
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            mm_inputs=[
+                SimpleNamespace(
+                    mm_items=[SimpleNamespace(precomputed_embeddings=audio_embedding)]
+                )
+            ],
+            mrope_positions=None,
+        )
+        with torch.cuda.stream(consumer_stream):
+            graph_outputs.append(
+                model.forward(
+                    input_ids=torch.tensor([1, 2], device=output_device),
+                    positions=torch.tensor([0, 1], device=output_device),
+                    forward_batch=forward_batch,
+                )
+            )
+
+    consumer_stream.synchronize()
+    assert consumer_stream.waited_events == producer_events
+    assert torch.equal(graph_outputs[0], torch.full((2, 4), 4.0, device=output_device))
+    assert torch.equal(graph_outputs[1], torch.full((2, 4), 14.0, device=output_device))
+    assert "QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED" in caplog.text
     producer_stream.synchronize()
 
 
