@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from torch import nn
 
 from sglang_omni.models.qwen3_asr import sglang_model
