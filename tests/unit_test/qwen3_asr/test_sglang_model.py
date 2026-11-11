@@ -199,7 +199,7 @@ def test_event_handoff_waits_for_every_producer_before_multimodal_consumption(
     assert "QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED" in caplog.text
 
 
-def test_event_handoff_graph_capture_falls_back_to_host_wait(
+def test_event_handoff_rejects_cuda_graph_capture(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -221,10 +221,11 @@ def test_event_handoff_graph_capture_falls_back_to_host_wait(
         forward_mode=ForwardMode.TARGET_VERIFY,
     )
 
-    model.wait_for_pre_lm_embeddings(forward_batch)
+    with pytest.raises(AssertionError, match="requires eager prefill"):
+        model.wait_for_pre_lm_embeddings(forward_batch)
 
     assert stream.waited_events == []
-    assert event.synchronize_calls == 1
+    assert event.synchronize_calls == 0
     assert not model.pre_lm_event_marker_emitted
     assert "QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED" not in caplog.text
 
@@ -276,18 +277,25 @@ def test_cuda_event_handoff_orders_streams_and_retains_the_output_tensor(
             self.waited_events: list[torch.cuda.Event] = []
 
         def wait_event(self, event: torch.cuda.Event) -> None:
+            assert not event.query()
             self.waited_events.append(event)
             super().wait_event(event)
 
     model = EventHandoffModel()
-    output = torch.empty((64,), device="cuda")
-    output_reference = weakref.ref(output)
-    producer_stream = torch.cuda.Stream(device=output.device)
-    consumer_stream = RecordingCudaStream(device=output.device)
+    output_shape = (16 * 1024 * 1024,)
+    output_device = torch.device("cuda")
+    producer_workload_iterations = 128
+    producer_stream = torch.cuda.Stream(device=output_device)
+    consumer_stream = RecordingCudaStream(device=output_device)
     producer_event = torch.cuda.Event()
     with torch.cuda.stream(producer_stream):
+        output = torch.empty(output_shape, device=output_device)
         output.fill_(3)
+        for _ in range(producer_workload_iterations):
+            output.add_(1)
         producer_event.record(producer_stream)
+    output_reference = weakref.ref(output)
+    output_storage_pointer = output.data_ptr()
     model.register_pre_lm_ready_event(output, producer_event)
     multimodal_item = SimpleNamespace(precomputed_embeddings=output)
     forward_batch = SimpleNamespace(
@@ -309,8 +317,16 @@ def test_cuda_event_handoff_orders_streams_and_retains_the_output_tensor(
     assert consumer_stream.waited_events == [producer_event]
     assert output_reference() is None
     assert model.pre_lm_ready_events == {}
+    with torch.cuda.stream(producer_stream):
+        allocator_pressure = torch.empty(output_shape, device=output_device)
+        allocator_pressure.fill_(0)
+    assert allocator_pressure.data_ptr() != output_storage_pointer
     consumer_stream.synchronize()
-    assert torch.equal(consumed_output.cpu(), torch.full((64,), 3.0))
+    assert torch.equal(
+        consumed_output.cpu(),
+        torch.full(output_shape, float(3 + producer_workload_iterations)),
+    )
+    producer_stream.synchronize()
 
 
 def test_fused_asr_qk_norm_rope_is_bound_per_attention(
