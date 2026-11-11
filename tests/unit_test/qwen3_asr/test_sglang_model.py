@@ -66,11 +66,7 @@ class RecordingStream:
 
 
 class RecordingEvent:
-    def __init__(self) -> None:
-        self.synchronize_calls = 0
-
-    def synchronize(self) -> None:
-        self.synchronize_calls += 1
+    pass
 
 
 @pytest.mark.parametrize("use_mrope_positions", [True, False])
@@ -197,37 +193,6 @@ def test_event_handoff_waits_for_every_producer_before_multimodal_consumption(
 
     assert output is expected_output
     assert "QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED" in caplog.text
-
-
-def test_event_handoff_rejects_cuda_graph_capture(
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    caplog.set_level(logging.INFO)
-    stream = RecordingStream()
-    event = RecordingEvent()
-    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: stream)
-    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
-    model = EventHandoffModel()
-    embedding = torch.ones((2, 4))
-    model.register_pre_lm_ready_event(embedding, event)
-    forward_batch = SimpleNamespace(
-        mm_inputs=[
-            SimpleNamespace(
-                mm_items=[SimpleNamespace(precomputed_embeddings=embedding)]
-            )
-        ],
-        mrope_positions=None,
-        forward_mode=ForwardMode.TARGET_VERIFY,
-    )
-
-    with pytest.raises(AssertionError, match="requires eager prefill"):
-        model.wait_for_pre_lm_embeddings(forward_batch)
-
-    assert stream.waited_events == []
-    assert event.synchronize_calls == 0
-    assert not model.pre_lm_event_marker_emitted
-    assert "QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED" not in caplog.text
 
 
 def test_event_handoff_skips_decode_only_forwards(

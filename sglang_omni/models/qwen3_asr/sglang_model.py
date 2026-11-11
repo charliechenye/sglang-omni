@@ -183,6 +183,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             owner_model = model_reference()
             if owner_model is None:
                 return
+            else:
+                pass
             with owner_model.pre_lm_ready_event_lock:
                 ready_event_entry = owner_model.pre_lm_ready_events.get(
                     embedding_identity
@@ -192,6 +194,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                     and ready_event_entry[0] is released_reference
                 ):
                     owner_model.pre_lm_ready_events.pop(embedding_identity)
+                else:
+                    pass
 
         embedding_reference = weakref.ref(embedding, remove_released_embedding)
         with self.pre_lm_ready_event_lock:
@@ -207,6 +211,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             ready_event_entry = self.pre_lm_ready_events.get(embedding_identity)
             if ready_event_entry is not None and ready_event_entry[0]() is embedding:
                 self.pre_lm_ready_events.pop(embedding_identity)
+            else:
+                pass
 
     def wait_for_pre_lm_embeddings(self, forward_batch: ForwardBatch) -> None:
         """Order extend forwards after their ASR encoder outputs are ready."""
@@ -216,6 +222,8 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
             or not forward_batch.mm_inputs
         ):
             return
+        else:
+            pass
 
         embeddings: list[torch.Tensor] = []
         producer_events: list[torch.cuda.Event] = []
@@ -225,36 +233,53 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 for multimodal_item in multimodal_input.mm_items:
                     if multimodal_item is None:
                         continue
+                    else:
+                        pass
                     embedding = multimodal_item.precomputed_embeddings
                     if not isinstance(embedding, torch.Tensor):
                         continue
+                    else:
+                        pass
                     ready_event_entry = self.pre_lm_ready_events.get(id(embedding))
                     if (
                         ready_event_entry is None
                         or ready_event_entry[0]() is not embedding
                     ):
                         continue
+                    else:
+                        pass
                     event = ready_event_entry[1]
                     if id(event) not in seen_events:
                         producer_events.append(event)
                         seen_events.add(id(event))
+                    else:
+                        pass
                     embeddings.append(embedding)
 
         if not producer_events:
             return
+        else:
+            pass
         consumer_stream = torch.cuda.current_stream(embeddings[0].device)
-        assert (
-            not torch.cuda.is_current_stream_capturing()
-        ), "Qwen3-ASR event handoff requires eager prefill"
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Qwen3-ASR event handoff cannot run during CUDA graph capture"
+            )
+        else:
+            pass
         for event in producer_events:
             consumer_stream.wait_event(event)
         for embedding in embeddings:
             if embedding.device.type == "cuda":
                 embedding.record_stream(consumer_stream)
+            else:
+                pass
         with self.pre_lm_ready_event_lock:
             if not self.pre_lm_event_marker_emitted:
                 logger.info("QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED")
                 self.pre_lm_event_marker_emitted = True
+            else:
+                pass
 
     def init_encoder_graphs(
         self, *, max_batch_size: int, max_tokens_per_clip: int
