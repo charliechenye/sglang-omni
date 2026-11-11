@@ -238,7 +238,6 @@ def test_cuda_event_handoff_orders_streams_and_retains_the_output_tensor(
 ) -> None:
     class RecordingCudaStream(torch.cuda.Stream):
         def __init__(self, device: torch.device) -> None:
-            super().__init__(device=device)
             self.waited_events: list[torch.cuda.Event] = []
 
         def wait_event(self, event: torch.cuda.Event) -> None:
