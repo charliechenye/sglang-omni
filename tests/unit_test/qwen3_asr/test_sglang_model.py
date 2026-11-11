@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from torch import nn
 
 from sglang_omni.models.qwen3_asr import sglang_model
@@ -174,6 +175,7 @@ def test_event_handoff_waits_for_every_producer_before_multimodal_consumption(
     forward_batch = SimpleNamespace(
         mm_inputs=[SimpleNamespace(mm_items=item_values)],
         mrope_positions=None,
+        forward_mode=ForwardMode.EXTEND,
     )
     expected_output = torch.zeros(1)
 
@@ -216,13 +218,39 @@ def test_event_handoff_graph_capture_falls_back_to_host_wait(
             )
         ],
         mrope_positions=None,
+        forward_mode=ForwardMode.TARGET_VERIFY,
     )
 
     model.wait_for_pre_lm_embeddings(forward_batch)
 
     assert stream.waited_events == []
     assert event.synchronize_calls == 1
+    assert not model.pre_lm_event_marker_emitted
     assert "QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED" not in caplog.text
+
+
+def test_event_handoff_skips_decode_only_forwards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = RecordingStream()
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda _device=None: stream)
+    model = EventHandoffModel()
+    embedding = torch.ones((2, 4))
+    model.register_pre_lm_ready_event(embedding, RecordingEvent())
+    forward_batch = SimpleNamespace(
+        mm_inputs=[
+            SimpleNamespace(
+                mm_items=[SimpleNamespace(precomputed_embeddings=embedding)]
+            )
+        ],
+        mrope_positions=None,
+        forward_mode=ForwardMode.DECODE,
+    )
+
+    model.wait_for_pre_lm_embeddings(forward_batch)
+
+    assert stream.waited_events == []
+    assert not model.pre_lm_event_marker_emitted
 
 
 def test_event_registry_releases_events_with_their_output_tensor() -> None:
@@ -235,6 +263,54 @@ def test_event_registry_releases_events_with_their_output_tensor() -> None:
     gc.collect()
 
     assert embedding_identity not in model.pre_lm_ready_events
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_event_handoff_orders_streams_and_retains_the_output_tensor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordingCudaStream(torch.cuda.Stream):
+        def __init__(self, device: torch.device) -> None:
+            super().__init__(device=device)
+            self.waited_events: list[torch.cuda.Event] = []
+
+        def wait_event(self, event: torch.cuda.Event) -> None:
+            self.waited_events.append(event)
+            super().wait_event(event)
+
+    model = EventHandoffModel()
+    output = torch.empty((64,), device="cuda")
+    output_reference = weakref.ref(output)
+    producer_stream = torch.cuda.Stream(device=output.device)
+    consumer_stream = RecordingCudaStream(device=output.device)
+    producer_event = torch.cuda.Event()
+    with torch.cuda.stream(producer_stream):
+        output.fill_(3)
+        producer_event.record(producer_stream)
+    model.register_pre_lm_ready_event(output, producer_event)
+    multimodal_item = SimpleNamespace(precomputed_embeddings=output)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.EXTEND,
+        mm_inputs=[SimpleNamespace(mm_items=[multimodal_item])],
+    )
+
+    with torch.cuda.stream(consumer_stream):
+        monkeypatch.setattr(
+            torch.cuda,
+            "current_stream",
+            lambda _device=None: consumer_stream,
+        )
+        model.wait_for_pre_lm_embeddings(forward_batch)
+        consumed_output = output.clone()
+        del output, multimodal_item, forward_batch
+    gc.collect()
+
+    assert consumer_stream.waited_events == [producer_event]
+    assert output_reference() is None
+    assert model.pre_lm_ready_events == {}
+    consumer_stream.synchronize()
+    assert torch.equal(consumed_output.cpu(), torch.full((64,), 3.0))
 
 
 def test_fused_asr_qk_norm_rope_is_bound_per_attention(

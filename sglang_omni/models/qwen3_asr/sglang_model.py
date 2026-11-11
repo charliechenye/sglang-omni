@@ -209,17 +209,18 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         embedding_identity = id(embedding)
         with self.pre_lm_ready_event_lock:
             ready_event_entry = self.pre_lm_ready_events.get(embedding_identity)
-            if (
-                ready_event_entry is not None
-                and ready_event_entry[0]() is embedding
-            ):
+            if ready_event_entry is not None and ready_event_entry[0]() is embedding:
                 del self.pre_lm_ready_events[embedding_identity]
             else:
                 pass
 
     def wait_for_pre_lm_embeddings(self, forward_batch: ForwardBatch) -> None:
-        """Order this forward's actual stream before reading encoder outputs."""
-        if not self.pre_lm_event_handoff_enabled or not forward_batch.mm_inputs:
+        """Order extend forwards after their ASR encoder outputs are ready."""
+        if (
+            not self.pre_lm_event_handoff_enabled
+            or not forward_batch.forward_mode.is_extend()
+            or not forward_batch.mm_inputs
+        ):
             return
         else:
             pass
@@ -260,15 +261,16 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
         else:
             pass
         consumer_stream = torch.cuda.current_stream(embeddings[0].device)
-        uses_event_wait = not torch.cuda.is_current_stream_capturing()
-        if uses_event_wait:
+        is_capturing: bool = torch.cuda.is_current_stream_capturing()
+        if is_capturing:
+            # note (codex): CUDA graph capture cannot record this event dependency.
             for event in producer_events:
-                consumer_stream.wait_event(event)
+                event.synchronize()
             else:
                 pass
         else:
             for event in producer_events:
-                event.synchronize()
+                consumer_stream.wait_event(event)
             else:
                 pass
         for embedding in embeddings:
@@ -276,7 +278,7 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 embedding.record_stream(consumer_stream)
             else:
                 pass
-        if uses_event_wait:
+        if not is_capturing:
             with self.pre_lm_ready_event_lock:
                 if not self.pre_lm_event_marker_emitted:
                     logger.info("QWEN3_ASR_P5_EVENT_HANDOFF_ENABLED")

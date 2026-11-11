@@ -70,7 +70,7 @@ class DetachedFailure:
 @dataclass(frozen=True, slots=True)
 class PendingCachePublication:
     multimodal_item: MultimodalDataItem
-    cache_key: str
+    future: concurrent.futures.Future[torch.Tensor]
     embedding: torch.Tensor
 
 
@@ -172,8 +172,7 @@ class Qwen3ASRPreLMEncoderService(
         self.lifecycle_lock = threading.Lock()
         self.closed = False
         self.inflight: dict[str, concurrent.futures.Future[torch.Tensor]] = {}
-        self.pending_cache_publication_keys: set[str] = set()
-        self.pending_cache_publications: dict[int, PendingCachePublication] = {}
+        self.pending_cache_publications: dict[str, PendingCachePublication] = {}
         self.hits = 0
         self.misses = 0
         self.merged = 0
@@ -354,8 +353,10 @@ class Qwen3ASRPreLMEncoderService(
     ) -> None:
         with self.lock:
             if self.inflight.get(cache_key) is future:
+                publication = self.pending_cache_publications.get(cache_key)
                 if (
-                    cache_key in self.pending_cache_publication_keys
+                    publication is not None
+                    and publication.future is future
                     and not future.cancelled()
                     and future.exception() is None
                 ):
@@ -593,14 +594,18 @@ class Qwen3ASRPreLMEncoderService(
         cache_key = self.cache_key(item)
         if cache_key is not None:
             if self.enable_event_handoff:
-                publication = PendingCachePublication(
-                    multimodal_item=item,
-                    cache_key=cache_key,
-                    embedding=embedding,
-                )
                 with self.lock:
-                    self.pending_cache_publication_keys.add(cache_key)
-                    self.pending_cache_publications[id(item)] = publication
+                    future = self.inflight.get(cache_key)
+                    if future is not None and not future.done():
+                        self.pending_cache_publications[cache_key] = (
+                            PendingCachePublication(
+                                multimodal_item=item,
+                                future=future,
+                                embedding=embedding,
+                            )
+                        )
+                    else:
+                        pass
             else:
                 self.cache.put(cache_key, embedding)
         else:
@@ -755,30 +760,40 @@ class Qwen3ASRPreLMEncoderService(
         self,
         batch: list[QueueEntry[MultimodalDataItem, torch.Tensor]],
     ) -> None:
-        """Publish after Futures resolve so cache copies cannot delay admission."""
+        """Publish after Futures resolve; stream sync still blocks this worker."""
         publications: list[
-            tuple[QueueEntry[MultimodalDataItem, torch.Tensor], PendingCachePublication]
+            tuple[
+                QueueEntry[MultimodalDataItem, torch.Tensor],
+                str,
+                PendingCachePublication,
+            ]
         ] = []
         with self.lock:
             for queue_entry in batch:
-                publication = self.pending_cache_publications.pop(
-                    id(queue_entry.item), None
-                )
+                cache_key = self.cache_key(queue_entry.item)
+                if cache_key is None:
+                    continue
+                else:
+                    pass
+                publication = self.pending_cache_publications.get(cache_key)
                 if (
                     publication is not None
                     and publication.multimodal_item is queue_entry.item
+                    and publication.future is queue_entry.future
                 ):
-                    publications.append((queue_entry, publication))
+                    self.pending_cache_publications.pop(cache_key)
+                    publications.append((queue_entry, cache_key, publication))
                 else:
                     pass
 
         ready_publications: list[
             tuple[
                 QueueEntry[MultimodalDataItem, torch.Tensor],
+                str,
                 PendingCachePublication,
             ]
         ] = []
-        for queue_entry, publication in publications:
+        for queue_entry, cache_key, publication in publications:
             if (
                 queue_entry.future.cancelled()
                 or queue_entry.future.exception() is not None
@@ -789,7 +804,7 @@ class Qwen3ASRPreLMEncoderService(
                 else:
                     pass
             else:
-                ready_publications.append((queue_entry, publication))
+                ready_publications.append((queue_entry, cache_key, publication))
 
         try:
             if ready_publications:
@@ -800,8 +815,8 @@ class Qwen3ASRPreLMEncoderService(
                 else:
                     pass
                 self.stream.synchronize()
-                for _, publication in ready_publications:
-                    self.cache.put(publication.cache_key, publication.embedding)
+                for _, cache_key, publication in ready_publications:
+                    self.cache.put(cache_key, publication.embedding)
                 else:
                     pass
             else:
@@ -809,28 +824,21 @@ class Qwen3ASRPreLMEncoderService(
         except Exception:
             logger.warning(
                 "%s event handoff cache publication failed; "
-                "leaving cache entries absent",
+                "unsuccessful entries will be re-encoded",
                 self.MODEL_NAME,
                 exc_info=True,
             )
         finally:
             with self.lock:
-                for queue_entry, publication in publications:
-                    self.pending_cache_publication_keys.discard(
-                        publication.cache_key
-                    )
-                    if (
-                        self.inflight.get(publication.cache_key)
-                        is queue_entry.future
-                    ):
-                        del self.inflight[publication.cache_key]
+                for queue_entry, cache_key, _ in publications:
+                    if self.inflight.get(cache_key) is queue_entry.future:
+                        del self.inflight[cache_key]
                     else:
                         pass
 
         for queue_entry in batch:
             if queue_entry.future.cancelled() or (
-                queue_entry.future.done()
-                and queue_entry.future.exception() is not None
+                queue_entry.future.done() and queue_entry.future.exception() is not None
             ):
                 embedding = queue_entry.item.precomputed_embeddings
                 if isinstance(embedding, torch.Tensor):

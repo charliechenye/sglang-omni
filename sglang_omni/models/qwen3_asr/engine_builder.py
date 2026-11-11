@@ -523,6 +523,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
             # note (luojiaxuan): constructed after SGLang's generation CUDA
             # graphs so the encoder's dedicated stream never interleaves with
             # graph capture.
+            # note (chenye): Event waits are supported only on eager prefill paths.
             self.audio_encoder_service = Qwen3ASRPreLMEncoderService(
                 model,
                 cache_namespace=build_cache_namespace(

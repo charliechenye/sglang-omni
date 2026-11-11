@@ -258,39 +258,16 @@ def test_event_handoff_defers_cpu_cache_until_producer_stream_is_ready(
     assert cache_key not in service.inflight
 
 
-def test_cancelled_event_handoff_drops_pending_cache_and_inflight_state() -> None:
-    service = make_service()
+@pytest.mark.parametrize("cancelled", [True, False])
+def test_cancelled_or_failed_event_handoff_clears_pending_cache_state(
+    cancelled: bool,
+) -> None:
+    model = StubModel()
+    service = make_service(model)
     service.enable_event_handoff = True
     stream = RecordingStream()
     service.stream = stream
     item = make_item(82, 3)
-    embedding = torch.ones((3, HIDDEN_SIZE))
-    cache_key = service.cache_key(item)
-    assert cache_key is not None
-    future: concurrent.futures.Future[torch.Tensor] = concurrent.futures.Future()
-    queue_entry = QueueEntry(item=item, future=future)
-    service.inflight[cache_key] = future
-    future.add_done_callback(
-        lambda completed: service.clear_inflight(cache_key, completed)
-    )
-    service.cache_embedding(item, embedding)
-
-    assert future.cancel()
-    service.on_batch_finished([queue_entry], None, None, 0.0)
-
-    assert service.cache.get(cache_key) is None
-    assert cache_key not in service.inflight
-    assert cache_key not in service.pending_cache_publication_keys
-    assert service.pending_cache_publications == {}
-    assert stream.synchronize_calls == 0
-
-
-def test_failed_event_handoff_releases_registered_event_and_pending_cache() -> None:
-    model = StubModel()
-    service = make_service(model)
-    service.enable_event_handoff = True
-    service.stream = RecordingStream()
-    item = make_item(83, 3)
     embedding = torch.ones((3, HIDDEN_SIZE))
     event = RecordingEvent()
     model.register_pre_lm_ready_event(embedding, event)
@@ -305,16 +282,53 @@ def test_failed_event_handoff_releases_registered_event_and_pending_cache() -> N
     )
     service.cache_embedding(item, embedding)
 
-    future.set_exception(RuntimeError("encode failed"))
-    service.on_batch_finished(
-        [queue_entry], RuntimeError("encode failed"), None, 0.0
-    )
+    failure: Exception | None = None
+    if cancelled:
+        assert future.cancel()
+    else:
+        failure = RuntimeError("encode failed")
+        future.set_exception(failure)
+    service.on_batch_finished([queue_entry], failure, None, 0.0)
 
     assert service.cache.get(cache_key) is None
     assert cache_key not in service.inflight
-    assert cache_key not in service.pending_cache_publication_keys
-    assert id(embedding) not in model.pre_lm_events
-    assert service.stream.synchronize_calls == 0
+    assert service.pending_cache_publications == {}
+    assert model.pre_lm_events == {}
+    assert stream.synchronize_calls == 0
+
+
+def test_cache_publication_failure_clears_pending_cache_state(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = make_service()
+    service.enable_event_handoff = True
+    stream = RecordingStream()
+    service.stream = stream
+    item = make_item(83, 3)
+    embedding = torch.ones((3, HIDDEN_SIZE))
+    cache_key = service.cache_key(item)
+    assert cache_key is not None
+    future: concurrent.futures.Future[torch.Tensor] = concurrent.futures.Future()
+    queue_entry = QueueEntry(item=item, future=future)
+    service.inflight[cache_key] = future
+    future.add_done_callback(
+        lambda completed: service.clear_inflight(cache_key, completed)
+    )
+    service.cache_embedding(item, embedding)
+
+    def fail_cache_put(cache_key: str, cache_value: torch.Tensor) -> None:
+        raise RuntimeError(
+            f"cache publication failed for {cache_key} with {tuple(cache_value.shape)}"
+        )
+
+    monkeypatch.setattr(service.cache, "put", fail_cache_put)
+    future.set_result(embedding)
+    service.on_batch_finished([queue_entry], None, None, 0.0)
+
+    assert service.cache.get(cache_key) is None
+    assert cache_key not in service.inflight
+    assert service.pending_cache_publications == {}
+    assert stream.synchronize_calls == 1
 
 
 def make_item(
