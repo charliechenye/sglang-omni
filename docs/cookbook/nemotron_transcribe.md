@@ -39,6 +39,18 @@ The pipeline runs one ASR stage. It accepts uploads up to one hour, resamples to
 
 Decoder CUDA graphs are enabled. Decoder compilation is unsupported in this integration; use encoder compilation to reduce launch overhead. Encoder batch size bounds activation memory separately from decoder concurrency. For longer audio or a smaller GPU, reduce the encoder batch size and choose a memory fraction that still fits the model weights.
 
+### FlashInfer JIT cache and startup
+
+The SGLang decoder uses FlashInfer kernels. To reduce cold start compilation overhead, we recommend installing the optional `flashinfer-jit-cache` package that matches your installed FlashInfer and CUDA versions.
+
+Follow the [official FlashInfer installation guide](https://docs.flashinfer.ai/installation.html) for the appropriate JIT cache wheel. Without the precompiled cache, FlashInfer may compile kernels on demand. Even with the cache installed, initial startup may still involve kernel autotuning and CUDA Graph capture.
+
+If startup exceeds the default timeout, increase it before launching the server:
+
+```bash
+export SGLANG_OMNI_STARTUP_TIMEOUT=1800
+```
+
 ## Transcribe an upload
 
 ```bash
