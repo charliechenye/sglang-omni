@@ -110,7 +110,7 @@ def test_component_screen_can_fail_and_cannot_claim_serving_speedup(tmp_path):
     a_file = next(a.glob("four_depth*.json"))
     row = json.loads(a_file.read_text())
     for cost in row["cost_by_dynamic_stage_sequence"]:
-        cost["cuda_event_ms_per_graph"] = .01 + 0.20 * cost["model_calls"]
+        cost["cuda_event_ms_per_graph"] = .01 + 0.25 * cost["model_calls"]
     a_file.write_text(json.dumps(row))
     negative = analyze(a,b,base,p2)
     assert negative["status"] == NO_GAIN
