@@ -12,7 +12,9 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "P16A requires clean tracked worktree" >&2; exit 2
 fi
 command -v nsys >/dev/null || { echo "nsys CLI required" >&2; exit 2; }
-if ! nsys profile --help 2>&1 | grep -q -- 'cuda-graph-trace'; then
+# Avoid grep -q under pipefail: an early SIGPIPE can give false failure.
+NSYS_HELP="$(nsys profile --help 2>&1)"
+if [[ "$NSYS_HELP" != *cuda-graph-trace* ]]; then
   echo "nsys node-graph trace unsupported" >&2; exit 2
 fi
 python - <<'PY'
