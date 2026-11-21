@@ -215,7 +215,13 @@ def profile_real_logits(
             saved_p, saved_q, u,
             temperature=temperature, top_k=top_k, top_p=top_p,
         )
+    # CUDA graph capture RECORDS kernels but does not execute them.
+    # Synchronize alone cannot initialize graph output tensors: the
+    # previous P9B H200 test compared unexecuted got_p/got_q to the
+    # actual reference and falsely reported ~5-6% distribution error.
+    graph.replay()
     torch.cuda.synchronize(device)
+    report["deterministic_graph_replayed_before_distribution_check"] = True
     report["distribution_p_max_abs"] = float((got_p - p_ref).abs().max().item())
     report["distribution_q_max_abs"] = float((got_q - q_ref).abs().max().item())
     if not torch.allclose(got_p, p_ref, rtol=1e-6, atol=1e-6) or not torch.allclose(
