@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import TYPE_CHECKING, Callable
+
+from . import code_predictor_spec_diagnostics as diag
 
 import torch
 import torch.nn.functional as F
@@ -214,6 +217,13 @@ def speculative_k2(
     k = int(model.sub_top_k_tensor[0].item())
     p_cut = float(model.sub_top_p_tensor[0].item())
 
+    # Source-locked opt-in diagnostics. A successful HTTP 200 never silently
+    # becomes a parity or sampled-distribution proof.
+    frame_index = int(getattr(model, "_qt_cp_spec_frames", 0)) + 1
+    diag_root, do_parity = diag.frame_enabled(frame_index)
+    depth_events: list[dict] | None = [] if diag_root is not None else None
+    parity_checks: list[dict] = []
+
     codec_tables = model.code_predictor.model.codec_embedding.weight
     projected_tables = model.predictor_projected_embeddings
     pos_codes = model.output_codes[:1]
@@ -294,9 +304,55 @@ def speculative_k2(
         h_after_proposal = verified[:, 1:2, :].clone()
         logits_target, _ = next_head(h_after_committed)
         p = sampling_probs(logits_target[:, -1, :], temperature=t, top_k=k, top_p=p_cut)
+
+        if do_parity:
+            # Pure oracle replay, no new sampling. It compares the live
+            # checkpoint, same prefix and both KV slots, then restores packed
+            # cache in a finally block before continuing target generation.
+            parity = diag.check_packed_verifier(
+                model,
+                cache_len=cache_len,
+                depth=depth,
+                last_embedding=last_embedding,
+                proposed_embedding=proposed_embedding,
+                packed_hidden=verified,
+            )
+            parity_checks.append(parity)
+            if not parity["pass"]:
+                assert diag_root is not None
+                diag.write_trace(
+                    diag_root, frame_index,
+                    {
+                        "frame": frame_index,
+                        "status": "P1_REAL_PACKED_TARGET_PARITY_FAIL",
+                        "failed_parity": parity,
+                        "completed_depth_events": depth_events,
+                    }, failed=True,
+                )
+                diag.assert_diagnostic_parity(parity)
+
         corrected_or_accepted, survived = accept_or_residual(
             proposal, p, q, generator
         )
+        if depth_events is not None:
+            proposal_depth = depth + 1
+            p_x = p.gather(1, proposal.view(1, 1))
+            q_x = q.gather(1, proposal.view(1, 1))
+            depth_events.append({
+                "proposal_depth": proposal_depth,
+                "expected_overlap": float(overlap_probability(p, q)[0].item()),
+                "accepted": bool(survived),
+                "proposal_code": int(proposal[0].item()),
+                "committed_code": int(corrected_or_accepted[0].item()),
+                "p_proposal": float(p_x[0, 0].item()),
+                "q_proposal": float(q_x[0, 0].item()),
+                "target_mass_on_q_support": float(p.masked_select(q > 0).sum().item()),
+                "proposal_mass_on_p_support": float(q.masked_select(p > 0).sum().item()),
+                "p_support": int((p > 0).sum().item()),
+                "q_support": int((q > 0).sum().item()),
+                "bonus_depth": proposal_depth + 1
+                if survived and proposal_depth < 15 else None,
+            })
         depth += 1
         commit_embed = commit(depth, corrected_or_accepted)
 
@@ -324,8 +380,44 @@ def speculative_k2(
             # The verifier wrote a KV suffix for the rejected draft. Its slot
             # lies beyond cache_len and is overwritten on the next verification.
 
-    count = getattr(model, "_qt_cp_spec_frames", 0) + 1
+    count = frame_index
     model._qt_cp_spec_frames = count
+    if depth_events is not None:
+        assert diag_root is not None
+        diag.validate_depth_events(depth_events)
+        embedding_check = diag.check_embedding_sum(
+            model, layer0_embedding, pos_codes, pos_summed,
+        )
+        payload = {
+            "frame": count,
+            "source_sha": os.environ.get(
+                "SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA", "UNATTESTED"
+            ),
+            "semantic_position": position_seed,
+            "sampling": {"temperature": t, "top_k": k, "top_p": p_cut},
+            "total_residual_codes": 15,
+            "proposed": proposed,
+            "accepted": accepted,
+            "rejected": rejected,
+            "bonus": bonus,
+            "rounds": rounds,
+            "output_codes": pos_codes[0].detach().cpu().tolist(),
+            "embedding_sum": embedding_check,
+            "per_depth": depth_events,
+            "target_parity": {
+                "executed": bool(parity_checks),
+                "checks": parity_checks,
+                "pass": all(x["pass"] for x in parity_checks),
+            },
+        }
+        if not embedding_check["close"]:
+            payload["status"] = "P1_EMBEDDING_SUM_PARITY_FAIL"
+            diag.write_trace(diag_root, count, payload, failed=True)
+            raise RuntimeError(
+                f"CP_SPEC_K2_EMBEDDING_SUM_PARITY_FAIL frame={count}"
+            )
+        payload["status"] = "P1_P2_K2_TRACE_CAPTURED_NOT_SAMPLER_OR_AUDIO_PARITY"
+        diag.write_trace(diag_root, count, payload)
     logger.info(
         "QTTS_CP_SPEC_K2 frame=%d rounds=%d proposed=%d accepted=%d "
         "bonus=%d rejected=%d committed_residual=15",
