@@ -156,6 +156,30 @@ def summarize(output: dict) -> str:
             f"{(m.get('accept_fraction_on_proposals') or 0):.2%} |"
         )
     lines.extend([
+        "", "## On-policy depth usage aggregated over the seeded visits", "",
+        "| Residual depth | Pure K2 proposals | Pure K2 acceptance | Pure K2 bonus | Hybrid direct AR | Hybrid proposals | Hybrid acceptance | Hybrid bonus |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ])
+    for depth in range(2, 16):
+        def stats(mode: str, field: str) -> int:
+            return sum(
+                item["metrics"]["depth_activity"][str(depth)][field]
+                for item in output["visits"] if item["mode"] == mode
+            )
+        k2_proposed = stats("k2", "proposed")
+        k2_accept = stats("k2", "accepted")
+        h_proposed = stats("hybrid", "proposed")
+        h_accept = stats("hybrid", "accepted")
+        k2_rate = (f"{k2_accept/k2_proposed:.1%}"
+                   if k2_proposed else "—")
+        hybrid_rate = (f"{h_accept/h_proposed:.1%}"
+                       if h_proposed else "—")
+        lines.append(
+            f"| {depth} | {k2_proposed} | {k2_rate} | "
+            f"{stats('k2', 'bonus')} | {stats('hybrid', 'ar')} | "
+            f"{h_proposed} | {hybrid_rate} | {stats('hybrid', 'bonus')} |"
+        )
+    lines.extend([
         "", "## Gate limitations", "",
         "- Natural EOS, correct depth accounting and fixed-seed source attribution are tested.",
         "- Native Graph-ON, K2 debug, and hybrid debug must NOT be ranked by HTTP wall time.",
