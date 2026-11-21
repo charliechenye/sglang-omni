@@ -124,6 +124,83 @@ QTTS_K2_VISIT_DONE for each arm, and on HTTP 500 writes failure.json naming
 the failed cell. No such server-side K2 log means the candidate was not activated.
 On CUDA failures or poor audio, stop instead of generating throughput claims.
 
+## 4B. Full-output C1 gate: finish_reason + live K2 activity
+
+First four-request smoke on Nov 21 produced HTTP 200 on all visits
+(00_base, 01_spec, 02_spec, 03_base), with deterministic matching WAV SHA
+within each arm. The debug K2 arm took ~3.3-3.6s versus baseline ~0.54-0.57s;
+**these are debug-only timings, not real speedup numbers**.
+
+Critically every output was **491564 bytes**. For a 24kHz 16-bit mono PCM
+WAV with 44-byte header, that is 10.24 seconds = exactly 128 80ms codec
+frames, and the original smoke had max_new_tokens=128. This strongly suggests
+all four visits were length-capped; the raw audio endpoint does NOT expose
+the terminal finish_reason to the old smoke. **Never infer a clean natural
+EOS just from HTTP 200 or stable WAV SHA.**
+
+The new quality_smoke.py uses the built-in single-item
+/v1/audio/speech/batch endpoint, which still invokes the normal client.speech
+generation path, but returns the authoritative per-item finish_reason and
+base64 WAV. It requires all four to finish with "stop", correct 24kHz mono
+PCM16 WAV, and actual candidate-only QTTS_CP_SPEC_K2 log lines.
+Length/unknown/missing-activity are failed gates. It writes complete results
+even when the final gate fails. No latency/throughput gate is attempted.
+
+### CPU tests first
+
+~~~bash
+cd ~/sglang-omni
+python -m pytest -q tests/unit_test/qwen3_tts/test_cp_spec_quality_smoke.py
+~~~
+
+### Use an already-healthy -002 server (if still running)
+
+No server restart is needed merely to run this *new client script*: the
+speculative decoder itself is unchanged by the quality harness. Do NOT run
+an unrelated load test concurrently. Ensure the original ARM file is absent.
+
+~~~bash
+cd ~/sglang-omni
+curl -fsS http://localhost:8000/health
+test ! -e "$HOME/results/qwen3tts-cpspec-k2-002/ARM"
+
+python experiments/qwen3_tts_cp_spec_k2/quality_smoke.py \
+  --base-url http://localhost:8000 \
+  --arm-file "$HOME/results/qwen3tts-cpspec-k2-002/ARM" \
+  --server-log "$HOME/results/qwen3tts-cpspec-k2-002/server.log" \
+  --max-new-tokens 512 \
+  --out "$HOME/results/qwen3tts-cpspec-k2-quality-001"
+~~~
+
+If the server is no longer running, start a **fresh** server using separate
+-003 ARM and server.log paths and pass those same paths here. Never overwrite
+an earlier server.log or output directory. The quality harness intentionally
+exits nonzero if any visit has finish_reason=length, if the K2 candidate
+did not run (missing log frames), if a baseline unexpectedly runs K2, or if
+the audio response is malformed. Inspect report.json in all cases.
+
+### Reuse old -002 server logs without generating audio again
+
+~~~bash
+cd ~/sglang-omni
+python - <<'PY'
+from pathlib import Path
+from experiments.qwen3_tts_cp_spec_k2.quality_smoke import parse_k2_log_entries
+log = Path.home() / "results/qwen3tts-cpspec-k2-002/server.log"
+events = parse_k2_log_entries(log.read_text(errors="replace"))
+print("K2 logged frames:", len(events))
+for key in ("rounds", "proposed", "accepted", "bonus", "rejected"):
+    print(key, sum(event[key] for event in events))
+proposed = sum(event["proposed"] for event in events)
+accepted = sum(event["accepted"] for event in events)
+print("observed draft acceptance:", accepted / proposed if proposed else None)
+PY
+~~~
+
+Do not mix acceptance percentages from multiple model revisions or sampling
+configs; this coarse parser does not identify the request or model SHA.
+It only summarizes the log files you explicitly select.
+
 ## 5. Gates before an upstream optimization
 
 1. Test live target per-depth logits and two-row causal verification vs
