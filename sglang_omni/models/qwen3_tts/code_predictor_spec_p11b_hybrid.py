@@ -102,6 +102,7 @@ def validate_counts(
         or ar_steps not in (0, 1, 2)
         or rounds != proposals
         or proposals != accepted + rejected
+        or bonus > accepted
         or ar_steps + proposals + bonus != residual_codes
     ):
         raise RuntimeError(
@@ -119,10 +120,13 @@ def stats_line(
     proposed: list[int],
     accepted: list[int],
     bonus: list[int],
+    source_sha: str,
 ) -> str:
     """Fixed parseable log; all lists have sorted unique residual depths."""
     if not 1 <= ar_through <= 3:
         raise ValueError("P11B ar_through out of range")
+    if len(source_sha) != 40 or any(c not in "0123456789abcdef" for c in source_sha):
+        raise ValueError("P11B requires attested lowercase 40-char source SHA")
     for lst in (ar, proposed, accepted, bonus):
         if lst != sorted(set(lst)) or any(not 2 <= d <= 15 for d in lst):
             raise ValueError("P11B audit depths invalid")
@@ -135,5 +139,6 @@ def stats_line(
     return (
         f"QTTS_CP_K2_DEPTHS frame={frame} ar_through={ar_through} "
         f"ar={fmt(ar)} proposed={fmt(proposed)} "
-        f"accepted={fmt(accepted)} bonus={fmt(bonus)}"
+        f"accepted={fmt(accepted)} bonus={fmt(bonus)} "
+        f"source_sha={source_sha}"
     )
