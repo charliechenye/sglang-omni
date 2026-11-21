@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import math
 import os
-import statistics
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -110,6 +110,7 @@ def capture_two_offsets(
 
     side = torch.cuda.Stream(device=device)
     side.wait_stream(torch.cuda.current_stream(device))
+    capture_completed = False
     try:
         # Explicitly initialize each fixed-offset variant before capture.
         with torch.inference_mode():
@@ -200,12 +201,18 @@ def capture_two_offsets(
             "Only two fixed offsets (2 and 6), not 14-way routing or nested CUDA WHILE",
             "One real target stack at fixed embeddings; no GPU sampled tokens or rejection correction",
             "P7 measures CUDA Graph conditional replay launch envelope, not GPU kernel busy time",
-            "All C1 model K/V is restored; no inference request performance claim",
+            "Successful P7 test restores all K/V; failed capture poisons this experimental server",
         ]
+        capture_completed = True
     finally:
-        torch.cuda.synchronize(device)
-        restore()
-        torch.cuda.synchronize(device)
+        # Avoid replacing the *original* capture exception with a secondary
+        # cudaErrorStreamCaptureInvalidated from synchronize/copy_ during
+        # cleanup. A failed capture is fatal for this experimental server;
+        # restart it rather than returning to serving.
+        if capture_completed:
+            torch.cuda.synchronize(device)
+            restore()
+            torch.cuda.synchronize(device)
     return result
 
 
@@ -225,8 +232,15 @@ def maybe_profile(
         raise RuntimeError("P7 must run without P1/P4/P5 profiling")
     if proposal_depth != 6 or getattr(model, "_qt_cp_p7_profiled", False):
         return
-    result = capture_two_offsets(model, fixed_embeds=token_embeds, repeats=32)
     output_dir = Path(root_path).expanduser().resolve()
+    try:
+        result = capture_two_offsets(model, fixed_embeds=token_embeds, repeats=32)
+    except BaseException:
+        output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        failure_path = output_dir / f"capture_failure_pid{os.getpid()}.txt"
+        with failure_path.open("x", encoding="utf-8") as failure:
+            failure.write(traceback.format_exc())
+        raise
     output_dir.mkdir(parents=True, exist_ok=False)
     result.update({
         "pid": os.getpid(),
