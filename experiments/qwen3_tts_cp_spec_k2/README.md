@@ -48,6 +48,26 @@ git rev-parse HEAD
 This experiment is source-pinned. Do not rebase onto newer upstream before
 re-running source and kernel parity gates.
 
+## Fix after the first HTTP 500: terminal-codebook projection
+
+The initial H200 smoke reached K2 but returned
+`index 14 is out of bounds for dimension 0 with size 14`.
+This was a prototype bug at residual depth 15: the codec embedding has
+15 tables, but Omni deliberately precomputes projection tables for only
+the first 14. For the last code, the revised code uses the ordinary
+embedding and projects it directly rather than indexing a nonexistent
+precomputed table.
+
+The CPU regression test covers both projected depth 14 and the final
+depth 15, and the extra CUDA test executes the full K2 loop against a
+fixture with **16 code groups, 15 codec tables, and 14 projected tables**.
+This guards against another terminal-depth crash before HTTP.
+Do not interpret the old 500 as a sampled-acceptance failure.
+
+Stop any old server, pull this branch, rerun correctness tests and restart
+the server so the worker loads the fixed Python code. The old smoke results
+are partial evidence: use fresh `-002` directories, never overwrite `-001`.
+
 ## 2. CPU and H200 GPU correctness tests
 
 ~~~bash
@@ -57,7 +77,7 @@ python -m pytest -q \
   -k 'not packed_two_token'
 CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
   tests/unit_test/qwen3_tts/test_code_predictor_spec_k2.py \
-  -k packed_two_token -s
+  -k 'packed_two_token or k2_real_16_group' -s
 ~~~
 
 **Stop on a failure.** The GPU test compares the nonzero-offset two-row
@@ -90,7 +110,7 @@ cd ~/sglang-omni
 python experiments/qwen3_tts_cp_spec_k2/smoke.py \
   --base-url http://localhost:8000 \
   --arm-file "$HOME/results/qwen3tts-cpspec-k2-001/ARM" \
-  --out "$HOME/results/qwen3tts-cpspec-k2-smoke-001"
+  --out "$HOME/results/qwen3tts-cpspec-k2-smoke-002"
 ~~~
 
 This runs baseline/spec/spec/baseline on ONE server, saving WAVs and
@@ -99,7 +119,9 @@ sampling streams contaminate timing and hash comparisons.
 
 Inspect the server log for lines beginning QTTS_CP_SPEC_K2. Confirm every
 sampled frame reports rounds, proposed, accepted, bonus, rejected and
-committed_residual=15. No such log means the candidate was not activated.
+committed_residual=15. The smoke script prints QTTS_K2_VISIT_BEGIN and
+QTTS_K2_VISIT_DONE for each arm, and on HTTP 500 writes failure.json naming
+the failed cell. No such server-side K2 log means the candidate was not activated.
 On CUDA failures or poor audio, stop instead of generating throughput claims.
 
 ## 5. Gates before an upstream optimization
