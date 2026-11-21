@@ -105,6 +105,15 @@ def test_p14_h200_single_top50_support_matches_reference():
         torch.testing.assert_close(full, ref, atol=1e-6, rtol=1e-6)
 
 
+class _FakeHead(torch.nn.Module):
+    def __init__(self, hidden: int, vocab: int, device):
+        super().__init__()
+        self.proj = torch.nn.Linear(hidden, vocab, bias=False, device=device)
+
+    def forward(self, hidden):
+        return self.proj(hidden), None
+
+
 class _FakePredictor:
     """5-layer-shaped GPU cache used to exercise capture dependencies only.
 
@@ -122,12 +131,12 @@ class _FakePredictor:
         )
         self.predictor_v_cache = self.predictor_k_cache.clone()
         heads = torch.nn.ModuleList([
-            torch.nn.Linear(h, vocab, bias=False, device=device)
+            _FakeHead(h, vocab, device=device)
             for _ in range(15)
         ])
         with torch.no_grad():
             for head in heads:
-                head.weight.mul_(0.02)
+                head.proj.weight.mul_(0.02)
         codec = torch.nn.Embedding(
             15 * vocab, h, device=device,
         )
