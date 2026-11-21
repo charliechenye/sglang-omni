@@ -201,7 +201,7 @@ def two_gpu_rounds(
             hidden=h, last_embedding=emb, accumulated=summed,
             uniforms=u, indices_gpu=indices_gpu,
             temperature=temperature, top_p=top_p,
-        bonus_policy=bonus_policy, trace_markers=trace_markers,
+            bonus_policy=bonus_policy, trace_markers=trace_markers,
         )
 
     def rejected_branch(h, emb, summed, offset, u):
@@ -210,7 +210,7 @@ def two_gpu_rounds(
             hidden=h, last_embedding=emb, accumulated=summed,
             uniforms=u, indices_gpu=indices_gpu,
             temperature=temperature, top_p=top_p,
-        bonus_policy=bonus_policy, trace_markers=trace_markers,
+            bonus_policy=bonus_policy, trace_markers=trace_markers,
         )
 
     second = cond_op(
