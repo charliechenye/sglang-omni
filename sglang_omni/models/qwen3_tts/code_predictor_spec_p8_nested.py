@@ -243,7 +243,7 @@ def capture_nested_real_predictor(
             times[label] = val
         report["cuda_graph_event_ms_per_case"] = times
         report["status"] = (
-            "P8_NESTED_WHILE_IF_REAL_5_LAYER_MODEL_PASS_"
+            "P8_NESTED_WHILE_IF_REAL_PREDICTOR_MODEL_PASS_"
             "NOT_SAMPLER_OR_SERVING_SPEEDUP"
         )
         report["limitations"] = [
