@@ -286,7 +286,7 @@ def make_causal_round(model, *,
     committed = decision["committed"]
     accepted = decision["accepted"]
     bonus_logits, _ = bonus_head(after_proposal)
-    _, _, _, bonus_code = (
+    bonus_idx, _, bonus_probs, bonus_code = (
         fast_selector(
             bonus_logits[:, -1, :], uniforms[3:4],
             temperature=temperature, top_p=top_p
@@ -323,6 +323,9 @@ def make_causal_round(model, *,
         "accepted": accepted,
         "corrected": decision["residual_correction"],
         "bonus": bonus_code,
+        "bonus_ids": bonus_idx,
+        "bonus_probs": bonus_probs,
+        "bonus_logits": bonus_logits[:, -1, :],
         "bonus_valid": accepted.clone(),
         "accept_probability": decision["accept_probability"],
         "residual_mass": decision["residual_mass"],
@@ -499,7 +502,7 @@ def capture_real_causal_round(
                 _strict_close(
                     name.upper(), triton_row[name], torch_row[name]
                 )
-            for side in ("q", "p"):
+            for side in ("q", "p", "bonus"):
                 triton_prob = _distribution(
                     triton_row[f"{side}_ids"], triton_row[f"{side}_probs"]
                 )
@@ -539,6 +542,33 @@ def capture_real_causal_round(
                 top_k=K, top_p=top_p,
             )
             independent = cpu_reference(p_ref, q_ref, quadruple[:3])
+            bonus_ref = sampling_probs(
+                torch_row["bonus_logits"], temperature=temperature,
+                top_k=K, top_p=top_p,
+            )[0].float().cpu()
+            expected_bonus = int(torch.searchsorted(
+                bonus_ref.cumsum(-1).contiguous(),
+                torch.tensor(quadruple[3], dtype=torch.float32)
+            ).clamp(max=VOCAB-1).item())
+            got_bonus = int(triton_row["bonus"][0].item())
+            if got_bonus != expected_bonus:
+                raise RuntimeError(
+                    f"P14_INDEPENDENT_BONUS_DRAW_FAIL "
+                    f"u={quadruple[3]} candidate={got_bonus} expected={expected_bonus}"
+                )
+            expected_sum = (
+                saved[2] +
+                F.embedding(
+                    triton_row["committed"],
+                    model.code_predictor.model.codec_embedding.weight[depth]
+                ).to(dtype=saved[2].dtype)
+            )
+            if bool(triton_row["accepted"][0].item()):
+                expected_sum = expected_sum + F.embedding(
+                    triton_row["bonus"],
+                    model.code_predictor.model.codec_embedding.weight[depth+1],
+                ).to(dtype=saved[2].dtype)
+            _strict_close("INDEPENDENT_COMMITTED_CODE_SUM", triton_row["next_sum"], expected_sum)
             got = {
                 "draft": int(triton_row["draft"][0].item()),
                 "accepted": bool(triton_row["accepted"][0].item()),
@@ -575,7 +605,9 @@ def capture_real_causal_round(
                 "residual_mass": float(
                     triton_row["residual_mass"][0].item()
                 ),
-                "q_p_distribution_parity": True,
+                "q_p_bonus_distribution_parity": True,
+                "independent_bonus_sampling_parity": True,
+                "independent_embedding_sum_parity": True,
                 "target_hidden_parity": True,
                 "complete_kv_parity": True,
                 "committed_embedding_sum_parity": True,
