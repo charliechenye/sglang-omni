@@ -170,9 +170,13 @@ cat "$HOME/results/qwen3tts-cpspec-k2-p12a-021/smoke/summary.md"
 
 This report covers actual q-before and p-after events for depths2/10,
 with exact static Torch reference, tie count, boundary tie, full Graph
-events, status and full native Graph ON baseline. **NO_SELECTION is a
-valid diagnostic outcome, not a speedup/accuracy PASS**. Do not select
-a faster candidate whose tied token support differs from reference.
+events, status and full native Graph ON baseline. It also compares the
+two INDEPENDENT q+p selector graph envelopes against a provisional
+11.47us/round savings threshold from P10's 0.30ms/frame reserve gate.
+This stage-sum estimate is **NOT a captured causal combined graph**:
+per-stage envelopes need not add. **NO_SELECTION is a valid diagnostic
+outcome, not a speedup/accuracy PASS**. Do not select a faster candidate
+whose tied token support differs from reference.
 
 ## 2. P12B GPU AR one-token vs packed two-token, NEW worker
 
