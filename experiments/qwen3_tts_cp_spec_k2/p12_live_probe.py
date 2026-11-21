@@ -190,6 +190,32 @@ def run(args):
             STATUS if report["selection_eligible"]
             else "P12A_REAL_CAUSAL_STAGE_TIE_NO_SELECTION_COST_ONLY"
         )
+        if args.mode == "selector":
+            # A 0.30ms/frame exploratory reserve requires approx 11.47us
+            # less sampling per historical K2 round. This merely sums
+            # separate causal-stage graph envelopes; not a composite graph.
+            comparison = []
+            for record in rows:
+                stages = record["stages"]
+                before = sum(
+                    s["median_ms"]["torch_topk_reference"]
+                    for s in stages.values()
+                )
+                after = sum(
+                    s["median_ms"]["triton_single_top50"]
+                    for s in stages.values()
+                )
+                comparison.append({
+                    "depth": record["depth"],
+                    "reference_q_plus_p_independent_ms": before,
+                    "triton_q_plus_p_independent_ms": after,
+                    "estimated_stage_sum_savings_ms": before - after,
+                    "passes_0p01147ms_round_savings_heuristic": (
+                        record["selection_eligible"] and
+                        before - after >= 0.01147
+                    ),
+                })
+            report["selector_component_stage_sum_screen"] = comparison
         report["gpu"] = baseline["device"]
         report["baseline_graph_on_ms"] = baseline["median_cuda_event_ms"]
         report["probes"] = rows
@@ -230,6 +256,21 @@ def run(args):
                     f"{data['tied_pairs_inside_top50']} | "
                     f"{data['tie_at_top50_boundary']} |"
                 )
+        lines += [
+            "",
+            "## Non-additive q+p stage cost screen (not a complete causal graph)",
+            "",
+            "| Depth | Torch q+p independent ms | Triton q+p independent ms | Estimated savings (ms) | Clears 11.47us/round with exact support? |",
+            "|---:|---:|---:|---:|---|",
+        ]
+        for item in report["selector_component_stage_sum_screen"]:
+            lines.append(
+                f"| {item['depth']} | "
+                f"{item['reference_q_plus_p_independent_ms']:.5f} | "
+                f"{item['triton_q_plus_p_independent_ms']:.5f} | "
+                f"{item['estimated_stage_sum_savings_ms']:+.5f} | "
+                f"{item['passes_0p01147ms_round_savings_heuristic']} |"
+            )
     else:
         lines += [
             "| Real proposal depth | 1-token target AR ms | Packed 2-token verifier ms | AR / packed | Hidden/KV parity |",
