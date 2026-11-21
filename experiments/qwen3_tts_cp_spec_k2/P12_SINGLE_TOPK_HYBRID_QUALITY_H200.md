@@ -243,44 +243,78 @@ cat "$HOME/results/qwen3tts-cpspec-k2-p12b-022/smoke/summary.md"
 This provides matched CUDA-event costs from the existing real model
 path and hidden/KV parity at depth4/10. Still not full Hybrid E2E.
 
-## 3. Offline quality audit of the ORIGINAL P11B WAVs — NO GPU
+## 3. Offline quality audit of ORIGINAL P11B WAVs — NO GPU REQUIRED
 
-Do NOT regenerate or overwrite original WAV evidence.
+**Run this step whenever the P11B WAVs exist, including before the P12
+H200 probes.** Preserve original WAV evidence. The GPU target-forward
+cost is OPTIONAL and must not be invented just to analyze audio.
+
+### 3A. WAV-only analysis NOW, without P12B timing
 
 ~~~bash
 cd ~/sglang-omni
+test -f "$HOME/results/qwen3tts-cpspec-k2-p11b-020/smoke/report.json"
+
 python -m experiments.qwen3_tts_cp_spec_k2.p12_quality_audit \
   --p11b-report "$HOME/results/qwen3tts-cpspec-k2-p11b-020/smoke/report.json" \
-  --p12b-timing-dir "$HOME/results/qwen3tts-cpspec-k2-p12b-022/ar_vs_pair" \
   --asr none \
   --out "$HOME/results/qwen3tts-cpspec-k2-p12-quality-023"
 
 cat "$HOME/results/qwen3tts-cpspec-k2-p12-quality-023/summary.md"
 ~~~
 
-For real ASR transcript WER/repeated phrases, an explicitly installed
-faster-whisper model is necessary; use a different NEW output folder:
+Expected: verified WAV SHA/format; duration, silence, trailing silence
+and repeatability by seed. ASR WER, speaker similarity, and GPU
+target-forward projection are **NOT_MEASURED**. If -023 already exists,
+choose a NEW output (e.g. -025); do not overwrite prior evidence.
+
+### 3B. Optional GPU cost projection — ONLY after P12B H200 Step 2
+
+First require real parity-passed depth4/depth10 JSON profiles under
+`ar_vs_pair`. If the P12B -022 run has not happened, OMIT the
+`--p12b-timing-dir` argument; do not create an empty timing directory.
+
+~~~bash
+cd ~/sglang-omni
+test -d "$HOME/results/qwen3tts-cpspec-k2-p12b-022/ar_vs_pair"
+
+python -m experiments.qwen3_tts_cp_spec_k2.p12_quality_audit \
+  --p11b-report "$HOME/results/qwen3tts-cpspec-k2-p11b-020/smoke/report.json" \
+  --p12b-timing-dir "$HOME/results/qwen3tts-cpspec-k2-p12b-022/ar_vs_pair" \
+  --asr none \
+  --out "$HOME/results/qwen3tts-cpspec-k2-p12-quality-with-gpu-026"
+
+cat "$HOME/results/qwen3tts-cpspec-k2-p12-quality-with-gpu-026/summary.md"
+~~~
+
+When optional GPU data is missing or incomplete, the analyzer now
+explains `P12B_TIMING_EVIDENCE_MISSING` or
+`P12B_TIMING_EVIDENCE_INCOMPLETE`. It must not silently claim the
+projection was measured.
+
+### 3C. Optional real ASR transcript WER / repeated phrases
+
+Use a separate output directory, and install/provide a working
+`faster-whisper` model. P12B GPU timing evidence is NOT required.
 
 ~~~bash
 python -m experiments.qwen3_tts_cp_spec_k2.p12_quality_audit \
   --p11b-report "$HOME/results/qwen3tts-cpspec-k2-p11b-020/smoke/report.json" \
-  --p12b-timing-dir "$HOME/results/qwen3tts-cpspec-k2-p12b-022/ar_vs_pair" \
   --asr faster-whisper --asr-model small.en --asr-device cuda \
   --out "$HOME/results/qwen3tts-cpspec-k2-p12-quality-asr-024"
 
 cat "$HOME/results/qwen3tts-cpspec-k2-p12-quality-asr-024/summary.md"
 ~~~
 
-The latter command requires \`faster-whisper\` installed in the current
-venv and may require a previously downloaded model or connectivity.
-If unavailable, report ASR **NOT_MEASURED**, not an invented WER.
-The speaker comparison is also **NOT_MEASURED** without explicit
-\`--speaker-embeddings\` JSON from a real external embedding model;
-speaker similarity is not PCM waveform correlation.
+The ASR command needs an installed model and possibly a previously
+downloaded checkpoint or connectivity. Otherwise report
+`NOT_MEASURED`; no invented WER. Speaker similarity also remains
+`NOT_MEASURED` without actual source-attributed embeddings via
+`--speaker-embeddings`; PCM correlation is not speaker identity.
 
-The historical P11B WAV cohort is from an earlier source SHA than
-P12B GPU cost probes. Any combined target-forward cost is explicitly
-a CROSS-SOURCE projection, not a source-matched E2E proof.
+P11B WAVs are from a prior source SHA; new P12B target event costs
+applied to them are a CROSS-SOURCE heuristic only, NOT source-matched
+on-policy serving performance.
 
 ## Decision and stop gates
 
