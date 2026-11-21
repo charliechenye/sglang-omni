@@ -349,6 +349,23 @@ def speculative_k2(
         logits_target, _ = next_head(h_after_committed)
         p = sampling_probs(logits_target[:, -1, :], temperature=t, top_k=k, top_p=p_cut)
 
+        # P9B measures an isolated, fully CUDA-resident sample/accept/
+        # positive-residual draw on *real* on-policy p/q logits. It never
+        # draws from or modifies the live K2 RNG/committed codes.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P9B_DIR"):
+            from .code_predictor_spec_p9b import maybe_probe as p9b_probe
+
+            p9b_probe(
+                model,
+                frame_index=frame_index,
+                proposal_depth=depth + 1,
+                logits_p=logits_target[:, -1, :],
+                logits_q=logits_draft[:, -1, :],
+                temperature=t,
+                top_k=k,
+                top_p=p_cut,
+            )
+
         if do_parity:
             # Pure oracle replay, no new sampling. It compares the live
             # checkpoint, same prefix and both KV slots, then restores packed
