@@ -8,12 +8,14 @@ import json
 import math
 import struct
 import wave
+from argparse import Namespace
 
 import pytest
 import torch
 
 from experiments.qwen3_tts_cp_spec_k2.p12_quality_audit import (
-    edit_distance, tokenize, transcript_features, waveform_features,
+    analyze as analyze_quality, edit_distance, tokenize,
+    transcript_features, waveform_features,
 )
 from experiments.qwen3_tts_cp_spec_k2.p12_live_probe import validate_probe
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p12a_selector import (
@@ -52,6 +54,74 @@ def test_p12_wav_integrity_rms_trailing_silence(tmp_path):
     assert result["trailing_silence_s"] == pytest.approx(.1)
     with pytest.raises(ValueError, match="WAV SHA mismatch"):
         waveform_features(dest, "0"*64)
+
+
+def test_p12_historical_wav_audit_does_not_require_p12b_gpu_results(tmp_path):
+    # Regression: P11B WAVs already exist, but the optional P12B -022
+    # H200 AR-vs-packed directory has NOT been collected. This must
+    # work without that flag and explicitly say target cost UNMEASURED.
+    audio = tmp_path / "audio"
+    audio.mkdir()
+    sound = [8000] * 2400 + [0] * 2400
+    visits = []
+    for seed in (20261120, 20261121):
+        for i, mode in enumerate(
+            ("native", "k2", "hybrid", "hybrid", "k2", "native")
+        ):
+            tag = f"seed{seed}_{i:02d}_{mode}"
+            wav = audio / f"{tag}.wav"
+            with wave.open(str(wav), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(24000)
+                wf.writeframes(struct.pack("<" + "h" * len(sound), *sound))
+            visits.append({
+                "tag": tag,
+                "seed": seed,
+                "mode": mode,
+                "duration_s": 0.2,
+                "wav_sha256": hashlib.sha256(wav.read_bytes()).hexdigest(),
+            })
+    report = audio / "report.json"
+    report.write_text(json.dumps({
+        "status": (
+            "P11B_REAL_ON_POLICY_HYBRID_AR_K2_"
+            "ALL_STOP_ACCOUNTING_PASS_NOT_PARITY_OR_SPEED"
+        ),
+        "source_sha": "a" * 40,
+        "seeds": [20261120, 20261121],
+        "visits": visits,
+    }))
+    args = Namespace(
+        p11b_report=report,
+        p12b_timing_dir=None,
+        speaker_embeddings=None,
+        asr="none",
+        asr_model="small.en",
+        asr_device="cpu",
+        reference_text="hello",
+        silence_threshold_dbfs=-45.0,
+    )
+    result = analyze_quality(args)
+    assert result["status"] == "P12B_WAV_STATS_PASS_ASR_OR_SPEAKER_UNMEASURED"
+    assert result["asr_engine"] == "NOT_MEASURED"
+    assert result["speaker_similarity_status"] == "NOT_MEASURED"
+    assert result["target_forward_component_projection"] is None
+    assert len(result["seed_comparison"]) == 6
+    assert all(
+        row["historical_projected_target_cuda_ms_per_codec_frame"] is None
+        for row in result["seed_comparison"]
+    )
+    assert all(row["same_audio_statistics"] for row in result["seed_comparison"])
+
+    # Explicitly specifying missing/incomplete GPU evidence must STOP
+    # with an actionable error instead of claiming a measurement.
+    args.p12b_timing_dir = tmp_path / "p12b-022" / "ar_vs_pair"
+    with pytest.raises(FileNotFoundError, match="P12B_TIMING_EVIDENCE_MISSING"):
+        analyze_quality(args)
+    args.p12b_timing_dir.mkdir(parents=True)
+    with pytest.raises(ValueError, match="P12B_TIMING_EVIDENCE_INCOMPLETE"):
+        analyze_quality(args)
 
 
 def test_p12_selector_has_no_cpu_sync_in_device_kernels():
