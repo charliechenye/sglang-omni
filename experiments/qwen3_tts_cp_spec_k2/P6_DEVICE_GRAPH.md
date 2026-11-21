@@ -1,5 +1,14 @@
 # P6.0 — H200 device-resident dynamic K2 graph compatibility gate
 
+**DEPRECATED AS A HARDWARE SUPPORT TEST (2026-11-21):** The original
+plain torch.cuda.graph() implementation omitted the explicit PyTorch
+CUDA conditional-node dispatch mode and returned
+cudaErrorStreamCaptureInvalidated on torch 2.14.1+cu130 / H200.
+This is NOT evidence the feature is unsupported. Use P6.1 instead:
+[experiments/qwen3_tts_cp_spec_k2/P6_1_CAPTURE_FIX.md](P6_1_CAPTURE_FIX.md).
+Keep the old -007 failure report as historical evidence; do NOT rerun
+this outdated script to decide hardware support.
+
 **Run this short feasibility test before implementing a GPU-resident K2 scheduler. No server required.**
 
 Prior P5 on the same Qwen3-TTS model:
