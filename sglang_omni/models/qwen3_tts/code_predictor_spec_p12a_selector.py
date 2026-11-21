@@ -48,7 +48,7 @@ def single_top50_kernel(
     VOCAB_WIDTH: tl.constexpr, K_COUNT: tl.constexpr,
     B: tl.constexpr,
 ):
-    """2048-score descending bitonic-sort candidate, one CTA, vocab-ID CDF.
+    """2048-score partial top-64 sorting candidate, one CTA, vocab-ID CDF.
 
     Positive IEEE float bit order is monotonic. Negative floats are
     inverted to monotonic unsigned ordering. Low 32 bits prefer smaller
@@ -61,9 +61,11 @@ def single_top50_kernel(
         (bits & 0x80000000) != 0, ~bits, bits ^ 0x80000000,
     ).to(tl.uint64)
     packed = (ordered << 32) | (0xFFFFFFFF - v.to(tl.uint32)).to(tl.uint64)
-    sorted_keys = tl.sort(packed, descending=True)
+    # Use the native partial top-k primitive, not full sorting 2048
+    # score/id keys. Triton topk needs power-of-two K so select 64 and
+    # mask the 14 extra ranks while exporting exactly 50.
+    chosen = tl.topk(packed, B, descending=True)
     r = tl.arange(0, B)
-    chosen = tl.gather(sorted_keys, r, axis=0)
     code = (0xFFFFFFFF - (chosen & 0xFFFFFFFF).to(tl.uint32)).to(tl.int32)
     chosen_score = tl.load(LOGITS + code, mask=r < K_COUNT, other=0).to(tl.float32)
     chosen_score = tl.where(r < K_COUNT, chosen_score / TEMPERATURE, float("-inf"))
