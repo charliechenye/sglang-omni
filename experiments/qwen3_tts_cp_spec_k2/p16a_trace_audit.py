@@ -33,7 +33,9 @@ ROUND_MARKER = "p16a_round_start_marker_kernel"
 BONUS_MARKER = "p16a_bonus_head_marker_kernel"
 
 
-def parse_nvtx_kernel_csv(data: str) -> dict[str, Counter]:
+def parse_nvtx_kernel_csv(
+    data: str, *, expected_pid: int | None = None,
+) -> dict[str, Counter]:
     """Return physical kernel counts per exact NVTX range, fail on ambiguity."""
     raw_rows = list(csv.reader(io.StringIO(data)))
     header = None
@@ -49,12 +51,26 @@ def parse_nvtx_kernel_csv(data: str) -> dict[str, Counter]:
             index = {name: header.index(name) for name in (
                 "nvtx range", "kernel name", "kern inst",
             )}
+            if expected_pid is not None:
+                if "pid" not in header:
+                    raise ValueError("P16A Nsight PID column missing")
+                index["pid"] = header.index("pid")
             continue
         if index is None or len(values) != len(header):
             continue
         label = values[index["nvtx range"]].strip()
         if not label.startswith("P16A_CASE_"):
             continue
+        if expected_pid is not None:
+            try:
+                pid = int(values[index["pid"]].strip())
+            except ValueError as exc:
+                raise ValueError("P16A invalid Nsight PID") from exc
+            if pid != expected_pid:
+                raise ValueError(
+                    f"P16A Nsight worker PID mismatch: "
+                    f"observed={pid} expected={expected_pid}"
+                )
         name = values[index["kernel name"]].strip()
         if not name:
             raise ValueError("P16A empty kernel name")
@@ -319,7 +335,9 @@ def main():
             "P16A nsys NVTX kernel summary unavailable; "
             "no CPU-only or graph-level fallback"
         ) from exc
-    grouped = parse_nvtx_kernel_csv(proc.stdout)
+    grouped = parse_nvtx_kernel_csv(
+        proc.stdout, expected_pid=result["pid"],
+    )
     audit = audit_report(
         result, grouped, head_regex=args.bonus_head_regex,
     )
