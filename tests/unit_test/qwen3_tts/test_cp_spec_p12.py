@@ -79,6 +79,7 @@ def test_p12_selector_tie_no_selection_keeps_cost_but_never_passes():
             "status": "P12A_TIE_OR_DISTRIBUTION_MISMATCH_NO_SELECTION",
             "selection_eligible": False,
             "selected_ids_match": False,
+            "selected_support_match": False,
             "probability_match": False,
             "fixed_uniform_draws": [0.125, 0.625, 0.995, 0.333],
             "times_ms": {
