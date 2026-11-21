@@ -194,3 +194,105 @@ def test_packed_two_token_verify_matches_serial_with_cached_prefix(patch_qk_norm
         serial_model.predictor_v_cache[:, :1, :4],
         **BF16_GEMM_ROUNDING
     )
+
+
+@pytest.mark.accelerator
+def test_k2_real_16_group_path_reaches_final_depth_with_14_projected_tables(
+    patch_qk_norm,
+):
+    """Exercise the actual K2 loop, not just its isolated embedding helper.
+
+    Config mirrors production: 16 code groups, 15 codec tables and heads,
+    but only 14 preprojected tables. It must emit all 16 code slots without
+    accessing the nonexistent projected index 14, whether code 15 was
+    generated as a draft or as a bonus.
+    """
+    if not torch.cuda.is_available():
+        pytest.skip("requires H200/CUDA")
+    from torch import nn
+
+    from sglang_omni.models.qwen3_tts.code_predictor_spec import speculative_k2
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSCodecTables
+    from tests.unit_test.qwen3_tts.test_predictor_cuda_graph import (
+        DTYPE,
+        HIDDEN,
+        HEAD_DIM,
+        MAX_BS,
+        NUM_KV_HEADS,
+        PRED_VOCAB,
+        TupleLinear,
+        build_talker,
+        step_inputs,
+        uniform_requests,
+    )
+
+    dev = torch.device("cuda")
+    torch.manual_seed(20261121)
+    talker = build_talker(dev)
+    talker.config.num_code_groups = 16
+    predictor_len = 17
+    positions = torch.arange(predictor_len, device=dev, dtype=torch.long)
+    talker.predictor_positions = positions
+    talker.predictor_position_rows = (
+        positions[:, None].expand(predictor_len, MAX_BS).contiguous()
+    )
+    talker.predictor_cache_slots = (
+        torch.arange(MAX_BS, device=dev, dtype=torch.long)[None, :] * predictor_len
+        + positions[:, None]
+    ).contiguous()
+    talker.predictor_pair_positions = positions[:2].repeat(MAX_BS)
+    talker.predictor_pair_cache_slots = (
+        talker.predictor_cache_slots[:2].t().reshape(-1)
+    )
+    talker.predictor_k_cache = torch.zeros(
+        1, MAX_BS, predictor_len, NUM_KV_HEADS, HEAD_DIM,
+        device=dev, dtype=DTYPE,
+    )
+    talker.predictor_v_cache = torch.zeros_like(talker.predictor_k_cache)
+    talker.predictor_k_rows = [
+        table.view(MAX_BS * predictor_len, -1)
+        for table in talker.predictor_k_cache
+    ]
+    talker.predictor_v_rows = [
+        table.view(MAX_BS * predictor_len, -1)
+        for table in talker.predictor_v_cache
+    ]
+    talker.output_codes = torch.zeros(
+        MAX_BS, 16, device=dev, dtype=torch.long,
+    )
+    talker.output_embeds = torch.zeros(
+        MAX_BS, HIDDEN, device=dev, dtype=DTYPE,
+    )
+    talker.sub_seed_offsets = torch.arange(1, 16, device=dev, dtype=torch.long)
+
+    talker.code_predictor.model.codec_embedding = Qwen3TTSCodecTables(
+        15, PRED_VOCAB, HIDDEN
+    ).to(device=dev, dtype=DTYPE)
+    talker.code_predictor.lm_head = nn.ModuleList([
+        TupleLinear(HIDDEN, PRED_VOCAB).to(device=dev, dtype=DTYPE)
+        for _ in range(15)
+    ])
+    projection = nn.Linear(
+        HIDDEN, HIDDEN, bias=True, device=dev, dtype=DTYPE,
+    )
+    talker.code_predictor.project_input = projection
+    with torch.no_grad():
+        talker.predictor_projected_embeddings = torch.stack(
+            [
+                projection(talker.code_predictor.model.codec_embedding.weight[i])
+                for i in range(14)
+            ],
+        ).contiguous()
+    talker.predictor_projected_buffer = torch.zeros(
+        MAX_BS, HIDDEN, device=dev, dtype=DTYPE,
+    )
+
+    talker.prepare_decode_buffers(uniform_requests(1, dosample=True, top_k=5))
+    input_ids, hidden, pos = step_inputs(1, dev)
+    with torch.inference_mode():
+        codes, embeds = speculative_k2(talker, input_ids, hidden, pos)
+    assert codes.shape == (1, 16, 1)
+    assert embeds.shape == (1, 1, HIDDEN)
+    assert codes[0, 0, 0].item() == input_ids[0, 0].item()
+    assert torch.all((codes >= 0) & (codes < PRED_VOCAB)).item()
+    assert torch.isfinite(embeds).all().item()
