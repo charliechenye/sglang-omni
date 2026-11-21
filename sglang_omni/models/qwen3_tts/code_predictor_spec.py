@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 import torch.nn.functional as F
@@ -118,6 +118,57 @@ def accept_or_residual(
     return correction.reshape(1), False
 
 
+def embed_residual_code(
+    *,
+    depth: int,
+    code: torch.Tensor,
+    codec_tables: torch.Tensor,
+    projected_tables: torch.Tensor | None,
+    project_input: Callable[[torch.Tensor], torch.Tensor],
+    accumulation_dtype: torch.dtype,
+    predictor_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Read residual code embedding and (if needed) its Predictor projection.
+
+    For N residual codebook depths, Omni deliberately materializes only N-1
+    *projected* tables: the last residual code contributes to codec summation,
+    but does not feed another Predictor step in the original AR decoder.
+
+    The experimental K=2 verifier can put that final code into a draft suffix
+    even though it will never consume its hidden state. Produce its projection
+    directly from the ordinary embedding instead of indexing a nonexistent
+    projected_tables[N-1] entry.
+    """
+    if codec_tables.ndim != 3:
+        raise ValueError("expected [residual_depths, vocab, hidden] codec tables")
+    total_depths = codec_tables.shape[0]
+    if not 1 <= depth <= total_depths:
+        raise ValueError(
+            f"invalid residual depth {depth}, expected 1..{total_depths}"
+        )
+    if code.ndim != 1 or code.shape[0] != 1 or code.dtype != torch.long:
+        raise ValueError("K2 P0 expects a single int64 code ID")
+    if projected_tables is not None and (
+        projected_tables.ndim != 3
+        or projected_tables.shape[0] != total_depths - 1
+    ):
+        raise ValueError(
+            "Omni projected tables must have exactly one fewer depth than "
+            f"codec tables: {total_depths - 1} projected vs {total_depths} residual"
+        )
+    raw = F.embedding(code, codec_tables[depth - 1]).to(dtype=accumulation_dtype)
+    if projected_tables is not None and depth <= projected_tables.shape[0]:
+        # Existing production fast path; no projection GEMM.
+        projected = F.embedding(
+            code, projected_tables[depth - 1]
+        ).unsqueeze(1)
+    else:
+        # Last depth (or models without preprojected embeddings):
+        # never index projected_tables[total_depths-1].
+        projected = project_input(raw.unsqueeze(1).to(dtype=predictor_dtype))
+    return raw, projected.contiguous()
+
+
 def speculative_k2(
     model: "Qwen3TTSTalker",
     layer0_codes: torch.Tensor,
@@ -198,13 +249,15 @@ def speculative_k2(
         ).clone()
 
     def embedding_for_code(depth: int, code: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        # depth indexes the residual code (1..15). Its embedding table is depth-1.
-        raw = F.embedding(code, codec_tables[depth - 1]).to(dtype=pos_summed.dtype)
-        if projected_tables is not None:
-            projected = F.embedding(code, projected_tables[depth - 1]).unsqueeze(1)
-        else:
-            projected = model.code_predictor.project_input(raw.unsqueeze(1).to(dtype=dtype))
-        return raw, projected.contiguous()
+        return embed_residual_code(
+            depth=depth,
+            code=code,
+            codec_tables=codec_tables,
+            projected_tables=projected_tables,
+            project_input=model.code_predictor.project_input,
+            accumulation_dtype=pos_summed.dtype,
+            predictor_dtype=dtype,
+        )
 
     def commit(depth: int, code: torch.Tensor) -> torch.Tensor:
         raw, projected = embedding_for_code(depth, code)
