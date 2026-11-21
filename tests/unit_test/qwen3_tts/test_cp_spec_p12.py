@@ -73,6 +73,32 @@ def test_p12_selector_has_no_cpu_sync_in_device_kernels():
     assert "pending" in source
 
 
+def test_p12_selector_tie_no_selection_keeps_cost_but_never_passes():
+    stages = {
+        name: {
+            "status": "P12A_TIE_OR_DISTRIBUTION_MISMATCH_NO_SELECTION",
+            "selection_eligible": False,
+            "selected_ids_match": False,
+            "probability_match": False,
+            "fixed_uniform_draws": [0.125, 0.625, 0.995, 0.333],
+            "times_ms": {
+                "torch_topk_reference": [.05] * 4,
+                "triton_single_top50": [.02] * 4,
+            },
+        }
+        for name in ("q_before_verifier", "p_after_verifier")
+    }
+    row = {
+        "schema": "qwen3tts-cpspec-p12a-causal-stage-single-distribution-top50-v1",
+        "status": "P12A_CAUSAL_REAL_Q_PRE_AND_P_POST_NO_SELECTION_TIE_OR_DRAW_MISMATCH",
+        "selection_eligible": False, "stages": stages,
+    }
+    assert validate_probe(row, mode="selector") is False
+    row["selection_eligible"] = True
+    with pytest.raises(ValueError, match="inconsistent"):
+        validate_probe(row, mode="selector")
+
+
 def test_p12_report_gates_refuse_false_component_pass():
     good = {
         "schema": "qwen3tts-cpspec-p12b-real-target-ar-vs-packed-verifier-cost-v1",
