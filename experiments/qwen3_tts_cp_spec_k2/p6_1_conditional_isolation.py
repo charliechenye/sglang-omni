@@ -216,6 +216,40 @@ def stage_main(stage: str, stage_dir: Path) -> int:
                     raise AssertionError(
                         f"graph replay was not dynamic or correct: {report['cases'][-1]}"
                     )
+            # The same dynamic graph should have different execution work for
+            # different on-device loop trip counts. Event timings remain
+            # launch envelopes; this is only a control-flow overhead screen.
+            report["dynamic_replay_costs"] = []
+            for value in values:
+                if stage == "while_minimal":
+                    limit.fill_(value)
+                    iteration_count = value
+                else:
+                    state.copy_(torch.tensor(
+                        masks()[value], dtype=torch.bool, device=device
+                    ))
+                    iteration_count = cpu_depth_reference(masks()[value])["rounds"]
+                for _ in range(4):
+                    graph.replay()
+                torch.cuda.synchronize()
+                begin = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                import time
+
+                wall_start = time.perf_counter()
+                begin.record()
+                for _ in range(32):
+                    graph.replay()
+                end.record()
+                end.synchronize()
+                report["dynamic_replay_costs"].append({
+                    "mask": str(value),
+                    "device_rounds": iteration_count,
+                    "cuda_event_ms_per_graph": begin.elapsed_time(end) / 32,
+                    "host_wall_ms_per_graph": (
+                        (time.perf_counter() - wall_start) * 1000.0 / 32
+                    ),
+                })
         report["status"] = "PASS"
     except BaseException as exc:
         # Do NOT attempt another capture in this process: a CUDA error may
@@ -272,6 +306,9 @@ def coordinator(out: Path, timeout: int) -> int:
                 "first_error_type": stage_report.get("first_error_type"),
                 "first_error_message": stage_report.get("first_error_message"),
                 "cases": stage_report.get("cases", []),
+                "dynamic_replay_costs": stage_report.get(
+                    "dynamic_replay_costs", []
+                ),
             }
         except subprocess.TimeoutExpired:
             row = {
@@ -308,9 +345,24 @@ def coordinator(out: Path, timeout: int) -> int:
             f"| {stage['stage']} | {stage['status']} | "
             f"{stage['exit_code']} | {err} |"
         )
+    for row in result["stages"]:
+        if row.get("dynamic_replay_costs"):
+            lines += [
+                "", "## " + row["stage"] + " dynamic replay envelopes",
+                "",
+                "| GPU loop rounds | CUDA event ms/graph | Host wall ms/graph |",
+                "|---:|---:|---:|",
+            ]
+            for cost in row["dynamic_replay_costs"]:
+                lines.append(
+                    f"| {cost['device_rounds']} | "
+                    f"{cost['cuda_event_ms_per_graph']:.5f} | "
+                    f"{cost['host_wall_ms_per_graph']:.5f} |"
+                )
     lines += [
         "", "Each stage lives in a separate fresh CUDA process.",
-        "Read <stage>/traceback.txt for the full first exception and chain.",
+        "Read the stage traceback.txt for the full first exception and chain.",
+        "CUDA-event time measures launch-to-completion envelope, NOT kernel busy.",
         "", "## Non-claims", "",
     ] + ["- " + item for item in result["limitations"]]
     (out / "summary.md").write_text("\n".join(lines) + "\n")
