@@ -1,5 +1,37 @@
 # P10 H200 — single-graph GPU dynamic KV & sparse fused speculation sampler
 
+**P10B H200 compilation fix:** The initial sparse kernel failed to compile
+with `NameError('proposed_rank is not defined')`. This was a stale rank
+lookup left after changing proposal sampling to the vocab-ID-ordered CDF.
+The kernel now uses `tl.sum(tl.where(valid & (qi == draft), q, 0.0))`
+to look up q of the selected vocabulary token. The source test
+`test_p10b_qx_uses_vocab_id_after_sparse_cdf_refactor` guards against
+the old undefined rank. **This code fix is not yet H200-validated.**
+
+Run this *before* starting either live P10 probe:
+
+~~~bash
+cd ~/sglang-omni
+git fetch charlie-fork
+git switch experiment/qwen3-tts-codepredictor-spec-k2-p0
+git merge --ff-only \
+  charlie-fork/experiment/qwen3-tts-codepredictor-spec-k2-p0
+python -m pytest -q tests/unit_test/qwen3_tts/test_cp_spec_p10b.py \
+  -k 'test_p10b_qx_uses_vocab_id_after_sparse_cdf_refactor'
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
+  tests/unit_test/qwen3_tts/test_cp_spec_p10b.py \
+  -k 'test_p10b_h200_real_vocab_probabilities_and_deterministic_draws' -s -x
+~~~
+
+If the fixed kernel compiles but fails p/q or deterministic draw parity,
+keep the 1e-6 tolerance and inspect the failing case; DO NOT proceed
+to timing or HTTP until numerical correctness passes. For the final
+source-locked P10A+P10B budget, both live probes must be collected
+from this SAME updated source SHA; do not mix prior P10A results with
+post-fix P10B evidence.
+
+
+
 **Goal:** two *real-checkpoint* cost/accuracy gates after P9 component
 budget rejected naive nested four-way CUDA conditional route:
 P9 real model branch-extrapolation ~2.000ms/frame, P9 Torch-op dense
