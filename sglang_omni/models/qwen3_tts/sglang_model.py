@@ -1435,6 +1435,13 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 return speculative_k2(
                     self, layer0_codes, talker_hidden, semantic_positions
                 )
+        # P5 opt-in captures actual *existing* sampled Predictor graph replay
+        # without replacing or disabling the production graph implementation.
+        p5_start = None
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P5_DIR"):
+            from .code_predictor_spec_graph_cost import baseline_begin
+
+            p5_start = baseline_begin(self)
         graph_result = self.predictor_forward_graphed(
             layer0_codes,
             talker_hidden,
@@ -1442,9 +1449,17 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         )
         if graph_result is not None:
             self.predictor_graph_replay_count += 1
+            if p5_start is not None:
+                from .code_predictor_spec_graph_cost import baseline_end
+
+                baseline_end(self, p5_start, graph_replayed=True)
             return graph_result
         else:
             self.predictor_eager_count += 1
+        if p5_start is not None:
+            from .code_predictor_spec_graph_cost import baseline_end
+
+            baseline_end(self, p5_start, graph_replayed=False)
         result_codes, summed_embeddings = self.code_predictor_forward_incremental(
             layer0_codes=layer0_codes,
             talker_hidden=talker_hidden,
