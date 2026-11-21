@@ -149,8 +149,44 @@ def analyze(
                 f"P9A vs P9B fresh-process Graph ON baseline drift "
                 f"{baseline_drift_fraction:.1%} exceeds 10%; no cost selection"
             )
-    acceptance = validate_acceptance(
-        json.loads(acceptance_report.expanduser().resolve(strict=True).read_text())
+    cohort_path = acceptance_report.expanduser().resolve(strict=True)
+    cohort_raw = json.loads(cohort_path.read_text())
+    acceptance = validate_acceptance(cohort_raw)
+
+    # The original P2 -004 report may be lost after node cleanup. A checked-in,
+    # explicitly attributed historical count aggregate can support this cost
+    # *screen* only; it is NOT the lost per-frame trace or a new parity proof.
+    provenance = cohort_raw.get("provenance")
+    reconstructed = cohort_raw.get("schema") == (
+        "qwen3tts-cpspec-p2-conversation-reconstructed-aggregate-v1"
+    )
+    if reconstructed:
+        if (
+            cohort_raw.get("status") !=
+            "P2_RECONSTRUCTED_HISTORICAL_AGGREGATE_NOT_ORIGINAL_TRACE_OR_PARITY_EVIDENCE"
+            or not isinstance(provenance, dict)
+            or provenance.get("kind") !=
+            "reconstructed_from_user_shared_prior_p2_720_frame_aggregate_in_chat"
+            or provenance.get("is_original_report") is not False
+            or provenance.get("is_raw_trace") is not False
+            or sum(row.get("accepted", -1) for row in acceptance["depths"])
+            != acceptance["accepted"]
+            or sum(row.get("rejected", -1) for row in acceptance["depths"])
+            != acceptance["rejected"]
+            or sum(row.get("bonus_skipped_proposals", -1)
+                   for row in acceptance["depths"]) != acceptance["bonus"]
+            or any(
+                row["proposals"] + row["bonus_skipped_proposals"] != acceptance["frames"]
+                for row in acceptance["depths"]
+            )
+        ):
+            raise ValueError(
+                "Historical P2 reconstruction lacks provenance or fails per-depth census"
+            )
+    provenance_label = (
+        "RECONSTRUCTED_PRIOR_USER_REPORTED_AGGREGATE_NOT_RAW_FRAMES"
+        if reconstructed else
+        "SUPPLIED_P2_REPORT_SOURCE_NOT_RECONSTRUCTED"
     )
     avg_rounds = acceptance["proposals"] / acceptance["frames"]
     model_screen = overhead + avg_rounds * per_round
@@ -165,6 +201,9 @@ def analyze(
         "p9_source_sha": next(iter(sha_values)),
         "p5_baseline_sha": baseline.get("source_sha"),
         "p2_acceptance_sha": acceptance.get("source_sha"),
+        "p2_acceptance_provenance": provenance_label,
+        "p2_acceptance_reconstructed": reconstructed,
+        "p2_aggregate_input": str(cohort_path),
         "source_locked_p9_components": True,
         "gpu": a["gpu"],
         "real_predictor_layers": a["predictor_layers"],
@@ -198,6 +237,7 @@ def analyze(
             "Summing two graph launch envelopes can double-count or misrepresent shared control.",
             "The K2 initial pair, codebook heads, bonus, projected embedding and dynamic KV ownership are not included.",
             "P9A/P9B/P9 Graph ON baseline sources are matched; historical P2 acceptance cohort differs.",
+            "If P2 source is reconstructed, only reported aggregate counts are restored; original per-frame traces/parity proof do NOT exist in this input.",
             "Actual device RNG distribution is compared only to PyTorch p/q, not native Omni fused sampler.",
             "A positive screen justifies integration; only profiler-OFF full-HTTP Graph-ON ABBA can demonstrate speedup.",
             "A negative component screen is a stop signal for naive four-way branching, not a proof all kernels are hopeless.",
@@ -216,6 +256,8 @@ def write_report(out: Path, report: dict) -> Path:
         f"Source SHA: {report['p9_source_sha']}",
         f"Baseline SHA: {report['p5_baseline_sha']}",
         f"P2 acceptance SHA: {report['p2_acceptance_sha']}",
+        f"P2 acceptance provenance: {report['p2_acceptance_provenance']}",
+        f"P2 cohort reconstructed (not raw trace): {report['p2_acceptance_reconstructed']}",
         f"Real predictor layers: {report['real_predictor_layers']}",
         f"GPU: {report['gpu']}",
         "",
