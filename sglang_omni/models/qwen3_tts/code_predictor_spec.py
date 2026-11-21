@@ -332,11 +332,34 @@ def speculative_k2(
         # before consuming the most recent committed code.
         next_head = model.code_predictor.lm_head[depth]
         logits_draft, _ = next_head(h0)
+        # P12A: record the real q state BEFORE the sampled proposal and
+        # actual target verifier; do not mutate the live K2 proposal/RNG.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P12A_DIR"):
+            from .code_predictor_spec_p12a_selector import (
+                maybe_observe_q,
+            )
+            maybe_observe_q(
+                model, frame=frame_index, depth=depth + 1,
+                logits=logits_draft[:, -1, :],
+                temperature=t, top_k=k, top_p=p_cut,
+            )
         q = sampling_probs(logits_draft[:, -1, :], temperature=t, top_k=k, top_p=p_cut)
         proposal = torch.multinomial(q, 1, generator=generator).reshape(1)
         proposed += 1
         _, proposed_embedding = embedding_for_code(depth + 1, proposal)
 
+        # P12B: actual one-token target AR and two-token verifier
+        # under identical checkpoint/KV prefix, compared and restored.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P12B_TIMING_DIR"):
+            from .code_predictor_spec_p12b_timing import (
+                maybe_profile as p12b_probe,
+            )
+            p12b_probe(
+                model, frame=frame_index, depth=depth + 1,
+                cache_len=cache_len,
+                last_embedding=last_embedding,
+                proposed_embedding=proposed_embedding,
+            )
         # P10A: one optimized fused Predictor CUDA graph with a GPU scalar
         # controlling real cache slot/RoPE position/causal attention end.
         # Opt-in only: snapshot/restore all K/V and do not affect K2 RNG.
@@ -406,6 +429,18 @@ def speculative_k2(
         h_after_proposal = verified[:, 1:2, :].clone()
         logits_target, _ = next_head(h_after_committed)
         p = sampling_probs(logits_target[:, -1, :], temperature=t, top_k=k, top_p=p_cut)
+
+        # P12A matching p state is available ONLY after the real
+        # proposed-code verifier and target head. This gate refuses
+        # mismatched (frame,depth) source rather than an offline dual q/p
+        # microbench being mistaken for a causal optimization.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P12A_DIR"):
+            from .code_predictor_spec_p12a_selector import maybe_observe_p
+            maybe_observe_p(
+                model, frame=frame_index, depth=depth + 1,
+                logits=logits_target[:, -1, :],
+                temperature=t, top_k=k, top_p=p_cut,
+            )
 
         # P11A: profile two top-k GPU ops, post-topk Triton, graph RNG,
         # and the complete sparse graph on REAL target/draft p/q logits.
