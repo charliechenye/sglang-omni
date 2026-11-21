@@ -226,3 +226,90 @@ invented kernel regex.
 is understood, with an independent A/A noise floor and an untouched
 source-locked baseline. Do not use the 0.49676ms P15 last-case timing
 as a projected 14-depth speedup.
+
+
+## P16A postmortem — saved Nsight report does not map kernels to NVTX
+
+If the final audit raises
+\`P16A nsys NVTX-to-GPU-kernel mapping unavailable\`, **do not repeat**
+the H200 ABBA experiment yet. The original source-locked serving evidence
+remains valid: conditional two-round correctness and branch-by-branch
+CUDA-event costs are NOT invalidated by failure to attribute graph nodes
+in the *offline* trace report.
+
+NVIDIA defines \`nvtx_kern_sum\` by joining GPU kernel instances to the
+enclosing NVTX range through the CUDA API that launched the kernels.
+Nested CUDA Graph nodes may not be attributed by that report in every
+Nsight version. This failure can also mean a missing capture range,
+missing kernel data, or an unexpected CSV header. The error ALONE
+does not distinguish those cases.
+
+This repo includes a conservative offline postmortem which reuses the
+unchanged \`.nsys-rep\` and needs NO GPU or serving restart. Update your
+P16A branch first, but **do not require the new Git HEAD to match the old
+source SHA**: we source-lock the original worker using
+\`source.sha == smoke/report.json.source_sha ==
+two_round_probe.source_sha\`, plus PID and GPU.
+
+~~~bash
+cd ~/sglang-omni
+git pull --ff-only
+python -m pytest -q -x \
+  tests/unit_test/qwen3_tts/test_cp_spec_p16a_nsys_diagnose.py
+
+ROOT="$HOME/results/qwen3tts-cpspec-k2-p16a-001"
+
+# Run direct saved-report diagnosis. The output directory must not exist.
+python -m experiments.qwen3_tts_cp_spec_k2.p16a_nsys_diagnose \
+  --nsys-report "$ROOT/nsys/p16a.nsys-rep" \
+  --expected-pid 4131882 \
+  --out "$ROOT/nsys-postmortem-001"
+
+# Print only a compact, non-pretending diagnostic summary.
+python - "$ROOT/nsys-postmortem-001/diagnosis.json" <<'PY'
+import json, sys
+from pathlib import Path
+d = json.loads(Path(sys.argv[1]).read_text())
+sq = d.get("nsys_sqlite") or {}
+print("STATUS", d["status"])
+print("CLASSIFICATION", sq.get("classification"))
+for t in ("NVTX_EVENTS", "CUPTI_ACTIVITY_KIND_KERNEL",
+          "CUPTI_ACTIVITY_KIND_RUNTIME", "CUPTI_ACTIVITY_KIND_DRIVER",
+          "CUPTI_ACTIVITY_KIND_GRAPH_TRACE"):
+    print(t, (sq.get("table_census") or {}).get(t))
+print("P16A_NVTX_RANGES", sq.get("p16a_nvtx_ranges"))
+print("P16A_NVTX_PIDS", sq.get("p16a_nvtx_pid_census"))
+print("GRAPH_NODE_KERNEL_COUNT", sq.get("graph_node_kernel_count"))
+print("MARKER_NAMES", sq.get("physical_marker_kernel_names"))
+print("EXPORT_ERROR", d.get("sqlite_diagnostic_error"))
+PY
+~~~
+
+The postmortem retains raw \`nvtx_kern_sum\`, \`nvtx_sum\`,
+\`cuda_gpu_kern_sum\` and \`cuda_api_sum\` stdout/stderr, exported SQLite
+schema, GPU node counts and only *candidate* same-thread graph-launch
+correlations. It makes **NO physical bonus-head skip claim** and does not
+reinterpret a graph-level trace as node-level evidence.
+
+After the raw diagnosis clarifies why NVTX mapping is unavailable, we
+can implement a version-aware, source-verified graph-launch-correlation
+adapter if (and only if) the correct node/launch identities actually
+exist in this report. Otherwise keep P16A trace \`INCOMPLETE\`, and
+avoid additional profiler runs until the missing evidence is identified.
+
+### Interpretation of existing timing
+
+The H200 source \`48b04e686c029ee080a7076ed9b3e10ed5454ee5\`
+reported the conditional graph SLOWER than the always-compute control
+for **all four observed fixed-u branch classes**:
+
+| Branch | Conditional minus always-compute (ms) |
+|---|---:|
+| AA | +0.01771 |
+| AR | +0.01038 |
+| RA | +0.00988 |
+| RR | +0.00168 |
+
+This is a performance NO-GO **for the current two-round conditional-bonus
+implementation**, not proof that CUDA Graph conditional control flow
+can never help. No projection to serving or 14-depth is justified.
