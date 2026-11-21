@@ -228,12 +228,9 @@ def profile_stage(
     ))
     if not torch_probs_equal:
         raise RuntimeError("P12A reference topk+top-p output does not match P9B")
-    if not (ids_equal and probs_equal):
-        raise RuntimeError(
-            "P12A_TIE_ORDER_OR_PROBABILITY_MISMATCH "
-            f"ids_equal={ids_equal} full_prob_equal={probs_equal}; "
-            "no fast Topk speed selection"
-        )
+    mismatch = not (ids_equal and probs_equal)
+    draws_match = True
+    mismatched_draws = []
     for draw in DRAWS:
         u.fill_(draw)
         for graph, _ in graphs.values():
@@ -242,10 +239,11 @@ def profile_stage(
         got = int(graphs["triton_single_top50"][1][3].item())
         expect = int(graphs["torch_topk_reference"][1][3].item())
         if got != expect:
-            raise RuntimeError(
-                f"P12A_FIXED_UNIFORM_DRAW_MISMATCH u={draw} "
-                f"candidate={got} torch={expect}"
-            )
+            draws_match = False
+            mismatched_draws.append({
+                "uniform": draw, "candidate_token": got,
+                "torch_reference_token": expect,
+            })
 
     def measure(graph: torch.cuda.CUDAGraph):
         for _ in range(6):
@@ -274,16 +272,33 @@ def profile_stage(
     medians = {name: statistics.median(series) for name, series in measures.items()}
     if any(not math.isfinite(val) or val <= 0 for val in medians.values()):
         raise RuntimeError("P12A invalid measured graph time")
+    top_values = torch.topk(
+        copy.float() / temperature, K + 1, dim=-1, sorted=True
+    )[0][0].cpu().tolist()
+    tied_within_topk = sum(
+        top_values[i] == top_values[i + 1] for i in range(K - 1)
+    )
+    tied_at_boundary = top_values[K-1] == top_values[K]
+    exact = not mismatch and draws_match
     return {
-        "status": "P12A_SINGLE_DISTRIBUTION_TOP50_EXACT_MATCH_PASS",
+        "status": (
+            "P12A_SINGLE_DISTRIBUTION_TOP50_EXACT_MATCH_PASS"
+            if exact else
+            "P12A_TIE_OR_DISTRIBUTION_MISMATCH_NO_SELECTION"
+        ),
         "probability_match": probs_equal,
         "selected_ids_match": ids_equal,
+        "deterministic_draws_match": draws_match,
+        "mismatched_draws": mismatched_draws,
+        "tied_pairs_inside_top50": tied_within_topk,
+        "tie_at_top50_boundary": tied_at_boundary,
         "fixed_uniform_draws": list(DRAWS),
         "times_ms": measures,
         "median_ms": medians,
         "fast_over_reference_ratio": (
             medians["triton_single_top50"] / medians["torch_topk_reference"]
         ),
+        "selection_eligible": exact,
     }
 
 
@@ -339,7 +354,7 @@ def maybe_observe_p(
     try:
         result = {
             "schema": SCHEMA,
-            "status": "P12A_CAUSAL_REAL_Q_PRE_AND_P_POST_COMPONENT_GATE_PASS_NOT_FULL_K2",
+            "status": "P12A_NOT_YET_FINAL",
             "frame": frame, "depth": depth,
             "source_sha": os.environ.get(
                 "SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA", "UNATTESTED"
@@ -364,6 +379,16 @@ def maybe_observe_p(
                 "No live code/KV/RNG mutation; no serving throughput proof",
             ],
         }
+        exact = all(
+            row["selection_eligible"]
+            for row in result["stages"].values()
+        )
+        result["selection_eligible"] = exact
+        result["status"] = (
+            "P12A_CAUSAL_REAL_Q_PRE_AND_P_POST_COMPONENT_GATE_PASS_NOT_FULL_K2"
+            if exact else
+            "P12A_CAUSAL_REAL_Q_PRE_AND_P_POST_NO_SELECTION_TIE_OR_DRAW_MISMATCH"
+        )
     except BaseException:
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
         (root / f"failure_pid{os.getpid()}_depth{depth:02d}.txt").write_text(
