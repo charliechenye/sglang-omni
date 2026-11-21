@@ -293,6 +293,18 @@ def speculative_k2(
         proposed += 1
         _, proposed_embedding = embedding_for_code(depth + 1, proposal)
 
+        # P8 opt-in: nest the real two-offset Predictor IF inside one
+        # GPU-controlled WHILE. Compare all output/KV with an eager oracle
+        # and restore original K/V before continuing normal K2 sampling.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P8_DIR"):
+            from .code_predictor_spec_p8_nested import maybe_capture
+
+            maybe_capture(
+                model,
+                frame_index=frame_index,
+                proposal_depth=depth + 1,
+                token_embeds=torch.cat((last_embedding, proposed_embedding), dim=1),
+            )
         # P7 opt-in (not normal serving): capture one real model's 2-way GPU
         # conditional branch between fixed Predictor KV offsets 2 and 6.
         # It restores all active K/V, performs no token sampling, and never
