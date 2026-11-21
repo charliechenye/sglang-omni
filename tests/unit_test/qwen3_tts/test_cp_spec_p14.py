@@ -8,6 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from experiments.qwen3_tts_cp_spec_k2.p14_live_causal_round import (
+    validate_probe as validate_p14_live_probe,
+)
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p9b import cpu_reference
 from sglang_omni.models.qwen3_tts.code_predictor_spec import sampling_probs
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p14_causal_round import (
@@ -55,6 +58,61 @@ def test_p14_cpu_selected_proposal_and_acceptance_accounting():
     assert 25 <= accepted["draft"] < 50
     assert rejected["committed"] >= 25
     assert accepted["committed"] == accepted["draft"]
+
+
+def test_p14_cpu_source_locked_causal_report_gate():
+    sha = "a" * 40
+    cases = [{
+        "uniforms": list(u),
+        "q_p_bonus_distribution_parity": True,
+        "independent_bonus_sampling_parity": True,
+        "independent_embedding_sum_parity": True,
+        "target_hidden_parity": True,
+        "complete_kv_parity": True,
+        "committed_embedding_sum_parity": True,
+        "accepted": False,
+        "bonus_committed": False,
+        "draft": 7,
+        "committed": 15,
+        "accept_probability": .1,
+    } for u in TRIPLES]
+    med = {
+        "torch_reference": .250,
+        "triton_candidate": .210,
+        "triton_private_rng": .215,
+    }
+    row = {
+        "schema": SCHEMA,
+        "status": (
+            "P14_REAL_CAUSAL_ONE_ROUND_Q_VERIFIER_P_RESIDUAL_BONUS_"
+            "GPU_GRAPH_PARITY_PASS_NOT_14DEPTH_OR_E2E"
+        ),
+        "source_sha": sha, "pid": 77, "gpu": "NVIDIA H200",
+        "predictor_layers": 5,
+        "backend": "matched_fused_predictor_layers_static_offset",
+        "proposal_depth": 10, "cache_len_at_entry": 10,
+        "sampling": {"top_k": 50},
+        "captured_graph_count": 3,
+        "private_rng_replay_unique": True,
+        "fixed_uniform_cases": cases,
+        "median_cuda_graph_ms": med,
+        "cuda_event_ms_blocks": {k: [v] * 4 for k, v in med.items()},
+        "sampled_branch_count": {"accepted": 0, "rejected": 4},
+        "relative_fast_vs_torch": med["triton_candidate"] / med["torch_reference"],
+    }
+    validate_p14_live_probe(row, sha=sha, pid=77, gpu="NVIDIA H200")
+    broken = dict(row, source_sha="b" * 40)
+    with pytest.raises(ValueError, match="mixed-source"):
+        validate_p14_live_probe(broken, sha=sha, pid=77, gpu="NVIDIA H200")
+    invalid = dict(row, fixed_uniform_cases=[
+        dict(case, independent_bonus_sampling_parity=False)
+        for case in cases
+    ])
+    with pytest.raises(ValueError, match="correctness"):
+        validate_p14_live_probe(invalid, sha=sha, pid=77, gpu="NVIDIA H200")
+    no_rng = dict(row, private_rng_replay_unique=False)
+    with pytest.raises(ValueError, match="mixed-source"):
+        validate_p14_live_probe(no_rng, sha=sha, pid=77, gpu="NVIDIA H200")
 
 
 @pytest.mark.accelerator
