@@ -357,6 +357,7 @@ def _strict_close(name: str, a: torch.Tensor, b: torch.Tensor, *,
         )
 
 
+@torch.no_grad()
 def capture_real_causal_round(
     model, *,
     depth: int,
