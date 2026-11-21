@@ -144,7 +144,7 @@ def baseline_end(
 
 def _capture_fixed_graph(
     model: "Qwen3TTSTalker", embeds: torch.Tensor, cache_len: int
-) -> torch.cuda.CUDAGraph:
+) -> tuple[torch.cuda.CUDAGraph, torch.Tensor]:
     device = embeds.device
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream(device))
@@ -159,11 +159,13 @@ def _capture_fixed_graph(
     # Capture on the dedicated stream just as the existing predictor-graph
     # startup uses a capture stream; preserve the model's K/V afterwards.
     with torch.cuda.graph(captured, stream=stream), torch.inference_mode():
-        model.predictor_forward_tokens(
+        output = model.predictor_forward_tokens(
             token_embeds=embeds, batch_size=1, cache_len=cache_len
         )
     torch.cuda.synchronize(device)
-    return captured
+    # Keep outputs alive for the full graph replay lifetime, including
+    # any capture-private allocation owners.
+    return captured, output
 
 
 def _replay_ms(graph: torch.cuda.CUDAGraph, repeats: int) -> float:
@@ -226,10 +228,13 @@ def maybe_profile_packed(
         # write its own suffix; it must not depend on a prior capture's writes.
         k_cache[:, :1, :end].copy_(old_k)
         v_cache[:, :1, :end].copy_(old_v)
-        graph_one = _capture_fixed_graph(model, embed_one, cache_len)
+        graph_one, out_one = _capture_fixed_graph(model, embed_one, cache_len)
         k_cache[:, :1, :end].copy_(old_k)
         v_cache[:, :1, :end].copy_(old_v)
-        graph_two = _capture_fixed_graph(model, embed_pair, cache_len)
+        graph_two, out_two = _capture_fixed_graph(model, embed_pair, cache_len)
+        # Hold captured outputs for the entire replay window.
+        keep_alive = (out_one, out_two)
+        assert all(value.numel() > 0 for value in keep_alive)
         observations = []
         for name, graph in (
             ("graph1", graph_one), ("graph2", graph_two),
