@@ -194,7 +194,12 @@ def test_p14_h200_fake_model_one_graph_full_causal_and_kv_restored():
         "torch_reference", "triton_candidate", "triton_private_rng"
     }
     assert all(x > 0 for x in report["median_cuda_graph_ms"].values())
-    assert all(c["q_p_distribution_parity"] for c in report["fixed_uniform_cases"])
+    assert all(
+        c["q_p_bonus_distribution_parity"]
+        and c["independent_bonus_sampling_parity"]
+        and c["independent_embedding_sum_parity"]
+        for c in report["fixed_uniform_cases"]
+    )
     torch.testing.assert_close(
         model.predictor_k_cache, k0, atol=0, rtol=0
     )
