@@ -149,7 +149,17 @@ def analyze(
                 f"P9A vs P9B fresh-process Graph ON baseline drift "
                 f"{baseline_drift_fraction:.1%} exceeds 10%; no cost selection"
             )
-    cohort_path = acceptance_report.expanduser().resolve(strict=True)
+    try:
+        cohort_path = acceptance_report.expanduser().resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"P2 acceptance report missing: {acceptance_report}. "
+            "If the old p2-report-004 directory was lost, explicitly use "
+            "--p2-acceptance-report "
+            "experiments/qwen3_tts_cp_spec_k2/data/"
+            "p2_720_historical_aggregate_reconstructed.json "
+            "(prior reported counts only, not original per-frame evidence)."
+        ) from exc
     cohort_raw = json.loads(cohort_path.read_text())
     acceptance = validate_acceptance(cohort_raw)
 
