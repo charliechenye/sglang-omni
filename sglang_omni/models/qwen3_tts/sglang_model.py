@@ -1435,10 +1435,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 return speculative_k2(
                     self, layer0_codes, talker_hidden, semantic_positions
                 )
-        # P5 opt-in captures actual *existing* sampled Predictor graph replay
-        # without replacing or disabling the production graph implementation.
+        # P5/P9 opt-in measures the *existing* sampled full Predictor
+        # CUDA Graph replay. P9A uses a separate ARM marker for this
+        # baseline in the same worker/source/GPU as its K2 probe.
         p5_start = None
-        if os.environ.get("SGLANG_OMNI_QTTS_CP_P5_DIR"):
+        if (
+            os.environ.get("SGLANG_OMNI_QTTS_CP_P5_DIR")
+            or os.environ.get("SGLANG_OMNI_QTTS_CP_P9_BASE_DIR")
+        ):
             from .code_predictor_spec_graph_cost import baseline_begin
 
             p5_start = baseline_begin(self)
