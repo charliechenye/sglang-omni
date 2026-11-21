@@ -23,6 +23,48 @@ def test_p7_compare_nonempty_cpu_tensors() -> None:
 
 
 @pytest.mark.accelerator
+def test_p7_h200_basic_conditional_cuda_graph_selector_changes_output():
+    """Distinguish PyTorch cond-node selection from Predictor state corruption."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires H200/CUDA")
+    from torch._higher_order_ops.cond import cond_op
+    from torch._higher_order_ops.cudagraph_conditional_nodes import (
+        CUDAGraphCaptureControlFlowOpDispatchMode,
+    )
+
+    device = torch.device("cuda")
+    selector = torch.ones((), device=device, dtype=torch.bool)
+    data = torch.tensor([3], device=device, dtype=torch.int64)
+    side = torch.cuda.Stream(device=device)
+    side.wait_stream(torch.cuda.current_stream(device))
+
+    def left(x):
+        return x + 11
+
+    def right(x):
+        return x + 22
+
+    with torch.inference_mode():
+        left(data)
+        right(data)
+    graph = torch.cuda.CUDAGraph()
+    with (
+        torch.cuda.graph(
+            graph, stream=side, capture_error_mode="thread_local"
+        ),
+        CUDAGraphCaptureControlFlowOpDispatchMode(),
+        torch.inference_mode(),
+    ):
+        output = cond_op(selector, left, right, (data,))
+
+    for chosen, expected in ((True, 14), (False, 25), (True, 14)):
+        selector.fill_(chosen)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert output.item() == expected
+
+
+@pytest.mark.accelerator
 def test_p7_h200_real_predictor_conditional_offsets_and_kv_restore(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("requires real H200/CUDA")
