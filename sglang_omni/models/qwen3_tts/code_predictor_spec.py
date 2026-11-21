@@ -624,6 +624,9 @@ def speculative_k2(
                 frame=count, ar_through=ar_through,
                 ar=ar_depths, proposed=proposed_depths,
                 accepted=accepted_depths, bonus=bonus_depths,
+                source_sha=os.environ.get(
+                    "SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA", "UNATTESTED"
+                ),
             ),
         )
     if os.environ.get("SGLANG_OMNI_QTTS_CP_K2_HYBRID_ARM_FILE"):
