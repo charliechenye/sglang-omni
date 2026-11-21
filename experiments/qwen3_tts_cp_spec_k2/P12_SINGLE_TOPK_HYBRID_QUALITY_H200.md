@@ -27,8 +27,9 @@ CUDA Graphs for two alternative ONE-DISTRIBUTION selectors:
 
 - exact-reference Torch float32/topk(50)/softmax/top-p plus one Triton
   sparse vocab-ID-order inverse-CDF draw, and
-- one experimental Triton CTA doing a full 2048-score unsigned-packed
-  descending sort, top-50, sparse probabilities, top-p and sampled ID.
+- one experimental Triton CTA doing a packed-score/ID **partial top-64**
+  selection with Triton `tl.topk` (power-of-two requirement), exporting
+  exactly top-50 probabilities, top-p and a sampled ID.
 
 Both sides use the SAME frozen on-policy q or p, same seed-independent
 fixed uniform draws and matched worker. The selector does NOT replace
