@@ -112,6 +112,11 @@ def test_cpu_analyzer_does_not_double_count_bonus_or_unverified_parity(tmp_path:
         "target_parity": {"pass": True, "executed": False, "checks": []},
     }
     write_trace(folder, 1, row)
+    with pytest.raises(RuntimeError, match="insufficient fully-verified"):
+        analyze(
+            folder, expect_source_sha="1" * 40,
+            min_frames=1, min_parity_frames=1,
+        )
     result = analyze(folder, expect_source_sha="1" * 40, min_frames=1)
     assert result["frames"] == 1
     assert result["parity_checked_frames"] == 0
