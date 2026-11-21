@@ -101,7 +101,11 @@ def sparse_accept_residual_kernel(
     draft = tl.where(
         draft == 2147483647, tl.max(tl.where(valid, qi, 0), axis=0), draft
     )
-    qx = tl.sum(tl.where(r == proposed_rank, q, 0.0), axis=0)
+    # The draft is now selected by vocabulary token ID (not top-k rank).
+    # Gather q(x) from q's sparse support using that same token ID.
+    # Using the removed 'proposed_rank' from the old rank-CDF path made
+    # this kernel fail Triton compilation on H200.
+    qx = tl.sum(tl.where(valid & (qi == draft), q, 0.0), axis=0)
     px = tl.sum(tl.where(pi == draft, p, 0.0), axis=0)
     probability = tl.minimum(1.0, px / tl.maximum(qx, 1.0e-20))
     accepted = u_accept < probability
