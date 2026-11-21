@@ -274,12 +274,14 @@ def write(out: Path, report: dict) -> Path:
         "|---:|---|---:|---:|---:|---:|---:|---|",
     ]
     for row in report["seed_comparison"]:
+        wer_label = (
+            f"{row['wer']:.2%}" if row["wer"] is not None else "NOT_MEASURED"
+        )
         lines.append(
             f"| {row['seed']} | {row['mode']} | {row['duration_s']:.3f} | "
             f"{row['duration_delta_vs_native_pct']:+.1f}% | "
             f"{row['silence_fraction']:.1%} | {row['trailing_silence_s']:.2f}s | "
-            f"{(f'{row['wer']:.2%}' if row['wer'] is not None else 'NOT_MEASURED')} | "
-            f"{row['flag_duration_gt_20pct']} |"
+            f"{wer_label} | {row['flag_duration_gt_20pct']} |"
         )
     lines.extend(["", "## Limits", ""] + [
         "- " + x for x in report["limits"]
