@@ -64,7 +64,7 @@ def test_p12_selector_has_no_cpu_sync_in_device_kernels():
         src = inspect.getsource(fn)
         assert ".item(" not in src
         assert "torch.multinomial" not in src
-    assert "tl.sort(" in inspect.getsource(mod.single_top50_kernel.fn)
+    assert "tl.topk(" in inspect.getsource(mod.single_top50_kernel.fn)
     # Two source-specific hook points prevent a simultaneous p/q
     # dual-topk micrograph from being mistaken for actual causal path.
     source = inspect.getsource(mod.maybe_observe_q)
