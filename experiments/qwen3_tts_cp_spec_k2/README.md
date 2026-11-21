@@ -288,6 +288,7 @@ python experiments/qwen3_tts_cp_spec_k2/quality_smoke.py \
 python -m experiments.qwen3_tts_cp_spec_k2.analyze_depth_trace \
   --frames-dir "$HOME/results/qwen3tts-cpspec-k2-p1-003/frames" \
   --expect-source-sha "$(git rev-parse HEAD)" --min-frames 16 \
+  --min-parity-frames 4 \
   --out "$HOME/results/qwen3tts-cpspec-k2-p1-report-003"
 
 cat "$HOME/results/qwen3tts-cpspec-k2-p1-report-003/summary.md"
@@ -344,6 +345,7 @@ python -m experiments.qwen3_tts_cp_spec_k2.quality_ab generate \
 python -m experiments.qwen3_tts_cp_spec_k2.analyze_depth_trace \
   --frames-dir "$HOME/results/qwen3tts-cpspec-k2-p2-004/frames" \
   --expect-source-sha "$(git rev-parse HEAD)" --min-frames 16 \
+  --min-parity-frames 4 \
   --out "$HOME/results/qwen3tts-cpspec-k2-p2-report-004"
 
 cat "$HOME/results/qwen3tts-cpspec-k2-p2-report-004/summary.md"
@@ -358,6 +360,10 @@ it is NOT a confidence interval or independent corpus study.
 
 ### P3. ASR-based WER/CER only (run after finishing TTS)
 
+Set `ASR_MODEL` in the score terminal to the actual running ASR model ID.
+The score command requires it, and an unconfigured ASR server cannot produce
+a quality result.
+
 You can run the TTS generation on a single H200; after it finishes, stop
 that server and start **a separate supported ASR deployment** (Qwen3-ASR or
 an already existing OpenAI-compatible ASR endpoint) on any accessible
@@ -369,12 +375,13 @@ cd ~/sglang-omni
 python -m experiments.qwen3_tts_cp_spec_k2.quality_ab score \
   --report "$HOME/results/qwen3tts-cpspec-k2-p3-quality-004/report.json" \
   --asr-base-url http://127.0.0.1:8001 \
-  --asr-model <YOUR_RUNNING_ASR_MODEL_ID>
+  --asr-model "$ASR_MODEL"
 cat "$HOME/results/qwen3tts-cpspec-k2-p3-quality-004/asr_quality.json"
 ~~~
 
-Replace the example ASR model ID with the exact model running on the ASR
-endpoint (no model is assumed to be installed). The scorer uses
+Set `ASR_MODEL` to the exact model ID served by the already running ASR
+endpoint before invoking the score command (no ASR model is assumed to be
+installed). The scorer uses
 /v1/audio/transcriptions with a WAV upload and computes EN WER / ZH
 character error rate. These scores assess intelligibility only.
 **Speaker similarity, MOS, audio naturalness and statistical distribution
