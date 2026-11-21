@@ -40,6 +40,7 @@ PHASES = ("base", "spec", "spec", "base")
 K2_LOG_RE = re.compile(
     r"QTTS_CP_SPEC_K2 frame=(\d+) rounds=(\d+) proposed=(\d+) "
     r"accepted=(\d+) bonus=(\d+) rejected=(\d+) committed_residual=(\d+)"
+    r"(?: ar_steps=(\d+) ar_through=(\d+))?"
 )
 
 
@@ -103,16 +104,25 @@ def parse_k2_log_entries(s: str) -> list[dict[str, int]]:
     """Count only K2 frames and reject malformed impossible counter values."""
     parsed = []
     for m in K2_LOG_RE.finditer(s):
-        frame, rounds, proposed, accepted, bonus, rejected, committed = map(int, m.groups())
+        frame, rounds, proposed, accepted, bonus, rejected, committed = map(
+            int, m.groups()[:7]
+        )
+        ar_steps = int(m.group(8)) if m.group(8) is not None else 0
+        ar_through = int(m.group(9)) if m.group(9) is not None else 1
         if (
             rounds < 1
             or proposed < 1
+            or rounds != proposed
             or accepted < 0
             or rejected < 0
             or bonus < 0
+            or ar_steps not in (0, 1, 2)
+            or ar_through not in (1, 2, 3)
+            or (ar_through == 1 and ar_steps != 0)
+            or (ar_steps > 0 and ar_steps != ar_through - 1)
             or committed != 15
             or accepted + rejected != proposed
-            or accepted + bonus + rejected != committed - 1
+            or accepted + bonus + rejected + ar_steps != committed - 1
         ):
             raise ValueError(
                 "K2 frame counters inconsistent; cannot trust candidate activation"
@@ -125,6 +135,8 @@ def parse_k2_log_entries(s: str) -> list[dict[str, int]]:
             "bonus": bonus,
             "rejected": rejected,
             "committed_residual": committed,
+            "ar_steps": ar_steps,
+            "ar_through": ar_through,
         })
     return parsed
 
