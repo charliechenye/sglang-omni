@@ -338,6 +338,20 @@ def speculative_k2(
                 )
                 diag.assert_diagnostic_parity(parity)
 
+        # P5: independently capture individual 1-row / packed 2-row stack
+        # CUDA graphs on selected on-policy states, preserving the original
+        # cache and all sampled/accepted tokens. No claim of full K2 speedup.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P5_DIR"):
+            from .code_predictor_spec_graph_cost import maybe_profile_packed
+
+            maybe_profile_packed(
+                model,
+                frame=frame_index,
+                depth=depth,
+                cache_len=cache_len,
+                last_embedding=last_embedding,
+                proposed_embedding=proposed_embedding,
+            )
         # Experimental P4: measure identical real-checkpoint fixed-KV cells,
         # WITHOUT consuming this request's sampler RNG. Off unless explicitly
         # configured. Do not enable P1 parity diagnostics in this server.
