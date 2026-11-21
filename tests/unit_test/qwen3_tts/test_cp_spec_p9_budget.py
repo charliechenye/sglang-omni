@@ -16,6 +16,12 @@ from sglang_omni.models.qwen3_tts.code_predictor_spec_p9a import (
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p9b import (
     SCHEMA as B_SCHEMA,
 )
+from experiments.qwen3_tts_cp_spec_k2.p4_cost_screen import validate_acceptance
+
+RECOVERED_P2 = (
+    Path(__file__).resolve().parents[3]
+    / "experiments/qwen3_tts_cp_spec_k2/data/p2_720_historical_aggregate_reconstructed.json"
+)
 
 
 def make_evidence(root: Path, *, sampler: float = 0.02, slope: float = 0.08):
@@ -137,3 +143,55 @@ def test_budget_rejects_missing_real_checkpoint_evidence(tmp_path):
     a_file.write_text(json.dumps(row))
     with pytest.raises(RuntimeError, match="missing/mixed"):
         analyze(a,b,base,p2)
+
+
+def test_historical_p2_720_aggregate_recovers_only_reported_counts():
+    """No synthetic per-frame parity proof: preserve exact historical census."""
+    raw = json.loads(RECOVERED_P2.read_text())
+    result = validate_acceptance(raw)
+    assert raw["provenance"]["is_original_report"] is False
+    assert raw["provenance"]["is_raw_trace"] is False
+    assert raw["source_sha"] == "398297b1d4d2a44d10d1056da5607a7d4ac08e41"
+    assert result["frames"] == 720
+    assert result["proposals"] == 6974
+    assert result["accepted"] == 3420
+    assert result["rejected"] == 3554
+    assert result["bonus"] == 3106
+    assert result["codes_per_round"] == pytest.approx(10080 / 6974)
+    assert sum(row["accepted"] for row in result["depths"]) == 3420
+    assert sum(row["rejected"] for row in result["depths"]) == 3554
+    assert sum(row["bonus_skipped_proposals"] for row in result["depths"]) == 3106
+    assert all(
+        row["proposals"] + row["bonus_skipped_proposals"] == 720
+        for row in result["depths"]
+    )
+
+
+def test_p9_budget_explicitly_identifies_reconstructed_p2_provenance(tmp_path):
+    a, b, base, _ = make_evidence(tmp_path)
+    report = analyze(a, b, base, RECOVERED_P2)
+    assert report["p2_acceptance_reconstructed"] is True
+    assert report["p2_acceptance_provenance"] == (
+        "RECONSTRUCTED_PRIOR_USER_REPORTED_AGGREGATE_NOT_RAW_FRAMES"
+    )
+    assert report["historical_accepted_proposals_per_frame"] == pytest.approx(6974 / 720)
+    assert report["p2_acceptance_sha"] != report["p9_source_sha"]
+    markdown = write_report(tmp_path / "reconstructed_report", report).read_text()
+    assert "RECONSTRUCTED_PRIOR_USER_REPORTED_AGGREGATE_NOT_RAW_FRAMES" in markdown
+    assert "original per-frame traces/parity proof do NOT exist" in markdown
+
+
+def test_p9_rejects_corrupted_historical_aggregate(tmp_path):
+    a, b, base, _ = make_evidence(tmp_path)
+    broken = json.loads(RECOVERED_P2.read_text())
+    broken["depths"][0]["accepted"] += 1
+    wrong = tmp_path / "broken.json"
+    wrong.write_text(json.dumps(broken))
+    with pytest.raises(ValueError, match="Historical P2 reconstruction"):
+        analyze(a, b, base, wrong)
+
+    broken = json.loads(RECOVERED_P2.read_text())
+    broken["provenance"]["is_raw_trace"] = True
+    wrong.write_text(json.dumps(broken))
+    with pytest.raises(ValueError, match="Historical P2 reconstruction"):
+        analyze(a, b, base, wrong)
