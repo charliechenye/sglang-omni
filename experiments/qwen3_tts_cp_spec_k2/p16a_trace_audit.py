@@ -335,15 +335,37 @@ def main():
             "P16A nsys NVTX kernel summary unavailable; "
             "no CPU-only or graph-level fallback"
         ) from exc
-    grouped = parse_nvtx_kernel_csv(
-        proc.stdout, expected_pid=result["pid"],
-    )
+    try:
+        grouped = parse_nvtx_kernel_csv(
+            proc.stdout, expected_pid=result["pid"],
+        )
+    except ValueError as exc:
+        # A valid .nsys-rep is not proof that GPU graph nodes can be joined
+        # to NVTX host ranges. Preserve raw reports, SQLite table census and
+        # exact PID/source evidence on failure without recapturing the GPU.
+        from experiments.qwen3_tts_cp_spec_k2.p16a_nsys_diagnose import diagnose
+
+        diagnostic = diagnose(
+            report_file, args.out, expected_pid=result["pid"],
+        )
+        classification = (
+            diagnostic.get("nsys_sqlite") or {}
+        ).get("classification", diagnostic["status"])
+        raise SystemExit(
+            f"P16A_NSYS_MAPPING_INCOMPLETE: {classification}; "
+            f"inspect {args.out/'diagnosis.json'}; "
+            "no physical LM-head skip claim"
+        ) from exc
     audit = audit_report(
         result, grouped, head_regex=args.bonus_head_regex,
     )
     audit["nsys_report_sha256"] = _sha256(report_file)
     audit["nsys_version"] = subprocess.check_output(
         ["nsys", "--version"], text=True,
+    ).strip()
+    # Source lock is for the ORIGINAL worker, not the offline analyzer build.
+    audit["analysis_code_sha"] = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], text=True,
     ).strip()
     args.out.mkdir(parents=True, exist_ok=False)
     (args.out / "nvtx_kern_sum.csv").write_text(proc.stdout)
