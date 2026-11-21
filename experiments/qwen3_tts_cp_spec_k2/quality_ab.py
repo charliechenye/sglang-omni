@@ -16,7 +16,6 @@ import argparse
 import hashlib
 import json
 import re
-import time
 import unicodedata
 import urllib.error
 import urllib.request
