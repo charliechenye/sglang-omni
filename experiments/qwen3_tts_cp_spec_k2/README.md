@@ -372,6 +372,7 @@ Score the audio generated above (no need to generate it again):
 
 ~~~bash
 cd ~/sglang-omni
+: "${ASR_MODEL:?export ASR_MODEL to the actual served ASR model ID}"
 python -m experiments.qwen3_tts_cp_spec_k2.quality_ab score \
   --report "$HOME/results/qwen3tts-cpspec-k2-p3-quality-004/report.json" \
   --asr-base-url http://127.0.0.1:8001 \
