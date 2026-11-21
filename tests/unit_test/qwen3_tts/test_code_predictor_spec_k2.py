@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import sglang_omni.models.qwen3_tts.sglang_model as model_module
 from sglang_omni.models.qwen3_tts.code_predictor_spec import (
     accept_or_residual,
+    embed_residual_code,
     offset_causal_mask,
     overlap_probability,
     sampling_probs,
@@ -71,6 +72,70 @@ def test_reject_residual_returns_target_marginal_not_q_marginal() -> None:
     for _ in range(10):
         selected, accepted = accept_or_residual(torch.tensor([1]), same, same, g)
         assert accepted and selected.item() == 1
+
+
+def test_full_16_group_last_codec_depth_uses_fallback_projection() -> None:
+    """Regression for HTTP 500: depth 15 cannot index 14 projected rows."""
+    torch.manual_seed(20261121)
+    total_residual_depths = 15  # num_code_groups=16
+    vocab, codec_hidden, predictor_hidden = 8, 4, 6
+    tables = torch.randn(total_residual_depths, vocab, codec_hidden)
+    projection = torch.nn.Linear(codec_hidden, predictor_hidden, bias=True)
+    with torch.no_grad():
+        preprojected = projection(tables[:-1]).detach().clone()
+    assert tables.shape[0] == 15
+    assert preprojected.shape[0] == 14
+
+    code = torch.tensor([3], dtype=torch.long)
+    raw14, projected14 = embed_residual_code(
+        depth=14, code=code, codec_tables=tables,
+        projected_tables=preprojected, project_input=projection,
+        accumulation_dtype=torch.float32, predictor_dtype=torch.float32,
+    )
+    torch.testing.assert_close(raw14, tables[13, 3].unsqueeze(0))
+    torch.testing.assert_close(
+        projected14, preprojected[13, 3].reshape(1, 1, predictor_hidden)
+    )
+
+    # First previously crashing path: proposal for final residual code.
+    # Second previously crashing path: the same last code was committed.
+    for _ in range(2):
+        raw15, projected15 = embed_residual_code(
+            depth=15, code=code, codec_tables=tables,
+            projected_tables=preprojected, project_input=projection,
+            accumulation_dtype=torch.float32, predictor_dtype=torch.float32,
+        )
+        torch.testing.assert_close(raw15, tables[14, 3].unsqueeze(0))
+        torch.testing.assert_close(
+            projected15, projection(raw15.unsqueeze(1))
+        )
+        assert projected15.shape == (1, 1, predictor_hidden)
+
+    with pytest.raises(ValueError, match="invalid residual depth"):
+        embed_residual_code(
+            depth=16, code=code, codec_tables=tables,
+            projected_tables=preprojected, project_input=projection,
+            accumulation_dtype=torch.float32, predictor_dtype=torch.float32,
+        )
+    with pytest.raises(ValueError, match="exactly one fewer depth"):
+        embed_residual_code(
+            depth=15, code=code, codec_tables=tables,
+            projected_tables=torch.zeros(15, vocab, predictor_hidden),
+            project_input=projection,
+            accumulation_dtype=torch.float32, predictor_dtype=torch.float32,
+        )
+
+
+def test_embedding_last_depth_without_preprojected_tables() -> None:
+    tables = torch.arange(15 * 8 * 4).float().view(15, 8, 4) / 100
+    projection = torch.nn.Identity()
+    raw, projected = embed_residual_code(
+        depth=15, code=torch.tensor([7]), codec_tables=tables,
+        projected_tables=None, project_input=projection,
+        accumulation_dtype=torch.float32, predictor_dtype=torch.float32,
+    )
+    torch.testing.assert_close(raw, tables[14, 7][None])
+    torch.testing.assert_close(projected, raw[:, None])
 
 
 @pytest.fixture
