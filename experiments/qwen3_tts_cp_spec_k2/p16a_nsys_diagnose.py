@@ -241,7 +241,11 @@ def diagnose(report: Path, out: Path, *, expected_pid: int | None = None):
     ])
     (out / "export.stdout.txt").write_text(exported["stdout"])
     (out / "export.stderr.txt").write_text(exported["stderr"])
-    trace_sha = hashlib.sha256(report.read_bytes()).hexdigest()
+    hasher = hashlib.sha256()
+    with report.open("rb") as stream:
+        for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
+            hasher.update(block)
+    trace_sha = hasher.hexdigest()
     payload = {
         "status": "P16A_NSYS_POSTMORTEM_DIAGNOSTIC_ONLY",
         "source_report": str(report),
@@ -253,9 +257,13 @@ def diagnose(report: Path, out: Path, *, expected_pid: int | None = None):
         "nsys_sqlite": None,
     }
     if exported["returncode"] == 0 and sqlite_out.is_file():
-        payload["nsys_sqlite"] = describe_sqlite(
-            sqlite_out, expected_pid=expected_pid,
-        )
+        try:
+            payload["nsys_sqlite"] = describe_sqlite(
+                sqlite_out, expected_pid=expected_pid,
+            )
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            payload["status"] = "P16A_NSYS_SQLITE_SCHEMA_UNSUPPORTED"
+            payload["sqlite_diagnostic_error"] = repr(exc)
     else:
         payload["status"] = "P16A_NSYS_SQLITE_EXPORT_UNAVAILABLE"
     (out / "diagnosis.json").write_text(json.dumps(payload, indent=2) + "\n")
