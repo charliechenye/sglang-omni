@@ -16,6 +16,7 @@ import torch
 from experiments.qwen3_tts_cp_spec_k2.p12_quality_audit import (
     analyze as analyze_quality, edit_distance, tokenize,
     transcript_features, waveform_features,
+    wav_24k_pcm16_to_whisper_16k_array,
 )
 from experiments.qwen3_tts_cp_spec_k2.p12_live_probe import validate_probe
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p12a_selector import (
@@ -54,6 +55,38 @@ def test_p12_wav_integrity_rms_trailing_silence(tmp_path):
     assert result["trailing_silence_s"] == pytest.approx(.1)
     with pytest.raises(ValueError, match="WAV SHA mismatch"):
         waveform_features(dest, "0"*64)
+
+
+def test_p12_asr_pcm_array_bypasses_pyav_19_decoder(tmp_path):
+    # Only the optional isolated-ASR mode needs SciPy. This provides
+    # a regression for the PyAV 19 metadata_errors API removal:
+    # faster-whisper accepts float32 16k NumPy audio directly,
+    # without entering faster_whisper.audio.decode_audio/av.open.
+    import numpy as np
+
+    pytest.importorskip("scipy.signal")
+    path = tmp_path / "sample24k.wav"
+    sample_rate = 24000
+    t = np.arange(sample_rate, dtype=np.float32) / sample_rate
+    sine = (np.sin(2 * np.pi * 440 * t) * 12000).astype("<i2")
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(sample_rate)
+        wav.writeframes(sine.tobytes())
+
+    result = wav_24k_pcm16_to_whisper_16k_array(path)
+    assert result.dtype == np.float32
+    assert result.shape == (16000,)
+    assert result.flags["C_CONTIGUOUS"]
+    assert np.all(np.isfinite(result))
+    assert np.max(np.abs(result)) <= 1.0
+
+    # The waveform must still represent the 440 Hz tone at 16 kHz.
+    spectrum = np.abs(np.fft.rfft(result))
+    peak = np.argmax(spectrum)
+    hz = peak * 16000 / len(result)
+    assert abs(hz - 440) < 1.0
 
 
 def test_p12_historical_wav_audit_does_not_require_p12b_gpu_results(tmp_path):
