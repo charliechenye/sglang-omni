@@ -222,23 +222,39 @@ def _clone_graph_row(row: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     return {name: value.detach().clone() for name, value in row.items()}
 
 
-def _time_graph(g: torch.cuda.CUDAGraph, dev: torch.device) -> list[float]:
+def _time_graph(
+    g: torch.cuda.CUDAGraph, dev: torch.device, *,
+    uniforms_gpu: torch.Tensor, cases: list[list[float]],
+    restore, vary_uniforms: bool,
+) -> list[dict]:
+    # Fix P15's last-uniform-only timing ambiguity: four distinct inputs
+    # and repeated blocks. The verifier-only cell is explicitly a fixed
+    # packed-input micrograph, so it does NOT pretend to vary its input.
+    case_indices = (0, 5, 10, 15) if vary_uniforms else (0,)
     blocks = []
-    for _ in range(BLOCKS):
-        for _ in range(4):
-            g.replay()
-        torch.cuda.synchronize(dev)
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(REPEAT):
-            g.replay()
-        end.record()
-        end.synchronize()
-        ms = start.elapsed_time(end) / REPEAT
-        if not math.isfinite(ms) or ms <= 0:
-            raise RuntimeError("P17_INVALID_CUDA_EVENT_ENVELOPE")
-        blocks.append(ms)
+    for case_idx in case_indices:
+        uniforms_gpu.copy_(torch.tensor(
+            cases[case_idx], dtype=torch.float32, device=dev,
+        ))
+        for repeat_index in range(BLOCKS):
+            restore()
+            for _ in range(4):
+                g.replay()
+            torch.cuda.synchronize(dev)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(REPEAT):
+                g.replay()
+            end.record()
+            end.synchronize()
+            ms = start.elapsed_time(end) / REPEAT
+            if not math.isfinite(ms) or ms <= 0:
+                raise RuntimeError("P17_INVALID_CUDA_EVENT_ENVELOPE")
+            blocks.append({
+                "case_index": case_idx, "repeat_index": repeat_index,
+                "cuda_event_ms": ms,
+            })
     return blocks
 
 
@@ -412,10 +428,15 @@ def capture_real_multiwidth(
                 event_blocks = {}
                 for name in ("full_round", "proposal_only", "verifier_only"):
                     restore()
-                    event_blocks[name] = _time_graph(graphs[name], dev)
+                    event_blocks[name] = _time_graph(
+                        graphs[name], dev, uniforms_gpu=uniforms_gpu,
+                        cases=cases, restore=restore,
+                        vary_uniforms=(name != "verifier_only"),
+                    )
                 medians = {
-                    name: statistics.median(vals)
-                    for name, vals in event_blocks.items()
+                    name: statistics.median(
+                        row["cuda_event_ms"] for row in vals
+                    ) for name, vals in event_blocks.items()
                 }
                 hist = {
                     str(committed): sum(
@@ -441,7 +462,9 @@ def capture_real_multiwidth(
                     },
                     "committed_count_histogram": hist,
                     "mean_committed_per_round_fixed_checkpoint": mean_committed,
-                    "first_uniform_case": cases[0],
+                    "uniform_case_seed": root_seed,
+                    "timed_full_and_proposal_case_indices": [0, 5, 10, 15],
+                    "verifier_only_frozen_case_index": 0,
                     "cuda_graph_event_ms_blocks": event_blocks,
                     "cuda_graph_event_ms_medians": medians,
                     "full_round_ms_per_committed_code_SCREEN_ONLY": (
