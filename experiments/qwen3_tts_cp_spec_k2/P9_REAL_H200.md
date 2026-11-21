@@ -1,5 +1,30 @@
 # P9 — Real H200 four-offset K2 verification + GPU sampler cost screen
 
+**P9B first H200 run stopped at a harness bug (fixed, needs rerun).**
+The first P9B CUDA Graph distribution parity check compared graph-owned
+p/q output tensors *immediately after capture*, before any graph.replay().
+Because capture records kernels without executing them, that check
+read uninitialized outputs and reported p=0.05425/q=0.06168 max abs.
+The fix explicitly replays and synchronizes BEFORE comparing
+probabilities to the PyTorch reference; the test retains strict 1e-6
+tolerance and adds a 3-replay H200 regression. The fix has NOT yet
+been validated on H200. Do not run HTTP until this GPU test passes:
+
+~~~bash
+cd ~/sglang-omni
+git fetch charlie-fork
+git switch experiment/qwen3-tts-codepredictor-spec-k2-p0
+git merge --ff-only \
+  charlie-fork/experiment/qwen3-tts-codepredictor-spec-k2-p0
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
+  tests/unit_test/qwen3_tts/test_cp_spec_p9b.py -k h200 -s -x
+~~~
+
+If the failure moves to RNG, proposal token or residual correction,
+preserve the exact new traceback; do not relax parity or use a
+partially captured probe result for the budget screen.
+
+
 **DO NOT CLAIM E2E SPEEDUP FROM THIS REPORT.**
 This phase moves from isolated P8 synthetic-control loops toward a measured
 real-checkpoint GPU-only K2 implementation. P9A and P9B execute actual
