@@ -54,6 +54,7 @@ def analyze(
     sampling_dir: Path,
     baseline_graph_dir: Path,
     acceptance_report: Path,
+    p9b_baseline_dir: Path | None = None,
 ) -> dict:
     four_offset_dir = four_offset_dir.expanduser().resolve(strict=True)
     sampling_dir = sampling_dir.expanduser().resolve(strict=True)
@@ -125,6 +126,29 @@ def analyze(
         for b in bs
     )
     full_ms = check_positive(baseline.get("median_cuda_event_ms"))
+    p9b_baseline_ms = None
+    baseline_drift_fraction = None
+    if p9b_baseline_dir is not None:
+        other_dir = p9b_baseline_dir.expanduser().resolve(strict=True)
+        other_files = list(other_dir.glob("baseline_graph_pid*.json"))
+        if len(other_files) != 1:
+            raise RuntimeError("P9B fresh server must have exactly one Graph ON baseline")
+        other = json.loads(other_files[0].read_text())
+        if (
+            other.get("source_sha") != next(iter(sha_values))
+            or other.get("device") != baseline.get("device")
+            or other.get("kind") != "baseline_full_predictor_graph_on"
+            or other.get("frames", 0) < 8
+            or other.get("graph_replays") != other.get("frames")
+        ):
+            raise ValueError("P9B Graph ON baseline source/GPU/replay mismatch")
+        p9b_baseline_ms = check_positive(other.get("median_cuda_event_ms"))
+        baseline_drift_fraction = abs(p9b_baseline_ms - full_ms) / full_ms
+        if baseline_drift_fraction > .10:
+            raise RuntimeError(
+                f"P9A vs P9B fresh-process Graph ON baseline drift "
+                f"{baseline_drift_fraction:.1%} exceeds 10%; no cost selection"
+            )
     acceptance = validate_acceptance(
         json.loads(acceptance_report.expanduser().resolve(strict=True).read_text())
     )
@@ -145,6 +169,8 @@ def analyze(
         "gpu": a["gpu"],
         "real_predictor_layers": a["predictor_layers"],
         "baseline_full_predictor_graph_on_ms_per_frame": full_ms,
+        "p9b_second_process_graph_on_baseline_ms_per_frame": p9b_baseline_ms,
+        "p9a_vs_p9b_baseline_drift_fraction": baseline_drift_fraction,
         "historical_accepted_proposals_per_frame": avg_rounds,
         "p9a_nested_control_intercept_ms": overhead,
         "p9a_model_round_slope_ms": per_round,
@@ -171,7 +197,7 @@ def analyze(
             "P9B is an independent graph using real p/q logits, NOT linked to model output or KV.",
             "Summing two graph launch envelopes can double-count or misrepresent shared control.",
             "The K2 initial pair, codebook heads, bonus, projected embedding and dynamic KV ownership are not included.",
-            "P5 Graph-ON baseline and P9 sources differ; acceptance cohort source differs too.",
+            "P9A/P9B/P9 Graph ON baseline sources are matched; historical P2 acceptance cohort differs.",
             "Actual device RNG distribution is compared only to PyTorch p/q, not native Omni fused sampler.",
             "A positive screen justifies integration; only profiler-OFF full-HTTP Graph-ON ABBA can demonstrate speedup.",
             "A negative component screen is a stop signal for naive four-way branching, not a proof all kernels are hopeless.",
@@ -196,6 +222,7 @@ def write_report(out: Path, report: dict) -> Path:
         "| Cost comparison | CUDA Graph event ms/frame |",
         "|---|---:|",
         f"| Existing entire Predictor Graph ON baseline | {report['baseline_full_predictor_graph_on_ms_per_frame']:.5f} |",
+        f"| P9B fresh-process Graph ON baseline | {report['p9b_second_process_graph_on_baseline_ms_per_frame']:.5f} |" if report["p9b_second_process_graph_on_baseline_ms_per_frame"] is not None else "| P9B fresh-process Graph ON baseline | — |",
         f"| Four-offset nested verifier extrapolation | {report['p9a_four_depth_model_only_extrapolated_ms_per_frame']:.5f} |",
         f"| Device proposal+accept+residual RNG extrapolation | {report['p9b_gpu_sample_extrapolated_ms_per_frame']:.5f} |",
         f"| Component sum (not full K2) | {report['separate_graph_component_sum_ms_per_frame']:.5f} |",
@@ -240,11 +267,13 @@ def main() -> None:
         help="Fresh same-SHA optimized Graph-ON baseline captured by P9 runner",
     )
     p.add_argument("--p2-acceptance-report", type=Path, required=True)
+    p.add_argument("--p9b-baseline-graph-dir", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     result = analyze(
         args.p9a_dir, args.p9b_dir,
         args.p5_baseline_graph_dir, args.p2_acceptance_report,
+        p9b_baseline_dir=args.p9b_baseline_graph_dir,
     )
     file = write_report(args.out, result)
     print(f"P9_COMPONENT_SCREEN={result['status']} RESULT={file}")
