@@ -9,7 +9,6 @@ import wave
 import pytest
 
 from experiments.qwen3_tts_cp_spec_k2.quality_smoke import (
-    STATUS_INCOMPLETE,
     decode_single_batch_response,
     parse_k2_log_entries,
     wav_info,
