@@ -1416,6 +1416,25 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             talker_hidden = talker_hidden.unsqueeze(1)
         else:
             pass
+        # Research-only CodePredictor speculation. Never intercept startup
+        # warmup or normal traffic without explicit post-health ARM file.
+        # Unarmed and K=0 are the exact unchanged production code path.
+        cp_spec_k = int(os.environ.get("SGLANG_OMNI_QTTS_CP_SPEC_K", "0"))
+        if cp_spec_k:
+            if cp_spec_k != 2:
+                raise ValueError(
+                    "Qwen3-TTS experimental CP speculation supports only K=2"
+                )
+            arm_path = os.environ.get("SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE")
+            if arm_path and os.path.isfile(arm_path):
+                from sglang_omni.models.qwen3_tts.code_predictor_spec import (
+                    speculative_k2,
+                )
+
+                self.predictor_eager_count += 1
+                return speculative_k2(
+                    self, layer0_codes, talker_hidden, semantic_positions
+                )
         graph_result = self.predictor_forward_graphed(
             layer0_codes,
             talker_hidden,
@@ -2269,10 +2288,23 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         if num_tokens == 1:
             positions = self.predictor_position_rows[cache_len, :batch_size]
             cache_slots = self.predictor_cache_slots[cache_len, :batch_size]
-        else:
-            assert (num_tokens, cache_len) == (2, 0), "pair tables hold slots 0 and 1"
+        elif (num_tokens, cache_len) == (2, 0):
             positions = self.predictor_pair_positions[: 2 * batch_size]
             cache_slots = self.predictor_pair_cache_slots[: 2 * batch_size]
+        else:
+            # Speculative verification needs a causal multi-row append at
+            # nonzero cache offsets. Row-major layout matches the first pair.
+            if not 1 < num_tokens <= 2 or cache_len + num_tokens > self.predictor_k_cache.shape[2]:
+                raise ValueError(
+                    "experimental Predictor verify only supports 2 tokens "
+                    "inside the allocated KV window"
+                )
+            positions = self.predictor_positions[
+                cache_len : cache_len + num_tokens
+            ].repeat(batch_size)
+            cache_slots = self.predictor_cache_slots[
+                cache_len : cache_len + num_tokens, :batch_size
+            ].t().reshape(-1)
         num_rows = batch_size * num_tokens
         if (
             self.predictor_cutedsl_layers is not None
@@ -2476,14 +2508,33 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         )
         cached_k = self.predictor_k_cache[layer_idx, :batch_size, :end].transpose(1, 2)
         cached_v = self.predictor_v_cache[layer_idx, :batch_size, :end].transpose(1, 2)
-        attn_output = predictor_gqa_attention(
-            q,
-            cached_k,
-            cached_v,
-            num_heads=attn.num_heads,
-            num_key_value_heads=attn.num_kv_heads,
-            is_causal=num_tokens > 1,
-        )
+        if cache_len > 0 and num_tokens > 1:
+            # torch SDPA is_causal=True aligns unequal Q/K lengths to the
+            # top-left: a two-row append would mask the entire old prefix.
+            # The fused/Triton decode_attention path already uses end-T+i.
+            from sglang_omni.models.qwen3_tts.code_predictor_spec import (
+                offset_causal_mask,
+            )
+
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q,
+                cached_k,
+                cached_v,
+                attn_mask=offset_causal_mask(
+                    cache_len, num_tokens, cached_k.device
+                ),
+                is_causal=False,
+                enable_gqa=True,
+            )
+        else:
+            attn_output = predictor_gqa_attention(
+                q,
+                cached_k,
+                cached_v,
+                num_heads=attn.num_heads,
+                num_key_value_heads=attn.num_kv_heads,
+                is_causal=num_tokens > 1,
+            )
         attn_output = attn_output.transpose(1, 2).reshape(
             batch_size * num_tokens, attn.num_heads * attn.head_dim
         )
