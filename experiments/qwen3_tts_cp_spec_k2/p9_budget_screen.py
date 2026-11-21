@@ -105,7 +105,12 @@ def analyze(
     if len(sha_values) != 1 or None in sha_values or "UNATTESTED" in sha_values:
         raise ValueError("P9A/P9B probes must share one fixed source revision")
     if len({a.get("gpu"), *[b.get("gpu") for b in bs], baseline.get("device")}) != 1:
-        raise ValueError("P9A/B and P5 baseline GPU name mismatch")
+        raise ValueError("P9A/B and full Graph ON baseline GPU name mismatch")
+    if baseline.get("source_sha") != next(iter(sha_values)):
+        raise ValueError(
+            "P9 requires SAME source SHA for full Graph ON and P9A/P9B; "
+            "use the fresh P9 baseline, not prior P5 reports"
+        )
 
     costs = a.get("cost_by_dynamic_stage_sequence", [])
     if len(costs) != 6:
