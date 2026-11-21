@@ -112,6 +112,13 @@ def test_p16a_nsys_invalid_header_or_no_gpu_nodes_is_not_pass():
         parse_nvtx_kernel_csv(HEADER + "\n")
 
 
+def test_p16a_nsys_pid_attestation_is_mandatory():
+    data, _ = sample_trace()
+    assert len(parse_nvtx_kernel_csv(data, expected_pid=4106413)) == 8
+    with pytest.raises(ValueError, match="PID mismatch"):
+        parse_nvtx_kernel_csv(data, expected_pid=987654)
+
+
 def test_p16a_manual_head_regex_must_not_point_to_markers():
     data, _ = sample_trace()
     grouped = parse_nvtx_kernel_csv(data)
