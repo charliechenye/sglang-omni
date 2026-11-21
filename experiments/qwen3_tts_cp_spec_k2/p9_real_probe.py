@@ -126,10 +126,39 @@ def run(args: argparse.Namespace) -> dict:
         source = json.loads(bases[0].read_text())
         if source.get("graph_replays") != source.get("frames") or source.get("frames", 0) < 8:
             raise RuntimeError("P9 did not capture real full Predictor Graph ON baseline")
+        if source.get("source_sha") in (None, "UNATTESTED"):
+            raise RuntimeError("P9 baseline source revision was not pinned")
+        candidate_depths = set()
         for file in candidates:
             row = json.loads(file.read_text())
             if row.get("source_sha") != source.get("source_sha") or row.get("pid") != source.get("pid"):
                 raise RuntimeError("P9 baseline and candidate trace are not SAME SHA/PID")
+            if args.mode == "a":
+                if (
+                    not row.get("status", "").startswith(
+                        "P9A_FOUR_REAL_PREDICTOR_OFFSET_GRAPH_PARITY_PASS"
+                    )
+                    or row.get("predictor_layers") != 5
+                    or len(row.get("cases", [])) != 6
+                    or not all(x.get("pass") is True for x in row["cases"])
+                ):
+                    raise RuntimeError("P9A actual five-layer model graph parity was not PASS")
+            else:
+                candidate_depths.add(row.get("proposal_depth"))
+                if (
+                    not row.get("status", "").startswith(
+                        "P9B_REAL_LOGITS_GPU_PROPOSAL_ACCEPT_RESIDUAL_AND_RNG_PASS"
+                    )
+                    or row.get("independent_graph_rng_replay_unique") is not True
+                    or row.get("output_input_parity") is not True
+                    or len(row.get("checks", [])) != 4
+                    or not all(x.get("pass") is True for x in row["checks"])
+                ):
+                    raise RuntimeError("P9B real p/q GPU sampler and RNG parity was not PASS")
+        if args.mode == "b" and candidate_depths != {2, 10}:
+            raise RuntimeError(
+                f"P9B missing true per-depth logits: {candidate_depths}, require {{2,10}}"
+            )
         report["source_sha"] = source.get("source_sha")
         report["status"] = STATUS
     except Exception as exc:
