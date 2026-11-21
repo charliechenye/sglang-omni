@@ -199,6 +199,8 @@ def test_packed_two_token_verify_matches_serial_with_cached_prefix(patch_qk_norm
 @pytest.mark.accelerator
 def test_k2_real_16_group_path_reaches_final_depth_with_14_projected_tables(
     patch_qk_norm,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
 ):
     """Exercise the actual K2 loop, not just its isolated embedding helper.
 
@@ -289,8 +291,26 @@ def test_k2_real_16_group_path_reaches_final_depth_with_14_projected_tables(
 
     talker.prepare_decode_buffers(uniform_requests(1, dosample=True, top_k=5))
     input_ids, hidden, pos = step_inputs(1, dev)
+    # Exercise the actual on-policy K2 code path WITH the new source-locked
+    # P1 serial replay and P2 per-depth logging enabled. No HTTP/server.
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_K2_DIAG_DIR", str(tmp_path))
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_K2_DIAG_MAX_FRAMES", "1")
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_K2_PARITY_MAX_FRAMES", "1")
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA", "a" * 40)
     with torch.inference_mode():
         codes, embeds = speculative_k2(talker, input_ids, hidden, pos)
+    import json
+    from sglang_omni.models.qwen3_tts.code_predictor_spec_diagnostics import SCHEMA
+
+    traces = list(tmp_path.glob("frame_pid*_*.json"))
+    assert len(traces) == 1
+    trace = json.loads(traces[0].read_text())
+    assert trace["schema"] == SCHEMA
+    assert trace["source_sha"] == "a" * 40
+    assert trace["target_parity"]["executed"]
+    assert trace["target_parity"]["pass"]
+    assert trace["embedding_sum"]["close"]
+    assert len(trace["per_depth"]) == trace["proposed"]
     assert codes.shape == (1, 16, 1)
     assert embeds.shape == (1, 1, HIDDEN)
     assert codes[0, 0, 0].item() == input_ids[0, 0].item()
