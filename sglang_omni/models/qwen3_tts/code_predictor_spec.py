@@ -338,6 +338,28 @@ def speculative_k2(
                 )
                 diag.assert_diagnostic_parity(parity)
 
+        # Experimental P4: measure identical real-checkpoint fixed-KV cells,
+        # WITHOUT consuming this request's sampler RNG. Off unless explicitly
+        # configured. Do not enable P1 parity diagnostics in this server.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P4_DIR"):
+            from .code_predictor_spec_perf import maybe_profile
+
+            maybe_profile(
+                model,
+                frame_index=frame_index,
+                depth=depth,
+                cache_len=cache_len,
+                last_embedding=last_embedding,
+                proposed_embedding=proposed_embedding,
+                draft_hidden=h0,
+                target_head=next_head,
+                p=p,
+                q=q,
+                proposal=proposal,
+                temperature=t,
+                top_k=k,
+                top_p=p_cut,
+            )
         corrected_or_accepted, survived = accept_or_residual(
             proposal, p, q, generator
         )
