@@ -141,6 +141,46 @@ def asr_engine(name: str, model_path: str, device: str):
     return WhisperModel(model_path, device=device, compute_type="float16" if device=="cuda" else "int8")
 
 
+def wav_24k_pcm16_to_whisper_16k_array(path: Path) -> np.ndarray:
+    """Resample validated Qwen3-TTS PCM with polyphase filtering, no PyAV.
+
+    faster-whisper treats a float32 NumPy array as *already 16 kHz*
+    waveform samples, skipping its PyAV file decoder. 24k input must
+    therefore be resampled, not passed unchanged as an ndarray.
+    SciPy is optional and needed ONLY for --asr-input pcm-array.
+    """
+    try:
+        from scipy.signal import resample_poly
+    except ImportError as exc:
+        raise RuntimeError(
+            "P12B PCM-array ASR requires scipy in the isolated ASR venv: "
+            'uv pip install --python "$HOME/.venv-qwen3tts-asr/bin/python" scipy. '
+            "Alternatively pin PyAV av==18.1.0 and use --asr-input file."
+        ) from exc
+
+    with wave.open(str(path), "rb") as wav:
+        if (
+            wav.getnchannels() != 1
+            or wav.getframerate() != 24000
+            or wav.getsampwidth() != 2
+            or wav.getcomptype() != "NONE"
+        ):
+            raise ValueError(f"P12B requires 24k mono PCM16 WAV: {path}")
+        frames = wav.getnframes()
+        pcm = wav.readframes(frames)
+    samples = np.frombuffer(pcm, dtype="<i2").astype(np.float32) / 32768.0
+    if not samples.size:
+        raise ValueError(f"P12B empty WAV: {path}")
+    # Exact 24k -> 16k sample-rate conversion is 2/3.
+    resampled = resample_poly(samples, 2, 3).astype(np.float32)
+    if (
+        len(resampled) != (len(samples) * 2 + 2) // 3
+        or not np.isfinite(resampled).all()
+    ):
+        raise RuntimeError(f"P12B ASR array resampling failed: {path}")
+    return np.ascontiguousarray(resampled)
+
+
 def analyze(args) -> dict:
     source = args.p11b_report.expanduser().resolve(strict=True)
     report = json.loads(source.read_text())
@@ -157,6 +197,9 @@ def analyze(args) -> dict:
     if len(report.get("visits", [])) != 6 * len(report["seeds"]):
         raise ValueError("P12B P11B visit count inconsistent")
     model = asr_engine(args.asr, args.asr_model, args.asr_device)
+    asr_input = getattr(args, "asr_input", "file")
+    if asr_input not in ("file", "pcm-array"):
+        raise ValueError("P12B unknown ASR input; choose file or pcm-array")
     speaker = None
     if args.speaker_embeddings:
         spath = args.speaker_embeddings.expanduser().resolve(strict=True)
@@ -225,6 +268,7 @@ def analyze(args) -> dict:
         "input_p11b_report": str(source),
         "reference_text": args.reference_text,
         "asr_engine": args.asr if model else "NOT_MEASURED",
+        "asr_input": asr_input if model else "NOT_MEASURED",
         "speaker_embeddings": speaker.get("model_id") if speaker else "NOT_MEASURED",
         "target_forward_component_projection": timing_context,
         "items": [],
@@ -242,12 +286,31 @@ def analyze(args) -> dict:
             "tag": row["tag"], **features,
         }
         if model is not None:
-            # Explicitly measured: no fabricated ASR/WER when model absent.
-            segments, info = model.transcribe(
-                str(path), language="en",
-                beam_size=5, vad_filter=False, condition_on_previous_text=False,
+            # Existing WAV has already passed SHA256, format and duration
+            # checks. In pcm-array mode, bypass the PyAV decoder that
+            # breaks on faster-whisper 1.2.1 + PyAV 19.
+            source_audio = (
+                wav_24k_pcm16_to_whisper_16k_array(path)
+                if asr_input == "pcm-array" else str(path)
             )
-            transcript = " ".join(x.text.strip() for x in segments)
+            try:
+                segments, info = model.transcribe(
+                    source_audio, language="en",
+                    beam_size=5, vad_filter=False,
+                    condition_on_previous_text=False,
+                )
+                transcript = " ".join(x.text.strip() for x in segments)
+            except TypeError as exc:
+                if "metadata_errors" in str(exc):
+                    raise RuntimeError(
+                        "P12B_ASR_PYAV19_INCOMPATIBLE: installed "
+                        "faster-whisper passes metadata_errors to av.open(), "
+                        "which PyAV 19 rejects. In the isolated ASR venv "
+                        "pin av==18.1.0, OR install scipy and rerun with "
+                        "--asr-input pcm-array to bypass PyAV decoding. "
+                        "Do not change the Omni serving venv."
+                    ) from exc
+                raise
             entry.update(transcript_features(transcript, args.reference_text))
         output["items"].append(entry)
     grouped = defaultdict(lambda: defaultdict(list))
@@ -342,6 +405,7 @@ def write(out: Path, report: dict) -> Path:
         "", f"**{report['status']}**", "",
         f"P11B source SHA: {report['p11b_source_sha']}",
         f"ASR: {report['asr_engine']}",
+        f"ASR audio input: {report['asr_input']}",
         f"Speaker similarity: {report['speaker_similarity_status']}",
         f"Target cost projection: {report['target_forward_component_projection'] or 'NOT_MEASURED'}",
         "",
@@ -378,6 +442,14 @@ def main():
     p.add_argument("--asr", choices=("none","faster-whisper"), default="none")
     p.add_argument("--asr-model", default="small.en")
     p.add_argument("--asr-device", choices=("cpu","cuda"), default="cuda")
+    p.add_argument(
+        "--asr-input", choices=("file", "pcm-array"), default="file",
+        help=(
+            "file: faster-whisper/PyAV decoder (pin av==18.1.0 for "
+            "faster-whisper 1.2.1). pcm-array: read Qwen3-TTS mono PCM16 "
+            "24k WAV, resample to 16k with scipy and bypass PyAV."
+        ),
+    )
     p.add_argument("--speaker-embeddings", type=Path, default=None)
     p.add_argument("--p12b-timing-dir", type=Path, default=None)
     p.add_argument("--silence-threshold-dbfs", type=float, default=-45.)
