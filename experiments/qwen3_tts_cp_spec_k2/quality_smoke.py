@@ -159,9 +159,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"ARM must be absent before start: {arm}")
     if not arm.parent.is_dir():
         raise FileNotFoundError(f"ARM parent directory missing: {arm.parent}")
-    server_log = args.server_log.expanduser().resolve() if args.server_log else None
-    if server_log is not None and not server_log.is_file():
-        raise FileNotFoundError(f"server log missing: {server_log}")
+    server_log = args.server_log.expanduser().resolve()
+    if not server_log.is_file():
+        raise FileNotFoundError(
+            f"server log missing: {server_log}; candidate activation cannot be proved"
+        )
     with urllib.request.urlopen(args.base_url.rstrip("/") + "/health", timeout=30) as resp:
         if resp.status != 200:
             raise RuntimeError("server not healthy; do not ARM")
@@ -194,10 +196,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         tag = f"{idx:02d}_{phase}"
         if arm.exists():
             raise RuntimeError("ARM marker unexpectedly present before a visit")
-        prior = (
-            len(parse_k2_log_entries(server_log.read_text(errors="replace")))
-            if server_log else None
-        )
+        prior = len(parse_k2_log_entries(server_log.read_text(errors="replace")))
         print(f"QTTS_K2_QUALITY_BEGIN={tag}", flush=True)
         try:
             if phase == "spec":
@@ -205,28 +204,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             audio, finish, elapsed = _http_call(args.base_url, payload)
             info = wav_info(audio)
             (output / f"{tag}.wav").write_bytes(audio)
-            after = (
-                len(parse_k2_log_entries(server_log.read_text(errors="replace")))
-                if server_log else None
+            entries = parse_k2_log_entries(server_log.read_text(errors="replace"))
+            new_entries = entries[prior:]
+            new_k2 = len(new_entries)
+            totals = {
+                metric: sum(row[metric] for row in new_entries)
+                for metric in ("rounds", "proposed", "accepted", "bonus", "rejected")
+            }
+            totals["accept_fraction"] = (
+                totals["accepted"] / totals["proposed"]
+                if totals["proposed"] else None
             )
-            new_k2 = after - prior if after is not None and prior is not None else None
             visit = {
                 "tag": tag,
                 "finish_reason": finish,
                 "wav_sha256": hashlib.sha256(audio).hexdigest(),
                 "wall_s_debug_not_perf": round(elapsed, 6),
                 "new_k2_log_frames": new_k2,
+                "k2_counters": totals,
                 **info,
             }
-            if new_k2 is not None and (
-                (phase == "spec" and new_k2 <= 0)
-                or (phase == "base" and new_k2 != 0)
+            if (phase == "spec" and new_k2 <= 0) or (
+                phase == "base" and new_k2 != 0
             ):
                 visit["activity_gate"] = "FAIL_ARM_OR_LOG_ROUTING"
             else:
                 visit["activity_gate"] = (
-                    "K2_LOG_OBSERVED" if phase == "spec" and new_k2 is not None
-                    else "NOT_CHECKED" if new_k2 is None else "BASELINE_NO_K2"
+                    "K2_LOG_OBSERVED" if phase == "spec" else "BASELINE_NO_K2"
                 )
             result["visits"].append(visit)
             print(
@@ -254,9 +258,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         else:
             result["status"] = STATUS_PASS
     result["complete_stop_gate"] = finished
-    result["k2_activity_gate"] = (
-        "CHECKED" if server_log is not None else "NOT_CHECKED"
-    )
+    result["k2_activity_gate"] = "CHECKED_FROM_SERVER_LOG"
     result["limits"] = [
         "A 1-item batch request invokes the same underlying client.speech path, "
         "but is a separate HTTP endpoint from the previous WAV-only smoke.",
@@ -276,7 +278,7 @@ def main() -> None:
     p.add_argument("--base-url", default="http://localhost:8000")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--arm-file", type=Path, required=True)
-    p.add_argument("--server-log", type=Path, default=None)
+    p.add_argument("--server-log", type=Path, required=True)
     p.add_argument("--model", default=MODEL)
     p.add_argument("--voice", default="Vivian")
     p.add_argument("--text", default=TEXT)
