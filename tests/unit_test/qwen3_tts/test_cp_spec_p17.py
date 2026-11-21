@@ -111,7 +111,7 @@ def test_p17_cpu_source_contract_true_multihead_single_wide():
     ) < round_source.index("batched_head_logits(")
     assert "torch.cumprod" in round_source
     assert "gpu_accept(" in round_source
-    assert "torch.where(full_accept" in round_source
+    assert "torch.where(\n        full_accept" in round_source
     assert "decode_attention_with_device_end" in verify_source
     for source in (q_source, verify_source, round_source):
         for forbidden in (
