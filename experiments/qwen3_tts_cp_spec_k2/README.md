@@ -90,13 +90,13 @@ including hidden and KV values under existing BF16 tolerances.
 cd ~/sglang-omni
 export CUDA_VISIBLE_DEVICES=0
 export SGLANG_OMNI_QTTS_CP_SPEC_K=2
-export SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE="$HOME/results/qwen3tts-cpspec-k2-001/ARM"
-mkdir -p "$HOME/results/qwen3tts-cpspec-k2-001"
+export SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE="$HOME/results/qwen3tts-cpspec-k2-002/ARM"
+mkdir -p "$HOME/results/qwen3tts-cpspec-k2-002"
 
 sgl-omni serve \
   --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --config examples/configs/qwen3_tts_1_7b_customvoice.yaml \
-  --port 8000 2>&1 | tee "$HOME/results/qwen3tts-cpspec-k2-001/server.log"
+  --port 8000 2>&1 | tee "$HOME/results/qwen3tts-cpspec-k2-002/server.log"
 ~~~
 
 **Do not ARM until health succeeds.** Server warmup runs baseline.
@@ -109,7 +109,7 @@ serving path. K values other than 0 and 2 explicitly fail closed.
 cd ~/sglang-omni
 python experiments/qwen3_tts_cp_spec_k2/smoke.py \
   --base-url http://localhost:8000 \
-  --arm-file "$HOME/results/qwen3tts-cpspec-k2-001/ARM" \
+  --arm-file "$HOME/results/qwen3tts-cpspec-k2-002/ARM" \
   --out "$HOME/results/qwen3tts-cpspec-k2-smoke-002"
 ~~~
 
