@@ -86,12 +86,26 @@ def main() -> None:
     for idx, phase in enumerate(["base", "spec", "spec", "base"]):
         if arm.exists():
             raise RuntimeError("stale ARM marker detected")
+        print(f"QTTS_K2_VISIT_BEGIN={idx:02d}_{phase}", flush=True)
         try:
             if phase == "spec":
                 arm.touch(exist_ok=False)
             audio, seconds = _call(
                 args.base_url.rstrip("/") + "/v1/audio/speech", payload
             )
+        except Exception as exc:
+            failure = {
+                "status": "QTTS_CP_SPEC_K2_SMOKE_ABORTED_DO_NOT_USE_FOR_PERF",
+                "failed_visit": f"{idx:02d}_{phase}",
+                "exception": str(exc),
+                "completed_visits": evidence,
+                "arm_removed": True,
+            }
+            (output / "failure.json").write_text(
+                json.dumps(failure, indent=2) + "\n"
+            )
+            print(f"QTTS_K2_VISIT_ERROR={idx:02d}_{phase}: {exc}", flush=True)
+            raise
         finally:
             arm.unlink(missing_ok=True)
         (output / f"{idx:02d}_{phase}.wav").write_bytes(audio)
@@ -102,6 +116,7 @@ def main() -> None:
             "bytes": len(audio),
             "sha256": hashlib.sha256(audio).hexdigest(),
         })
+        print(f"QTTS_K2_VISIT_DONE={idx:02d}_{phase}", flush=True)
     report = {
         "status": "QTTS_CP_SPEC_K2_SMOKE_OUTPUTS_ONLY_NO_DISTRIBUTION_OR_SPEED_PROOF",
         "run_order": "ABBA",
