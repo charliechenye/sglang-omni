@@ -234,7 +234,11 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--p9a-dir", type=Path, required=True)
     p.add_argument("--p9b-dir", type=Path, required=True)
-    p.add_argument("--p5-baseline-graph-dir", type=Path, required=True)
+    p.add_argument(
+        "--baseline-graph-dir", "--p5-baseline-graph-dir",
+        dest="p5_baseline_graph_dir", type=Path, required=True,
+        help="Fresh same-SHA optimized Graph-ON baseline captured by P9 runner",
+    )
     p.add_argument("--p2-acceptance-report", type=Path, required=True)
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
