@@ -352,7 +352,10 @@ def speculative_k2(
         # second verifier consumes GPU-selected Round 1 depth/KV/hidden.
         # It is source-locked, restores all physical KV, does not consume
         # the live request RNG, and never changes the live decoder output.
-        if os.environ.get("SGLANG_OMNI_QTTS_CP_P15_TWO_ROUND_DIR"):
+        if (
+            os.environ.get("SGLANG_OMNI_QTTS_CP_P15_TWO_ROUND_DIR")
+            or os.environ.get("SGLANG_OMNI_QTTS_CP_P16A_DIR")
+        ):
             from .code_predictor_spec_p15_two_round import (
                 maybe_probe as p15_two_round_probe,
             )
