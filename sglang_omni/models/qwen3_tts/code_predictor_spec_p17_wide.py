@@ -139,7 +139,9 @@ def wide_device_fused_predictor(
         raise ValueError("P17_DEVICE_OFFSET_SHAPE_MISMATCH")
     if cache_len_gpu.dtype != torch.long:
         raise ValueError("P17_DEVICE_OFFSET_INT64_REQUIRED")
-    check_wide_backend(model, width, 10 if width == 4 else 2)
+    # True on-policy cache_len was validated on the host before capture.
+    # Never branch on a device scalar or assume a magic static offset here.
+    check_wide_backend(model, width, 0)
     fused = model.predictor_fused_layers
     shape = fused.shape
     end = cache_len_gpu + width
