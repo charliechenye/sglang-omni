@@ -75,6 +75,7 @@ def capture_two_offsets(
     original_k = cache_k[:, :1, :8].clone()
     original_v = cache_v[:, :1, :8].clone()
     pair = fixed_embeds.detach().contiguous().clone()
+    original_pair = pair.clone()
     selector = torch.ones((), device=device, dtype=torch.bool)
     result = {
         "status": "P7_FAILED_NOT_PROOF",
@@ -86,13 +87,16 @@ def capture_two_offsets(
     }
 
     def branch2(embeds):
+        # Some BF16 Predictor paths call torch.addmm(..., out=residual)
+        # on the reshaped token input. A conditional branch MUST NOT mutate
+        # the graph's persistent input and poison subsequent replays.
         return model.predictor_forward_tokens(
-            token_embeds=embeds, batch_size=1, cache_len=2,
+            token_embeds=embeds.clone(), batch_size=1, cache_len=2,
         ).clone()
 
     def branch6(embeds):
         return model.predictor_forward_tokens(
-            token_embeds=embeds, batch_size=1, cache_len=6,
+            token_embeds=embeds.clone(), batch_size=1, cache_len=6,
         ).clone()
 
     def operation():
@@ -130,6 +134,7 @@ def capture_two_offsets(
         ):
             output = operation()
         torch.cuda.synchronize(device)
+        capture_completed = True
 
         # The test consumes the one capture on both GPU choices; all K/V and
         # hidden comparisons include inactive-branch suffix ownership.
@@ -144,11 +149,18 @@ def capture_two_offsets(
             restore()
             with torch.inference_mode():
                 serial_hidden = model.predictor_forward_tokens(
-                    token_embeds=pair, batch_size=1, cache_len=depth
+                    token_embeds=pair.clone(), batch_size=1, cache_len=depth
                 ).clone()
             serial_k, serial_v = gpu_snapshot()
             checks = {
                 "hidden": compare(graph_hidden, serial_hidden),
+                "persistent_input_unchanged": compare(pair, original_pair),
+                "original_kv_prefix_k_untouched": compare(
+                    graph_k[:, :, :depth], original_k[:, :, :depth]
+                ),
+                "original_kv_prefix_v_untouched": compare(
+                    graph_v[:, :, :depth], original_v[:, :, :depth]
+                ),
                 "kv_prefix_k": compare(
                     graph_k[:, :, :depth], serial_k[:, :, :depth]
                 ),
@@ -167,6 +179,12 @@ def capture_two_offsets(
                 "inactive_kv_v": compare(
                     graph_v[:, :, depth + 2:8], serial_v[:, :, depth + 2:8]
                 ) if depth < 6 else {"max_abs": 0.0, "close": True},
+                "inactive_kv_k_vs_pre_capture": compare(
+                    graph_k[:, :, depth + 2:8], original_k[:, :, depth + 2:8]
+                ) if depth < 6 else {"max_abs": 0.0, "close": True},
+                "inactive_kv_v_vs_pre_capture": compare(
+                    graph_v[:, :, depth + 2:8], original_v[:, :, depth + 2:8]
+                ) if depth < 6 else {"max_abs": 0.0, "close": True},
             }
             passed = all(row["close"] for row in checks.values())
             result["cases"].append({
@@ -174,8 +192,14 @@ def capture_two_offsets(
                 "pass": passed,
             })
             if not passed:
+                failed = {
+                    name: {"max_abs": measured["max_abs"]}
+                    for name, measured in checks.items()
+                    if not measured["close"]
+                }
                 raise RuntimeError(
-                    f"P7_REAL_PREDICTOR_BRANCH_PARITY_FAIL at offset={depth}"
+                    f"P7_REAL_PREDICTOR_BRANCH_PARITY_FAIL "
+                    f"offset={depth} failed_checks={failed}"
                 )
         timings = {}
         for flag, depth in ((True, 2), (False, 6)):
@@ -203,12 +227,10 @@ def capture_two_offsets(
             "P7 measures CUDA Graph conditional replay launch envelope, not GPU kernel busy time",
             "Successful P7 test restores all K/V; failed capture poisons this experimental server",
         ]
-        capture_completed = True
     finally:
-        # Avoid replacing the *original* capture exception with a secondary
-        # cudaErrorStreamCaptureInvalidated from synchronize/copy_ during
-        # cleanup. A failed capture is fatal for this experimental server;
-        # restart it rather than returning to serving.
+        # Restore on BOTH success and a logical parity failure. The only
+        # exception is an invalidated/failed CUDA capture: synchronizing or
+        # touching its stream can mask the first exception.
         if capture_completed:
             torch.cuda.synchronize(device)
             restore()
