@@ -156,6 +156,8 @@ def test_live_gpu_parity_checker_restores_kv_and_compares_same_prefix(
         model.predictor_forward_tokens(
             token_embeds=all_embeds[:, :2].clone(), batch_size=1, cache_len=0
         )
+        prefix_k_before = model.predictor_k_cache[:, :1, :2].clone()
+        prefix_v_before = model.predictor_v_cache[:, :1, :2].clone()
         packed = model.predictor_forward_tokens(
             token_embeds=all_embeds[:, 2:4].clone(), batch_size=1, cache_len=2
         ).clone()
@@ -167,6 +169,8 @@ def test_live_gpu_parity_checker_restores_kv_and_compares_same_prefix(
             last_embedding=all_embeds[:, 2:3].clone(),
             proposed_embedding=all_embeds[:, 3:4].clone(),
             packed_hidden=packed,
+            prefix_k_before=prefix_k_before,
+            prefix_v_before=prefix_v_before,
         )
         assert row["pass"], row
         assert row["checks"]["target_logits"]["close"]
@@ -179,6 +183,8 @@ def test_live_gpu_parity_checker_restores_kv_and_compares_same_prefix(
             last_embedding=all_embeds[:, 2:3].clone(),
             proposed_embedding=all_embeds[:, 3:4].clone(),
             packed_hidden=packed + 2.0,
+            prefix_k_before=prefix_k_before,
+            prefix_v_before=prefix_v_before,
         )
         assert not bad["pass"]
         with pytest.raises(RuntimeError, match="PARITY_FAIL"):
