@@ -26,7 +26,11 @@ and 10, vocab 2048 with T=.9, topk50, top-p=1. A sparse Triton
 kernel consumes PyTorch topk(50) sorted values/indices for p and q,
 then fuses softmax/top-p, draft proposal, accept min(1,p(x)/q(x)),
 and correction from normalized positive residual (p-q)+ with
-at most 50 nonzero candidates. This eliminates dense vocab-wide
+at most 50 nonzero candidates. To match P9B's deterministic reference
+for a fixed uniform draw, the sparse kernel accumulates CDF in ascending
+**vocabulary-token ID**, not probability-sorted top-k rank; this is
+essential for fixed-u token parity even when the marginal p/q
+distributions are identical. This eliminates dense vocab-wide
 scatter/searchsorted but **still launches two Torch topk kernels**.
 Compares p/q probabilities at original 1e-6 tolerance, 4 deterministic
 proposal/accept/replacement draws against independent CPU oracle,
