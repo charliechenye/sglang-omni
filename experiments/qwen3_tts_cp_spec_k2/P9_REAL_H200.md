@@ -194,6 +194,7 @@ python -m experiments.qwen3_tts_cp_spec_k2.p9_budget_screen \
   --p9a-dir "$HOME/results/qwen3tts-cpspec-k2-p9a-012/four" \
   --p9b-dir "$HOME/results/qwen3tts-cpspec-k2-p9b-013/sampler" \
   --baseline-graph-dir "$HOME/results/qwen3tts-cpspec-k2-p9a-012/baseline" \
+  --p9b-baseline-graph-dir "$HOME/results/qwen3tts-cpspec-k2-p9b-013/baseline" \
   --p2-acceptance-report "$HOME/results/qwen3tts-cpspec-k2-p2-report-004/report.json" \
   --out "$HOME/results/qwen3tts-cpspec-k2-p9-budget-014"
 
@@ -202,6 +203,8 @@ cat "$HOME/results/qwen3tts-cpspec-k2-p9-budget-014/summary.md"
 
 The CPU budget analyzer fails on missing P9A parity, missing P9B
 real-logit sampling, missing true Graph ON, or nonmatching P9 source.
+It additionally compares both fresh-process Graph ON baselines and
+rejects an unstable GPU/environment if their median differs by >10%.
 The historical P2 acceptance source remains different, and is
 explicitly identified as a separate cohort.
 
