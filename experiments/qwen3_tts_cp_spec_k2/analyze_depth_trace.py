@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import statistics
 from collections import defaultdict
 from pathlib import Path
 
