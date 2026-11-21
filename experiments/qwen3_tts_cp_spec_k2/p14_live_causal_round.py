@@ -75,7 +75,9 @@ def validate_probe(row: dict, *, sha: str, pid: int, gpu: str) -> None:
     for case in cases:
         if (
             len(case.get("uniforms", [])) != 4
-            or case.get("q_p_distribution_parity") is not True
+            or case.get("q_p_bonus_distribution_parity") is not True
+            or case.get("independent_bonus_sampling_parity") is not True
+            or case.get("independent_embedding_sum_parity") is not True
             or case.get("target_hidden_parity") is not True
             or case.get("complete_kv_parity") is not True
             or case.get("committed_embedding_sum_parity") is not True
