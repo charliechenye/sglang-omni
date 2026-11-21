@@ -8,9 +8,23 @@ if [[ ! -s "$ROOT/nsys/p16a.nsys-rep" ||
       ! -s "$ROOT/smoke/report.json" ]]; then
   echo "P16A requires finalized Nsight report + source-locked smoke" >&2; exit 2
 fi
-test "$(cat "$ROOT/source.sha")" = "$(git rev-parse HEAD)" || {
-  echo "P16A source drift" >&2; exit 2;
-}
+# Old captured data stays pinned to its ORIGINAL serving SHA, while
+# diagnostics/auditor may be updated later. Do not demand HEAD==serving SHA.
+python - "$ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+r = Path(sys.argv[1])
+pin = (r / "source.sha").read_text().strip()
+report = json.loads((r / "smoke/report.json").read_text())
+probe = report.get("two_round_probe", {})
+assert len(pin) == 40, "P16A invalid original worker source SHA"
+assert report.get("source_sha") == pin, "P16A smoke/worker SHA mismatch"
+assert probe.get("source_sha") == pin, "P16A probe/worker SHA mismatch"
+assert probe.get("pid") == report.get("pid"), "P16A cross-worker PID"
+assert probe.get("gpu") == report.get("gpu"), "P16A cross-GPU evidence"
+print("P16A_OFFLINE_SOURCE_LOCK_PASS", pin)
+PY
 ARGS=()
 OUT="$ROOT/trace-audit-markers"
 if [[ $# -ge 2 ]]; then
