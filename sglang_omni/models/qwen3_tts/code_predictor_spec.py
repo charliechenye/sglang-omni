@@ -220,7 +220,22 @@ def speculative_k2(
     # Source-locked opt-in diagnostics. A successful HTTP 200 never silently
     # becomes a parity or sampled-distribution proof.
     frame_index = int(getattr(model, "_qt_cp_spec_frames", 0)) + 1
+    from .code_predictor_spec_p11b_hybrid import (
+        active_ar_through, stats_line, validate_counts, AUDIT,
+    )
+
+    ar_through = active_ar_through()
+    hybrid_audit = os.environ.get(AUDIT) == "1"
     diag_root, do_parity = diag.frame_enabled(frame_index)
+    if ar_through > 1 and diag_root is not None:
+        raise RuntimeError(
+            "P11B hybrid AR prefix is incompatible with legacy P1/P2 "
+            "all-spec per-depth trace. Run a clean P11B audit, not P1/P2."
+        )
+    ar_depths: list[int] = []
+    proposed_depths: list[int] = []
+    accepted_depths: list[int] = []
+    bonus_depths: list[int] = []
     depth_events: list[dict] | None = [] if diag_root is not None else None
     parity_checks: list[dict] = []
 
@@ -282,8 +297,37 @@ def speculative_k2(
     accepted = 0
     bonus = 0
     rejected = 0
+    ar_steps = 0
     while depth < 15:
+        if depth + 1 <= ar_through:
+            # Real target AR: consume the last committed embedding once
+            # at its existing KV position, sample the true target head,
+            # then continue the same K2 state machine at the next depth.
+            # The newly calculated h0 is the correct draft-head input
+            # for the next speculative K2 round.
+            from .code_predictor_spec_p11b_hybrid import (
+                direct_target_ar_step,
+            )
+
+            depth, cache_len, h0, last_embedding = direct_target_ar_step(
+                model=model,
+                depth=depth,
+                cache_len=cache_len,
+                last_embedding=last_embedding,
+                commit=commit,
+                generator=generator,
+                temperature=t,
+                top_k=k,
+                top_p=p_cut,
+            )
+            ar_steps += 1
+            if hybrid_audit:
+                ar_depths.append(depth)
+            continue
+
         rounds += 1
+        if hybrid_audit:
+            proposed_depths.append(depth + 1)
         # q for code_(depth+1) is head[depth] on the *old* hidden,
         # before consuming the most recent committed code.
         next_head = model.code_predictor.lm_head[depth]
@@ -363,6 +407,23 @@ def speculative_k2(
         logits_target, _ = next_head(h_after_committed)
         p = sampling_probs(logits_target[:, -1, :], temperature=t, top_k=k, top_p=p_cut)
 
+        # P11A: profile two top-k GPU ops, post-topk Triton, graph RNG,
+        # and the complete sparse graph on REAL target/draft p/q logits.
+        # Source-locked, opt-in, no changes to the live K2 decisions.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P11A_DIR"):
+            from .code_predictor_spec_p11a_attribution import (
+                maybe_probe as p11a_probe,
+            )
+            p11a_probe(
+                model,
+                frame_index=frame_index,
+                proposal_depth=depth + 1,
+                logits_p=logits_target[:, -1, :],
+                logits_q=logits_draft[:, -1, :],
+                temperature=t,
+                top_k=k,
+                top_p=p_cut,
+            )
         # P10B sparse top-k sampler: a real candidate p/q state, a
         # private CUDA generator and a single post-topk fused residual
         # kernel. The probe does NOT replace the live K2's decisions.
@@ -488,6 +549,8 @@ def speculative_k2(
 
         if survived:
             accepted += 1
+            if hybrid_audit:
+                accepted_depths.append(depth)
             cache_len += 2
             h0 = h_after_proposal
             if depth == 15:
@@ -501,6 +564,8 @@ def speculative_k2(
             bonus_code = torch.multinomial(bonus_prob, 1, generator=generator).reshape(1)
             depth += 1
             bonus += 1
+            if hybrid_audit:
+                bonus_depths.append(depth)
             last_embedding = commit(depth, bonus_code)
         else:
             rejected += 1
@@ -510,6 +575,10 @@ def speculative_k2(
             # The verifier wrote a KV suffix for the rejected draft. Its slot
             # lies beyond cache_len and is overwritten on the next verification.
 
+    validate_counts(
+        ar_steps=ar_steps, rounds=rounds, proposals=proposed,
+        accepted=accepted, rejected=rejected, bonus=bonus,
+    )
     count = frame_index
     model._qt_cp_spec_frames = count
     if depth_events is not None:
@@ -548,9 +617,27 @@ def speculative_k2(
             )
         payload["status"] = "P1_P2_K2_TRACE_CAPTURED_NOT_SAMPLER_OR_AUDIO_PARITY"
         diag.write_trace(diag_root, count, payload)
-    logger.info(
-        "QTTS_CP_SPEC_K2 frame=%d rounds=%d proposed=%d accepted=%d "
-        "bonus=%d rejected=%d committed_residual=15",
-        count, rounds, proposed, accepted, bonus, rejected,
-    )
+    if hybrid_audit:
+        logger.info(
+            "%s",
+            stats_line(
+                frame=count, ar_through=ar_through,
+                ar=ar_depths, proposed=proposed_depths,
+                accepted=accepted_depths, bonus=bonus_depths,
+            ),
+        )
+    if os.environ.get("SGLANG_OMNI_QTTS_CP_K2_HYBRID_ARM_FILE"):
+        logger.info(
+            "QTTS_CP_SPEC_K2 frame=%d rounds=%d proposed=%d accepted=%d "
+            "bonus=%d rejected=%d committed_residual=15 "
+            "ar_steps=%d ar_through=%d",
+            count, rounds, proposed, accepted, bonus, rejected,
+            ar_steps, ar_through,
+        )
+    else:
+        logger.info(
+            "QTTS_CP_SPEC_K2 frame=%d rounds=%d proposed=%d accepted=%d "
+            "bonus=%d rejected=%d committed_residual=15",
+            count, rounds, proposed, accepted, bonus, rejected,
+        )
     return pos_codes.unsqueeze(-1), pos_summed.unsqueeze(1)
