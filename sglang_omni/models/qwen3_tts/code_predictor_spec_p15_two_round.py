@@ -28,9 +28,6 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch._higher_order_ops.cond import cond_op
-from torch._higher_order_ops.cudagraph_conditional_nodes import (
-    CUDAGraphCaptureControlFlowOpDispatchMode,
-)
 
 from .code_predictor_spec import sampling_probs
 from .code_predictor_spec_p10a_dynamic_kv import dynamic_fused_predictor
@@ -412,6 +409,7 @@ def capture_two_rounds(
             model.predictor_v_cache[:, :1, :MAX_CACHE_SLOTS].clone(),
         )
 
+    failed = False
     try:
         # CUDA kernels must be JIT-warmed OUTSIDE graph capture. Do not call
         # the nested GPU control-flow graph here (only its constituent kernels).
@@ -436,6 +434,12 @@ def capture_two_rounds(
                 gpu_accept(ids, probs, ids, probs, u[0], draft)
         torch.cuda.synchronize(dev)
         restore()
+
+        # This private PyTorch API is version-gated; fail closed if absent.
+        # Import only when capturing so CPU report validators can still run.
+        from torch._higher_order_ops.cudagraph_conditional_nodes import (
+            CUDAGraphCaptureControlFlowOpDispatchMode,
+        )
 
         with (
             torch.cuda.graph(
@@ -552,18 +556,29 @@ def capture_two_rounds(
             if not torch.equal(value, saved):
                 raise RuntimeError("P15_ON_POLICY_PROBE_INPUT_MUTATION")
         return report
+    except BaseException:
+        failed = True
+        raise
     finally:
-        # Failed conditional capture may poison CUDA. Do NOT retry in-worker.
-        if captured:
-            torch.cuda.synchronize(dev)
-            restore()
-            torch.cuda.synchronize(dev)
-            if not torch.equal(
-                model.predictor_k_cache[:, :1, :MAX_CACHE_SLOTS], original_k
-            ) or not torch.equal(
-                model.predictor_v_cache[:, :1, :MAX_CACHE_SLOTS], original_v
-            ):
-                raise RuntimeError("P15_FULL_PHYSICAL_KV_NOT_RESTORED")
+        # Always attempt restoration, including failed warmups/captures.
+        # If CUDA context is poisoned, preserve the FIRST exception and
+        # stop the live request; caller records it and worker must restart.
+        if captured or failed:
+            try:
+                torch.cuda.synchronize(dev)
+                restore()
+                torch.cuda.synchronize(dev)
+                if not torch.equal(
+                    model.predictor_k_cache[:, :1, :MAX_CACHE_SLOTS],
+                    original_k,
+                ) or not torch.equal(
+                    model.predictor_v_cache[:, :1, :MAX_CACHE_SLOTS],
+                    original_v,
+                ):
+                    raise RuntimeError("P15_FULL_PHYSICAL_KV_NOT_RESTORED")
+            except BaseException:
+                if not failed:
+                    raise
 
 
 def maybe_probe(
