@@ -16,6 +16,18 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "P15 requires clean tracked working tree" >&2
   exit 2
 fi
+# Fail before starting the large model if this PyTorch build lacks
+# CUDA Graph device conditional nodes. No CPU fallback is valid evidence.
+python - <<'PY'
+import torch
+from torch._higher_order_ops.cudagraph_conditional_nodes import (
+    CUDAGraphCaptureControlFlowOpDispatchMode,
+)
+assert torch.cuda.is_available(), "P15 requires CUDA"
+assert "H200" in torch.cuda.get_device_name(0), "P15 requires NVIDIA H200"
+print("P15_CUDA_CONDITIONAL_API_PRESENT", torch.__version__)
+PY
+
 mkdir -p "$ROOT"
 SHA="$(git rev-parse HEAD)"
 printf '%s\n' "$SHA" > "$ROOT/source.sha"
