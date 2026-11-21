@@ -1,5 +1,57 @@
 # P9 — Real H200 four-offset K2 verification + GPU sampler cost screen
 
+## Recover missing P2 historical acceptance aggregate (no H200 rerun)
+
+If the original historical P2 directory
+`$HOME/results/qwen3tts-cpspec-k2-p2-report-004` is gone, the P9 budget
+analyzer will raise FileNotFoundError on its old `report.json`.
+**Do not fabricate an original P2 raw report and do not rerun P2 solely
+to calculate this screening estimate.**
+
+A separate, clearly attributed, checked-in historical aggregate was
+reconstructed from the previously user-shared 720-frame P2 summary:
+
+`experiments/qwen3_tts_cp_spec_k2/data/p2_720_historical_aggregate_reconstructed.json`
+
+It has 720 frames, 6974 proposals, 3420 accepted, 3554 rejected,
+3106 bonus and all fourteen individual depth-count records. The
+historical source SHA remains `398297b1d4d2a44d10d1056da5607a7d4ac08e41`,
+not the new P9 source. **This is not the original report or any recovered
+per-frame/parity trace.** The cost report now prominently labels this
+provenance. If the original verified report still exists elsewhere,
+prefer it; do not overwrite or replace any original file with the
+reconstruction.
+
+If P9A/P9B's new evidence is still intact, you only need to pull the
+branch and rerun the CPU budget screen; do NOT redo GPU tests:
+
+~~~bash
+cd ~/sglang-omni
+git fetch charlie-fork
+git switch experiment/qwen3-tts-codepredictor-spec-k2-p0
+git merge --ff-only \
+  charlie-fork/experiment/qwen3-tts-codepredictor-spec-k2-p0
+
+python -m pytest -q \
+  tests/unit_test/qwen3_tts/test_cp_spec_p9_budget.py
+
+python -m experiments.qwen3_tts_cp_spec_k2.p9_budget_screen \
+  --p9a-dir "$HOME/results/qwen3tts-cpspec-k2-p9a-012/four" \
+  --p9b-dir "$HOME/results/qwen3tts-cpspec-k2-p9b-013/sampler" \
+  --baseline-graph-dir "$HOME/results/qwen3tts-cpspec-k2-p9a-012/baseline" \
+  --p9b-baseline-graph-dir "$HOME/results/qwen3tts-cpspec-k2-p9b-013/baseline" \
+  --p2-acceptance-report "experiments/qwen3_tts_cp_spec_k2/data/p2_720_historical_aggregate_reconstructed.json" \
+  --out "$HOME/results/qwen3tts-cpspec-k2-p9-budget-014"
+
+cat "$HOME/results/qwen3tts-cpspec-k2-p9-budget-014/summary.md"
+~~~
+
+The output directory must not already exist; if it contains an older
+attempt, choose a new numbered output instead of overwriting it.
+This changes only the historical acceptance input to the cost screen;
+it does **not** imply the P9 full GPU K2 serving path is implemented.
+
+
 **P9B first H200 run stopped at a harness bug (fixed, needs rerun).**
 The first P9B CUDA Graph distribution parity check compared graph-owned
 p/q output tensors *immediately after capture*, before any graph.replay().
@@ -220,7 +272,7 @@ python -m experiments.qwen3_tts_cp_spec_k2.p9_budget_screen \
   --p9b-dir "$HOME/results/qwen3tts-cpspec-k2-p9b-013/sampler" \
   --baseline-graph-dir "$HOME/results/qwen3tts-cpspec-k2-p9a-012/baseline" \
   --p9b-baseline-graph-dir "$HOME/results/qwen3tts-cpspec-k2-p9b-013/baseline" \
-  --p2-acceptance-report "$HOME/results/qwen3tts-cpspec-k2-p2-report-004/report.json" \
+  --p2-acceptance-report "experiments/qwen3_tts_cp_spec_k2/data/p2_720_historical_aggregate_reconstructed.json" \
   --out "$HOME/results/qwen3tts-cpspec-k2-p9-budget-014"
 
 cat "$HOME/results/qwen3tts-cpspec-k2-p9-budget-014/summary.md"
