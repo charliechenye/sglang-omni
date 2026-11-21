@@ -293,6 +293,19 @@ def speculative_k2(
         proposed += 1
         _, proposed_embedding = embedding_for_code(depth + 1, proposal)
 
+        # P7 opt-in (not normal serving): capture one real model's 2-way GPU
+        # conditional branch between fixed Predictor KV offsets 2 and 6.
+        # It restores all active K/V, performs no token sampling, and never
+        # runs unless manually ARM'd for this experiment.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P7_DIR"):
+            from .code_predictor_spec_p7_dispatch import maybe_profile
+
+            maybe_profile(
+                model,
+                frame_index=frame_index,
+                proposal_depth=depth + 1,
+                token_embeds=torch.cat((last_embedding, proposed_embedding), dim=1),
+            )
         # Snapshot the committed KV prefix BEFORE packed verification when
         # P1 audit is armed. No output outside the append may be modified.
         if do_parity:
