@@ -130,6 +130,7 @@ def test_p12a_h200_tie_free_single_distribution_top50_graph(top_p):
         "P12A_SINGLE_DISTRIBUTION_TOP50_EXACT_MATCH_PASS"
     )
     assert report["selected_ids_match"] is True
+    assert report["selected_support_match"] is True
     assert report["probability_match"] is True
     assert report["fixed_uniform_draws"] == list(DRAWS)
     assert all(
