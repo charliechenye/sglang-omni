@@ -201,6 +201,186 @@ Do not mix acceptance percentages from multiple model revisions or sampling
 configs; this coarse parser does not identify the request or model SHA.
 It only summarizes the log files you explicitly select.
 
+
+## 4C. P1 real target parity / P2 per-depth trace (new opt-in diagnostics)
+
+**Status: code committed, not yet executed/verified on H200.** Stop your
+previous -002 server first: the model worker must import the new diagnostic
+code. The production/normal predictor path is unchanged when not ARM'd.
+Diagnostics have three explicit controls:
+
+- SGLANG_OMNI_QTTS_CP_K2_DIAG_DIR: enable per-frame JSON evidence only on K2
+  C1 ARM'd requests. This adds GPU->CPU synchronizations.
+- SGLANG_OMNI_QTTS_CP_K2_DIAG_MAX_FRAMES: bounded frame budget (1..4096).
+- SGLANG_OMNI_QTTS_CP_K2_PARITY_MAX_FRAMES: number of early frames where
+  *every* K2 verify step is re-run as two serial model steps on the same
+  committed KV prefix and identical draft tokens. Cache and output states
+  are restored after each oracle check. The parity test compares two
+  hidden positions, target logits, KV prefix/suffix, and BF16 embedding sum.
+
+The per-depth trace stores conditional q/p overlap, proposed and committed
+tokens, actual accepted/rejected outcome, and any bonus codebook depth.
+Acceptance at later depths is **conditional on reaching that depth**,
+because earlier bonus tokens skip proposal slots.
+
+### P1.0 CPU checks and GPU fixture checks (first)
+
+~~~bash
+cd ~/sglang-omni
+git fetch charlie-fork
+git switch experiment/qwen3-tts-codepredictor-spec-k2-p0
+git merge --ff-only \
+  charlie-fork/experiment/qwen3-tts-codepredictor-spec-k2-p0
+git status --short
+
+python -m pytest -q \
+  tests/unit_test/qwen3_tts/test_cp_spec_diagnostics.py \
+  tests/unit_test/qwen3_tts/test_cp_spec_quality_ab.py \
+  tests/unit_test/qwen3_tts/test_cp_spec_quality_smoke.py \
+  -k 'not live_gpu'
+
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
+  tests/unit_test/qwen3_tts/test_cp_spec_diagnostics.py \
+  -k live_gpu -s
+
+CUDA_VISIBLE_DEVICES=0 python -m pytest -q \
+  tests/unit_test/qwen3_tts/test_code_predictor_spec_k2.py \
+  -k 'packed_two_token or k2_real_16_group' -s
+~~~
+
+Do NOT run the HTTP experiment when any CPU/GPU test fails. The K2 GPU
+fixture test now also enables the real parity/trace sidecar; the CPU oracle
+tests run without model weights.
+
+### P1.1 First live C1 parity audit (new -003 server)
+
+Terminal A:
+
+~~~bash
+cd ~/sglang-omni
+mkdir -p "$HOME/results/qwen3tts-cpspec-k2-p1-003"
+export CUDA_VISIBLE_DEVICES=0
+export SGLANG_OMNI_QTTS_CP_SPEC_K=2
+export SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE="$HOME/results/qwen3tts-cpspec-k2-p1-003/ARM"
+export SGLANG_OMNI_QTTS_CP_K2_DIAG_DIR="$HOME/results/qwen3tts-cpspec-k2-p1-003/frames"
+export SGLANG_OMNI_QTTS_CP_K2_DIAG_MAX_FRAMES=16
+export SGLANG_OMNI_QTTS_CP_K2_PARITY_MAX_FRAMES=4
+export SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA="$(git rev-parse HEAD)"
+
+sgl-omni serve \
+  --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --config examples/configs/qwen3_tts_1_7b_customvoice.yaml \
+  --port 8000 \
+  2>&1 | tee "$HOME/results/qwen3tts-cpspec-k2-p1-003/server.log"
+~~~
+
+Terminal B, after the server is healthy:
+
+~~~bash
+cd ~/sglang-omni
+python experiments/qwen3_tts_cp_spec_k2/quality_smoke.py \
+  --base-url http://localhost:8000 \
+  --arm-file "$HOME/results/qwen3tts-cpspec-k2-p1-003/ARM" \
+  --server-log "$HOME/results/qwen3tts-cpspec-k2-p1-003/server.log" \
+  --max-new-tokens 512 \
+  --out "$HOME/results/qwen3tts-cpspec-k2-p1-smoke-003"
+
+python -m experiments.qwen3_tts_cp_spec_k2.analyze_depth_trace \
+  --frames-dir "$HOME/results/qwen3tts-cpspec-k2-p1-003/frames" \
+  --expect-source-sha "$(git rev-parse HEAD)" --min-frames 16 \
+  --out "$HOME/results/qwen3tts-cpspec-k2-p1-report-003"
+
+cat "$HOME/results/qwen3tts-cpspec-k2-p1-report-003/summary.md"
+~~~
+
+**P1 gate:** parity_checked_frames must be 4 and every hidden/logit/KV
+check must pass; all 16 traced frames must have full codec embedding sums.
+On failure, the experiment writes frame_pid..._FAIL.json and raises a
+diagnostic RuntimeError. Stop here; do not change tolerances or ignore it.
+This is the real-checkpoint side-by-side verification we previously lacked.
+Even if it passes, GPU sampler distribution parity vs the original fused
+sampler and end-to-end stochastic equivalence are separate remaining gates.
+
+### P2/P3. Generate varied real prompts and collect full-depth acceptance
+
+After P1 PASS, stop the previous server. Start a NEW server, new paths,
+DIAG_MAX_FRAMES=2048, PARITY_MAX_FRAMES=4, and the same K2 config/model.
+Use the -004 paths throughout (do not overwrite the -003 evidence).
+The new quality_ab module includes two English and two Chinese seeded
+prompts, sequential C1, each baseline/spec/spec/baseline. Each visit must
+end naturally and K2 activity must be observed only in the candidate arms.
+
+Terminal A:
+
+~~~bash
+cd ~/sglang-omni
+mkdir -p "$HOME/results/qwen3tts-cpspec-k2-p2-004"
+export CUDA_VISIBLE_DEVICES=0
+export SGLANG_OMNI_QTTS_CP_SPEC_K=2
+export SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE="$HOME/results/qwen3tts-cpspec-k2-p2-004/ARM"
+export SGLANG_OMNI_QTTS_CP_K2_DIAG_DIR="$HOME/results/qwen3tts-cpspec-k2-p2-004/frames"
+export SGLANG_OMNI_QTTS_CP_K2_DIAG_MAX_FRAMES=2048
+export SGLANG_OMNI_QTTS_CP_K2_PARITY_MAX_FRAMES=4
+export SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA="$(git rev-parse HEAD)"
+
+sgl-omni serve \
+  --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
+  --config examples/configs/qwen3_tts_1_7b_customvoice.yaml \
+  --port 8000 \
+  2>&1 | tee "$HOME/results/qwen3tts-cpspec-k2-p2-004/server.log"
+~~~
+
+Terminal B:
+
+~~~bash
+cd ~/sglang-omni
+python -m experiments.qwen3_tts_cp_spec_k2.quality_ab generate \
+  --base-url http://localhost:8000 \
+  --arm-file "$HOME/results/qwen3tts-cpspec-k2-p2-004/ARM" \
+  --server-log "$HOME/results/qwen3tts-cpspec-k2-p2-004/server.log" \
+  --max-new-tokens 512 \
+  --out "$HOME/results/qwen3tts-cpspec-k2-p3-quality-004"
+
+python -m experiments.qwen3_tts_cp_spec_k2.analyze_depth_trace \
+  --frames-dir "$HOME/results/qwen3tts-cpspec-k2-p2-004/frames" \
+  --expect-source-sha "$(git rev-parse HEAD)" --min-frames 16 \
+  --out "$HOME/results/qwen3tts-cpspec-k2-p2-report-004"
+
+cat "$HOME/results/qwen3tts-cpspec-k2-p2-report-004/summary.md"
+~~~
+
+The P2 report contains proposal count, observed and expected acceptance,
+target mass on q support and skipped bonus depths for each residual codebook
+depth 2..15. Check whether A1's 10.2% first-future-code result is seen
+at depth=2 on its own proposal cohort; do not equate it with aggregate
+selected-depth acceptance. The trace may include repeated seeded requests;
+it is NOT a confidence interval or independent corpus study.
+
+### P3. ASR-based WER/CER only (run after finishing TTS)
+
+You can run the TTS generation on a single H200; after it finishes, stop
+that server and start **a separate supported ASR deployment** (Qwen3-ASR or
+an already existing OpenAI-compatible ASR endpoint) on any accessible
+port. Do not load ASR into the same busy TTS service for a benchmark.
+Score the audio generated above (no need to generate it again):
+
+~~~bash
+cd ~/sglang-omni
+python -m experiments.qwen3_tts_cp_spec_k2.quality_ab score \
+  --report "$HOME/results/qwen3tts-cpspec-k2-p3-quality-004/report.json" \
+  --asr-base-url http://127.0.0.1:8001 \
+  --asr-model <YOUR_RUNNING_ASR_MODEL_ID>
+cat "$HOME/results/qwen3tts-cpspec-k2-p3-quality-004/asr_quality.json"
+~~~
+
+Replace the example ASR model ID with the exact model running on the ASR
+endpoint (no model is assumed to be installed). The scorer uses
+/v1/audio/transcriptions with a WAV upload and computes EN WER / ZH
+character error rate. These scores assess intelligibility only.
+**Speaker similarity, MOS, audio naturalness and statistical distribution
+parity remain unmeasured.** Do not claim full quality parity from WER/CER
+alone. Without ASR the P3 output is explicitly marked not yet scored.
+
 ## 5. Gates before an upstream optimization
 
 1. Test live target per-depth logits and two-row causal verification vs
