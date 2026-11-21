@@ -47,8 +47,8 @@ def test_p14_cpu_selected_proposal_and_acceptance_accounting():
     p = torch.zeros_like(q)
     q[0, :50] = 1 / 50.
     p[0, 25:75] = 1 / 50.
-    rejected = cpu_reference(p, q, (0.10, 0.50, 0.625))
-    accepted = cpu_reference(p, q, (0.60, 0.00, 0.625))
+    rejected = cpu_reference(p, q, (0.09, 0.50, 0.625))
+    accepted = cpu_reference(p, q, (0.59, 0.00, 0.625))
     assert rejected["accepted"] is False
     assert accepted["accepted"] is True
     assert rejected["draft"] < 25
@@ -71,8 +71,8 @@ def test_p14_h200_sparse_accept_and_correct_both_decisions():
     )
     q = torch.zeros_like(p).scatter(-1, qids.long(), qp)
     for draft, triple, surviving in (
-        (4, (0.10, 0.50, 0.625, 0.125), False),
-        (29, (0.60, 0.00, 0.625, 0.125), True),
+        (4, (0.09, 0.50, 0.625, 0.125), False),
+        (29, (0.59, 0.00, 0.625, 0.125), True),
     ):
         u = torch.tensor(triple, device=dev, dtype=torch.float32)
         actual = gpu_accept(
