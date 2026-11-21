@@ -35,8 +35,10 @@ Both sides use the SAME frozen on-policy q or p, same seed-independent
 fixed uniform draws and matched worker. The selector does NOT replace
 live K2 output, change model RNG, alter KV, or fuse across the verifier.
 Real q/p source is checked for exact frame+depth identity. Selector
-output must match reference selected **IDs**, dense normalized
-probabilities (1e-6), and fixed-uniform codes.
+output must match the exact **selected token support set**, dense
+normalized probabilities (1e-6), and fixed-uniform codes. It also
+reports Top-k rank-order equality separately: harmless reordering of
+equal-score selected tokens is not itself a distribution mismatch.
 
 **Important BF16 ties:** the custom Triton selector deliberately ties
 by smaller token ID; Torch topk may choose another token ID for tied
