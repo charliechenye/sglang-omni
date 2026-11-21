@@ -37,6 +37,21 @@ def test_p10b_sparse_graph_contains_no_cpu_sync():
     assert "torch.cumsum(" not in source
 
 
+def test_p10b_qx_uses_vocab_id_after_sparse_cdf_refactor():
+    # P10B originally changed its draft from top-k rank to vocabulary
+    # ID, but left a stale q lookup using proposed_rank; Triton raised
+    # NameError while compiling. A CPU-only source guard catches this
+    # before the next expensive H200 capture test.
+    from sglang_omni.models.qwen3_tts.code_predictor_spec_p10b_sparse_sampler import (
+        sparse_accept_residual_kernel,
+    )
+
+    kernel_source = inspect.getsource(sparse_accept_residual_kernel.fn)
+    assert "proposed_rank" not in kernel_source
+    assert "qi == draft" in kernel_source
+    assert "qx = tl.sum(" in kernel_source
+
+
 @pytest.mark.accelerator
 @pytest.mark.parametrize("top_p", (1.0, 0.90))
 def test_p10b_h200_real_vocab_probabilities_and_deterministic_draws(top_p):
