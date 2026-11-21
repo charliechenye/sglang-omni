@@ -222,6 +222,14 @@ def profile_stage(
     # On BF16 ties, torch.topk can choose a different (but same-score)
     # ID. That changes q/p support, so it is NOT a lossless replacement.
     ids_equal = bool(torch.equal(xidx.to(torch.long), yidx))
+    # Exact rank order is NOT semantically relevant when tied selected
+    # tokens carry equal mass. What matters is the identical supported
+    # token set, identical final dense distribution (including top-p
+    # tie pruning), and identical token draws for fixed uniforms.
+    support_equal = bool(torch.equal(
+        torch.sort(xidx.to(torch.long), dim=-1).values,
+        torch.sort(yidx, dim=-1).values,
+    ))
     probs_equal = bool(torch.allclose(
         _full_dist(xidx, xprob), ref, atol=1e-6, rtol=1e-6
     ))
@@ -230,7 +238,7 @@ def profile_stage(
     ))
     if not torch_probs_equal:
         raise RuntimeError("P12A reference topk+top-p output does not match P9B")
-    mismatch = not (ids_equal and probs_equal)
+    mismatch = not (support_equal and probs_equal)
     draws_match = True
     mismatched_draws = []
     for draw in DRAWS:
@@ -290,6 +298,7 @@ def profile_stage(
         ),
         "probability_match": probs_equal,
         "selected_ids_match": ids_equal,
+        "selected_support_match": support_equal,
         "deterministic_draws_match": draws_match,
         "mismatched_draws": mismatched_draws,
         "tied_pairs_inside_top50": tied_within_topk,
