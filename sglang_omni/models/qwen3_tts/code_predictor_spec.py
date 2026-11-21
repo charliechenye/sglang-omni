@@ -293,6 +293,11 @@ def speculative_k2(
         proposed += 1
         _, proposed_embedding = embedding_for_code(depth + 1, proposal)
 
+        # Snapshot the committed KV prefix BEFORE packed verification when
+        # P1 audit is armed. No output outside the append may be modified.
+        if do_parity:
+            prefix_k = model.predictor_k_cache[:, :1, :cache_len].clone()
+            prefix_v = model.predictor_v_cache[:, :1, :cache_len].clone()
         # Run the true target once for both the previously committed code and
         # the proposed future code. Position-aware causal masking is essential.
         verified = model.predictor_forward_tokens(
@@ -316,6 +321,8 @@ def speculative_k2(
                 last_embedding=last_embedding,
                 proposed_embedding=proposed_embedding,
                 packed_hidden=verified,
+                prefix_k_before=prefix_k,
+                prefix_v_before=prefix_v,
             )
             parity_checks.append(parity)
             if not parity["pass"]:
