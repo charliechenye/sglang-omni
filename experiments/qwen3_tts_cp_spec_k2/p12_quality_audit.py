@@ -335,12 +335,15 @@ def write(out: Path, report: dict) -> Path:
         wer_label = (
             f"{row['wer']:.2%}" if row["wer"] is not None else "NOT_MEASURED"
         )
+        projected = row["historical_projected_target_cuda_ms_per_codec_frame"]
+        projected_label = (
+            f"{projected:.5f}" if projected is not None else "NOT_MEASURED"
+        )
         lines.append(
             f"| {row['seed']} | {row['mode']} | {row['duration_s']:.3f} | "
             f"{row['duration_delta_vs_native_pct']:+.1f}% | "
             f"{row['silence_fraction']:.1%} | {row['trailing_silence_s']:.2f}s | "
-            f"{wer_label} | "
-            f"{(f'{row['historical_projected_target_cuda_ms_per_codec_frame']:.5f}' if row['historical_projected_target_cuda_ms_per_codec_frame'] is not None else 'NOT_MEASURED')} | "
+            f"{wer_label} | {projected_label} | "
             f"{row['flag_duration_gt_20pct']} |"
         )
     lines.extend(["", "## Limits", ""] + [
