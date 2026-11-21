@@ -100,6 +100,7 @@ def waveform_features(path: Path, expected_sha: str, *, threshold_dbfs=-45.) -> 
     return {
         "path": str(path),
         "sha256_verified": True,
+        "sha256": sha,
         "duration_s": duration,
         "duration_80ms_codec_frames_approx": duration / .08,
         "silence_threshold_dbfs": threshold_dbfs,
@@ -162,6 +163,44 @@ def analyze(args) -> dict:
         speaker = json.loads(spath.read_text())
         if not isinstance(speaker, dict) or not speaker.get("model_id"):
             raise ValueError("Speaker embeddings need externally recorded model_id and vectors mapping")
+    # Optional same-worker component timing. The old P11B WAV cohort
+    # is on a PRIOR commit and must never be promoted to source-matched
+    # full serving performance, even if component timing improves.
+    timing_context = None
+    if args.p12b_timing_dir is not None:
+        folder_t = args.p12b_timing_dir.expanduser().resolve(strict=True)
+        measured = sorted(folder_t.glob("ar_vs_pair_pid*_frame*_depth*.json"))
+        if len(measured) != 2:
+            raise ValueError("P12B needs real depth4/10 AR-vs-packed timing evidence")
+        records = [json.loads(x.read_text()) for x in measured]
+        if (
+            {row.get("depth") for row in records} != {4, 10}
+            or len({row.get("source_sha") for row in records}) != 1
+            or any(
+                row.get("schema") !=
+                "qwen3tts-cpspec-p12b-real-target-ar-vs-packed-verifier-cost-v1"
+                or row.get("parity_pass") is not True
+                or not row.get("status", "").startswith(
+                    "P12B_REAL_TARGET_AR_ONE_VS_PACKED_TWO_KV_PARITY_PASS"
+                )
+                for row in records
+            )
+        ):
+            raise ValueError("P12B timing must have source-identical real parity PASS")
+        timing_context = {
+            "source_sha": records[0]["source_sha"],
+            "source_matches_prior_p11b": records[0]["source_sha"] == sha,
+            "one_token_ar_cuda_event_ms": float(np.median([
+                row["median_cuda_event_ms"]["ar_one"] for row in records
+            ])),
+            "packed_two_cuda_event_ms": float(np.median([
+                row["median_cuda_event_ms"]["packed_two"] for row in records
+            ])),
+            "warning": (
+                "Cross-source cohort cost projection, NOT a full on-policy "
+                "or source-matched serving speedup estimate"
+            ),
+        }
     output = {
         "schema": SCHEMA,
         "status": "P12B_WAV_STATS_PASS_ASR_OR_SPEAKER_UNMEASURED",
@@ -170,6 +209,7 @@ def analyze(args) -> dict:
         "reference_text": args.reference_text,
         "asr_engine": args.asr if model else "NOT_MEASURED",
         "speaker_embeddings": speaker.get("model_id") if speaker else "NOT_MEASURED",
+        "target_forward_component_projection": timing_context,
         "items": [],
         "seed_comparison": [],
     }
@@ -206,7 +246,8 @@ def analyze(args) -> dict:
                 raise ValueError(f"P12B expected 2 repeated visits for {seed}/{mode}")
             # Reproducibility is not independent cohort sampling.
             same = visits[0]["sha256_verified"] and (
-                visits[0]["duration_s"] == visits[1]["duration_s"]
+                visits[0]["sha256"] == visits[1]["sha256"]
+                and visits[0]["duration_s"] == visits[1]["duration_s"]
                 and visits[0]["silence_fraction_20ms"] == visits[1]["silence_fraction_20ms"]
             )
             output["seed_comparison"].append({
@@ -227,7 +268,23 @@ def analyze(args) -> dict:
                 "flag_duration_gt_20pct": (
                     visits[0]["duration_s"] > 1.2 * base["duration_s"]
                 ),
+                "historical_projected_target_cuda_ms_per_codec_frame": None,
             })
+            if timing_context and mode != "native":
+                original = next(
+                    visit for visit in report["visits"]
+                    if visit["tag"] == visits[0]["tag"]
+                )["metrics"]
+                estimated = (
+                    original["spec_rounds_per_frame"] *
+                    timing_context["packed_two_cuda_event_ms"]
+                    + (
+                        original["ar_steps"] / original["frames"]
+                    ) * timing_context["one_token_ar_cuda_event_ms"]
+                )
+                output["seed_comparison"][-1][
+                    "historical_projected_target_cuda_ms_per_codec_frame"
+                ] = estimated
         if speaker:
             emb = speaker.get("vectors", {})
             reference = emb.get(modes["native"][0]["tag"])
@@ -269,9 +326,10 @@ def write(out: Path, report: dict) -> Path:
         f"P11B source SHA: {report['p11b_source_sha']}",
         f"ASR: {report['asr_engine']}",
         f"Speaker similarity: {report['speaker_similarity_status']}",
+        f"Target cost projection: {report['target_forward_component_projection'] or 'NOT_MEASURED'}",
         "",
-        "| Seed | Mode | WAV seconds | vs Native | 20ms silence fraction | Trailing silence | ASR WER | >20% longer |",
-        "|---:|---|---:|---:|---:|---:|---:|---|",
+        "| Seed | Mode | WAV seconds | vs Native | 20ms silence fraction | Trailing silence | ASR WER | Projected GPU target ms / codec frame | >20% longer |",
+        "|---:|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     for row in report["seed_comparison"]:
         wer_label = (
@@ -281,7 +339,9 @@ def write(out: Path, report: dict) -> Path:
             f"| {row['seed']} | {row['mode']} | {row['duration_s']:.3f} | "
             f"{row['duration_delta_vs_native_pct']:+.1f}% | "
             f"{row['silence_fraction']:.1%} | {row['trailing_silence_s']:.2f}s | "
-            f"{wer_label} | {row['flag_duration_gt_20pct']} |"
+            f"{wer_label} | "
+            f"{(f'{row['historical_projected_target_cuda_ms_per_codec_frame']:.5f}' if row['historical_projected_target_cuda_ms_per_codec_frame'] is not None else 'NOT_MEASURED')} | "
+            f"{row['flag_duration_gt_20pct']} |"
         )
     lines.extend(["", "## Limits", ""] + [
         "- " + x for x in report["limits"]
@@ -299,6 +359,7 @@ def main():
     p.add_argument("--asr-model", default="small.en")
     p.add_argument("--asr-device", choices=("cpu","cuda"), default="cuda")
     p.add_argument("--speaker-embeddings", type=Path, default=None)
+    p.add_argument("--p12b-timing-dir", type=Path, default=None)
     p.add_argument("--silence-threshold-dbfs", type=float, default=-45.)
     args = p.parse_args()
     if not -80 <= args.silence_threshold_dbfs <= -15:
