@@ -36,16 +36,22 @@ BASE_ARM = "SGLANG_OMNI_QTTS_CP_P5_BASE_ARM_FILE"
 GRAPH_DEPTHS = "SGLANG_OMNI_QTTS_CP_P5_GRAPH_DEPTHS"
 REPEATS = "SGLANG_OMNI_QTTS_CP_P5_REPEATS"
 BASE_FRAMES = "SGLANG_OMNI_QTTS_CP_P5_BASE_FRAMES"
+P9_BASE_DIR = "SGLANG_OMNI_QTTS_CP_P9_BASE_DIR"
+P9_BASE_ARM = "SGLANG_OMNI_QTTS_CP_P9_BASE_ARM_FILE"
 
 
 def config() -> dict | None:
-    root = os.environ.get(P5_DIR)
-    if not root:
+    p5_root = os.environ.get(P5_DIR)
+    p9_root = os.environ.get(P9_BASE_DIR)
+    if not p5_root and not p9_root:
         return None
+    if p5_root and p9_root:
+        raise RuntimeError("P5 and P9 Graph baseline environments cannot coexist")
+    root = p9_root or p5_root
     if os.environ.get("SGLANG_OMNI_QTTS_CP_P4_DIR") or os.environ.get(
         "SGLANG_OMNI_QTTS_CP_K2_DIAG_DIR"
     ):
-        raise RuntimeError("P5 graph probe must run without P4/P1 instrumentation")
+        raise RuntimeError("P5/P9 baseline needs P4/P1 instrumentation OFF")
     depths = os.environ.get(GRAPH_DEPTHS, "2,6,10,14")
     try:
         picked = tuple(int(x) for x in depths.split(","))
@@ -78,7 +84,9 @@ def baseline_begin(model: "Qwen3TTSTalker") -> torch.cuda.Event | None:
     cfg = config()
     if cfg is None:
         return None
-    arm = os.environ.get(BASE_ARM)
+    arm = os.environ.get(
+        P9_BASE_ARM if os.environ.get(P9_BASE_DIR) else BASE_ARM
+    )
     if not arm or not os.path.isfile(arm):
         return None
     if model.predictor_device.type != "cuda" or torch.cuda.is_current_stream_capturing():
