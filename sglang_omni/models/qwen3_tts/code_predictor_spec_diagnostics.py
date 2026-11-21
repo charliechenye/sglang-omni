@@ -77,7 +77,6 @@ def check_packed_verifier(
             token_embeds=proposed_embedding.clone(), batch_size=1,
             cache_len=cache_len + 1
         ).clone()
-        serial = torch.cat((first, second), dim=1)
         logits_packed, _ = model.code_predictor.lm_head[depth](packed[:, :1])
         logits_serial, _ = model.code_predictor.lm_head[depth](first)
         checks = {
