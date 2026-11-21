@@ -237,12 +237,20 @@ def test_p14_h200_fake_model_one_graph_full_causal_and_kv_restored():
     hidden = torch.randn((1, 1, 32), device=dev) * .01
     last = torch.randn_like(hidden) * .01
     summed = torch.randn((1, 32), device=dev) * .01
-    report = capture_real_causal_round(
-        model, depth=depth, cache_len=2,
-        draft_hidden=hidden, last_embedding=last,
-        accumulated_before=summed,
-        temperature=.9, top_k=50, top_p=1., repeats=8,
-    )
+    # Regression: inference-mode graph outputs must never enter autograd.
+    # Keep trainable fake weights to reproduce the original embedding failure.
+    assert model.code_predictor.model.codec_embedding.weight.requires_grad
+    assert model.code_predictor.lm_head[depth].proj.weight.requires_grad
+    with torch.enable_grad():
+        assert torch.is_grad_enabled()
+        report = capture_real_causal_round(
+            model, depth=depth, cache_len=2,
+            draft_hidden=hidden, last_embedding=last,
+            accumulated_before=summed,
+            temperature=.9, top_k=50, top_p=1., repeats=8,
+        )
+        # The probe must restore the caller's grad mode.
+        assert torch.is_grad_enabled()
     assert report["status"].startswith(
         "P14_REAL_CAUSAL_ONE_ROUND_Q_VERIFIER_P_RESIDUAL_BONUS_"
     )
