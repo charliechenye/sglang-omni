@@ -168,10 +168,27 @@ def analyze(args) -> dict:
     # full serving performance, even if component timing improves.
     timing_context = None
     if args.p12b_timing_dir is not None:
-        folder_t = args.p12b_timing_dir.expanduser().resolve(strict=True)
+        # The WAV audit is independent of the P12B GPU cost probe. When
+        # the caller explicitly supplies timing evidence, require it:
+        # never silently turn a requested cost comparison into a claim
+        # with missing data. Omit the flag to audit P11B WAVs first.
+        folder_t = args.p12b_timing_dir.expanduser().resolve()
+        if not folder_t.is_dir():
+            raise FileNotFoundError(
+                f"P12B_TIMING_EVIDENCE_MISSING: {folder_t}. "
+                "This optional directory exists only AFTER the separate "
+                "P12B H200 AR-vs-packed probe completes. To audit existing "
+                "P11B WAVs now, OMIT --p12b-timing-dir; timing will be "
+                "reported NOT_MEASURED. Do not fabricate GPU costs."
+            )
         measured = sorted(folder_t.glob("ar_vs_pair_pid*_frame*_depth*.json"))
         if len(measured) != 2:
-            raise ValueError("P12B needs real depth4/10 AR-vs-packed timing evidence")
+            raise ValueError(
+                f"P12B_TIMING_EVIDENCE_INCOMPLETE: {folder_t} contains "
+                f"{len(measured)} matching profiles; require real parity-"
+                "passed depth4 AND depth10. Omit --p12b-timing-dir for "
+                "WAV-only audit; don't claim a cost projection."
+            )
         records = [json.loads(x.read_text()) for x in measured]
         if (
             {row.get("depth") for row in records} != {4, 10}
