@@ -294,23 +294,77 @@ projection was measured.
 
 ### 3C. Optional real ASR transcript WER / repeated phrases
 
-Use a separate output directory, and install/provide a working
-`faster-whisper` model. P12B GPU timing evidence is NOT required.
+The first attempt at `--asr faster-whisper --asr-device cuda` failed
+with `ModuleNotFoundError: No module named 'faster_whisper'`. That
+is an **uninstalled OPTIONAL dependency**, not quality/ASR evidence.
+The report is not written when ASR initialization raises.
+
+**Safest default on the H200 model host: create a separate
+home-scoped ASR virtualenv and run CPU INT8**, leaving Omni's active
+PyTorch/CUDA environment untouched. Do NOT downgrade or reinstall
+Torch, Triton, cuDNN or CTranslate2 in the model-serving venv.
 
 ~~~bash
-python -m experiments.qwen3_tts_cp_spec_k2.p12_quality_audit \
+cd ~/sglang-omni
+ASR_VENV="$HOME/.venv-qwen3tts-asr"
+
+# uv already available in the model experimentation environment.
+# This is independent of the serving .venv.
+uv venv "$ASR_VENV" --python 3.12
+uv pip install --python "$ASR_VENV/bin/python" numpy faster-whisper
+
+"$ASR_VENV/bin/python" -c \
+  "from faster_whisper import WhisperModel; import numpy; print('ASR_ENV_READY')"
+
+# CPU INT8 avoids CTranslate2 CUDA/cuDNN runtime incompatibility.
+# Use an output directory that does not yet exist.
+"$ASR_VENV/bin/python" \
+  -m experiments.qwen3_tts_cp_spec_k2.p12_quality_audit \
   --p11b-report "$HOME/results/qwen3tts-cpspec-k2-p11b-020/smoke/report.json" \
-  --asr faster-whisper --asr-model small.en --asr-device cuda \
+  --asr faster-whisper \
+  --asr-model small.en \
+  --asr-device cpu \
   --out "$HOME/results/qwen3tts-cpspec-k2-p12-quality-asr-024"
 
 cat "$HOME/results/qwen3tts-cpspec-k2-p12-quality-asr-024/summary.md"
 ~~~
 
-The ASR command needs an installed model and possibly a previously
-downloaded checkpoint or connectivity. Otherwise report
-`NOT_MEASURED`; no invented WER. Speaker similarity also remains
-`NOT_MEASURED` without actual source-attributed embeddings via
-`--speaker-embeddings`; PCM correlation is not speaker identity.
+This uses the original P11B WAVs; no P12B GPU `--timing-dir` and no
+server are required. `small.en` may require a model download from
+Hugging Face. If outbound network is disabled, replace `small.en`
+with a locally cached CTranslate2 Whisper model directory. Do not
+treat network/model-download failure as quality failure.
+
+To inspect ACTUAL transcripts and repeated phrases, not just WER:
+
+~~~bash
+"$ASR_VENV/bin/python" - <<'PY'
+import json
+from pathlib import Path
+p = (Path.home() / "results/qwen3tts-cpspec-k2-p12-quality-asr-024/report.json")
+data = json.loads(p.read_text())
+for x in data["items"]:
+    # Only first visit of each (seed,mode); the repeats are not
+    # statistically independent.
+    if x["tag"].split("_")[1] not in ("00", "01", "02"):
+        continue
+    print(f"\nseed={x['seed']} mode={x['mode']} wer={x.get('wer')}")
+    print("transcript:", x.get("transcript", "NOT_MEASURED"))
+    print("repeated_trigrams:", x.get("repeated_trigrams", [])[:5])
+PY
+~~~
+
+ASR WER measures recognition against the fixed English prompt; it
+does **not** measure speaker identity, and automatic ASR may be wrong
+on long silences. Manual playback remains useful if Hybrid contains
+unexpected words or repeated phrases. Speaker similarity is
+`NOT_MEASURED` without real source-attributed embedding vectors via
+`--speaker-embeddings`; PCM correlation is not identity.
+
+The official faster-whisper README currently specifies CUDA 12
+cuBLAS/cuDNN 9 for its CTranslate2 GPU backend. This runbook chooses
+CPU INT8 intentionally to isolate the optional ASR from the active
+H200 Omni/CUDA runtime.
 
 P11B WAVs are from a prior source SHA; new P12B target event costs
 applied to them are a CROSS-SOURCE heuristic only, NOT source-matched
