@@ -77,7 +77,7 @@ def test_p8_h200_nested_while_cond_real_model_parity_and_kv(
         report = capture_nested_real_predictor(
             model, fixed_embeds=embeds, repeats=8
         )
-    assert report["status"].startswith("P8_NESTED_WHILE_IF_REAL_5_LAYER_MODEL_PASS")
+    assert report["status"].startswith("P8_NESTED_WHILE_IF_REAL_PREDICTOR_MODEL_PASS")
     assert report["predictor_layers"] == 2  # fixture only, not actual model
     assert len(report["cases"]) == len(STATES) == 6
     assert all(row["pass"] for row in report["cases"]), report["cases"]
