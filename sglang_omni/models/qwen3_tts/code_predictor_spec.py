@@ -332,6 +332,22 @@ def speculative_k2(
         # before consuming the most recent committed code.
         next_head = model.code_predictor.lm_head[depth]
         logits_draft, _ = next_head(h0)
+        # P14: one source-locked genuine CUDA Graph round: q GPU sample
+        # -> projected proposal embedding -> real two-token verifier ->
+        # p support / accept / positive residual -> masked bonus and
+        # GPU next-state. This probe snapshots/restores the whole KV
+        # and never changes the live code, RNG or output embedding.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P14_CAUSAL_DIR"):
+            from .code_predictor_spec_p14_causal_round import (
+                maybe_probe as p14_probe,
+            )
+            p14_probe(
+                model, frame=frame_index, proposal_depth=depth+1,
+                cache_len=cache_len, draft_hidden=h0,
+                last_embedding=last_embedding,
+                accumulated_before=pos_summed,
+                temperature=t, top_k=k, top_p=p_cut,
+            )
         # P12A: record the real q state BEFORE the sampled proposal and
         # actual target verifier; do not mutate the live K2 proposal/RNG.
         if os.environ.get("SGLANG_OMNI_QTTS_CP_P12A_DIR"):
