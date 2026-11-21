@@ -8,7 +8,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from torch import nn
 
 import sglang_omni.models.qwen3_tts.sglang_model as model_module
 from experiments.qwen3_tts_cp_spec_k2.analyze_depth_trace import analyze, write_report
