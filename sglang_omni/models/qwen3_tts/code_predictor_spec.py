@@ -293,6 +293,20 @@ def speculative_k2(
         proposed += 1
         _, proposed_embedding = embedding_for_code(depth + 1, proposal)
 
+        # P10A: one optimized fused Predictor CUDA graph with a GPU scalar
+        # controlling real cache slot/RoPE position/causal attention end.
+        # Opt-in only: snapshot/restore all K/V and do not affect K2 RNG.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P10A_DIR"):
+            from .code_predictor_spec_p10a_dynamic_kv import maybe_probe as p10a_probe
+
+            p10a_probe(
+                model,
+                frame_index=frame_index,
+                proposal_depth=depth + 1,
+                token_embeds=torch.cat(
+                    (last_embedding, proposed_embedding), dim=1
+                ),
+            )
         # P9A opt-in: GPU-controlled four-depth nested model routing.
         # Probe once at a late live checkpoint state, restore K/V and
         # continue the original K2 request without consuming sampled RNG.
@@ -349,6 +363,23 @@ def speculative_k2(
         logits_target, _ = next_head(h_after_committed)
         p = sampling_probs(logits_target[:, -1, :], temperature=t, top_k=k, top_p=p_cut)
 
+        # P10B sparse top-k sampler: a real candidate p/q state, a
+        # private CUDA generator and a single post-topk fused residual
+        # kernel. The probe does NOT replace the live K2's decisions.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P10B_DIR"):
+            from .code_predictor_spec_p10b_sparse_sampler import (
+                maybe_probe as p10b_probe,
+            )
+            p10b_probe(
+                model,
+                frame_index=frame_index,
+                proposal_depth=depth + 1,
+                logits_p=logits_target[:, -1, :],
+                logits_q=logits_draft[:, -1, :],
+                temperature=t,
+                top_k=k,
+                top_p=p_cut,
+            )
         # P9B measures an isolated, fully CUDA-resident sample/accept/
         # positive-residual draw on *real* on-policy p/q logits. It never
         # draws from or modifies the live K2 RNG/committed codes.
