@@ -20,7 +20,7 @@ STATUS = "P1_P2_K2_DEPTH_DIAGNOSTIC_COMPLETE_NOT_FULL_MODEL_DISTRIBUTION_PARITY_
 STATUS_PARTIAL = "P1_P2_K2_TRACE_PARTIAL_OR_PARITY_NOT_CHECKED"
 
 
-def analyze(folder: Path, *, expect_source_sha: str | None, min_frames: int) -> dict:
+def analyze(folder: Path, *, expect_source_sha: str | None, min_frames: int, min_parity_frames: int = 0) -> dict:
     folder = folder.expanduser().resolve(strict=True)
     paths = sorted(folder.glob("frame_pid*_*.json"))
     failed = sorted(folder.glob("frame_pid*_*_FAIL.json"))
@@ -50,7 +50,6 @@ def analyze(folder: Path, *, expect_source_sha: str | None, min_frames: int) -> 
         "proposal_on_target_support_sum": 0.0,
     })
     total_proposals = total_accepted = total_rejected = total_bonus = 0
-    observed_expected = []
     parity_checked = 0
     worst_abs: dict[str, float] = {}
     for row in rows:
@@ -112,9 +111,6 @@ def analyze(folder: Path, *, expect_source_sha: str | None, min_frames: int) -> 
         total_accepted += accepted
         total_rejected += rejected
         total_bonus += bonuses
-        observed_expected.append(
-            sum(event["expected_overlap"] for event in events) / proposals
-        )
     table = []
     for depth in range(2, 16):
         data = per_depth[depth]
@@ -138,6 +134,13 @@ def analyze(folder: Path, *, expect_source_sha: str | None, min_frames: int) -> 
                 data["proposal_on_target_support_sum"] / n if n else None
             ),
         })
+    if not 0 <= min_parity_frames <= len(rows):
+        raise ValueError("min_parity_frames must fit in selected frame count")
+    if parity_checked < min_parity_frames:
+        raise RuntimeError(
+            f"insufficient fully-verified real target frames: "
+            f"{parity_checked} < {min_parity_frames}"
+        )
     expected = sum(event["expected_overlap_sum"] for event in per_depth.values())
     result = {
         "status": STATUS if parity_checked else STATUS_PARTIAL,
@@ -209,13 +212,14 @@ def main() -> None:
     p.add_argument("--frames-dir", type=Path, required=True)
     p.add_argument("--expect-source-sha", default=None)
     p.add_argument("--min-frames", type=int, default=16)
+    p.add_argument("--min-parity-frames", type=int, default=0)
     p.add_argument("--out", type=Path, required=True)
     args = p.parse_args()
     if args.min_frames < 1:
         p.error("min-frames must be positive")
     report = analyze(
         args.frames_dir, expect_source_sha=args.expect_source_sha,
-        min_frames=args.min_frames,
+        min_frames=args.min_frames, min_parity_frames=args.min_parity_frames,
     )
     write_report(args.out, report)
     print(f"{report['status']}: {args.out / 'summary.md'}")
