@@ -58,7 +58,7 @@ def make_evidence(root: Path, *, sampler: float = 0.02, slope: float = 0.08):
         (b / f"sample_pid100_frame0001_depth{depth:02d}.json").write_text(json.dumps(row))
     graph = {
         "kind": "baseline_full_predictor_graph_on",
-        "source_sha": "b" * 40,
+        "source_sha": "a" * 40,
         "device": "NVIDIA H200",
         "frames": 32,
         "graph_replays": 32,
@@ -119,6 +119,14 @@ def test_component_screen_can_fail_and_cannot_claim_serving_speedup(tmp_path):
 
 def test_budget_rejects_missing_real_checkpoint_evidence(tmp_path):
     a,b,base,p2 = make_evidence(tmp_path)
+    old = next(base.glob("baseline_graph*.json"))
+    record = json.loads(old.read_text())
+    record["source_sha"] = "z" * 40
+    old.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="SAME source SHA"):
+        analyze(a,b,base,p2)
+    record["source_sha"] = "a" * 40
+    old.write_text(json.dumps(record))
     (next(b.glob("*depth10.json"))).unlink()
     with pytest.raises(RuntimeError, match="missing/mixed"):
         analyze(a,b,base,p2)
