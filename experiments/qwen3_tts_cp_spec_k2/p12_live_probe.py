@@ -27,26 +27,30 @@ STATUS = "P12_REAL_CHECKPOINT_COMPONENT_PROBE_PASS_NOT_FULL_K2_OR_E2E"
 PHASES = ("base", "spec", "spec", "base")
 
 
-def validate_probe(row: dict, *, mode: str) -> None:
+def validate_probe(row: dict, *, mode: str) -> bool:
     if mode == "selector":
         if (
             row.get("schema") != "qwen3tts-cpspec-p12a-causal-stage-single-distribution-top50-v1"
-            or not row.get("status", "").startswith(
-                "P12A_CAUSAL_REAL_Q_PRE_AND_P_POST_COMPONENT_GATE_PASS"
+            or row.get("status") not in (
+                "P12A_CAUSAL_REAL_Q_PRE_AND_P_POST_COMPONENT_GATE_PASS_NOT_FULL_K2",
+                "P12A_CAUSAL_REAL_Q_PRE_AND_P_POST_NO_SELECTION_TIE_OR_DRAW_MISMATCH",
             )
             or set(row.get("stages", {})) != {
                 "q_before_verifier", "p_after_verifier",
             }
         ):
             raise ValueError("P12A real q/pre p/post evidence missing")
+        eligible = row.get("selection_eligible") is True
         for stage in row["stages"].values():
             if (
-                not stage.get("status", "").startswith(
-                    "P12A_SINGLE_DISTRIBUTION_TOP50_EXACT_MATCH_PASS"
+                stage.get("status") not in (
+                    "P12A_SINGLE_DISTRIBUTION_TOP50_EXACT_MATCH_PASS",
+                    "P12A_TIE_OR_DISTRIBUTION_MISMATCH_NO_SELECTION",
                 )
-                or stage.get("selected_ids_match") is not True
-                or stage.get("probability_match") is not True
                 or len(stage.get("fixed_uniform_draws", [])) != 4
+                or set(stage.get("times_ms", {})) != {
+                    "torch_topk_reference", "triton_single_top50",
+                }
                 or any(
                     len(series) != 4 or any(
                         type(v) not in (float, int)
@@ -55,7 +59,13 @@ def validate_probe(row: dict, *, mode: str) -> None:
                     for series in stage.get("times_ms", {}).values()
                 )
             ):
-                raise ValueError("P12A tie, probability, deterministic draw or timer gate failed")
+                raise ValueError("P12A missing valid tied-rank numerical and graph cost evidence")
+            if eligible != all(
+                st.get("selection_eligible") is True
+                for st in row["stages"].values()
+            ):
+                raise ValueError("P12A inconsistent topk parity eligibility flags")
+        return eligible
     else:
         if (
             row.get("schema") != "qwen3tts-cpspec-p12b-real-target-ar-vs-packed-verifier-cost-v1"
@@ -69,6 +79,7 @@ def validate_probe(row: dict, *, mode: str) -> None:
             or set(row.get("median_cuda_event_ms", {})) != {"ar_one", "packed_two"}
         ):
             raise ValueError("P12B real-model AR/packed KV parity evidence invalid")
+        return True
 
 
 def run(args):
@@ -165,15 +176,20 @@ def run(args):
         depths = {row.get("depth") for row in rows}
         if depths != ({2, 10} if args.mode == "selector" else {4, 10}):
             raise RuntimeError(f"P12 expected real depths missing: {depths}")
+        eligibility = []
         for row in rows:
-            validate_probe(row, mode=args.mode)
+            eligibility.append(validate_probe(row, mode=args.mode))
             if (
                 row.get("source_sha") != sha
                 or row.get("pid") != baseline.get("pid")
                 or row.get("gpu") != baseline.get("device")
             ):
                 raise RuntimeError("P12 probe source SHA, worker PID or GPU mismatch")
-        report["status"] = STATUS
+        report["selection_eligible"] = all(eligibility)
+        report["status"] = (
+            STATUS if report["selection_eligible"]
+            else "P12A_REAL_CAUSAL_STAGE_TIE_NO_SELECTION_COST_ONLY"
+        )
         report["gpu"] = baseline["device"]
         report["baseline_graph_on_ms"] = baseline["median_cuda_event_ms"]
         report["probes"] = rows
@@ -192,15 +208,15 @@ def run(args):
     (out / "report.json").write_text(json.dumps(report, indent=2)+"\n")
     lines = [
         f"# P12 {args.mode} on-policy H200 real component screen",
-        "", f"**{STATUS}**", "",
+        "", f"**{report['status']}**", "",
         f"Source SHA: {sha}",
         f"GPU: {report['gpu']}",
         f"Native full Graph ON: {report['baseline_graph_on_ms']:.5f} ms/frame", "",
     ]
     if args.mode == "selector":
         lines += [
-            "| Real proposal depth | Stage | Torch topk+draw ms | Triton top50+draw ms | Ratio |",
-            "|---:|---|---:|---:|---:|",
+            "| Real proposal depth | Stage | Torch topk+draw ms | Triton top50+draw ms | Ratio | Exact support/draw | Tied within top50 | Boundary tie |",
+            "|---:|---|---:|---:|---:|---|---:|---|",
         ]
         for row in rows:
             for stage, data in row["stages"].items():
@@ -209,7 +225,10 @@ def run(args):
                     f"| {row['depth']} | {stage} | "
                     f"{med['torch_topk_reference']:.5f} | "
                     f"{med['triton_single_top50']:.5f} | "
-                    f"{data['fast_over_reference_ratio']:.3f}x |"
+                    f"{data['fast_over_reference_ratio']:.3f}x | "
+                    f"{data['selection_eligible']} | "
+                    f"{data['tied_pairs_inside_top50']} | "
+                    f"{data['tie_at_top50_boundary']} |"
                 )
     else:
         lines += [
@@ -225,7 +244,10 @@ def run(args):
             )
     lines += ["", "## Non-claims", ""] + ["- "+x for x in report["limits"]]
     (out / "summary.md").write_text("\n".join(lines)+"\n")
-    print(f"P12_{args.mode.upper()}_STATUS={STATUS} REPORT={out/'summary.md'}")
+    print(
+        f"P12_{args.mode.upper()}_STATUS={report['status']} "
+        f"REPORT={out/'summary.md'}"
+    )
     return report
 
 
