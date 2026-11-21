@@ -103,8 +103,8 @@ def sparse_accept_residual_kernel(
     )
     # The draft is now selected by vocabulary token ID (not top-k rank).
     # Gather q(x) from q's sparse support using that same token ID.
-    # Using the removed 'proposed_rank' from the old rank-CDF path made
-    # this kernel fail Triton compilation on H200.
+    # A stale rank-based lookup here would refer to an undefined
+    # variable and fail Triton compilation.
     qx = tl.sum(tl.where(valid & (qi == draft), q, 0.0), axis=0)
     px = tl.sum(tl.where(pi == draft, p, 0.0), axis=0)
     probability = tl.minimum(1.0, px / tl.maximum(qx, 1.0e-20))
