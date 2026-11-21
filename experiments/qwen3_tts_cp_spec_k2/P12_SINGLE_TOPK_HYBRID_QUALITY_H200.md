@@ -311,7 +311,21 @@ ASR_VENV="$HOME/.venv-qwen3tts-asr"
 # uv already available in the model experimentation environment.
 # This is independent of the serving .venv.
 uv venv "$ASR_VENV" --python 3.12
-uv pip install --python "$ASR_VENV/bin/python" numpy faster-whisper
+uv pip install --python "$ASR_VENV/bin/python" \
+  numpy faster-whisper "av==18.1.0"
+
+# This repair also works on an ALREADY created ASR-only venv.
+# Old faster-whisper releases still use the av.open metadata_errors
+# keyword removed in PyAV 19; av==18.1.0 accepts the old call.
+"$ASR_VENV/bin/python" - <<'PY'
+import av
+import faster_whisper
+print("PyAV:", av.__version__)
+print("faster-whisper:", faster_whisper.__version__)
+assert int(av.__version__.split(".")[0]) < 19, (
+    "For legacy faster-whisper file decode, use av==18.1.0"
+)
+PY
 
 "$ASR_VENV/bin/python" -c \
   "from faster_whisper import WhisperModel; import numpy; print('ASR_ENV_READY')"
@@ -328,6 +342,30 @@ uv pip install --python "$ASR_VENV/bin/python" numpy faster-whisper
 
 cat "$HOME/results/qwen3tts-cpspec-k2-p12-quality-asr-024/summary.md"
 ~~~
+
+**Second independent workaround if you cannot change PyAV:** the
+quality analyzer also accepts `--asr-input pcm-array` and reads the
+already SHA-verified 24 kHz mono PCM16 WAV through Python `wave`, then
+uses SciPy `resample_poly(audio, 2, 3)` to create a contiguous float32
+16 kHz NumPy array. Faster-whisper accepts an ndarray without invoking
+PyAV decoding. Install SciPy into this isolated ASR venv (not Omni's
+serving venv) and use a NEW output directory:
+
+~~~bash
+uv pip install --python "$ASR_VENV/bin/python" scipy
+
+"$ASR_VENV/bin/python" \
+  -m experiments.qwen3_tts_cp_spec_k2.p12_quality_audit \
+  --p11b-report "$HOME/results/qwen3tts-cpspec-k2-p11b-020/smoke/report.json" \
+  --asr faster-whisper --asr-device cpu --asr-model small.en \
+  --asr-input pcm-array \
+  --out "$HOME/results/qwen3tts-cpspec-k2-p12-quality-asr-array-027"
+~~~
+
+**For the current error the quickest fix is just `av==18.1.0`**;
+the PCM-array option avoids PyAV entirely if package compatibility
+remains problematic. The two modes use different resampling backends;
+do not mix ASR results across them as if they used identical preprocessing.
 
 This uses the original P11B WAVs; no P12B GPU `--timing-dir` and no
 server are required. `small.en` may require a model download from
