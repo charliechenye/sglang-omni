@@ -84,11 +84,23 @@ def sparse_accept_residual_kernel(
     u_draft = tl.load(U + 0)
     u_accept = tl.load(U + 1)
     u_correct = tl.load(U + 2)
-    q_cdf = tl.cumsum(q, axis=0)
-    proposed_rank = tl.minimum(
-        tl.sum((q_cdf < u_draft).to(tl.int32), axis=0), K_COUNT - 1
+    # The existing P9B reference samples a DENSE vocab-ID-ordered
+    # 2048-wide CDF. Top-k is in probability order instead. Preserve
+    # identical inverse-CDF coupling for the deterministic fixed-u
+    # parity oracle using only 50 sparse terms:
+    # q_cdf_at_i = sum(q_j for token_id_j <= token_id_i).
+    q_cdf_by_id = tl.sum(
+        tl.where(
+            (qi[None, :] <= qi[:, None]) & valid[None, :],
+            q[None, :], 0.0,
+        ), axis=1,
     )
-    draft = tl.sum(tl.where(r == proposed_rank, qi, 0), axis=0)
+    draft = tl.min(
+        tl.where(valid & (q_cdf_by_id >= u_draft), qi, 2147483647), axis=0
+    )
+    draft = tl.where(
+        draft == 2147483647, tl.max(tl.where(valid, qi, 0), axis=0), draft
+    )
     qx = tl.sum(tl.where(r == proposed_rank, q, 0.0), axis=0)
     px = tl.sum(tl.where(pi == draft, p, 0.0), axis=0)
     probability = tl.minimum(1.0, px / tl.maximum(qx, 1.0e-20))
@@ -104,12 +116,25 @@ def sparse_accept_residual_kernel(
     corrected_prob = tl.where(
         mass > 1.0e-12, positive / tl.maximum(mass, 1.0e-12), p
     )
-    corrected_cdf = tl.cumsum(corrected_prob, axis=0)
-    corrected_rank = tl.minimum(
-        tl.sum((corrected_cdf < u_correct).to(tl.int32), axis=0),
-        K_COUNT - 1,
+    # Residual support is p's top-50, but reference CDF is again in
+    # ascending vocabulary ID order rather than probability rank.
+    corrected_cdf_by_id = tl.sum(
+        tl.where(
+            (pi[None, :] <= pi[:, None]) & valid[None, :],
+            corrected_prob[None, :], 0.0,
+        ), axis=1,
     )
-    correction = tl.sum(tl.where(r == corrected_rank, pi, 0), axis=0)
+    correction = tl.min(
+        tl.where(
+            valid & (corrected_cdf_by_id >= u_correct),
+            pi, 2147483647,
+        ), axis=0,
+    )
+    correction = tl.where(
+        correction == 2147483647,
+        tl.max(tl.where(valid, pi, 0), axis=0),
+        correction,
+    )
     result = tl.where(accepted, draft, correction)
     tl.store(COMMITTED, result.to(tl.int64))
     tl.store(PROPOSAL, draft.to(tl.int64))
