@@ -47,6 +47,8 @@ def check_packed_verifier(
     last_embedding: torch.Tensor,
     proposed_embedding: torch.Tensor,
     packed_hidden: torch.Tensor,
+    prefix_k_before: torch.Tensor,
+    prefix_v_before: torch.Tensor,
 ) -> dict:
     """Real-model packed-vs-two-serial target parity on identical prefix.
 
@@ -60,6 +62,8 @@ def check_packed_verifier(
     if packed_hidden.shape[1] != 2 or last_embedding.shape[1] != 1 or proposed_embedding.shape[1] != 1:
         raise ValueError("P1 checks exactly a two-token target append")
     end = cache_len + 2
+    if prefix_k_before.shape[2] != cache_len or prefix_v_before.shape[2] != cache_len:
+        raise ValueError("must snapshot exact logical prefix before packed verification")
     k_cache = model.predictor_k_cache
     v_cache = model.predictor_v_cache
     if end > k_cache.shape[2]:
@@ -68,6 +72,14 @@ def check_packed_verifier(
     # forward calls may mutate the same GPU workspace, so never trust views.
     saved_k = k_cache[:, :1, :end].clone()
     saved_v = v_cache[:, :1, :end].clone()
+    before_checks = {
+        "packed_prefix_k_preserved": _compare(
+            prefix_k_before, saved_k[:, :, :cache_len]
+        ),
+        "packed_prefix_v_preserved": _compare(
+            prefix_v_before, saved_v[:, :, :cache_len]
+        ),
+    }
     packed = packed_hidden.detach().clone()
     try:
         first = model.predictor_forward_tokens(
@@ -80,6 +92,7 @@ def check_packed_verifier(
         logits_packed, _ = model.code_predictor.lm_head[depth](packed[:, :1])
         logits_serial, _ = model.code_predictor.lm_head[depth](first)
         checks = {
+            **before_checks,
             "hidden_first": _compare(packed[:, :1], first),
             "hidden_second": _compare(packed[:, 1:], second),
             "target_logits": _compare(logits_packed, logits_serial),
