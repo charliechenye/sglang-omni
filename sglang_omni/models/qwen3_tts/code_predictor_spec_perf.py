@@ -238,6 +238,7 @@ def maybe_profile(
     )
     seen.add(proposal_depth)
     record.update({
+        "pid": os.getpid(),
         "frame": frame_index,
         "source_sha": os.environ.get("SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA", "UNATTESTED"),
         "num_code_groups": model.config.num_code_groups,
