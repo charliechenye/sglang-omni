@@ -195,3 +195,10 @@ def test_p9_rejects_corrupted_historical_aggregate(tmp_path):
     wrong.write_text(json.dumps(broken))
     with pytest.raises(ValueError, match="Historical P2 reconstruction"):
         analyze(a, b, base, wrong)
+
+
+def test_p9_missing_old_p2_report_has_explicit_reconstructed_option(tmp_path):
+    a, b, base, _ = make_evidence(tmp_path)
+    missing = tmp_path / "missing-p2-report-004" / "report.json"
+    with pytest.raises(FileNotFoundError, match="p2_720_historical_aggregate_reconstructed.json"):
+        analyze(a, b, base, missing)
