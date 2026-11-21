@@ -159,3 +159,53 @@ def test_p16a_matched_abba_and_graph_code_not_cpu_branching():
             "torch.cuda.synchronize(",
         ):
             assert forbidden not in source
+
+
+@pytest.mark.accelerator
+def test_p16a_h200_conditional_marker_capture_smoke():
+    """Check that the real test environment supports marked cond nodes."""
+    import torch
+    from torch._higher_order_ops.cond import cond_op
+    from torch._higher_order_ops.cudagraph_conditional_nodes import (
+        CUDAGraphCaptureControlFlowOpDispatchMode,
+    )
+    from sglang_omni.models.qwen3_tts.code_predictor_spec_p16a_markers import (
+        mark_bonus, mark_round,
+    )
+
+    if not torch.cuda.is_available():
+        pytest.skip("P16A requires H200")
+    device = torch.device("cuda")
+    if "H200" not in torch.cuda.get_device_name(device):
+        pytest.skip("P16A requires H200")
+    flag = torch.ones((), device=device, dtype=torch.bool)
+    tensor = torch.ones((1, 1, 32), device=device, dtype=torch.float32)
+    # JIT first: no Triton compilation may happen during CUDA graph capture.
+    mark_round(tensor)
+    mark_bonus(tensor)
+    torch.cuda.synchronize(device)
+
+    def yes(x):
+        mark_bonus(x)
+        return x + 1
+
+    def no(x):
+        return x - 1
+
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    graph = torch.cuda.CUDAGraph()
+    with (
+        torch.cuda.graph(graph, stream=stream),
+        CUDAGraphCaptureControlFlowOpDispatchMode(),
+        torch.inference_mode(),
+    ):
+        mark_round(tensor)
+        out = cond_op(flag, yes, no, (tensor,))
+    for accepted in (True, False, True):
+        flag.fill_(accepted)
+        graph.replay()
+        torch.cuda.synchronize(device)
+        assert torch.allclose(
+            out, tensor + (1 if accepted else -1), atol=0, rtol=0
+        )
