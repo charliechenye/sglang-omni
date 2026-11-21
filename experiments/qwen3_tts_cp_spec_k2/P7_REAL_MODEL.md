@@ -1,5 +1,22 @@
 # P7 — Real Qwen3-TTS Predictor CUDA conditional two-depth dispatch
 
+**P7 first H200 GPU unit test was PARITY_FAIL at offset=2.** This was a
+successful graph capture/replay, not a CUDA capture error. The initial P7
+test had two concrete bugs: (a) it reused one tensor across Predictor
+calls that can mutate their BF16 residual in-place, and (b) it expanded
+the fixture cache capacity without extending predictor_positions beyond
+its old length of 5. Fixes now clone input separately in *both* captured
+branches and the serial oracle, extend the full position table, compare
+the preserved source embedding and both original KV prefix and inactive
+suffix, and emit every failing tensor name with max_abs instead of only
+an offset. A logical parity failure restores KV in finally; an invalidated
+capture still fails closed.
+
+**The updated P7 has NOT yet passed H200.** Rerun the GPU unit test
+before starting a new HTTP smoke. If a mismatch remains, copy the
+exception's failed_checks and do not relax tolerance. Use fresh -010
+evidence paths so prior attempts stay distinct.
+
 P6.1 PASS on H200 / torch 2.14.1+cu130 proved a GPU-controlled CUDA
 WHILE graph with 7–14 residual depth iterations. Its toy depth-control
 cost was ~0.165–0.316 ms/graph. That is not an actual model.
@@ -65,7 +82,7 @@ runs separately from server).
 
 ~~~bash
 cd ~/sglang-omni
-mkdir -p "$HOME/results/qwen3tts-cpspec-k2-p7-009"
+mkdir -p "$HOME/results/qwen3tts-cpspec-k2-p7-010"
 
 unset SGLANG_OMNI_QTTS_CP_P4_DIR
 unset SGLANG_OMNI_QTTS_CP_P5_DIR
@@ -73,8 +90,8 @@ unset SGLANG_OMNI_QTTS_CP_K2_DIAG_DIR
 
 export CUDA_VISIBLE_DEVICES=0
 export SGLANG_OMNI_QTTS_CP_SPEC_K=2
-export SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE="$HOME/results/qwen3tts-cpspec-k2-p7-009/ARM"
-export SGLANG_OMNI_QTTS_CP_P7_DIR="$HOME/results/qwen3tts-cpspec-k2-p7-009/conditional"
+export SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE="$HOME/results/qwen3tts-cpspec-k2-p7-010/ARM"
+export SGLANG_OMNI_QTTS_CP_P7_DIR="$HOME/results/qwen3tts-cpspec-k2-p7-010/conditional"
 export SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA="$(git rev-parse HEAD)"
 
 test ! -e "$SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE"
@@ -84,7 +101,7 @@ sgl-omni serve \
   --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice \
   --config examples/configs/qwen3_tts_1_7b_customvoice.yaml \
   --port 8000 \
-  2>&1 | tee "$HOME/results/qwen3tts-cpspec-k2-p7-009/server.log"
+  2>&1 | tee "$HOME/results/qwen3tts-cpspec-k2-p7-010/server.log"
 ~~~
 
 ## 3. Trigger the actual model (terminal B)
@@ -95,15 +112,15 @@ curl -fsS http://localhost:8000/health
 
 python experiments/qwen3_tts_cp_spec_k2/quality_smoke.py \
   --base-url http://localhost:8000 \
-  --arm-file "$HOME/results/qwen3tts-cpspec-k2-p7-009/ARM" \
-  --server-log "$HOME/results/qwen3tts-cpspec-k2-p7-009/server.log" \
+  --arm-file "$HOME/results/qwen3tts-cpspec-k2-p7-010/ARM" \
+  --server-log "$HOME/results/qwen3tts-cpspec-k2-p7-010/server.log" \
   --max-new-tokens 512 \
-  --out "$HOME/results/qwen3tts-cpspec-k2-p7-smoke-009"
+  --out "$HOME/results/qwen3tts-cpspec-k2-p7-smoke-010"
 
 python - <<'PY'
 import json
 from pathlib import Path
-p = Path.home() / "results/qwen3tts-cpspec-k2-p7-009/conditional"
+p = Path.home() / "results/qwen3tts-cpspec-k2-p7-010/conditional"
 files = list(p.glob("real_cond_pid*.json"))
 if len(files) != 1:
     raise SystemExit(f"INVALID P7 EVIDENCE: expected one report, got {len(files)}")
