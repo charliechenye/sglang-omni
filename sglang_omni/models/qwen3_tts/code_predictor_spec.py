@@ -293,6 +293,20 @@ def speculative_k2(
         proposed += 1
         _, proposed_embedding = embedding_for_code(depth + 1, proposal)
 
+        # P9A opt-in: GPU-controlled four-depth nested model routing.
+        # Probe once at a late live checkpoint state, restore K/V and
+        # continue the original K2 request without consuming sampled RNG.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P9A_DIR"):
+            from .code_predictor_spec_p9a import maybe_probe as p9a_probe
+
+            p9a_probe(
+                model,
+                frame_index=frame_index,
+                proposal_depth=depth + 1,
+                token_embeds=torch.cat(
+                    (last_embedding, proposed_embedding), dim=1
+                ),
+            )
         # P8 opt-in: nest the real two-offset Predictor IF inside one
         # GPU-controlled WHILE. Compare all output/KV with an eager oracle
         # and restore original K/V before continuing normal K2 sampling.
