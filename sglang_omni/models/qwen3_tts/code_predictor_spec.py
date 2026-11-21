@@ -348,6 +348,22 @@ def speculative_k2(
                 accumulated_before=pos_summed,
                 temperature=t, top_k=k, top_p=p_cut,
             )
+        # P15: independent research-only TWO-round CUDA Graph. The real
+        # second verifier consumes GPU-selected Round 1 depth/KV/hidden.
+        # It is source-locked, restores all physical KV, does not consume
+        # the live request RNG, and never changes the live decoder output.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P15_TWO_ROUND_DIR"):
+            from .code_predictor_spec_p15_two_round import (
+                maybe_probe as p15_two_round_probe,
+            )
+
+            p15_two_round_probe(
+                model, frame=frame_index, proposal_depth=depth + 1,
+                cache_len=cache_len, draft_hidden=h0,
+                last_embedding=last_embedding,
+                accumulated_before=pos_summed,
+                temperature=t, top_k=k, top_p=p_cut,
+            )
         # P12A: record the real q state BEFORE the sampled proposal and
         # actual target verifier; do not mutate the live K2 proposal/RNG.
         if os.environ.get("SGLANG_OMNI_QTTS_CP_P12A_DIR"):
