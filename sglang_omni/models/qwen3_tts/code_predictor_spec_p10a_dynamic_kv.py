@@ -347,7 +347,13 @@ def capture_real_dynamic_kv(
                 ),
                 "original_input_untouched": compare(pair, initial_pair),
             }
-            passed = all(x["close"] for x in checks.values())
+            # We reuse the exact same fused model kernels, weight format,
+            # RoPE/cache indices and BF16 rounding. Device-END must be
+            # bit-identical to the static-end reference, not merely close.
+            passed = all(
+                x["close"] and x["max_abs"] == 0.0
+                for x in checks.values()
+            )
             case = {"depth": depth, "checks": checks, "pass": passed}
             report["cases"].append(case)
             if not passed:
