@@ -41,6 +41,7 @@ from .code_predictor_spec_p9b import cpu_reference
 from .code_predictor_spec_p7_dispatch import compare
 
 ENV = "SGLANG_OMNI_QTTS_CP_P15_TWO_ROUND_DIR"
+P16A_ENV = "SGLANG_OMNI_QTTS_CP_P16A_DIR"
 SCHEMA = "qwen3tts-cpspec-p15-two-round-device-branch-real-fused-v1"
 FIRST_DEPTH = 9
 FIRST_CACHE_LEN = 10
@@ -80,10 +81,14 @@ def gpu_round(
     hidden: torch.Tensor, last_embedding: torch.Tensor,
     accumulated: torch.Tensor, uniforms: torch.Tensor,
     indices_gpu: torch.Tensor, temperature: float, top_p: float,
+    bonus_policy: str = "conditional", trace_markers: bool = False,
 ) -> tuple[torch.Tensor, ...]:
-    """One true causal round; no host-read decisions; conditional bonus head."""
+    """One true causal round; P16A opt-in matched bonus policies."""
     head = model.code_predictor.lm_head[depth]
     bonus_head = model.code_predictor.lm_head[depth + 1]
+    if trace_markers:
+        from .code_predictor_spec_p16a_markers import mark_round
+        mark_round(hidden)
     q_logits = head(hidden)[0][:, -1, :]
     q_ids, _, q_probs, draft = fast_selector(
         q_logits, uniforms[0:1], temperature=temperature, top_p=top_p,
@@ -109,6 +114,9 @@ def gpu_round(
     )
 
     def bonus_yes(after_hidden, committed_code, raw, projected):
+        if trace_markers:
+            from .code_predictor_spec_p16a_markers import mark_bonus
+            mark_bonus(after_hidden)
         bonus_logits = bonus_head(after_hidden)[0][:, -1, :]
         _, _, _, bonus_code = fast_selector(
             bonus_logits, uniforms[3:4],
@@ -130,10 +138,31 @@ def gpu_round(
             torch.zeros_like(committed_code, dtype=torch.int32),
         )
 
-    bonus, bonus_raw, bonus_projected, bonus_executed = cond_op(
-        accepted.reshape(()), bonus_yes, bonus_no,
-        (after, committed, committed_raw, committed_proj),
-    )
+    if bonus_policy == "conditional":
+        bonus, bonus_raw, bonus_projected, bonus_executed = cond_op(
+            accepted.reshape(()), bonus_yes, bonus_no,
+            (after, committed, committed_raw, committed_proj),
+        )
+    elif bonus_policy == "always_compute_mask":
+        # P16A matched baseline: compute bonus head AND selector even on
+        # rejection, but preserve the exact *logical* committed outputs.
+        speculative_bonus, speculative_raw, speculative_projected, _ = (
+            bonus_yes(after, committed, committed_raw, committed_proj)
+        )
+        bonus = torch.where(
+            accepted, speculative_bonus, torch.zeros_like(speculative_bonus)
+        )
+        bonus_raw = torch.where(
+            accepted, speculative_raw, torch.zeros_like(speculative_raw)
+        )
+        bonus_projected = torch.where(
+            accepted.reshape(1, 1, 1), speculative_projected,
+            torch.zeros_like(speculative_projected),
+        )
+        # This is LOGICAL bonus commitment, not physical compute count.
+        bonus_executed = accepted.to(dtype=torch.int32)
+    else:
+        raise ValueError("P16A_UNSUPPORTED_BONUS_POLICY")
     next_hidden = torch.where(accepted.reshape(1, 1, 1), after, before)
     next_embedding = torch.where(
         accepted.reshape(1, 1, 1), bonus_projected, committed_proj,
@@ -155,6 +184,7 @@ def two_gpu_rounds(
     hidden: torch.Tensor, last_embedding: torch.Tensor,
     accumulated: torch.Tensor, uniforms: torch.Tensor,
     indices_gpu: torch.Tensor, temperature: float, top_p: float,
+    bonus_policy: str = "conditional", trace_markers: bool = False,
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
     """Round 2 head is GPU-selected by actual Round 1 acceptance."""
     first = gpu_round(
@@ -162,6 +192,7 @@ def two_gpu_rounds(
         hidden=hidden, last_embedding=last_embedding,
         accumulated=accumulated, uniforms=uniforms[0],
         indices_gpu=indices_gpu, temperature=temperature, top_p=top_p,
+        bonus_policy=bonus_policy, trace_markers=trace_markers,
     )
 
     def accepted_branch(h, emb, summed, offset, u):
@@ -170,6 +201,7 @@ def two_gpu_rounds(
             hidden=h, last_embedding=emb, accumulated=summed,
             uniforms=u, indices_gpu=indices_gpu,
             temperature=temperature, top_p=top_p,
+        bonus_policy=bonus_policy, trace_markers=trace_markers,
         )
 
     def rejected_branch(h, emb, summed, offset, u):
@@ -178,6 +210,7 @@ def two_gpu_rounds(
             hidden=h, last_embedding=emb, accumulated=summed,
             uniforms=u, indices_gpu=indices_gpu,
             temperature=temperature, top_p=top_p,
+        bonus_policy=bonus_policy, trace_markers=trace_markers,
         )
 
     second = cond_op(
@@ -520,6 +553,22 @@ def capture_two_rounds(
         else:
             report["status"] = SUCCESS
 
+        if os.environ.get(P16A_ENV):
+            from .code_predictor_spec_p16a_profile import profile_branch_costs
+
+            report["p16a"] = profile_branch_costs(
+                model=model, conditional_graph=graph,
+                conditional_outputs=graph_outputs,
+                stream=stream, uniforms_gpu=u,
+                reference_cases=report["cases"],
+                restore=restore, snapshot=snapshot,
+                depth=depth, cache_start=cache_start,
+                indices=indices, hidden=hidden,
+                embedding=embedding, summed=summed,
+                temperature=temperature, top_p=top_p,
+                original_k=original_k, original_v=original_v,
+            )
+
         # Optional CUDA graph envelope; always restore the original prefix.
         event_blocks = []
         for _ in range(4):
@@ -587,7 +636,11 @@ def maybe_probe(
     accumulated_before: torch.Tensor, temperature: float,
     top_k: int, top_p: float,
 ) -> None:
-    out = os.environ.get(ENV)
+    p16_out = os.environ.get(P16A_ENV)
+    p15_out = os.environ.get(ENV)
+    if p15_out and p16_out:
+        raise RuntimeError("P15_P16A_SIMULTANEOUS_CAPTURE_FORBIDDEN")
+    out = p16_out or p15_out
     if not out:
         return
     conflicts = (
