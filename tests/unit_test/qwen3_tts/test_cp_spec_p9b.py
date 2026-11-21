@@ -78,6 +78,33 @@ def test_p9b_h200_captured_realistic_logits_and_private_graph_rng():
     assert len(report["checks"]) == len(TEST_UNIFORMS)
     assert report["independent_graph_rng_replay_unique"] is True
     assert report["output_input_parity"] is True
+    # Guard against P9B's original capture-only check: CUDA graph output
+    # is uninitialized until the first actual graph.replay().
+    assert report["deterministic_graph_replayed_before_distribution_check"] is True
     assert report["distribution_p_max_abs"] <= 1e-6
     assert report["distribution_q_max_abs"] <= 1e-6
     assert report["gpu_sampler_with_independent_rng_graph_ms"] > 0
+
+
+@pytest.mark.accelerator
+def test_p9b_h200_captured_distribution_stable_after_multiple_replays():
+    """Execute a *real* CUDA graph before reading its probability outputs."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.manual_seed(20261121)
+    logits = torch.randn(1, 2048, device="cuda", dtype=torch.bfloat16)
+    uniforms = torch.tensor([[.125, .25, .375]], device="cuda")
+    original = logits.detach().clone()
+    ref = sampling_probs(logits, temperature=.9, top_k=50, top_p=1.)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph), torch.inference_mode():
+        _, _, _, p, q = gpu_round(
+            logits, logits, uniforms,
+            temperature=.9, top_k=50, top_p=1.,
+        )
+    for _ in range(3):
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(p, ref, atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(q, ref, atol=1e-6, rtol=1e-6)
+    assert torch.equal(logits, original)
