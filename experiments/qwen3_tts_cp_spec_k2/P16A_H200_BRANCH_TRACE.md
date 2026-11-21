@@ -92,7 +92,9 @@ python -m pytest -q -x \
 
 # P14 GPU regression once on H200 before starting production-like worker.
 CUDA_VISIBLE_DEVICES=0 python -m pytest -q -x \
-  tests/unit_test/qwen3_tts/test_cp_spec_p14.py -m accelerator
+  tests/unit_test/qwen3_tts/test_cp_spec_p14.py \
+  tests/unit_test/qwen3_tts/test_cp_spec_p16a.py \
+  -m accelerator
 ~~~
 
 If the local branch exists, use \`git switch\` and \`git pull --ff-only\`,
