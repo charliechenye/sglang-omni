@@ -367,6 +367,21 @@ def speculative_k2(
                 accumulated_before=pos_summed,
                 temperature=t, top_k=k, top_p=p_cut,
             )
+        # P17 research: compare NVIDIA-style multi-head K2/3/4 wide
+        # verification on this REAL live K2 checkpoint (depth2/10).
+        # This probe is read-only to the original K2 output, RNG and KV:
+        # captures are compared to an independent static fused oracle
+        # and restore the entire physical KV cache before live resume.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_MULTIWIDTH_DIR"):
+            from .code_predictor_spec_p17_probe import maybe_probe as p17_probe
+
+            p17_probe(
+                model, frame=frame_index, proposal_depth=depth+1,
+                cache_len=cache_len, draft_hidden=h0,
+                last_embedding=last_embedding,
+                accumulated_before=pos_summed,
+                temperature=t, top_k=k, top_p=p_cut,
+            )
         # P12A: record the real q state BEFORE the sampled proposal and
         # actual target verifier; do not mutate the live K2 proposal/RNG.
         if os.environ.get("SGLANG_OMNI_QTTS_CP_P12A_DIR"):
