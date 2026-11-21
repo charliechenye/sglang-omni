@@ -166,25 +166,33 @@ def run(repeats: int) -> dict[str, Any]:
                     f"dynamic graph did not follow device mask for {name}: {record}"
                 )
 
-        # Repeated graph replay of one fixed input: launch-envelope only.
-        state.copy_(torch.tensor(masks["alternating"], device=dev, dtype=torch.bool))
-        for _ in range(8):
-            graph.replay()
-        torch.cuda.synchronize(dev)
-        t0 = time.perf_counter()
-        cuda_begin = torch.cuda.Event(enable_timing=True)
-        cuda_end = torch.cuda.Event(enable_timing=True)
-        cuda_begin.record()
-        for _ in range(repeats):
-            graph.replay()
-        cuda_end.record()
-        cuda_end.synchronize()
-        result["cuda_event_ms_per_replay"] = cuda_begin.elapsed_time(cuda_end) / repeats
-        result["host_wall_ms_per_replay"] = (time.perf_counter() - t0) * 1e3 / repeats
-        if any(not math.isfinite(result[k]) or result[k] <= 0 for k in (
-            "cuda_event_ms_per_replay", "host_wall_ms_per_replay"
-        )):
-            raise RuntimeError("invalid conditional graph replay timing")
+        # Same captured dynamic graph, three different actual GPU loop
+        # iteration counts. Distinguish host launch cost from a kernel-heavy
+        # device-scheduled while-node body.
+        replay_costs = {}
+        for name in ("reject_all", "accept_all", "alternating"):
+            state.copy_(torch.tensor(masks[name], device=dev, dtype=torch.bool))
+            for _ in range(8):
+                graph.replay()
+            torch.cuda.synchronize(dev)
+            t0 = time.perf_counter()
+            cuda_begin = torch.cuda.Event(enable_timing=True)
+            cuda_end = torch.cuda.Event(enable_timing=True)
+            cuda_begin.record()
+            for _ in range(repeats):
+                graph.replay()
+            cuda_end.record()
+            cuda_end.synchronize()
+            event_ms = cuda_begin.elapsed_time(cuda_end) / repeats
+            wall_ms = (time.perf_counter() - t0) * 1e3 / repeats
+            if any(not math.isfinite(x) or x <= 0 for x in (event_ms, wall_ms)):
+                raise RuntimeError("invalid P6 dynamic loop graph replay timing")
+            replay_costs[name] = {
+                "gpu_iterations": reference(masks[name])["rounds"],
+                "cuda_event_ms_per_replay": event_ms,
+                "host_wall_ms_per_replay": wall_ms,
+            }
+        result["replay_costs_by_dynamic_iterations"] = replay_costs
         result["status"] = STATUS_PASS
     except Exception as exc:
         result["status"] = STATUS_FAIL
@@ -222,12 +230,18 @@ def main() -> None:
             f"| {c['name']} | {c['expected']['rounds']} | "
             f"{c['actual']['rounds']} | {c['pass']} |"
         )
-    if "cuda_event_ms_per_replay" in result:
-        lines.extend([
-            "", f"Graph replay CUDA-event envelope: "
-            f"{result['cuda_event_ms_per_replay']:.5f} ms",
-            f"Graph replay host wall: {result['host_wall_ms_per_replay']:.5f} ms",
-        ])
+    if "replay_costs_by_dynamic_iterations" in result:
+        lines += [
+            "", "## Conditional graph replay cost at different device loop counts",
+            "", "| Decision mask | GPU loop rounds | CUDA event ms/replay | Host wall ms/replay |",
+            "|---|---:|---:|---:|",
+        ]
+        for label, values in result["replay_costs_by_dynamic_iterations"].items():
+            lines.append(
+                f"| {label} | {values['gpu_iterations']} | "
+                f"{values['cuda_event_ms_per_replay']:.5f} | "
+                f"{values['host_wall_ms_per_replay']:.5f} |"
+            )
     if "error" in result:
         lines += ["", "Capture/replay failure: " + result["error"]]
     lines.extend(["", "## Non-claims", ""] + [
