@@ -38,6 +38,10 @@ def test_p7_h200_real_predictor_conditional_offsets_and_kv_restore(monkeypatch):
     model = with_predictor_layers(build_talker(dev), 2)
     capacity = 18
     pos = torch.arange(capacity, device=dev, dtype=torch.long)
+    # The factory fixture originally has NUM_CODE_GROUPS+1 positions (5).
+    # Extending cache slots without extending predictor_positions silently
+    # invalidates the cache_len=6 branch.
+    model.predictor_positions = pos
     model.predictor_position_rows = pos[:, None].expand(capacity, MAX_BS).contiguous()
     model.predictor_cache_slots = (
         torch.arange(MAX_BS, device=dev, dtype=torch.long)[None, :] * capacity
@@ -55,12 +59,16 @@ def test_p7_h200_real_predictor_conditional_offsets_and_kv_restore(monkeypatch):
     ]
     torch.manual_seed(20261121)
     embeds = torch.randn(1, 2, HIDDEN, device=dev).to(DTYPE)
+    unmodified_embeds = embeds.clone()
     # Explicitly fill the legitimate prefix before the live P7 verifier.
+    # Fused BF16 Predictor may overwrite residual input, so each call must
+    # have private input and leave embeds immutable.
     with torch.inference_mode():
         for cache_len in (0, 2, 4):
             model.predictor_forward_tokens(
-                token_embeds=embeds, batch_size=1, cache_len=cache_len
+                token_embeds=embeds.clone(), batch_size=1, cache_len=cache_len
             )
+        torch.testing.assert_close(embeds, unmodified_embeds, rtol=0, atol=0)
         before_k = model.predictor_k_cache[:, :1, :8].clone()
         before_v = model.predictor_v_cache[:, :1, :8].clone()
         report = capture_two_offsets(model, fixed_embeds=embeds, repeats=8)
@@ -68,6 +76,16 @@ def test_p7_h200_real_predictor_conditional_offsets_and_kv_restore(monkeypatch):
     assert [x["offset"] for x in report["cases"]] == [2, 6, 2]
     assert all(x["pass"] for x in report["cases"])
     assert all(x["checks"]["hidden"]["max_abs"] == 0 for x in report["cases"])
+    assert all(
+        x["checks"]["persistent_input_unchanged"]["close"]
+        for x in report["cases"]
+    )
+    assert all(
+        x["checks"]["original_kv_prefix_k_untouched"]["close"]
+        and x["checks"]["original_kv_prefix_v_untouched"]["close"]
+        for x in report["cases"]
+    )
+    torch.testing.assert_close(embeds, unmodified_embeds, atol=0, rtol=0)
     assert set(report["conditional_cuda_event_ms_by_offset"]) == {"2", "6"}
     torch.testing.assert_close(
         model.predictor_k_cache[:, :1, :8], before_k, atol=0, rtol=0
