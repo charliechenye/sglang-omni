@@ -85,8 +85,9 @@ def test_p10_component_budget_honest_positive_and_negative(tmp_path):
     assert report["p10a_dynamic_median_ms_per_round"] == pytest.approx(.15)
     assert report["p10b_sparse_sampler_median_ms_per_round"] == pytest.approx(.03)
     path = write(tmp_path / "summary", report)
-    assert "NOT serving" not in path.read_text().lower()
-    assert "NOT E2E" in path.read_text() or "NOT full" in path.read_text()
+    assert "A positive reserve DOES NOT prove full GPU-resident K2" in path.read_text()
+    assert "NO" not in report["status"]  # positive cost gate, still not E2E evidence
+    assert report["limits"][-1].startswith("Graph-ON baseline is")
     with pytest.raises(FileExistsError):
         write(tmp_path / "summary", report)
 
