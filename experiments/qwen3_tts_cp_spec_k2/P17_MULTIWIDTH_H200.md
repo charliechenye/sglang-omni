@@ -187,3 +187,72 @@ accept/sampler kernels and native seeded RNG before performance ABBA.
 The accurate conclusion can be "K4 wide verifier works but the current
 research sampler overhead dominates", which would still identify the
 specific optimization gap relative to NVIDIA.
+
+## P17 activation-only triage on a fresh worker
+
+A newly rebuilt machine once returned `finish=stop` for `01_spec`, but
+the server log contained zero `QTTS_CP_SPEC_K2` messages and there were
+no P17 `wide_pid*.json` or `failure_pid*.txt` files. A separate
+`/proc/*/environ` read confirmed that the actual TTS stage process
+inherited all four P17 environment variables. That establishes only
+ENV inheritance, **not that the ARM file was visible at inference
+time**, nor that the `Qwen3TTSTalker.code_predictor_forward` method
+was actually called.
+
+Do not repeat full ABBA until this dispatch failure is understood.
+The P17 branch contains a separate opt-in one-time diagnostic, with
+bounded, append-only JSONL produced inside the real TTS worker at:
+
+1. `Qwen3TTSModelRunner.collect_codes` before predictor invocation.
+2. `Qwen3TTSTalker.code_predictor_forward` entry.
+3. The K2-selection or native-fallback branch taken at that entry.
+4. `speculative_k2` decoder function entry, if reached.
+
+Each event includes PID, source SHA, the executable's module path,
+and **the actual ARM file existence at that instant**. This is CPU-only
+observability and reads no tensor contents. In diagnostic mode the
+P17 **wide Graph capture is bypassed**, while the real K2 path is
+left unchanged. It is NOT a speculative acceleration/parity benchmark.
+
+Stop the prior worker, `git pull --ff-only` in the P17 worktree, and
+use an **absent** fresh output root:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p17-multiwidth
+git pull --ff-only
+source ~/.venv/bin/activate
+python -m pytest -q -x   tests/unit_test/qwen3_tts/test_cp_spec_p17_activation.py
+# Terminal A, new server, strict port=8000:
+P17_ACTIVATION_DIAG=1 bash   experiments/qwen3_tts_cp_spec_k2/p17_launch.sh   "$HOME/results/qwen3tts-p17-activation-003"
+~~~
+
+After Terminal A reports `/health=200`, run in Terminal B:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p17-multiwidth
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p17-activation-003"
+python -m experiments.qwen3_tts_cp_spec_k2.p17_activation_smoke   --root "$ROOT" --out "$ROOT/activation-smoke"
+cat "$ROOT/activation-smoke/summary.md"
+~~~
+
+This makes **one baseline and one spec HTTP call**, and writes the
+exact worker events to `ROOT/activation/dispatch_pid*.jsonl`.
+Possible classifications:
+
+- `P17_ACTIVATION_DISPATCH_NOT_OBSERVED`: no event from stage hooks.
+- `P17_ACTIVATION_CODE_PREDICTOR_NOT_ENTERED`: runner call observed
+  but no model's `code_predictor_forward` entry.
+- `P17_ACTIVATION_ARM_NOT_VISIBLE_TO_WORKER`: forward ran but
+  `os.path.isfile(ARM_SPEC)` false during spec request.
+- `P17_ACTIVATION_NATIVE_FALLBACK_WITH_ARM_PRESENT`: forward ran and
+  file was visible, but no `speculative_k2` call; check `SPEC_K`
+  and the imported actual model code.
+- `P17_ACTIVATION_K2_ENTERED_NOT_MULTIWIDTH_PARITY`: K2 **entry**
+  proven, but it is NOT proof the native K2 completed, ran the
+  P17 multiwidth probe, or improved performance.
+
+All outcomes preserve the first raw worker evidence. Do not edit
+`code_predictor_forward` to force the K2 path, or bypass the strict
+runner K2-frame gate. Restart with a new source-locked root for any
+full P17 verification after resolving the activation issue.
