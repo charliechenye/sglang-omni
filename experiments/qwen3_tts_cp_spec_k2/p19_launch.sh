@@ -46,21 +46,24 @@ for name in (
 ):
     module = importlib.import_module(name)
     file = Path(module.__file__).resolve()
-    print(f"P18_IMPORT_PREFLIGHT {name}={file}", flush=True)
+    print(f"P19_IMPORT_PREFLIGHT {name}={file}", flush=True)
     if not file.is_relative_to(root / "sglang_omni"):
-        raise RuntimeError(f"P18_IMPORT_SOURCE_MISMATCH: {name}")
+        raise RuntimeError(f"P19_IMPORT_SOURCE_MISMATCH: {name}")
+import inspect
 from sglang_omni.models.qwen3_tts import code_predictor_spec_p18_census as probe
+if "maybe_measure(" not in inspect.getsource(probe.maybe_census):
+    raise RuntimeError("P19_HOOK_MISSING_FROM_LIVE_P18_NATIVE_CENSUS")
 assert probe.feasible_widths(1) == (2, 3, 4)
 assert probe.feasible_widths(12) == (2, 3)
 assert probe.feasible_widths(13) == (2,)
 assert probe.feasible_widths(14) == ()
-print("P18_IMPORT_PREFLIGHT_PASS", flush=True)
+print("P19_IMPORT_PREFLIGHT_PASS", flush=True)
 PY
 python - <<'PY'
 import torch
 if not torch.cuda.is_available() or "H200" not in torch.cuda.get_device_name(0):
-    raise RuntimeError("P18 requires one NVIDIA H200")
-print("P18_DEVICE:", torch.cuda.get_device_name(0), flush=True)
+    raise RuntimeError("P19 requires one NVIDIA H200")
+print("P19_DEVICE:", torch.cuda.get_device_name(0), flush=True)
 PY
 
 mkdir -p "$ROOT/census/rows" "$ROOT/census/failures"
