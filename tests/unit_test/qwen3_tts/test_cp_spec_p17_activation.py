@@ -96,7 +96,7 @@ def test_p17_raw_event_census_distinguishes_startup_from_http_window(tmp_path):
         },
     ]
     (folder / "dispatch_pid1234.jsonl").write_text(
-        "".join(json.dumps(item) + "\\n" for item in events)
+        "".join(json.dumps(item) + "\n" for item in events)
     )
     assert {e["event"] for e in _collect(root)} >= STARTUP_EVENTS
     assert [e["event"] for e in _collect(
