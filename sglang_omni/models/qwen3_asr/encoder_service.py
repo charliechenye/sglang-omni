@@ -30,6 +30,10 @@ from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInp
 from sglang.srt.utils import create_device_stream, device_stream_context
 from transformers import WhisperFeatureExtractor
 
+from sglang_omni.scheduling.fatal_gpu_context import (
+    is_fatal_cuda_context_error,
+    terminate_poisoned_cuda_stage,
+)
 from sglang_omni.scheduling.pre_lm_encoder import (
     PreLMEncoderService,
     QueueEntry,
@@ -546,13 +550,20 @@ class Qwen3ASRPreLMEncoderService(
     def retry_batch(
         self, batch: list[QueueEntry[MultimodalDataItem, torch.Tensor]], _exc: Exception
     ) -> bool:
-        return len(batch) > 1
+        # Defense in depth if a subclass overrides handle_batch_failure.
+        # Fatal CUDA700 is never recoverable through per-item re-encode.
+        return len(batch) > 1 and not is_fatal_cuda_context_error(_exc)
 
     def handle_batch_failure(
         self,
         batch: list[QueueEntry[MultimodalDataItem, torch.Tensor]],
         exc: Exception,
     ) -> Exception:
+        if is_fatal_cuda_context_error(exc):
+            # The stage process CUDA context is poisoned; raising only in
+            # this Python worker thread would leave the scheduler alive.
+            # Exit before detach_failure, GPU cleanup, or per-item retry.
+            terminate_poisoned_cuda_stage(exc, component=self.MODEL_NAME)
         failure = self.detach_failure(exc)
         if len(batch) == 1:
             logger.error(
@@ -576,6 +587,8 @@ class Qwen3ASRPreLMEncoderService(
         _entry: QueueEntry[MultimodalDataItem, torch.Tensor],
         exc: Exception,
     ) -> Exception:
+        if is_fatal_cuda_context_error(exc):
+            terminate_poisoned_cuda_stage(exc, component=self.MODEL_NAME)
         failure = self.detach_failure(exc)
         logger.error(
             "%s per-item audio encode retry failed:\n%s",
