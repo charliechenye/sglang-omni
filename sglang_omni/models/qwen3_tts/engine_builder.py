@@ -519,6 +519,10 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         model_worker: ModelWorker,
         output_proc: SGLangOutputProcessor,
     ) -> Qwen3TTSModelRunner:
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"):
+            from .code_predictor_spec_p17_activation import record
+
+            record("engine_builder_make_model_runner", caller_module=__file__)
         model_runner_mod = importlib.import_module(
             "sglang_omni.models.qwen3_tts.model_runner"
         )
