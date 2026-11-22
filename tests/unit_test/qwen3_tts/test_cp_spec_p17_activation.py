@@ -7,6 +7,7 @@ import json
 import pytest
 
 from experiments.qwen3_tts_cp_spec_k2.p17_activation_smoke import (
+    STARTUP_EVENTS, _collect,
     STATUS_ARM_MISSING,
     STATUS_ENTERED,
     STATUS_NATIVE,
@@ -74,3 +75,31 @@ def test_p17_activation_disabled_is_noop(tmp_path, monkeypatch):
     record("speculative_k2_enter", caller_module=__file__)
     assert not list(tmp_path.iterdir())
     assert not _COUNTS
+
+
+def test_p17_raw_event_census_distinguishes_startup_from_http_window(tmp_path):
+    root = tmp_path / "root"
+    folder = root / "activation"
+    folder.mkdir(parents=True)
+    events = [
+        {
+            "event": "engine_builder_make_model_runner",
+            "monotonic_ns": 100,
+        },
+        {
+            "event": "model_runner_initialized",
+            "monotonic_ns": 200,
+        },
+        {
+            "event": "collect_codes_called_with_tokens",
+            "monotonic_ns": 500,
+        },
+    ]
+    (folder / "dispatch_pid1234.jsonl").write_text(
+        "".join(json.dumps(item) + "\\n" for item in events)
+    )
+    assert {e["event"] for e in _collect(root)} >= STARTUP_EVENTS
+    assert [e["event"] for e in _collect(
+        root, start_ns=400, end_ns=600
+    )] == ["collect_codes_called_with_tokens"]
+    assert _collect(root, start_ns=600, end_ns=900) == []
