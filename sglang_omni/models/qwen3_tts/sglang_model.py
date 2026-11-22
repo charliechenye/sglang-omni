@@ -1416,6 +1416,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             talker_hidden = talker_hidden.unsqueeze(1)
         else:
             pass
+        # P17 debug-only CPU-side entry signal: no token values or GPU sync.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"):
+            from .code_predictor_spec_p17_activation import record
+
+            record("code_predictor_forward_enter", caller_module=__file__)
+
         # Research-only CodePredictor speculation. Never intercept startup
         # warmup or normal traffic without explicit post-health ARM file.
         # Unarmed and K=0 are the exact unchanged production code path.
@@ -1427,6 +1433,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 )
             arm_path = os.environ.get("SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE")
             if arm_path and os.path.isfile(arm_path):
+                if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"):
+                    from .code_predictor_spec_p17_activation import record
+
+                    record("code_predictor_forward_k2_selected", caller_module=__file__)
                 from sglang_omni.models.qwen3_tts.code_predictor_spec import (
                     speculative_k2,
                 )
@@ -1435,6 +1445,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 return speculative_k2(
                     self, layer0_codes, talker_hidden, semantic_positions
                 )
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"):
+            from .code_predictor_spec_p17_activation import record
+
+            record("code_predictor_forward_native_selected", caller_module=__file__)
         # P5/P9 opt-in measures the *existing* sampled full Predictor
         # CUDA Graph replay. P9A uses a separate ARM marker for this
         # baseline in the same worker/source/GPU as its K2 probe.
