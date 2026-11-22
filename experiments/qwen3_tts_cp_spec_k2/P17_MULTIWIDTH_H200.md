@@ -408,3 +408,39 @@ serving concurrently on the same H200: this Qwen3-TTS config has a
 ~110.7 GiB static KV pool alone. If the server exits, the **last 100
 log lines** are required to distinguish shutdown, CUDA OOM, port
 conflict or an unexpected worker crash.
+
+
+### P17 first real wide-probe failure: Long bonus predicate (007)
+
+In `qwen3tts-p17-multiwidth-007`, source-locked native `00_base`
+completed. The first K2-probe checkpoint in `01_spec` entered the real
+wide-verifier code but failed before producing correctness/cost evidence:
+
+~~~text
+wide/failure_pid*_frame0001_depth01.txt
+make_wide_round(): torch.where(full_accept, bonus[0], ...)
+RuntimeError: where expected condition to be a boolean tensor,
+but got a tensor with dtype Long
+~~~
+
+Root cause: `survived = torch.cumprod(flags.to(torch.long), dim=0)`
+produces int64. The derived scalar `full_accept` was incorrectly
+passed directly as a condition to both the bonus-code and bonus-sum
+`torch.where` operations. The P17 branch now casts it explicitly to
+`torch.bool` **on device**, leaving the acceptance prefix, bonus
+selection, GPU graph semantics, and fail-closed parity gates unchanged.
+
+The CPU regression invokes the **real** `make_wide_round` with CPU
+fake proposal/verifier kernels for K2/3/4 and all-accept, first-reject,
+and intermediate-reject cases. It checks committed-code sentinels,
+bonus, accumulated sum, next hidden, next embedding and next KV
+position. This is a unit test, **not** an H200 correctness PASS.
+
+After stopping the failed worker, update the P17 worktree and use a
+new `$HOME/results/qwen3tts-p17-multiwidth-008` result directory.
+Re-run non-accelerator P17 unit tests, then the existing source-locked
+`p17_launch.sh` and `p17_measure.sh` (with
+`P17_ACTIVATION_DIAG=0`). Do not reuse 007, which contains incomplete
+first-failure evidence. If another GPU trace occurs, preserve the
+`failure_pid*.txt` and stop on that first error; do not weaken the
+independent distribution, full physical K/V, or CUDA-event gates.
