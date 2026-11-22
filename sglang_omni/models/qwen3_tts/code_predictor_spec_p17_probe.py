@@ -509,6 +509,10 @@ def maybe_probe(
     raw_dir = os.environ.get(ENV)
     if not raw_dir:
         return
+    # Activation-only test: prove real K2 dispatch without starting the
+    # expensive K2/K3/K4 capture. Not a correctness or speedup gate.
+    if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_ONLY") == "1":
+        return
     conflicts = (
         "SGLANG_OMNI_QTTS_CP_P14_CAUSAL_DIR",
         "SGLANG_OMNI_QTTS_CP_P15_TWO_ROUND_DIR",
