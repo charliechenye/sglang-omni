@@ -271,11 +271,26 @@ class Qwen3TTSModelRunner(ModelRunner):
             from .code_predictor_spec_p17_activation import record
 
             record("model_runner_collect_before_predictor", caller_module=__file__)
-        self.model.code_predictor_forward(
-            layer0_codes,
-            hidden,
-            semantic_positions=semantic_positions,
+        # P18A is C1-only: bind an actual scheduler request identity
+        # to the on-policy depth observations, not an inferred HTTP frame.
+        p18_arm = os.environ.get("SGLANG_OMNI_QTTS_CP_P18_ARM_FILE")
+        p18_on = bool(
+            os.environ.get("SGLANG_OMNI_QTTS_CP_P18_DIR")
+            and p18_arm and os.path.isfile(p18_arm)
         )
+        if p18_on:
+            if len(requests) != 1 or not requests[0].request_id:
+                raise RuntimeError("P18_REQUIRES_EXACTLY_ONE_SCHEDULER_REQUEST")
+            self.model._p18_current_request_id = str(requests[0].request_id)
+        try:
+            self.model.code_predictor_forward(
+                layer0_codes,
+                hidden,
+                semantic_positions=semantic_positions,
+            )
+        finally:
+            if p18_on:
+                del self.model._p18_current_request_id
         self.has_pending_code_step = True
 
     def post_process_outputs(
