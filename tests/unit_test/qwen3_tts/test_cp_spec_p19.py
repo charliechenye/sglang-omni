@@ -14,7 +14,7 @@ from experiments.qwen3_tts_cp_spec_k2.p19_analyze import (
     STATUS as COST_PASS, analyze as analyze_costs, validate_costs,
 )
 from experiments.qwen3_tts_cp_spec_k2.p19_dp import (
-    RESULT, analyze as analyze_dp, bellman, fixed_width_policy,
+    RESULT, _case_tables, analyze as analyze_dp, bellman, fixed_width_policy,
 )
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_cost import (
     BLOCKS, REPEATS, SCHEMA,
@@ -249,6 +249,40 @@ def test_p19a_fail_closed_missing_or_corrupted_matching_cost(tmp_path):
     path.write_text(json.dumps(value))
     with pytest.raises(RuntimeError, match="INVALID_COST_OR_PARITY"):
         validate_costs(root)
+
+
+def test_p19_dp_ar_only_tail_depth_has_no_speculative_histogram(tmp_path):
+    """Depth 14 has measured AR cost but zero legal K widths / prefix rows.
+
+    Regression: an empty histogram dict used to fail the unconditional
+    len({len(v) for v in native_probs.values()}) == 1 check.
+    """
+    root = _fake_source_locked_run(tmp_path)
+    driver, acceptance, cost_rows = validate_costs(root)
+    per_case, prompts, prompt_map = _case_tables(
+        driver, acceptance, cost_rows,
+    )
+    assert len(per_case) == 4
+    assert len(prompts) == 2
+    assert len(prompt_map) == 4
+    for case in per_case:
+        assert set(per_case[case][14]["cost"]) == {"AR"}
+        assert per_case[case][14]["counts"] == {}
+        # The penultimate depth must still require native AR AND K2.
+        assert set(per_case[case][13]["cost"]) == {"AR", "2"}
+        assert set(per_case[case][13]["counts"]) == {"2"}
+        assert per_case[case][13]["counts"]["2"] == [2, 0]
+
+
+def test_p19_dp_rejects_missing_earlier_depth_speculative_cost(tmp_path):
+    """The AR-only tail exception must NOT hide missing K2 at depth13."""
+    root = _fake_source_locked_run(tmp_path)
+    driver, acceptance, cost_rows = validate_costs(root)
+    for row in cost_rows:
+        if row["last_committed_depth"] == 13:
+            row["arms"].pop("2")
+    with pytest.raises(RuntimeError, match="P19_DP_UNPAIRED_REAL_NATIVE_CASES"):
+        _case_tables(driver, acceptance, cost_rows)
 
 
 def test_p19_analysis_smoke_is_not_serving_go(tmp_path):
