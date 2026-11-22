@@ -113,6 +113,7 @@ def validate_rows(root: Path) -> tuple[dict, list[dict]]:
     rows, unique = [], set()
     case_frames = defaultdict(set)
     case_requests = defaultdict(set)
+    case_native_seeds = defaultdict(set)
     pids = set()
     for path in paths:
         row = json.loads(path.read_text())
@@ -127,6 +128,10 @@ def validate_rows(root: Path) -> tuple[dict, list[dict]]:
                 or row.get("trajectory") != "NATIVE_AR_EAGER_CODEBOOK_SAMPLING"
                 or row.get("probe") != "P17_INDEPENDENT_ORACLE_COUNTERFACTUAL"
                 or row.get("gpu") != "NVIDIA H200"
+                or type(row.get("pid")) is not int or row["pid"] <= 0
+                or type(row.get("native_sub_sampling_seed")) is not int
+                or type(row.get("native_committed_code")) is not int
+                or not 0 <= row["native_committed_code"] < 2048
                 or type(frame) is not int or frame < 0
                 or type(depth) is not int or depth not in DEPTHS
                 or row.get("cache_len") != depth + 1
@@ -152,7 +157,8 @@ def validate_rows(root: Path) -> tuple[dict, list[dict]]:
         unique.add(marker)
         case_frames[case].add(frame)
         case_requests[case].add(row["request_hash"])
-        pids.add(row.get("pid"))
+        case_native_seeds[case].add(row["native_sub_sampling_seed"])
+        pids.add(row["pid"])
         for sw, evidence in row["widths"].items():
             width = int(sw)
             prefix = evidence.get("accepted_prefix")
@@ -185,6 +191,18 @@ def validate_rows(root: Path) -> tuple[dict, list[dict]]:
     hashes = [v["request_hash"] for v in known_cases.values()]
     if len(hashes) != len(set(hashes)):
         raise RuntimeError("P18A_REQUEST_IDS_NOT_INDEPENDENT")
+    if any(len(case_native_seeds[c]) != 1 for c in known_cases):
+        raise RuntimeError("P18A_NATIVE_SUBSAMPLING_SEED_DRIFT_WITHIN_REQUEST")
+    per_prompt = defaultdict(dict)
+    for case, visit in known_cases.items():
+        per_prompt[visit["prompt_id"]][visit["seed"]] = next(
+            iter(case_native_seeds[case])
+        )
+    if any(len(observed) != len(set(observed.values()))
+           for observed in per_prompt.values()):
+        raise RuntimeError(
+            "P18A_REQUESTED_SEEDS_DID_NOT_PRODUCE_DISTINCT_NATIVE_SAMPLER_SEEDS"
+        )
     return driver, rows
 
 
