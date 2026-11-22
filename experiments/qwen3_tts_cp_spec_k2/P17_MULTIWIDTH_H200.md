@@ -256,3 +256,59 @@ All outcomes preserve the first raw worker evidence. Do not edit
 `code_predictor_forward` to force the K2 path, or bypass the strict
 runner K2-frame gate. Restart with a new source-locked root for any
 full P17 verification after resolving the activation issue.
+
+
+### Updated P17 startup-first diagnostic (after empty 00_base/01_spec)
+
+The activation-only smoke was observed to return two naturally stopped
+WAVs with **zero in-request events** and zero K2 frames. This does not
+prove the model did not run: the old instrumentation was after a
+`result.next_token_ids is None` early return, and its reporting window
+could exclude useful startup evidence.
+
+The revised code adds source-locked, opt-in worker events in the
+`Qwen3TtsEngineBuilder.make_model_runner` constructor path, in
+`Qwen3TTSModelRunner.__init__`, and **before the early return** in
+`Qwen3TTSModelRunner.collect_codes`. Only CPU metadata is written.
+The existing K2 gate and all GPU kernels are untouched.
+
+**STOP the old worker** and create a NEW root. The existing
+`activation-003` result is immutable, and its old worker cannot load
+new Python instrumentation without restarting.
+
+~~~bash
+cd ~/sglang-omni-worktrees/p17-multiwidth
+git pull --ff-only
+source ~/.venv/bin/activate
+python -m py_compile   sglang_omni/models/qwen3_tts/engine_builder.py   sglang_omni/models/qwen3_tts/model_runner.py   sglang_omni/models/qwen3_tts/sglang_model.py   experiments/qwen3_tts_cp_spec_k2/p17_activation_smoke.py   sglang_omni/models/qwen3_tts/code_predictor_spec_p17_activation.py
+python -m pytest -q -x   tests/unit_test/qwen3_tts/test_cp_spec_p17_activation.py
+
+# Terminal A; use absent root. Must print P17_ACTIVATION_ONLY=1.
+P17_ACTIVATION_DIAG=1 bash   experiments/qwen3_tts_cp_spec_k2/p17_launch.sh   "$HOME/results/qwen3tts-p17-activation-004"
+~~~
+
+Once `/health` returns HTTP 200, in **Terminal B**:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p17-multiwidth
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p17-activation-004"
+python -m experiments.qwen3_tts_cp_spec_k2.p17_activation_smoke   --root "$ROOT" --out "$ROOT/activation-smoke"
+cat "$ROOT/activation-smoke/summary.md"
+~~~
+
+The new smoke **checks both worker construction events BEFORE sending
+any HTTP**. If either is absent, it writes
+`P17_ACTIVATION_WORKER_STARTUP_NOT_INSTRUMENTED`, records a
+source-matched live `multiprocessing.spawn` environment snapshot and
+stops without wasting H200 inference. Otherwise the HTTP request logs
+whether `collect_codes` was called with or without sampled tokens,
+whether the model Predictor entered, and whether the ARM file existed
+at that instant. The summary also retains counts from the **entire
+raw JSONL**, not only the request-time window. Inspect the
+`caller_module` fields in
+`activation/dispatch_pid*.jsonl` to catch an actual import path
+outside the P17 worktree.
+
+This is an activation diagnosis, **not** a P17 multiwidth correctness,
+acceptance or speedup PASS.
