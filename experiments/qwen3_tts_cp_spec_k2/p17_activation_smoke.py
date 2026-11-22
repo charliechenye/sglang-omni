@@ -27,9 +27,17 @@ STATUS_ARM_MISSING = "P17_ACTIVATION_ARM_NOT_VISIBLE_TO_WORKER"
 STATUS_NATIVE = "P17_ACTIVATION_NATIVE_FALLBACK_WITH_ARM_PRESENT"
 STATUS_PARTIAL = "P17_ACTIVATION_CODE_PREDICTOR_NOT_ENTERED"
 STATUS_FAILED = "P17_ACTIVATION_SMOKE_INCOMPLETE"
+STATUS_STARTUP_MISSING = "P17_ACTIVATION_WORKER_STARTUP_NOT_INSTRUMENTED"
+STATUS_EVENT_WINDOW = "P17_ACTIVATION_EVENTS_OUTSIDE_REQUEST_WINDOW"
+STARTUP_EVENTS = frozenset((
+    "engine_builder_make_model_runner",
+    "model_runner_initialized",
+))
 
 
-def _collect(root: Path, *, start_ns: int, end_ns: int) -> list[dict]:
+def _collect(
+    root: Path, *, start_ns: int | None = None, end_ns: int | None = None,
+) -> list[dict]:
     folder = root / "activation"
     output = []
     for path in sorted(folder.glob("dispatch_pid*.jsonl")):
@@ -42,7 +50,8 @@ def _collect(root: Path, *, start_ns: int, end_ns: int) -> list[dict]:
             timestamp = event.get("monotonic_ns")
             if not isinstance(timestamp, int):
                 raise RuntimeError("P17 activation event missing clock")
-            if start_ns <= timestamp <= end_ns:
+            if ((start_ns is None or start_ns <= timestamp)
+                    and (end_ns is None or timestamp <= end_ns)):
                 output.append(event)
     return sorted(output, key=lambda e: e["monotonic_ns"])
 
@@ -83,6 +92,10 @@ def run(root: Path, out: Path, *, base_url: str) -> dict:
             "P17_ACTIVATION_DIR_NOT_CREATED: start Terminal A with "
             "P17_ACTIVATION_DIAG=1 before running this smoke"
         )
+    launcher_pin = (diag / "launcher-source.sha")
+    if (not launcher_pin.is_file()
+            or launcher_pin.read_text().strip() != pin):
+        raise RuntimeError("P17_ACTIVATION_LAUNCHER_SHA_ATTESTATION_MISSING")
     if (root / "ARM_BASE").exists() or (root / "ARM_SPEC").exists():
         raise RuntimeError("P17 stale ARM file before smoke")
     if (root / "smoke").exists():
@@ -104,14 +117,35 @@ def run(root: Path, out: Path, *, base_url: str) -> dict:
             },
         },
     }
+    startup = _collect(root)
+    startup_counts = Counter(row["event"] for row in startup)
     report = {
         "status": STATUS_FAILED,
         "schema": "qwen3tts-p17-activation-smoke-v1",
         "worker_source_sha": pin,
         "experiment_root": str(root),
         "kind": "activation_entry_only_NOT_PARITY_OR_PERFORMANCE",
+        "raw_startup_events": startup,
+        "raw_startup_counts": dict(startup_counts),
         "visits": [],
     }
+    if not STARTUP_EVENTS.issubset(startup_counts):
+        report["status"] = STATUS_STARTUP_MISSING
+        report["missing_startup_events"] = sorted(
+            STARTUP_EVENTS.difference(startup_counts)
+        )
+        (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
+        (out / "summary.md").write_text(
+            "# P17 activation worker startup preflight\n\n"
+            f"**{STATUS_STARTUP_MISSING}**\n\n"
+            f"Source SHA: {pin}\n"
+            f"Raw startup counts: {dict(startup_counts)}\n"
+            f"Missing: {report['missing_startup_events']}\n"
+            "No HTTP requests sent; investigate worker env/module import.\n"
+        )
+        print(f"P17_ACTIVATION_STATUS={STATUS_STARTUP_MISSING}")
+        print(f"P17_ACTIVATION_REPORT={out/'summary.md'}")
+        return report
     try:
         for label, arm_name in (
             ("00_base", "ARM_BASE"), ("01_spec", "ARM_SPEC")
@@ -128,6 +162,8 @@ def run(root: Path, out: Path, *, base_url: str) -> dict:
             finally:
                 arm.unlink(missing_ok=True)
             events = _collect(root, start_ns=start_ns, end_ns=end_ns)
+            full_snapshot = _collect(root)
+            all_counts = Counter(x["event"] for x in full_snapshot)
             for event in events:
                 if event.get("source_sha") != pin:
                     raise RuntimeError(
@@ -154,9 +190,12 @@ def run(root: Path, out: Path, *, base_url: str) -> dict:
                 "wall_s_NOT_PERFORMANCE": wall,
                 "native_k2_log_frames": new_frames,
                 "worker_event_counts": dict(states),
+                "all_raw_event_counts_after_visit": dict(all_counts),
+                "all_raw_event_count_after_visit": len(full_snapshot),
                 "worker_events": events,
                 "diagnostic_classification": (
-                    _classify(events) if label == "01_spec" else "BASELINE"
+                    (_classify(events) if events else STATUS_EVENT_WINDOW)
+                    if label == "01_spec" else "BASELINE"
                 ),
                 **wav_info(audio),
             }
@@ -192,8 +231,10 @@ def run(root: Path, out: Path, *, base_url: str) -> dict:
         "# P17 activation-only worker diagnosis\n\n"
         f"**{report['status']}**\n\n"
         f"Source SHA: {pin}\n"
+        f"Startup event counts: {dict(startup_counts)}\n"
         f"Baseline event counts: {base['worker_event_counts']}\n"
         f"Spec event counts: {spec['worker_event_counts']}\n"
+        f"All raw events after spec: {spec['all_raw_event_counts_after_visit']}\n"
         f"Spec native K2 log frames: {spec['native_k2_log_frames']}\n\n"
         "No GPU multiwidth parity or performance inference.\n"
     )
