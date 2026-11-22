@@ -33,7 +33,8 @@ cost = json.loads((root / "matched_cost" / "config.json").read_text())
 expected = 2 if mode == "smoke" else 8
 if (p18.get("frames_per_request") != expected
         or cost.get("p18_frames_per_request") != expected
-        or p18.get("source_sha") != cost.get("source_sha")):
+        or p18.get("source_sha") != cost.get("source_sha")
+        or cost.get("diagnostic") is not None):
     raise RuntimeError("P19_CLIENT_COHORT_OR_COST_SOURCE_DRIFT")
 PY
 python -m experiments.qwen3_tts_cp_spec_k2.p18_run \
