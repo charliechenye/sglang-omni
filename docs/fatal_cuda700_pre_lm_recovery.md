@@ -46,9 +46,16 @@ responsible for a fresh process after the stage exits.
 ## CPU-only regression tests
 
 ~~~bash
-git fetch origin fix/prelm-fatal-cuda700-failfast
-git switch -c fix/prelm-fatal-cuda700-failfast \
-  --track origin/fix/prelm-fatal-cuda700-failfast
+# Use a separate worktree; do NOT move/rebase the pinned A338EB0
+# source used by the P39/P40A reliability experiments.
+git -C ~/sglang-omni fetch \
+  https://github.com/charliechenye/sglang-omni.git \
+  fix/prelm-fatal-cuda700-failfast
+
+git -C ~/sglang-omni worktree add --detach \
+  ~/sglang-omni-worktrees/fatal-cuda700-review FETCH_HEAD
+
+cd ~/sglang-omni-worktrees/fatal-cuda700-review
 
 python -m pytest -q \
   tests/unit_test/qwen3_asr/test_fatal_cuda700_failfast.py \
