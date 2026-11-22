@@ -490,6 +490,20 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
     def post_scheduler_setup(
         self, scheduler: OmniScheduler[Qwen3TTSSGLangRequestData], model_runner: object
     ) -> None:
+        # P17 BRANCH-ONLY canary: this method already emits the native KV-pool
+        # startup log, so observing that log without this marker proves the
+        # live engine imported a different engine_builder module. Do not gate
+        # this canary on os.environ; the purpose is to detect that exact error.
+        logger.warning(
+            "P17_ENGINE_BUILDER_SOURCE_CANARY module=%s "
+            "runtime_spec_k=%r runtime_activation_dir=%r "
+            "runtime_activation_only=%r runtime_arm_path=%r",
+            __file__,
+            os.environ.get("SGLANG_OMNI_QTTS_CP_SPEC_K"),
+            os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"),
+            os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_ONLY"),
+            os.environ.get("SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE"),
+        )
         del model_runner
         schedule = get_schedule()
         running = int(schedule.max_running_requests)
