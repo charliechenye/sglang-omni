@@ -54,7 +54,7 @@ if [[ "${P17_ACTIVATION_DIAG:-0}" == "1" ]]; then
   export SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR="$ROOT/activation"
   export SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_ONLY=1
   mkdir -p "$SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"
-  printf '%s\\n' "$SHA" > "$SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR/launcher-source.sha"
+  printf '%s\n' "$SHA" > "$SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR/launcher-source.sha"
   echo "P17_ACTIVATION_ONLY=1 diagnostic_dir=$SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"
 elif [[ "${P17_ACTIVATION_DIAG:-0}" != "0" ]]; then
   echo "P17_ACTIVATION_DIAG must be 0 or 1" >&2
