@@ -13,6 +13,7 @@ import torch
 from experiments.qwen3_tts_cp_spec_k2.p17_multiwidth_gate import (
     SCHEMA, PROBE_PASS, validate_probe,
 )
+from sglang_omni.models.qwen3_tts import code_predictor_spec_p17_wide as p17_wide
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p17_wide import (
     WIDTHS, UNIFORM_COUNT, prefix_accept_count, check_wide_backend,
     make_q_proposals, wide_device_fused_predictor,
@@ -155,3 +156,126 @@ def test_p17_cpu_source_and_acceptance_evidence_fail_closed(mutator):
     mutator(report)
     with pytest.raises((ValueError, KeyError, TypeError)):
         validate_probe(report, sha=SHA, pid=PID, gpu=GPU)
+
+
+@pytest.mark.parametrize("width,accepts", [
+    (2, (False,)),
+    (2, (True,)),
+    (3, (False, True)),
+    (3, (True, False)),
+    (3, (True, True)),
+    (4, (False, True, True)),
+    (4, (True, False, True)),
+    (4, (True, True, False)),
+    (4, (True, True, True)),
+])
+def test_p17_wide_round_bonus_mask_is_bool_and_prefix_is_correct(
+    monkeypatch, width, accepts,
+):
+    """Exercise the REAL round's torch.where/bonus path with CPU fake kernels.
+
+    Old P17 used int64 cumprod[-1] directly as torch.where(condition),
+    which raised RuntimeError before any on-policy GPU evidence existed.
+    Do not replace or skip the actual make_wide_round call.
+    """
+    hidden_dim = 3
+    n = width - 1
+    draft_codes = [11 + j for j in range(n)]
+    rejected_codes = [41 + j for j in range(n)]
+    bonus_code = 99
+
+    def fake_proposals(model, *, depth, width, old_hidden, head_bank,
+                       uniforms, temperature, top_p, accumulation_dtype):
+        assert old_hidden.shape == (1, 1, hidden_dim)
+        return (
+            torch.zeros((n, 2048)),
+            torch.zeros((n, 50), dtype=torch.int32),
+            torch.full((n, 50), 1 / 50.0),
+            torch.tensor(draft_codes, dtype=torch.long),
+            torch.ones((1, n, hidden_dim)),
+        )
+
+    def fake_verifier(model, *, packed, cache_len_gpu, offsets_gpu):
+        assert packed.shape == (1, width, hidden_dim)
+        assert cache_len_gpu.dtype == torch.long
+        assert offsets_gpu.shape == (width,)
+        return torch.arange(width, dtype=torch.float32).reshape(
+            1, width, 1
+        ).expand(1, width, hidden_dim).clone()
+
+    def fake_logits(states, bank):
+        assert states.shape == (width, 1, hidden_dim)
+        return torch.zeros((width, 2048))
+
+    def fake_support(logits, *, temperature, top_p, fast):
+        return (torch.zeros((1, 50), dtype=torch.int32),
+                torch.full((1, 50), 1 / 50.0))
+
+    def fake_accept(p_ids, p_probs, q_ids, q_probs, u, q_draft):
+        idx = int(q_draft[0]) - draft_codes[0]
+        is_accepted = accepts[idx]
+        return {
+            "accepted": torch.tensor([is_accepted], dtype=torch.bool),
+            "committed": torch.tensor(
+                [draft_codes[idx] if is_accepted else rejected_codes[idx]],
+                dtype=torch.long,
+            ),
+        }
+
+    def fake_bonus(logits, uniform, *, temperature, top_p):
+        return None, None, None, torch.tensor([bonus_code], dtype=torch.long)
+
+    def fake_project(model, index, code, accum_dtype):
+        raw = code.to(dtype=accum_dtype).reshape(1, 1).expand(
+            1, hidden_dim
+        ).clone()
+        return raw, raw.unsqueeze(1).clone()
+
+    monkeypatch.setattr(p17_wide, "make_q_proposals", fake_proposals)
+    monkeypatch.setattr(p17_wide, "wide_device_fused_predictor", fake_verifier)
+    monkeypatch.setattr(p17_wide, "batched_head_logits", fake_logits)
+    monkeypatch.setattr(p17_wide, "single_support", fake_support)
+    monkeypatch.setattr(p17_wide, "gpu_accept", fake_accept)
+    monkeypatch.setattr(p17_wide, "fast_selector", fake_bonus)
+    monkeypatch.setattr(p17_wide, "_project", fake_project)
+
+    result = make_wide_round(
+        SimpleNamespace(), depth=1, width=width,
+        cache_len_gpu=torch.tensor(2, dtype=torch.long),
+        old_hidden=torch.zeros((1, 1, hidden_dim)),
+        last_embedding=torch.zeros((1, 1, hidden_dim)),
+        accumulated=torch.full((1, hidden_dim), 7.0),
+        uniforms=torch.zeros(UNIFORM_COUNT),
+        head_bank=torch.zeros((width, hidden_dim, 2048)),
+        offset_ids=torch.arange(width, dtype=torch.long),
+        temperature=0.9, top_p=1.0,
+    )
+    prefix = prefix_accept_count(accepts)
+    expected_codes = [
+        (draft_codes[j] if accepts[j] else rejected_codes[j])
+        if j <= prefix else -1
+        for j in range(n)
+    ]
+    expected_codes.append(bonus_code if prefix == n else -1)
+    assert result["accepted_flags"].dtype == torch.bool
+    assert result["accepted_prefix"].item() == prefix
+    assert result["committed_count"].item() == prefix + 1
+    assert result["committed_codes"].tolist() == expected_codes
+    assert result["next_cache_len"].item() == 2 + prefix + 1
+    assert result["next_depth"].item() == 2 + prefix
+    expected_last = expected_codes[prefix]
+    torch.testing.assert_close(
+        result["next_embedding"],
+        torch.full((1, 1, hidden_dim), float(expected_last)),
+    )
+    torch.testing.assert_close(
+        result["next_hidden"],
+        torch.full((1, 1, hidden_dim), float(prefix)),
+    )
+    torch.testing.assert_close(
+        result["next_sum"],
+        torch.full(
+            (1, hidden_dim),
+            7.0 + sum(code for code in expected_codes if code >= 0),
+        ),
+    )
