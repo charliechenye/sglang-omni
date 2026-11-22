@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from experiments.qwen3_tts_cp_spec_k2.p18_analyze import (
-    clustered_ci, seed_for, validate_rows, widths,
+    clustered_ci, hierarchical_ci, seed_for, validate_rows, widths,
 )
 from experiments.qwen3_tts_cp_spec_k2.p18_cost_model import (
     estimated_cost, paired_bootstrap,
@@ -235,3 +235,45 @@ def test_p18_worker_native_sampling_seed_must_stay_constant_per_case(tmp_path):
     one.write_text(json.dumps(record))
     with pytest.raises(RuntimeError, match="SUBSAMPLING_SEED_DRIFT"):
         validate_rows(root)
+
+
+def test_p18_primary_hierarchical_bootstrap_has_prompt_not_request_clusters():
+    data = {
+        "p1s1": [1, 1], "p1s2": [2, 2],
+        "p2s1": [3, 3], "p2s2": [4, 4],
+    }
+    mapping = {
+        "p1s1": "prompt1", "p1s2": "prompt1",
+        "p2s1": "prompt2", "p2s2": "prompt2",
+    }
+    out = hierarchical_ci(data, mapping, seed=321, repeats=200)
+    assert out["mean"] == 2.5
+    assert out["independent_prompt_clusters"] == 2
+    assert out["request_clusters_conditional_on_prompts"] == 4
+    lo, hi = out["prompt_then_seed_bootstrap_95pct"]
+    assert lo <= 2.5 <= hi
+    assert 1 <= lo < hi <= 4
+
+
+def test_p18_b_cost_uses_hierarchical_paired_prompt_bootstrap():
+    values = {
+        "p1s1": {2: [1, 1], 3: [2, 2]},
+        "p1s2": {2: [1, 1], 3: [2, 2]},
+        "p2s1": {2: [2, 2], 3: [2, 2]},
+        "p2s2": {2: [2, 2], 3: [3, 3]},
+    }
+    prompts = {
+        case: case[:2] for case in values
+    }
+    report = paired_bootstrap(
+        values, {2: 0.25, 3: 0.29},
+        seed=77, prompt_of_case=prompts,
+    )
+    assert (report["3"]["advantage_vs_K2_paired_request_bootstrap"]
+            ["primary_resampling_unit"] == "PROMPT_THEN_SEED")
+    assert report["2"]["assumed_ms_per_committed"] > 0
+    with pytest.raises(RuntimeError, match="PROMPT_IDENTITY"):
+        paired_bootstrap(
+            values, {2: 0.25, 3: 0.29},
+            seed=77, prompt_of_case={"p1s1": "p1"},
+        )
