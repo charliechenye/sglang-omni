@@ -66,6 +66,10 @@ class Qwen3TTSModelRunner(ModelRunner):
         silence_codec_ids: torch.Tensor,
     ) -> None:
         super().__init__(tp_worker, output_processor)
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"):
+            from .code_predictor_spec_p17_activation import record
+
+            record("model_runner_initialized", caller_module=__file__)
         self.has_pending_code_step = False
         self.row_ids_cache: torch.Tensor | None = None
         self.leading_silence_mask_frames = leading_silence_mask_frames
@@ -234,6 +238,15 @@ class Qwen3TTSModelRunner(ModelRunner):
         schedule_batch: ScheduleBatch | None,
         requests: list[SchedulerRequest],
     ) -> None:
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"):
+            from .code_predictor_spec_p17_activation import record
+
+            record(
+                "collect_codes_called_with_tokens"
+                if result.next_token_ids is not None
+                else "collect_codes_called_without_tokens",
+                caller_module=__file__,
+            )
         self.has_pending_code_step = False
         if result.next_token_ids is None:
             return
