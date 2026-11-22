@@ -27,11 +27,12 @@ def diagnostic_config() -> tuple[str, int] | None:
     if arm not in MODES:
         raise RuntimeError(f"P19_UNKNOWN_DIAGNOSTIC_ARM {arm!r}")
     raw_depth = os.environ.get(DEPTH_ENV, "")
-    if not raw_depth.isdecimal() or not 1 <= int(raw_depth) <= 13:
-        raise RuntimeError("P19_DIAGNOSTIC_DEPTH_MUST_BE_1_TO_13")
+    if not raw_depth.isdecimal() or not 1 <= int(raw_depth) <= 14:
+        raise RuntimeError("P19_DIAGNOSTIC_DEPTH_MUST_BE_1_TO_14")
     depth = int(raw_depth)
     if (arm.startswith("K4") and depth > 11
-            or arm.startswith("K3") and depth > 12):
+            or arm.startswith("K3") and depth > 12
+            or arm.startswith("K2") and depth > 13):
         raise RuntimeError("P19_DIAGNOSTIC_ILLEGAL_K_AT_DEPTH")
     return arm, depth
 
