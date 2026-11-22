@@ -31,6 +31,10 @@ def validate_costs(root: Path) -> tuple[dict, list[dict], list[dict]]:
     cfg = json.loads((root / "matched_cost" / "config.json").read_text())
     src = (root / "source.sha").read_text().strip()
     count = cfg.get("p19_cost_frames_per_request")
+    if cfg.get("diagnostic") is not None:
+        raise RuntimeError(
+            "P19A_DIAGNOSTIC_MODE_NO_FORMAL_COST_OR_GO_SELECTION"
+        )
     mode = driver["mode"]
     p18_frames = {"smoke": 2, "main": 8}[mode]
     if (cfg.get("schema") != CONFIG_SCHEMA or cfg.get("source_sha") != src
