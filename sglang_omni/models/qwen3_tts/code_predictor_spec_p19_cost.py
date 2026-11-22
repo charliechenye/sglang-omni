@@ -20,6 +20,8 @@ import traceback
 from pathlib import Path
 from typing import Callable
 
+from .code_predictor_spec_p19_diag import diagnostic_config, event as diag_event
+
 import torch
 
 from .code_predictor_spec_p17_wide import (
@@ -61,31 +63,44 @@ def _one_arm(
     *, operation: Callable[[], dict[str, torch.Tensor]],
     restore: Callable[[], None], model, arm: str,
     device: torch.device, old_k: torch.Tensor, old_v: torch.Tensor,
-    prefix_len: int,
+    prefix_len: int, trace: Callable[[str], None] | None = None,
 ) -> dict:
     """Compile -> capture -> exact eager-vs-replay -> timed replay blocks."""
+    def mark(stage: str) -> None:
+        if trace is not None:
+            trace(stage)
+
+    mark("P19_ARM_EAGER_BEGIN")
     restore()
     eager = _clone(operation())
+    mark("P19_ARM_EAGER_OUTPUT_CAPTURED")
     eager_k = model.predictor_k_cache[:, :1, :16].detach().clone()
     eager_v = model.predictor_v_cache[:, :1, :16].detach().clone()
     restore()
     for _ in range(2):
+        mark("P19_ARM_WARMUP_BEGIN")
         operation()
         restore()
     torch.cuda.synchronize(device)
+    mark("P19_ARM_EAGER_AND_WARMUP_SYNC_PASS")
 
     capture_stream = torch.cuda.Stream(device=device)
     capture_stream.wait_stream(torch.cuda.current_stream(device))
     graph = torch.cuda.CUDAGraph()
     restore()
+    mark("P19_ARM_GRAPH_CAPTURE_BEGIN")
     with torch.cuda.graph(
         graph, stream=capture_stream, capture_error_mode="thread_local"
     ), torch.inference_mode():
         outputs = operation()
+    mark("P19_ARM_GRAPH_CAPTURE_RETURNED")
     torch.cuda.synchronize(device)
+    mark("P19_ARM_GRAPH_CAPTURE_SYNC_PASS")
     restore()
+    mark("P19_ARM_FIRST_REPLAY_BEGIN")
     graph.replay()
     torch.cuda.synchronize(device)
+    mark("P19_ARM_FIRST_REPLAY_SYNC_PASS")
     replay = _clone(outputs)
     if set(replay) != set(eager):
         raise RuntimeError(f"P19_{arm}_OUTPUT_SCHEMA_DRIFT")
@@ -110,8 +125,10 @@ def _one_arm(
         old_v[:, :, :prefix_len],
     )
 
+    mark("P19_ARM_REPLAY_EAGER_PARITY_PASS")
     records = []
     for block in range(BLOCKS):
+        mark(f"P19_ARM_TIMING_BLOCK_{block}_BEGIN")
         restore()
         for _ in range(WARM_REPLAYS):
             graph.replay()
@@ -123,6 +140,7 @@ def _one_arm(
             graph.replay()
         stop.record()
         stop.synchronize()
+        mark(f"P19_ARM_TIMING_BLOCK_{block}_SYNC_PASS")
         duration = start.elapsed_time(stop) / REPEATS
         if not math.isfinite(duration) or duration <= 0:
             raise RuntimeError(f"P19_{arm}_INVALID_GRAPH_EVENT")
@@ -131,6 +149,7 @@ def _one_arm(
         })
     del graph
     torch.cuda.synchronize(device)
+    mark("P19_ARM_GRAPH_RELEASE_AND_SYNC_PASS")
     return {
         "parity": "CAPTURED_REPLAY_VS_EAGER_OUTPUT_AND_FULL_KV_PASS",
         "cuda_graph_event_ms_blocks": records,
@@ -154,6 +173,15 @@ def maybe_measure(
     from .code_predictor_spec_p18_census import armed
 
     if not armed():
+        return
+    diagnostic = diagnostic_config()
+    if diagnostic is not None and depth != diagnostic[1]:
+        return
+    if diagnostic is not None and diagnostic[0] == "OFF":
+        diag_event(
+            "P19_COST_PROBE_SKIPPED_OFF", depth=depth,
+            frame=frame, case_id=case["case_id"], arm="OFF",
+        )
         return
     root = Path(root_raw)
     if not root.is_absolute() or root_raw != str(root):
@@ -282,7 +310,22 @@ def maybe_measure(
     records = {}
     failed = False
     try:
-        for arm in ("AR", *(str(w) for w in feasible_widths(depth))):
+        candidate_arms = ("AR", *(str(w) for w in feasible_widths(depth)))
+        if diagnostic is not None:
+            requested = diagnostic[0].split("_", 1)[0]
+            wanted = "AR" if requested == "AR" else requested[1:]
+            if wanted not in candidate_arms:
+                raise RuntimeError("P19_DIAG_ARM_ILLEGAL_AT_THIS_DEPTH")
+            candidate_arms = (wanted,)
+        for arm in candidate_arms:
+            def phase(stage: str) -> None:
+                if diagnostic is not None:
+                    diag_event(
+                        stage, depth=depth, arm=arm, frame=frame,
+                        case_id=case["case_id"],
+                    )
+
+            phase("P19_ARM_SELECTED")
             if arm == "AR":
                 operation = native_step
             else:
@@ -305,11 +348,22 @@ def maybe_measure(
                         head_bank=bank, offset_ids=offsets,
                         temperature=temp, top_p=top_p,
                     )
-            records[arm] = _one_arm(
-                operation=operation, restore=restore, model=model,
-                arm=arm, device=device, old_k=old_k, old_v=old_v,
-                prefix_len=cache_len,
-            )
+            if diagnostic is not None and diagnostic[0].endswith("_EAGER"):
+                # Diagnostic ONLY: never create full P19 matched cost rows.
+                phase("P19_EAGER_ONLY_OPERATION_BEGIN")
+                restore()
+                result = operation()
+                torch.cuda.synchronize(device)
+                if not isinstance(result, dict) or not result:
+                    raise RuntimeError("P19_EAGER_ONLY_EMPTY_ARM_RESULT")
+                phase("P19_EAGER_ONLY_DEVICE_SYNC_PASS")
+                restore()
+            else:
+                records[arm] = _one_arm(
+                    operation=operation, restore=restore, model=model,
+                    arm=arm, device=device, old_k=old_k, old_v=old_v,
+                    prefix_len=cache_len, trace=phase,
+                )
             if not all(torch.equal(x, y) for x, y in zip(
                 (old_hidden, last_embedding, accumulated, uniform_input),
                 immutable_inputs,
@@ -318,11 +372,21 @@ def maybe_measure(
                     f"P19_{arm}_FROZEN_NATIVE_CHECKPOINT_INPUT_MUTATED"
                 )
         restore()
+        if diagnostic is not None:
+            diag_event(
+                "P19_DIAGNOSTIC_ARM_RETURNED_NO_COST_SELECTION",
+                depth=depth, arm=diagnostic[0], frame=frame,
+                case_id=case["case_id"],
+            )
         if (not torch.equal(torch.get_rng_state(), cpu_rng)
                 or not torch.equal(torch.cuda.get_rng_state(device), cuda_rng)
                 or not torch.equal(model.predictor_k_cache[:, :1, :16], old_k)
                 or not torch.equal(model.predictor_v_cache[:, :1, :16], old_v)):
             raise RuntimeError("P19_COST_KV_OR_RNG_RESTORATION_FAILED")
+        if diagnostic is not None:
+            # Never pass an isolated one-arm result into the full all-arm
+            # analyzer. The phase trace is the diagnostic deliverable.
+            return
         report = {
             "schema": SCHEMA, "source_sha": source_sha,
             "pid": os.getpid(), "gpu": torch.cuda.get_device_name(device),
@@ -344,6 +408,12 @@ def maybe_measure(
             out.write("\n")
     except BaseException:
         failed = True
+        if diagnostic is not None:
+            diag_event(
+                "P19_DIAGNOSTIC_EXCEPTION_ENTERED",
+                depth=depth, arm=diagnostic[0], frame=frame,
+                case_id=case["case_id"],
+            )
         failure = root / "failures" / (
             f"pid{os.getpid()}_req{req_hash}_f{frame:07d}_d{depth:02d}.txt"
         )
@@ -363,6 +433,12 @@ def maybe_measure(
             if (not torch.equal(model.predictor_k_cache[:, :1, :16], old_k)
                     or not torch.equal(model.predictor_v_cache[:, :1, :16], old_v)):
                 raise RuntimeError("P19_FINAL_PHYSICAL_KV_RESTORE_FAILED")
+            if diagnostic is not None:
+                diag_event(
+                    "P19_DIAGNOSTIC_FINAL_RESTORE_SYNC_PASS",
+                    depth=depth, arm=diagnostic[0], frame=frame,
+                    case_id=case["case_id"],
+                )
         except BaseException:
             if not failed:
                 raise
