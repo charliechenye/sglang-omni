@@ -257,3 +257,125 @@ fail-closed error. No correctness requirement was relaxed.
 Update the P19 worktree using `git fetch` and `git merge --ff-only`,
 then rerun the P19 unit tests BEFORE starting the H200 smoke server.
 Prior synthetic test failure does not invalidate P18A/P18B H200 data.
+
+
+## P19 CUDA700 after first real smoke: isolate the first faulty kernel
+
+An initial P19 smoke crashed its H200 pipeline worker with
+`CUDA_ERROR_ILLEGAL_ADDRESS (700)` and `exit=-6`. The visible Python
+frame was `p18_census.maybe_census(): semantic_position.item()`, but
+CUDA errors may be reported asynchronously at later synchronizations.
+The rest of the server traceback is shutdown fallout, not a second
+root cause. A sticky CUDA700 requires a **NEW worker/process**.
+Do not retry in the failed process, reuse its evidence root, or
+treat its partial cost files as valid.
+
+PyTorch's CUDA Graph contract requires stable input addresses and
+graph-private output/pool lifetime across each replay. The new
+P19 native seeded sampler capture and graph/allocator lifecycle are
+suspects, not yet proven causes. P18 native-eager without P19 graph
+capture previously passed. We therefore isolate phases rather than
+changing `.item()`, skipping parity, or claiming the cause.
+
+### 0. Preserve first crash evidence without changing it
+
+~~~bash
+ROOT="$HOME/results/qwen3tts-p19-smoke-001"
+test -d "$ROOT"
+cat "$ROOT/source.sha"
+find "$ROOT/matched_cost/rows" -name '*.json' | wc -l
+find "$ROOT/census/rows" -name '*.json' | wc -l
+find "$ROOT/matched_cost/failures" "$ROOT/census/failures" \
+  -name '*.txt' -print 2>/dev/null
+grep -nE 'CUDA_ERROR_ILLEGAL_ADDRESS|illegal memory|CUDA error|P19_' \
+  "$ROOT/server.log" | tail -n 40
+~~~
+
+Counts establish which complete rows existed BEFORE the crash.
+They do not prove which kernel first wrote the invalid address.
+
+### 1. Update branch, run CPU tests, then single-request isolation
+
+Always use a **fresh root per mode**. Stop the old server first. Source
+lock and the ordinary native-AR P18 independent oracle remain enabled.
+
+Start with **AR_GRAPH at depth 1**; it is P19's first new graph arm
+in the first selected frame. If it fails, compare OFF and AR_EAGER,
+each on a fresh worker. If AR_GRAPH passes, test K2_GRAPH then
+K3_GRAPH and K4_GRAPH, still one depth and fresh worker per mode.
+
+Terminal A, example AR_GRAPH at depth 1:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+
+P19_DIAG_ARM=AR_GRAPH P19_DIAG_DEPTH=1 P19_DIAG_FENCE=0 \
+P18_CAPTURE_FRAMES=2 P19_COST_FRAMES=1 bash \
+  experiments/qwen3_tts_cp_spec_k2/p19_launch.sh \
+  "$HOME/results/qwen3tts-p19-diag-argraph-d01-001"
+~~~
+
+Terminal B, after /health (same root as Terminal A):
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p19-diag-argraph-d01-001"
+curl -fsS http://127.0.0.1:8000/health
+python -m experiments.qwen3_tts_cp_spec_k2.p19_diag_once --root "$ROOT"
+cat "$ROOT/matched_cost/diagnostic/client.json"
+~~~
+
+If `python` exits nonzero, preserve the trace; the diagnostic is
+expected to stop at the FIRST error, never fall back or run P19B.
+Read the durable CPU-only phase events:
+
+~~~bash
+ROOT="$HOME/results/qwen3tts-p19-diag-argraph-d01-001"
+grep -hE 'P19_ARM_|P19_DIAGNOSTIC_|P18_CENSUS_' \
+  "$ROOT"/matched_cost/diagnostic/worker_pid*.jsonl | tail -n 35
+find "$ROOT/matched_cost/failures" "$ROOT/census/failures" \
+  -name '*.txt' -exec sh -c 'echo "$1"; head -n 60 "$1"' sh {} \;
+~~~
+
+Available modes:
+- `OFF`: P18 only, no P19 matched-cost operation; isolates native
+  P18 path under the P19 source SHA.
+- `AR_EAGER`: P19 private native seeded AR operation without graph.
+- `AR_GRAPH`: that same operation with capture and repeated replay.
+- `K2_EAGER` / `K2_GRAPH`, likewise K3/K4: isolate each real wide arm.
+  Use only legal depths (K2 d<=13, K3 d<=12, K4 d<=11).
+
+All modes must run via the **same** `p19_diag_once` client and a
+new root/worker. `P19_DIAG_DEPTH` defaults to 1 and can target
+other depths, notably 9. `P19_DIAG_FENCE=0` preserves the normal
+async schedule; if an arm's last event is ambiguous, repeat with
+`P19_DIAG_FENCE=1` to add an explicit device synchronize before the
+P18 frame `.item()`. This changes scheduling, so a pass with the
+extra fence is **not** evidence of a production-safe kernel.
+
+Success reads
+`P19_SINGLE_REQUEST_COMPLETED_DIAGNOSTIC_ONLY_NO_COST_SELECTION`;
+failure reads
+`P19_CUDA700_OR_OTHER_DIAGNOSTIC_FAILURE_NO_SELECTION`.
+Both leave `matched_cost/rows` empty, and P19A/P19B analyzers reject
+diagnostic roots. **Neither status is a P19A correctness or speed PASS.**
+
+If OFF passes but AR_EAGER fails, focus on the native seeded sampler
+and its buffer/shape contract. If AR_EAGER passes but AR_GRAPH fails,
+focus on capture safety, warmup stream, graph inputs/lifetime and
+allocator behavior. If AR_GRAPH passes but K2_GRAPH fails, isolate
+P17 wide verifier/accept kernels under repeated graph replay. If a
+targeted one-arm diagnosis passes but full P19 still fails, investigate
+cross-arm graph resource reuse and interaction with subsequent native
+steps. These are hypotheses, not root-cause proofs.
+
+### 2. Do NOT run P19 main during isolation
+
+A 24-request/336-cost-row run is premature until a diagnostic arm
+reliably passes and the full four-arm smoke has fresh-worker correctness
+and cost provenance. No DIL/HTTP trace alone proves the fault's first
+GPU instruction. Add CUDA_LAUNCH_BLOCKING or Compute Sanitizer as a
+subsequent *targeted* step only when the failing arm is identified
+and the environment supports it.
