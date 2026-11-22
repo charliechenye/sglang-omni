@@ -207,3 +207,38 @@ successful P18B result is NOT a production runtime recommendation.
 - No per-request refusal override, seeded full-decoder parity,
   listening/ASR assessment, quality or HTTP QPS comparison is
   established by P18A/B. No PR merge from this study.
+
+
+## Optional one-command Terminal B wrapper
+
+Instead of invoking the client driver, analyzer, and P18B model separately,
+you may use the existing fail-closed `p18_measure.sh` wrapper. This still
+requires the running matching server from Terminal A and a NEW evidence root:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p18-depth-census
+source ~/.venv/bin/activate
+# SMOKE: Terminal A uses P18_CAPTURE_FRAMES=2
+bash experiments/qwen3_tts_cp_spec_k2/p18_measure.sh \
+  "$HOME/results/qwen3tts-p18-smoke-001" smoke
+
+# MAIN: Terminal A uses P18_CAPTURE_FRAMES=8, new worker/root
+bash experiments/qwen3_tts_cp_spec_k2/p18_measure.sh \
+  "$HOME/results/qwen3tts-p18-main-001" main \
+  "$HOME/results/qwen3tts-p17-multiwidth-008/smoke/report.json"
+~~~
+
+The optional third argument is allowed ONLY for the main cohort and
+must be an existing real P17 report; it runs P18B offline after P18A
+pass. Do not run this wrapper twice on the same evidence root.
+
+### P18 live native-state invariants
+
+The P18 observer copies the native original hidden, projected embedding,
+accumulated code sum, sampled native code, CPU/CUDA RNG state, and all
+16 physical KV slots. Every counterfactual width runs on a clone of
+the real sampled checkpoint. After the P17 independent oracle, the
+probe compares ALL original live tensors and restores them in a
+`finally` block, even if a wide-verifier kernel aliases scratch storage.
+Any mutation or failure invalidates the experiment; it is never
+accepted as speedup evidence.
