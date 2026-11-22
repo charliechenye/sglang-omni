@@ -343,6 +343,11 @@ def maybe_measure(
         try:
             torch.cuda.synchronize(device)
             restore()
+            # A failed graph capture must not leave a changed CPU/CUDA
+            # RNG stream on the continuing native request. The prior
+            # parity check still fails the experiment on any mutation.
+            torch.set_rng_state(cpu_rng)
+            torch.cuda.set_rng_state(cuda_rng, device=device)
             torch.cuda.synchronize(device)
             if (not torch.equal(model.predictor_k_cache[:, :1, :16], old_k)
                     or not torch.equal(model.predictor_v_cache[:, :1, :16], old_v)):
