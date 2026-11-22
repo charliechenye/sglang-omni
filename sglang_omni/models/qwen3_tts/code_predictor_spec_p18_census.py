@@ -116,7 +116,22 @@ def maybe_census(
             ))
             or "H200" not in torch.cuda.get_device_name(old_hidden.device)):
         raise RuntimeError("P18_REQUIRES_NATIVE_SAMPLED_H200_C1")
+    # P19 CUDA700 attribution: a CPU-only durable breadcrumb BEFORE
+    # reading a CUDA scalar. .item() can merely surface a stale
+    # asynchronous error from previous native/P19 kernels.
+    # No extra synchronization is introduced unless explicitly enabled
+    # in a DIAGNOSTIC-ONLY run (never a timed cost cohort).
+    diag = os.environ.get("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM") is not None
+    if diag:
+        from .code_predictor_spec_p19_diag import event
+
+        event("P18_CENSUS_ENTER_BEFORE_FRAME_ITEM", depth=depth)
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P19_DIAG_FENCE") == "1":
+            torch.cuda.synchronize(old_hidden.device)
+            event("P18_CENSUS_EXPLICIT_DEVICE_FENCE_PASS", depth=depth)
     frame = int(semantic_position.item())
+    if diag:
+        event("P18_CENSUS_FRAME_ITEM_PASS", depth=depth, frame=frame)
     req_id = getattr(model, "_p18_current_request_id", None)
     if not isinstance(req_id, str) or not req_id:
         raise RuntimeError("P18_MISSING_ENGINE_REQUEST_ID")
