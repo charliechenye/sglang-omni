@@ -11,6 +11,12 @@ MODE="$2"
 if [[ "$MODE" != "smoke" && "$MODE" != "main" ]]; then
   echo "P18 mode must be smoke or main" >&2; exit 2
 fi
+if [[ $# -eq 3 && "$MODE" != "main" ]]; then
+  echo "P18B is forbidden on the smoke cohort" >&2; exit 2
+fi
+if [[ $# -eq 3 && ! -r "$3" ]]; then
+  echo "P18B prior P17 cost report missing or unreadable: $3" >&2; exit 2
+fi
 if [[ -e "$ROOT/visits.json" || -e "$ROOT/analysis" || -e "$ROOT/cost-model" ]]; then
   echo "P18 requires fresh client evidence under this server root" >&2
   exit 2
@@ -28,10 +34,6 @@ python -m experiments.qwen3_tts_cp_spec_k2.p18_analyze \
   --root "$ROOT" --out "$ROOT/analysis"
 cat "$ROOT/analysis/summary.md"
 if [[ $# -eq 3 ]]; then
-  if [[ "$MODE" != "main" ]]; then
-    echo "P18B cost selection is not authorized on the smoke cohort" >&2
-    exit 2
-  fi
   python -m experiments.qwen3_tts_cp_spec_k2.p18_cost_model \
     --root "$ROOT" --p17-cost-report "$3" \
     --out "$ROOT/cost-model"
