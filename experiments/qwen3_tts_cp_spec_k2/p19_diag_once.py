@@ -128,7 +128,23 @@ def run(root: Path, base_url: str) -> dict:
         result["P19_full_cost_rows_should_be_zero"] = len(list(
             (root / "matched_cost" / "rows").glob("*.json")
         ))
-        result["trace_tail"] = trace_tail(root)
+        all_trace = trace_tail(root, count=100000)
+        result["trace_tail"] = all_trace[-40:]
+        phase_names = {entry.get("stage") for entry in all_trace}
+        required = (
+            "P19_COST_PROBE_SKIPPED_OFF"
+            if diagnostic["arm"] == "OFF"
+            else "P19_DIAGNOSTIC_FINAL_RESTORE_SYNC_PASS"
+        )
+        if result["status"] == STATUS_OK and (
+            result["census_rows"] == 0 or required not in phase_names
+        ):
+            result["status"] = STATUS_BAD
+            result["error"] = (
+                "P19_DIAGNOSTIC_HTTP_STOP_WITHOUT_ACTUAL_ARM_EVIDENCE: "
+                f"missing={required} rows={result['census_rows']}"
+            )
+            failure = RuntimeError(result["error"])
         if result["P19_full_cost_rows_should_be_zero"] != 0:
             result["status"] = STATUS_BAD
             result["error"] = "P19_DIAGNOSTIC_ILLEGAL_FORMAL_COST_RECORD"
