@@ -17,7 +17,8 @@ ARM_ENV = "SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM"
 DEPTH_ENV = "SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH"
 DIR_ENV = "SGLANG_OMNI_QTTS_CP_P19_COST_DIR"
 MODES = ("OFF", "AR_EAGER", "AR_GRAPH", "K2_EAGER", "K2_GRAPH",
-         "K3_EAGER", "K3_GRAPH", "K4_EAGER", "K4_GRAPH")
+         "K3_EAGER", "K3_GRAPH", "K4_EAGER", "K4_GRAPH",
+         "ALL_GRAPH")
 
 
 def diagnostic_config() -> tuple[str, int] | None:
