@@ -144,10 +144,19 @@ def _case_tables(driver: dict, accept_rows: list[dict],
             expected_costs = {"AR", *(str(w) for w in widths(depth))}
             native_costs = costs_per_case[case][depth]
             native_probs = prefixes_per_case[case][depth]
+            # Depth 14 has NO legal speculative width. Its native_probs
+            # must be empty, while native AR cost must still be present.
+            # Do not require a non-empty speculative histogram at this
+            # terminal-adjacent state. Every earlier depth keeps strict
+            # non-empty and balanced acceptance/cost checks.
             if (set(native_costs) != expected_costs
                     or set(native_probs) != expected_costs - {"AR"}
                     or len({len(v) for v in native_costs.values()}) != 1
-                    or len({len(v) for v in native_probs.values()}) != 1):
+                    or any(not values for values in native_costs.values())
+                    or (bool(native_probs) and (
+                        len({len(v) for v in native_probs.values()}) != 1
+                        or any(not values for values in native_probs.values())
+                    ))):
                 raise RuntimeError("P19_DP_UNPAIRED_REAL_NATIVE_CASES")
             per_case[case][depth] = {
                 "cost": {a: statistics.mean(v)
