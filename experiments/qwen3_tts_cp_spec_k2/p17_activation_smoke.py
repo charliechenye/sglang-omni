@@ -56,6 +56,58 @@ def _collect(
     return sorted(output, key=lambda e: e["monotonic_ns"])
 
 
+def _active_worker_env_snapshot(root: Path, sha: str) -> list[dict]:
+    """Only expose P17 keys from source-matched live spawn workers, no secrets."""
+    found = []
+    proc_root = Path("/proc")
+    if not proc_root.is_dir():
+        return found
+    for proc in proc_root.iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            command = (proc / "cmdline").read_bytes().replace(
+                b"\\0", b" "
+            ).decode(errors="replace")
+            if "multiprocessing.spawn" not in command:
+                continue
+            env = {}
+            for item in (proc / "environ").read_bytes().split(b"\\0"):
+                if b"=" not in item:
+                    continue
+                key, value = item.split(b"=", 1)
+                name = key.decode(errors="replace")
+                if name in (
+                    "SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA",
+                    "SGLANG_OMNI_QTTS_CP_SPEC_K",
+                    "SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE",
+                    "SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR",
+                    "SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_ONLY",
+                ):
+                    env[name] = value.decode(errors="replace")
+        except OSError:
+            continue
+        if env.get("SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA") != sha:
+            continue
+        found.append({
+            "pid": int(proc.name),
+            "command": command[:180],
+            "spec_k": env.get("SGLANG_OMNI_QTTS_CP_SPEC_K"),
+            "spec_arm_matches": (
+                env.get("SGLANG_OMNI_QTTS_CP_SPEC_ARM_FILE")
+                == str(root / "ARM_SPEC")
+            ),
+            "activation_dir_matches": (
+                env.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR")
+                == str(root / "activation")
+            ),
+            "activation_only": env.get(
+                "SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_ONLY"
+            ),
+        })
+    return found
+
+
 def _classify(events: list[dict]) -> str:
     if not events:
         return STATUS_NOT_SEEN
@@ -127,6 +179,9 @@ def run(root: Path, out: Path, *, base_url: str) -> dict:
         "kind": "activation_entry_only_NOT_PARITY_OR_PERFORMANCE",
         "raw_startup_events": startup,
         "raw_startup_counts": dict(startup_counts),
+        "source_matched_worker_environment": _active_worker_env_snapshot(
+            root, pin,
+        ),
         "visits": [],
     }
     if not STARTUP_EVENTS.issubset(startup_counts):
@@ -141,6 +196,8 @@ def run(root: Path, out: Path, *, base_url: str) -> dict:
             f"Source SHA: {pin}\n"
             f"Raw startup counts: {dict(startup_counts)}\n"
             f"Missing: {report['missing_startup_events']}\n"
+            f"Live source-matched worker env: "
+            f"{report['source_matched_worker_environment']}\n"
             "No HTTP requests sent; investigate worker env/module import.\n"
         )
         print(f"P17_ACTIVATION_STATUS={STATUS_STARTUP_MISSING}")
