@@ -346,6 +346,10 @@ Available modes:
 - `AR_GRAPH`: that same operation with capture and repeated replay.
 - `K2_EAGER` / `K2_GRAPH`, likewise K3/K4: isolate each real wide arm.
   Use only legal depths (K2 d<=13, K3 d<=12, K4 d<=11).
+- `ALL_GRAPH`: after individual graph arms pass, execute **all legal
+  arms sequentially at ONE depth** and retain a separate phase trace
+  for each arm. This diagnoses cross-arm graph/scratch interactions,
+  but still does NOT produce valid P19A matched cost rows.
 
 All modes must run via the **same** `p19_diag_once` client and a
 new root/worker. `P19_DIAG_DEPTH` defaults to 1 and can target
@@ -361,6 +365,11 @@ failure reads
 `P19_CUDA700_OR_OTHER_DIAGNOSTIC_FAILURE_NO_SELECTION`.
 Both leave `matched_cost/rows` empty, and P19A/P19B analyzers reject
 diagnostic roots. **Neither status is a P19A correctness or speed PASS.**
+
+For `ALL_GRAPH`, make a NEW worker/root with
+`P19_DIAG_ARM=ALL_GRAPH P19_DIAG_DEPTH=1`; run the same
+`p19_diag_once` command. An individual-arm result and an
+ALL_GRAPH result must never share the same server instance or output.
 
 If OFF passes but AR_EAGER fails, focus on the native seeded sampler
 and its buffer/shape contract. If AR_EAGER passes but AR_GRAPH fails,
