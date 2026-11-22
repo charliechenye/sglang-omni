@@ -12,6 +12,53 @@ fi
 if ! git diff --quiet || ! git diff --cached --quiet; then
   echo "P17 requires clean tracked worktree" >&2; exit 2
 fi
+
+# In fresh H200 venvs, the CLI console script and Python's editable import
+# can select different copies of sglang_omni. Pin this experiment worktree
+# FIRST on sys.path for the launcher AND multiprocessing.spawn children.
+WORKTREE="$(git rev-parse --show-toplevel)"
+if [[ "$(pwd -P)" != "$WORKTREE" ]]; then
+  echo "P17 must be launched from the experiment worktree root" >&2
+  exit 2
+fi
+export PYTHONPATH="$WORKTREE${PYTHONPATH:+:$PYTHONPATH}"
+python - <<'PY'
+import importlib
+import inspect
+import os
+import pathlib
+import sys
+
+root = pathlib.Path.cwd().resolve()
+import sglang_omni
+eb = importlib.import_module("sglang_omni.models.qwen3_tts.engine_builder")
+runner = importlib.import_module("sglang_omni.models.qwen3_tts.model_runner")
+model = importlib.import_module("sglang_omni.models.qwen3_tts.sglang_model")
+expected = {
+    "sglang_omni": root / "sglang_omni" / "__init__.py",
+    "engine_builder": root / "sglang_omni" / "models" / "qwen3_tts" / "engine_builder.py",
+    "model_runner": root / "sglang_omni" / "models" / "qwen3_tts" / "model_runner.py",
+    "sglang_model": root / "sglang_omni" / "models" / "qwen3_tts" / "sglang_model.py",
+}
+modules = {
+    "sglang_omni": sglang_omni,
+    "engine_builder": eb,
+    "model_runner": runner,
+    "sglang_model": model,
+}
+for label, mod in modules.items():
+    actual = pathlib.Path(mod.__file__).resolve()
+    want = expected[label].resolve()
+    print(f"P17_IMPORT_PREFLIGHT {label}={actual}", flush=True)
+    if actual != want:
+        raise RuntimeError(
+            f"P17_SOURCE_IMPORT_MISMATCH: {label}: actual={actual}, expected={want}"
+        )
+source = inspect.getsource(eb.Qwen3TtsEngineBuilder.post_scheduler_setup)
+if "P17_ENGINE_BUILDER_SOURCE_CANARY" not in source:
+    raise RuntimeError("P17_CURRENT_WORKTREE_MISSING_SOURCE_CANARY")
+print("P17_IMPORT_PREFLIGHT_PASS python=", sys.executable, flush=True)
+PY
 python - <<'PY'
 import torch
 assert torch.cuda.is_available(), "P17 requires NVIDIA H200"
