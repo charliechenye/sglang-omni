@@ -1,0 +1,237 @@
+# P19A/B — Qwen3-TTS matched native AR costs and all-depth Bellman DP (H200)
+
+**Research-only. Not a serving optimization, full native Predictor Graph
+benchmark, causal speculative rollout, audio equivalence or production GO.**
+
+## Why P19 exists
+
+Source P17 H200: `de4075501633a4d5054d820ea2eb13039fb5d8dc`.
+P17 verified native-head distributions / physical KV of one K2/3/4
+wide verifier, but costs were measured at only depths 1 and 9 and were
+not a matched single-native-step comparison. P18A main
+`86e60743b21db575631d6e9e98d67a413cb997ea` sampled 8 prompts
+x 3 seeds x 8 frames, 2688 native-AR-eager depth checkpoints with
+independent P17 oracle parity. P18B used EXTRAPOLATED P17 costs and
+the local heuristic `round cost / expected committed codes`, which
+cannot account for jumping over entire future depth states.
+
+P19 fixes those two gaps, without claiming a full 14-depth native
+speculative CUDA Graph or a deployment speedup.
+
+### P19A — same real checkpoint, same GPU worker, full depth graph components
+
+This P19 branch derives from P18's validated native AR source. For
+each actual `code_predictor_forward_incremental` checkpoint AFTER
+native code[d] was sampled and BEFORE its KV append, P18 still
+validates independent q/p sampling distribution, residual correction,
+static wide verifier and every physical KV slot.
+
+Then, ONLY for the FIRST selected frame of each request by default,
+P19 captures separately from exactly that checkpoint:
+
+- **AR:** one native
+  `predictor_forward_tokens(last_embedding,cache_len)`,
+  `lm_head[depth]`, genuine native seeded
+  `sample_subtalker_embedding` with private same-shape sampler
+  buffers, actual codec sum, and next projected token (unless final
+  code15).
+- **K2/K3/K4:** the exact P17
+  `make_wide_round`, with real batched heads, one causal fused wide
+  verifier, conditional accept / positive residual and bonus, and
+  output code, embedding, state.
+- Only legal widths run: depths 1..11 K2/K3/K4, depth12 K2/K3,
+  depth13 K2, depth14 native AR only.
+
+Each arm is warmed, independently captured in a CUDA Graph and
+checked against an eager invocation of THE SAME arm. Each comparison
+includes code outputs and full physical K/V. It then collects four
+blocks of twelve graph replays with GPU CUDA Events. It restores
+physical KV and CPU/CUDA RNG in all cases, including errors.
+A failed capture, incorrect code, mismatched KV, missing depth,
+wrong source/PID or non-natural HTTP finish fails CLOSED and retains
+the first failure file. Graph events include graph launch gaps;
+the arms are separate components, not a fused full-decoder graph.
+
+The experiment uses the same code/prompt/seed inputs across all arms
+but **native AR uses the genuine seeded SGLang sampler**, whereas
+P17 speculative widths use a predeclared paired uniform tuple.
+These are equivalent *distributions* (validated independently in
+P18), not identical seeded output trajectories. This is intentionally
+not called native seeded full-decoder parity.
+
+P19 records `matched_cost/rows/*.json` one file per actual
+(request, measured-frame, depth) and matches each row with the
+`census/rows/*.json` P18 row of the SAME source/PID/request/frame.
+Source SHA is NEW (P19), but both acceptance and matched costs are
+from this same P19 run. No P17 cost extrapolation is used.
+
+### P19B — correct residual-depth transition DP
+
+The terminal state is **last committed code=15**, and d=1..14
+represents the last committed residual code. The original first
+pair (code0/code1) is NOT priced in P19B.
+
+At state d:
+- Native AR cost `AR(d)` advances to d+1.
+- K-wide round costs `C(d,K)`; its actual accepted-prefix distribution
+  commits j=1..K codes and advances to d+j.
+- The model solves the Bellman equation backwards:
+
+`V(d) = min_a [C(d,a) + sum_j P(j | native checkpoint,d,a) * V(d+j)]`
+
+The report includes true native-AR-only residual component cost,
+fixed K2/K3/K4 with AR tail fallback, nominal adaptive policy, and
+full per-depth Q-values. The CI resamples PROMPTS then SEEDS (paired
+across ALL widths and costs); frames stay correlated inside a request.
+**The bootstrap evaluates the FROZEN nominal policy**, not a newly
+re-optimized policy each resample; separate reselected-optimal
+statistics are explicitly marked optimistic.
+
+**Important limitations:** native AR checkpoint distributions are
+NOT the distributions after causal speculative commit changes future
+state. Separate captured components are NOT a whole sampled Predictor
+Graph-ON. The initial pair, integrated graph control, changes in
+cross-depth KV/sampling, graph memory, startup, quality and HTTP serving
+are unmeasured. The historical 2.23234ms/frame complete native
+Predictor Graph ON is CONTEXT ONLY and MUST NOT be compared directly
+to P19 residual-component costs.
+
+Even a positive P19B "headroom" is a reason to study causal rollout,
+not permission to merge production speculation. The default research
+follow-up threshold is >15% lower hierarchical fixed-policy headroom,
+NOT a serving GO threshold.
+
+## 0. Create isolated worktree (bootstrap already installed)
+
+Use the existing git worktree as control; do not switch or reset P18.
+
+~~~bash
+P18="$HOME/sglang-omni-worktrees/p18-depth-census"
+P19="$HOME/sglang-omni-worktrees/p19-matched-dp"
+
+git -C "$P18" fetch \
+  https://github.com/charliechenye/sglang-omni.git \
+  experiment/qwen3-tts-cpspec-p19-matched-dp
+
+git -C "$P18" worktree add -b \
+  experiment/qwen3-tts-cpspec-p19-matched-dp \
+  "$P19" FETCH_HEAD
+
+cd "$P19"
+source ~/.venv/bin/activate
+git status --short
+git rev-parse HEAD
+
+python -m py_compile \
+  sglang_omni/models/qwen3_tts/code_predictor_spec_p19_cost.py \
+  experiments/qwen3_tts_cp_spec_k2/p19_analyze.py \
+  experiments/qwen3_tts_cp_spec_k2/p19_dp.py \
+  tests/unit_test/qwen3_tts/test_cp_spec_p19.py
+
+bash -n experiments/qwen3_tts_cp_spec_k2/p19_launch.sh
+bash -n experiments/qwen3_tts_cp_spec_k2/p19_measure.sh
+
+python -m pytest -q -x \
+  tests/unit_test/qwen3_tts/test_cp_spec_p17.py \
+  tests/unit_test/qwen3_tts/test_cp_spec_p18.py \
+  tests/unit_test/qwen3_tts/test_cp_spec_p19.py \
+  -m "not accelerator"
+~~~
+
+If the P19 local branch already exists, add worktree without `-b`;
+never force-reset. P19 launch prepends this worktree to PYTHONPATH
+BEFORE starting the Python multiprocessing spawned worker. No
+editable pip reinstallation or bootstrap is necessary.
+
+## 1. Smoke first — 4 requests, 56 matched depth checkpoints
+
+STOP old P18 or P17 servers and any other large GPU experiment. The
+Qwen3-TTS server can reserve ~110 GiB of a single H200 in its KV pool.
+
+Terminal A:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+P18_CAPTURE_FRAMES=2 P19_COST_FRAMES=1 bash \
+  experiments/qwen3_tts_cp_spec_k2/p19_launch.sh \
+  "$HOME/results/qwen3tts-p19-smoke-001"
+~~~
+
+Terminal B, only after `/health` returns HTTP 200:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p19-smoke-001"
+curl -fsS http://127.0.0.1:8000/health
+
+bash experiments/qwen3_tts_cp_spec_k2/p19_measure.sh "$ROOT" smoke
+
+cat "$ROOT/matched_cost/analysis/summary.md"
+cat "$ROOT/dp/summary.md"
+~~~
+
+The smoke checks exactly 4 requests * 2 frames * 14 depths =
+112 independently validated P18 depth rows; costs attach to the
+FIRST frame from each request at all 14 depths (56 matched cost rows).
+The DP smoke output is a **software-correctness diagnostic only**,
+never width policy selection.
+
+Expected statuses:
+- P18A `P18A_ALL_DEPTH_CLUSTERED_ACCEPTANCE_CENSUS_PASS_NO_SPEEDUP`
+- P19A `P19A_SAME_NATIVE_CHECKPOINT_GRAPH_COMPONENT_COST_PASS_NOT_E2E`
+- P19B `P19B_ALL_DEPTH_MATCHED_COMPONENT_DP_SCREEN_NOT_E2E_GO`
+
+If any first error occurs: DO NOT reuse this root, inspect the earliest
+`matched_cost/failures/*.txt` or `census/failures/*.txt`, and the
+first server traceback. Never turn off parity or add fallback kernels.
+
+## 2. Main — 24 requests, 336 matched depth costs
+
+ONLY after smoke PASS. Stop the smoke server and use a fresh worker,
+same source SHA, with 8 native acceptance frames and 1 cost frame per
+request. This produces 2688 native acceptance rows plus
+24 requests x 14 depths = 336 matched graph-cost rows.
+
+Terminal A:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+P18_CAPTURE_FRAMES=8 P19_COST_FRAMES=1 bash \
+  experiments/qwen3_tts_cp_spec_k2/p19_launch.sh \
+  "$HOME/results/qwen3tts-p19-main-001"
+~~~
+
+Terminal B:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p19-main-001"
+curl -fsS http://127.0.0.1:8000/health
+bash experiments/qwen3_tts_cp_spec_k2/p19_measure.sh "$ROOT" main
+cat "$ROOT/matched_cost/analysis/summary.md"
+cat "$ROOT/dp/summary.md"
+~~~
+
+No historical P17 report is needed; P19's costs and acceptance are
+source-matched from one worker. The P19 DP uses only the measured
+P19A costs at every eligible depth, not interpolation.
+
+## 3. Stop/go policy
+
+- If capture or correctness fails: preserve the first exception and
+  repair; no model substitution, tolerance relaxation or skipped depth.
+- If smoke passes and main has weak fixed-policy hierarchical headroom:
+  do not build the full adaptive decoder.
+- If main suggests >15% hierarchical lower bound on residual-component
+  potential: investigate a minimal causal rollout under native
+  Graph-ON and collect real audio-quality and HTTP latency/QPS ABBA
+  before committing to fused acceptance kernels.
+- Even P19 PASS cannot prove production beats the 2.232ms/frame native
+  Graph-ON Predictor. The scopes are different and initial tokens
+  and integrated control are unpriced.
+
+No PR merge or performance claim is authorized by P19A/B.
