@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 import time
 from collections.abc import Callable, Sequence
 from types import FunctionType
