@@ -66,6 +66,54 @@ def clustered_ci(per_request: dict[str, list[float]],
     }
 
 
+def hierarchical_ci(
+    per_request: dict[str, list[float]],
+    prompt_of_case: dict[str, str], *,
+    seed: int, repeats: int = BOOTSTRAPS,
+) -> dict:
+    """Hierarchical prompt->seed bootstrap; frames stay inside each request."""
+    if set(per_request) != set(prompt_of_case) or repeats < 100:
+        raise ValueError("P18_HIERARCHICAL_BOOTSTRAP_MISSING_PROMPT_MAP")
+    grouped = defaultdict(list)
+    request_mean = {
+        case: statistics.mean(values)
+        for case, values in per_request.items()
+    }
+    for case, prompt in prompt_of_case.items():
+        grouped[prompt].append(case)
+    prompts = sorted(grouped)
+    if len(prompts) < 2:
+        raise ValueError("P18_NEEDS_AT_LEAST_TWO_PROMPT_CLUSTERS")
+    counts = {len(grouped[prompt]) for prompt in prompts}
+    if len(counts) != 1:
+        raise ValueError("P18_UNBALANCED_SEEDS_PER_PROMPT")
+    original = statistics.mean(
+        statistics.mean(request_mean[c] for c in grouped[prompt])
+        for prompt in prompts
+    )
+    rng = random.Random(seed)
+    bootstrap = []
+    for _ in range(repeats):
+        sampled_prompts = [
+            prompts[rng.randrange(len(prompts))] for _ in prompts
+        ]
+        means = []
+        for prompt in sampled_prompts:
+            cases = grouped[prompt]
+            means.append(statistics.mean(
+                request_mean[cases[rng.randrange(len(cases))]]
+                for _ in cases
+            ))
+        bootstrap.append(statistics.mean(means))
+    lo, hi = _ci(bootstrap)
+    return {
+        "mean": original,
+        "prompt_then_seed_bootstrap_95pct": [lo, hi],
+        "independent_prompt_clusters": len(prompts),
+        "request_clusters_conditional_on_prompts": len(per_request),
+    }
+
+
 def validate_rows(root: Path) -> tuple[dict, list[dict]]:
     config = json.loads((root / "config.json").read_text())
     driver = json.loads((root / "visits.json").read_text())
@@ -203,6 +251,13 @@ def validate_rows(root: Path) -> tuple[dict, list[dict]]:
         raise RuntimeError(
             "P18A_REQUESTED_SEEDS_DID_NOT_PRODUCE_DISTINCT_NATIVE_SAMPLER_SEEDS"
         )
+    expected_prompts = 2 if mode == "smoke" else 8
+    expected_seed_set = set(driver.get("seeds", []))
+    if (len(per_prompt) != expected_prompts
+            or len(expected_seed_set) != (2 if mode == "smoke" else 3)
+            or any(set(observed) != expected_seed_set
+                   for observed in per_prompt.values())):
+        raise RuntimeError("P18A_PROMPT_AND_SEED_COHORT_INCOMPLETE")
     return driver, rows
 
 
@@ -221,10 +276,16 @@ def analyze(root: Path, out: Path) -> dict:
         "trajectory": "NATIVE_AR_EAGER_NOT_GRAPH_ON",
         "independent_units": "REQUEST (prompt_id + seed)",
         "independent_requests": len(driver["visits"]),
+        "independent_prompt_clusters": len({
+            v["prompt_id"] for v in driver["visits"]
+        }),
         "frames_per_request_correlated": driver["frames_per_request"],
         "total_native_checkpoint_rows": len(rows),
-        "bootstrap": {"method": "cluster resample request IDs",
-                      "resamples": BOOTSTRAPS, "confidence": 0.95},
+        "bootstrap": {
+            "primary": "hierarchical prompt then seed clusters",
+            "secondary": "resample request IDs conditional on fixed prompts",
+            "resamples": BOOTSTRAPS, "confidence": 0.95,
+        },
         "depths": {},
     }
     for d in DEPTHS:
@@ -242,6 +303,9 @@ def analyze(root: Path, out: Path) -> dict:
                 per_request[row["case_id"]].append(
                     row["widths"][str(w)]["committed_count"]
                 )
+            prompt_map = {
+                v["case_id"]: v["prompt_id"] for v in driver["visits"]
+            }
             result["depths"][str(d)][str(w)] = {
                 "checkpoints_NOT_independent": len(cases),
                 "independent_requests": len(per_request),
@@ -250,9 +314,17 @@ def analyze(root: Path, out: Path) -> dict:
                 "prefix_histogram": {
                     str(n): hist[n] for n in range(w)
                 },
-                "mean_committed": clustered_ci(
-                    per_request, seed=20261123 + 101*d + 17*w,
-                ),
+                "mean_committed": {
+                    **clustered_ci(
+                        per_request, seed=20261123 + 101*d + 17*w,
+                    ),
+                    **{
+                        "hierarchical_prompt_seed": hierarchical_ci(
+                            per_request, prompt_map,
+                            seed=20261123 + 101*d + 17*w + 50000,
+                        ),
+                    },
+                },
             }
     out.mkdir(parents=True, exist_ok=False)
     (out / "report.json").write_text(json.dumps(
@@ -265,12 +337,13 @@ def analyze(root: Path, out: Path) -> dict:
         "",
         f"Source SHA: {result['source_sha']}",
         f"Mode: {result['mode']}; independent request clusters: "
-        f"{result['independent_requests']}; correlated frames/request: "
+        f"{result['independent_requests']}; independent prompt clusters: "
+        f"{result['independent_prompt_clusters']}; correlated frames/request: "
         f"{result['frames_per_request_correlated']}",
         "Native AR EAGER to expose true checkpoints; no Graph-ON serving cost.",
         "",
         "| Last committed depth | Width | Mean committed | "
-        "Request-cluster bootstrap 95% CI | First accept | "
+        "Prompt/seed hierarchical bootstrap 95% CI | First accept | "
         "Full block accept |",
         "|---:|---:|---:|---:|---:|---:|",
     ]
@@ -280,7 +353,9 @@ def analyze(root: Path, out: Path) -> dict:
         for w in widths(d):
             v = result["depths"][str(d)][str(w)]
             mean = v["mean_committed"]
-            lo, hi = mean["cluster_bootstrap_95pct"]
+            lo, hi = mean["hierarchical_prompt_seed"][
+                "prompt_then_seed_bootstrap_95pct"
+            ]
             table.append(
                 f"| {d} | K={w} | {mean['mean']:.3f} | "
                 f"[{lo:.3f}, {hi:.3f}] | "
@@ -295,8 +370,12 @@ def analyze(root: Path, out: Path) -> dict:
         "the same checkpoint and one predeclared uniform tuple.",
         "- Every K2/K3/K4 case individually passed P17's native LM-head, "
         "probability, static verifier, CPU accept/residual and physical KV oracle.",
-        "- Resampling is BY REQUEST. Multiple acoustic frames and widths "
-        "from the same request are correlated, not independent samples.",
+        "- PRIMARY CI resamples PROMPTS, then SEEDS within sampled prompts; "
+        "frames remain inside each request. Request-only conditional "
+        "bootstrap is also retained in report.json.",
+        "- Eight main prompts, each repeated across three seeds, are NOT "
+        "24 independent linguistic prompt clusters. Results remain "
+        "conditional on this chosen prompt set.",
         "- Tail depth 14 has no legal K2 bonus head and must remain AR.",
         "- These are native-AR counterfactual outcomes, not the distribution "
         "under a deployed speculative decoding policy after its state shifts.",
