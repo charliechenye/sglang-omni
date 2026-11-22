@@ -188,7 +188,12 @@ def _synthetic_smoke(tmp_path: Path) -> Path:
         "source_sha": SHA, "mode": "smoke",
         "status": "P18A_NATIVE_AR_ALL_DEPTH_CENSUS_EVIDENCE_CAPTURED",
         "trajectory": "NATIVE_AR_EAGER_NOT_GRAPH_SERVING",
-        "frames_per_request": 2, "visits": visits,
+        # Mirror the exact manifest field emitted by p18_run.run().
+        # Without this, the synthetic fixture fails the newer strict
+        # prompt/seed cohort provenance gate despite valid case rows.
+        "frames_per_request": 2,
+        "seeds": [20261123, 20261124],
+        "visits": visits,
     }))
     return root
 
@@ -200,6 +205,26 @@ def test_p18_smoke_gate_and_independent_request_count(tmp_path):
     assert len(rows) == 4 * 2 * 14
     assert all(not r["widths"] for r in rows
                if r["last_committed_depth"] == 14)
+
+
+def test_p18_missing_manifest_seed_cohort_fails_closed(tmp_path):
+    root = _synthetic_smoke(tmp_path)
+    file = root / "visits.json"
+    manifest = json.loads(file.read_text())
+    manifest.pop("seeds")
+    file.write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match="PROMPT_AND_SEED_COHORT_INCOMPLETE"):
+        validate_rows(root)
+
+
+def test_p18_incorrect_manifest_seed_cohort_fails_closed(tmp_path):
+    root = _synthetic_smoke(tmp_path)
+    file = root / "visits.json"
+    manifest = json.loads(file.read_text())
+    manifest["seeds"] = [20261123, 20261199]
+    file.write_text(json.dumps(manifest))
+    with pytest.raises(RuntimeError, match="PROMPT_AND_SEED_COHORT_INCOMPLETE"):
+        validate_rows(root)
 
 
 def test_p18_missing_depth_or_wrong_source_fails_closed(tmp_path):
