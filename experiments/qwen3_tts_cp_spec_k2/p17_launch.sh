@@ -48,6 +48,19 @@ export SGLANG_OMNI_QTTS_CP_P9_BASE_ARM_FILE="$ROOT/ARM_BASE"
 export SGLANG_OMNI_QTTS_CP_P17_MULTIWIDTH_DIR="$ROOT/wide"
 export SGLANG_OMNI_QTTS_CP_P17_MAX_FRAMES_PER_DEPTH=2
 export SGLANG_OMNI_QTTS_CP_K2_SOURCE_SHA="$SHA"
+# Never fall back to another port if a stale server owns port 8000.
+export SGLANG_OMNI_STRICT_PORT=1
+if [[ "${P17_ACTIVATION_DIAG:-0}" == "1" ]]; then
+  export SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR="$ROOT/activation"
+  export SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_ONLY=1
+  echo "P17_ACTIVATION_ONLY=1 diagnostic_dir=$SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"
+elif [[ "${P17_ACTIVATION_DIAG:-0}" != "0" ]]; then
+  echo "P17_ACTIVATION_DIAG must be 0 or 1" >&2
+  exit 2
+else
+  unset SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR
+  unset SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_ONLY
+fi
 test ! -e "$ROOT/ARM_SPEC"
 test ! -e "$ROOT/ARM_BASE"
 test ! -e "$ROOT/wide"
