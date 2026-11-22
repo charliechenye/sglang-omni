@@ -235,3 +235,25 @@ P19A costs at every eligible depth, not interpolation.
   and integrated control are unpriced.
 
 No PR merge or performance claim is authorized by P19A/B.
+
+## P19 DP AR-only terminal regression
+
+An early P19 CPU test failed in `test_p19_analysis_smoke_is_not_serving_go`
+with `P19_DP_UNPAIRED_REAL_NATIVE_CASES`. The cause was NOT an
+incomplete source-locked cost row. At last-committed depth 14,
+`widths(14) == ()`: only the terminal-adjacent native AR step exists,
+so `native_probs == {}` is the **correct** histogram. The original
+`_case_tables` check incorrectly required the set of histogram
+value lengths to contain exactly one element, which fails for an
+intentionally empty dictionary.
+
+The corrected gate still requires a non-empty measured native AR cost
+at depth14, a completely empty speculative histogram there, and
+nonempty balanced costs and acceptance histograms at all earlier
+eligible depths. Regression tests validate the legitimate empty depth14
+histogram and deliberately omit the K2 cost at depth13 to require a
+fail-closed error. No correctness requirement was relaxed.
+
+Update the P19 worktree using `git fetch` and `git merge --ff-only`,
+then rerun the P19 unit tests BEFORE starting the H200 smoke server.
+Prior synthetic test failure does not invalidate P18A/P18B H200 data.
