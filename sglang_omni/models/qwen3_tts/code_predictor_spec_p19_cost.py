@@ -311,7 +311,7 @@ def maybe_measure(
     failed = False
     try:
         candidate_arms = ("AR", *(str(w) for w in feasible_widths(depth)))
-        if diagnostic is not None:
+        if diagnostic is not None and diagnostic[0] != "ALL_GRAPH":
             requested = diagnostic[0].split("_", 1)[0]
             wanted = "AR" if requested == "AR" else requested[1:]
             if wanted not in candidate_arms:
