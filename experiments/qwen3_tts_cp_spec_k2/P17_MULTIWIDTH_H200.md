@@ -312,3 +312,52 @@ outside the P17 worktree.
 
 This is an activation diagnosis, **not** a P17 multiwidth correctness,
 acceptance or speedup PASS.
+
+### Source-canary gate after startup preflight failed
+
+On the fresh H200 host `activation-004` returned
+`P17_ACTIVATION_WORKER_STARTUP_NOT_INSTRUMENTED`, but `/proc` proved the
+spawned stage worker PID inherited `SPEC_K=2`, the correct ARM path,
+`P17_ACTIVATION_DIR`, and `ACTIVATION_ONLY=1`. No HTTP was sent.
+This does NOT prove the worker actually imported the P17 engine code:
+`/proc/<pid>/environ` reports process-start state rather than a direct
+reading of Python `os.environ` after initialization.
+
+The revised P17 **experiment branch** deliberately puts an
+**unconditional one-line source canary** into
+`Qwen3TtsEngineBuilder.post_scheduler_setup`, directly before the
+existing "Qwen3-TTS KV pool holds ..." log. The new marker is
+`P17_ENGINE_BUILDER_SOURCE_CANARY`, containing actual `__file__` and
+runtime values of the four relevant variables. Only this experiment
+branch emits the extra warning; no data-plane GPU code changes.
+
+To classify without generating any audio:
+
+1. Stop the old server, update this P17 worktree, and start a **new**
+   `P17_ACTIVATION_DIAG=1` worker at a fresh root
+   `$HOME/results/qwen3tts-p17-activation-005`.
+2. After `/health` is healthy, run **only**:
+
+~~~bash
+ROOT="$HOME/results/qwen3tts-p17-activation-005"
+grep -E 'P17_ENGINE_BUILDER_SOURCE_CANARY|Qwen3-TTS KV pool holds'   "$ROOT/server.log" | tail -n 5
+~~~
+
+Do not run `p17_activation_smoke` yet. Interpret exactly:
+
+- KV-pool INFO log present but P17 source-canary absent: the live
+  builder did not execute the instrumented method from this branch.
+  Verify worker's import source; do not trust client HEAD or /proc
+  source SHA as module import attestation.
+- Source-canary present with `module=` pointing **outside**
+  `sglang-omni-worktrees/p17-multiwidth`: wrong source imported.
+- Source-canary present with `runtime_activation_dir=None` despite
+  /proc initial env containing it: Python runtime env differs from
+  process initial env. Inspect initialization, not the K2 gate.
+- Source-canary present with correct P17 module path and runtime
+  env: worker loaded the correct source with active diagnostics;
+  then inspect the raw `ROOT/activation/dispatch_pid*.jsonl`
+  (or run activation smoke after confirming those startup records)
+  before any real multiwidth experiments.
+
+This canary is not a correctness, acceptance or performance result.
