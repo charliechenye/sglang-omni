@@ -172,6 +172,8 @@ def _synthetic_smoke(tmp_path: Path) -> Path:
                         "request_hash": req_hash,
                         "frame": frame, "last_committed_depth": depth,
                         "cache_len": depth + 1,
+                        "native_sub_sampling_seed": sd,
+                        "native_committed_code": 123,
                         "uniform_seed": seed_for(SHA, case_id, frame, depth),
                         "sampling": {"top_k": 50, "temperature": 0.9,
                                      "top_p": 1.0},
@@ -212,4 +214,24 @@ def test_p18_missing_depth_or_wrong_source_fails_closed(tmp_path):
     record["source_sha"] = "b" * 40
     one.write_text(json.dumps(record))
     with pytest.raises(RuntimeError, match="BAD_ROW_PROVENANCE"):
+        validate_rows(root)
+
+
+def test_p18_seeds_must_actually_differ_inside_native_sampler(tmp_path):
+    root = _synthetic_smoke(tmp_path)
+    for path in (root / "census" / "rows").glob("*.json"):
+        row = json.loads(path.read_text())
+        row["native_sub_sampling_seed"] = 42
+        path.write_text(json.dumps(row))
+    with pytest.raises(RuntimeError, match="SEEDS_DID_NOT_PRODUCE_DISTINCT"):
+        validate_rows(root)
+
+
+def test_p18_worker_native_sampling_seed_must_stay_constant_per_case(tmp_path):
+    root = _synthetic_smoke(tmp_path)
+    one = next((root / "census" / "rows").glob("*.json"))
+    record = json.loads(one.read_text())
+    record["native_sub_sampling_seed"] += 1
+    one.write_text(json.dumps(record))
+    with pytest.raises(RuntimeError, match="SUBSAMPLING_SEED_DRIFT"):
         validate_rows(root)
