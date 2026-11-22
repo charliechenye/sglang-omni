@@ -84,9 +84,12 @@ def estimated_cost(cost: dict, depth: int, width: int) -> dict:
     }
 
 
-def paired_bootstrap(case_values: dict[str, dict[int, list[int]]],
-                     costs: dict[int, float], seed: int) -> dict:
-    """Paired K2 baseline: same requests and same frozen checkpoints."""
+def paired_bootstrap(
+    case_values: dict[str, dict[int, list[int]]],
+    costs: dict[int, float], seed: int,
+    prompt_of_case: dict[str, str] | None = None,
+) -> dict:
+    """Paired K2 baseline; optional hierarchical prompt->seed bootstrap."""
     names = sorted(case_values)
     if len(names) < 2 or 2 not in costs:
         raise RuntimeError("P18B_NEEDS_PAIRED_K2_REQUESTS")
@@ -114,8 +117,27 @@ def paired_bootstrap(case_values: dict[str, dict[int, list[int]]],
     original = calc(names)
     rng = random.Random(seed)
     boot = defaultdict(list)
+    prompt_groups = defaultdict(list)
+    if prompt_of_case is not None:
+        if set(prompt_of_case) != set(names):
+            raise RuntimeError("P18B_PROMPT_IDENTITY_MISMATCH")
+        for name in names:
+            prompt_groups[prompt_of_case[name]].append(name)
+        if (len(prompt_groups) < 2
+                or len({len(v) for v in prompt_groups.values()}) != 1):
+            raise RuntimeError("P18B_NEEDS_BALANCED_PROMPT_SEED_CLUSTERS")
+    prompts = sorted(prompt_groups)
     for _ in range(RESAMPLES):
-        drawn = [names[rng.randrange(len(names))] for _ in names]
+        if prompt_of_case is None:
+            drawn = [names[rng.randrange(len(names))] for _ in names]
+        else:
+            sampled = [prompts[rng.randrange(len(prompts))]
+                       for _ in prompts]
+            drawn = []
+            for prompt in sampled:
+                members = prompt_groups[prompt]
+                drawn += [members[rng.randrange(len(members))]
+                          for _ in members]
         surrogate = calc(drawn)
         for width in costs:
             boot[width].append(1 - surrogate[width] / surrogate[2])
@@ -129,6 +151,10 @@ def paired_bootstrap(case_values: dict[str, dict[int, list[int]]],
             "advantage_vs_K2_paired_request_bootstrap": {
                 "nominal": 1 - value / original[2],
                 "interval_95pct_ACCEPTANCE_ONLY": [low, high],
+                "primary_resampling_unit": (
+                    "PROMPT_THEN_SEED" if prompt_of_case is not None
+                    else "REQUEST_CONDITIONAL_ON_PROMPTS"
+                ),
             },
         }
     return results
@@ -160,6 +186,9 @@ def analyze(root: Path, p17_report: Path, out: Path) -> dict:
     groups = defaultdict(list)
     for row in native_rows:
         groups[row["last_committed_depth"]].append(row)
+    prompt_of_case = {
+        v["case_id"]: v["prompt_id"] for v in visits["visits"]
+    }
     for d in DEPTHS:
         possible = widths(d)
         if not possible:
@@ -182,6 +211,7 @@ def analyze(root: Path, p17_report: Path, out: Path) -> dict:
             per_case, {w: cost_model[w]["assumed_full_round_ms"]
                        for w in possible},
             seed=20261123 + 101*d,
+            prompt_of_case=prompt_of_case,
         )
         best = min(possible, key=lambda w: (
             paired[str(w)]["assumed_ms_per_committed"], w
@@ -252,9 +282,10 @@ def analyze(root: Path, p17_report: Path, out: Path) -> dict:
         "- P18A acceptance was measured on NATIVE AR EAGER trajectories "
         "using exact P17 q/p, static verifier, CPU residual and physical "
         "KV parity. Spec policy would change later checkpoints.",
-        "- Bootstrap CI resamples REQUESTS, keeping paired widths and "
-        "correlated acoustic frames together. It covers acceptance "
-        "variability, NOT future GPU cost variability or causal rollout.",
+        "- PRIMARY paired CI resamples PROMPTS then SEEDS, retaining "
+        "paired widths and correlated frames. Eight main prompts are "
+        "NOT 24 independent linguistic prompt clusters. The CI covers "
+        "acceptance, NOT GPU cost variability or causal rollout.",
         "- A width is robust vs K2 only when paired acceptance-only 95% "
         "lower improvement exceeds 5% AND data is from the main cohort. "
         "This is still a research hypothesis, not an optimization GO.",
