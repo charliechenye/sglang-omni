@@ -45,8 +45,12 @@ uniform tuple per checkpoint. Smoke uses 2 prompts x 2 seeds x 2
 correlated frames = 4 request clusters. Main uses 8 prompts x 3
 seeds x 8 correlated frames = **24 unique request clusters** and 192
 checkpoints per eligible depth. Frames/widths in the same request
-MUST NOT be treated as independent observations. Bootstrap resamples
-whole requests, keeping frames and widths paired.
+MUST NOT be treated as independent observations. Primary uncertainty
+uses a HIERARCHICAL bootstrap: resample 8 PROMPTS, then the 3 SEEDS
+inside each resampled prompt, retaining entire correlated frame groups
+and paired widths. A separate request-only CI is retained for the
+fixed-prompt setting. Eight prompts are NOT 24 independent text
+distributions.
 
 Native codebook sampling remains native AR (eager). The speculative
 outcomes are counterfactuals from those native states; they are NOT
@@ -58,7 +62,9 @@ time nor WAV bytes prove a serving speedup/quality claim.
 histograms with *previous* P17 H200 CUDA Graph full-wide-round costs
 at depth1 and depth9. Cost at other depths is clearly tagged as
 INTERPOLATED or EXTRAPOLATED, not measured. Compare K2/K3/K4 using
-paired request-cluster bootstrap 95% acceptance-only uncertainty.
+paired hierarchical prompt-then-seed bootstrap 95% acceptance-only
+uncertainty. The 24 individual calls are request clusters, but only
+8 different prompts are represented.
 `AR` is unpriced: the old native Graph-ON full-Predictor 2.232ms/frame
 is NOT a matched per-code AR cost. There is no valid
 production-wide AR/Spec width policy yet. No 14-depth causal rollout
@@ -194,8 +200,8 @@ cat "$ROOT/cost-model/summary.md"
 Expected status:
 `P18B_PAIRED_REQUEST_WIDTH_COST_SCREEN_NOT_NATIVE_AR_OR_E2E_GO`.
 
-The model performs paired request-level bootstrap for each eligible
-width against K2 and only flags a width hypothesis if its lower 95%
+The model performs paired PROMPT-THEN-SEED hierarchical bootstrap for
+each eligible width against K2 and only flags a width hypothesis if its lower 95%
 acceptance-only improvement exceeds 5% in the main cohort. Even a
 successful P18B result is NOT a production runtime recommendation.
 
