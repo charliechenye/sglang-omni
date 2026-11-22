@@ -61,6 +61,7 @@ def _one_arm(
     *, operation: Callable[[], dict[str, torch.Tensor]],
     restore: Callable[[], None], model, arm: str,
     device: torch.device, old_k: torch.Tensor, old_v: torch.Tensor,
+    prefix_len: int,
 ) -> dict:
     """Compile -> capture -> exact eager-vs-replay -> timed replay blocks."""
     restore()
@@ -98,10 +99,16 @@ def _one_arm(
         f"{arm}_PHYSICAL_KV_V",
         model.predictor_v_cache[:, :1, :16], eager_v,
     )
-    _assert_exact(f"{arm}_PREFIX_K", eager_k[:, :, :old_k.shape[2]],
-                  old_k)
-    _assert_exact(f"{arm}_PREFIX_V", eager_v[:, :, :old_v.shape[2]],
-                  old_v)
+    # Eager arm legitimately writes its verification/AR KV suffix.
+    # Only the truly committed prefix must remain immutable.
+    _assert_exact(
+        f"{arm}_PREFIX_K", eager_k[:, :, :prefix_len],
+        old_k[:, :, :prefix_len],
+    )
+    _assert_exact(
+        f"{arm}_PREFIX_V", eager_v[:, :, :prefix_len],
+        old_v[:, :, :prefix_len],
+    )
 
     records = []
     for block in range(BLOCKS):
@@ -297,6 +304,7 @@ def maybe_measure(
             records[arm] = _one_arm(
                 operation=operation, restore=restore, model=model,
                 arm=arm, device=device, old_k=old_k, old_v=old_v,
+                prefix_len=cache_len,
             )
         restore()
         if (not torch.equal(torch.get_rng_state(), cpu_rng)
