@@ -307,7 +307,7 @@ def test_p19_cuda700_diag_modes_gate_and_legal_depth(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     assert diagnostic_config() is None
-    assert len(DIAG_MODES) == 9
+    assert len(DIAG_MODES) == 10
     monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH", "1")
     for mode in DIAG_MODES:
         monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", mode)
