@@ -199,6 +199,10 @@ def maybe_measure(
     last_embedding = last_embedding.detach().clone().contiguous()
     accumulated = accumulated.detach().clone().contiguous()
     uniform_input = uniforms_gpu.detach().clone().contiguous()
+    immutable_inputs = (
+        old_hidden.clone(), last_embedding.clone(),
+        accumulated.clone(), uniform_input.clone(),
+    )
     old_k = model.predictor_k_cache[:, :1, :16].clone()
     old_v = model.predictor_v_cache[:, :1, :16].clone()
     cpu_rng = torch.get_rng_state().clone()
@@ -306,6 +310,13 @@ def maybe_measure(
                 arm=arm, device=device, old_k=old_k, old_v=old_v,
                 prefix_len=cache_len,
             )
+            if not all(torch.equal(x, y) for x, y in zip(
+                (old_hidden, last_embedding, accumulated, uniform_input),
+                immutable_inputs,
+            )):
+                raise RuntimeError(
+                    f"P19_{arm}_FROZEN_NATIVE_CHECKPOINT_INPUT_MUTATED"
+                )
         restore()
         if (not torch.equal(torch.get_rng_state(), cpu_rng)
                 or not torch.equal(torch.cuda.get_rng_state(device), cuda_rng)
