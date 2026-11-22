@@ -185,6 +185,10 @@ def speculative_k2(
     This debug version synchronizes every round for acceptance decisions and
     logs counts; it deliberately does not promise latency gains.
     """
+    if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"):
+        from .code_predictor_spec_p17_activation import record
+
+        record("speculative_k2_enter", caller_module=__file__)
     if (
         layer0_codes.shape != (1, 1)
         or talker_hidden.ndim != 3
