@@ -152,9 +152,15 @@ def maybe_census(
     )
     if file.exists():
         raise RuntimeError("P18_DUPLICATE_CHECKPOINT")
+    # Wide fused kernels may reuse scratch buffers that a live native AR
+    # tensor aliases. Snapshot the ORIGINAL views as well as K/V so this
+    # read-only observer can detect and restore non-KV side effects.
+    live_hidden, live_last = old_hidden, last_embedding
+    live_sum, live_code = accumulated, native_code
     old_hidden = old_hidden.detach().clone().contiguous()
     last_embedding = last_embedding.detach().clone().contiguous()
     accumulated = accumulated.detach().clone().contiguous()
+    old_code = native_code.detach().clone()
     old_k = model.predictor_k_cache[:, :1, :16].clone()
     old_v = model.predictor_v_cache[:, :1, :16].clone()
     rng_cpu = torch.get_rng_state().clone()
@@ -223,6 +229,11 @@ def maybe_census(
                 "bonus_committed": evidence["bonus_committed"],
             }
         restore()
+        if (not torch.equal(live_hidden, old_hidden)
+                or not torch.equal(live_last, last_embedding)
+                or not torch.equal(live_sum, accumulated)
+                or not torch.equal(live_code, old_code)):
+            raise RuntimeError("P18_LIVE_NATIVE_INPUT_OR_OUTPUT_MUTATED")
         if (not torch.equal(model.predictor_k_cache[:, :1, :16], old_k)
                 or not torch.equal(model.predictor_v_cache[:, :1, :16], old_v)
                 or not torch.equal(torch.get_rng_state(), rng_cpu)
@@ -271,6 +282,12 @@ def maybe_census(
         try:
             torch.cuda.synchronize(old_hidden.device)
             restore()
+            # Restore ALL original views, even on a detected scratch alias.
+            # An incorrect mutation still raises above and invalidates run.
+            live_hidden.copy_(old_hidden)
+            live_last.copy_(last_embedding)
+            live_sum.copy_(accumulated)
+            live_code.copy_(old_code)
             torch.cuda.synchronize(old_hidden.device)
             if (not torch.equal(model.predictor_k_cache[:, :1, :16], old_k)
                     or not torch.equal(model.predictor_v_cache[:, :1, :16], old_v)):
