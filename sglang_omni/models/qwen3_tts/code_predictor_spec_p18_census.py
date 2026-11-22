@@ -229,6 +229,21 @@ def maybe_census(
                 "bonus_committed": evidence["bonus_committed"],
             }
         restore()
+        # P19A opt-in: same real native-AR checkpoint, case, depth and
+        # P18 paired q/p uniforms, now with measured native AR vs wide
+        # Graph component envelopes. Independent P17 oracle ABOVE
+        # must pass first. Never substitute P17 cross-SHA timing.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P19_COST_DIR"):
+            from .code_predictor_spec_p19_cost import maybe_measure
+
+            maybe_measure(
+                model, case=case, req_hash=req_hash, frame=frame,
+                depth=depth, cache_len=cache_len,
+                semantic_position=semantic_position,
+                old_hidden=old_hidden, last_embedding=last_embedding,
+                accumulated=accumulated, uniforms_gpu=uniforms_gpu,
+            )
+            restore()
         if (not torch.equal(live_hidden, old_hidden)
                 or not torch.equal(live_last, last_embedding)
                 or not torch.equal(live_sum, accumulated)
