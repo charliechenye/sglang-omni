@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from types import ModuleType
 from typing import TYPE_CHECKING, TypedDict
 
@@ -253,6 +254,10 @@ class Qwen3TTSModelRunner(ModelRunner):
         else:
             pass
         semantic_positions = self.sample_positions(forward_batch, layer0_codes.device)
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"):
+            from .code_predictor_spec_p17_activation import record
+
+            record("model_runner_collect_before_predictor", caller_module=__file__)
         self.model.code_predictor_forward(
             layer0_codes,
             hidden,
