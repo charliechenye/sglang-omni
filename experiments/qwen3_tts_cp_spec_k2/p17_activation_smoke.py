@@ -67,12 +67,12 @@ def _active_worker_env_snapshot(root: Path, sha: str) -> list[dict]:
             continue
         try:
             command = (proc / "cmdline").read_bytes().replace(
-                b"\\0", b" "
+                b"\0", b" "
             ).decode(errors="replace")
             if "multiprocessing.spawn" not in command:
                 continue
             env = {}
-            for item in (proc / "environ").read_bytes().split(b"\\0"):
+            for item in (proc / "environ").read_bytes().split(b"\0"):
                 if b"=" not in item:
                     continue
                 key, value = item.split(b"=", 1)
