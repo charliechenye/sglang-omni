@@ -30,6 +30,34 @@ if (( COST_FRAMES > FRAMES )); then
   echo "P19_COST_FRAMES must not exceed P18_CAPTURE_FRAMES" >&2; exit 2
 fi
 
+# One worker per diagnostic arm, no multi-arm evidence or DP claim.
+if [[ -n "${P19_DIAG_ARM:-}" ]]; then
+  case "$P19_DIAG_ARM" in
+    OFF|AR_EAGER|AR_GRAPH|K2_EAGER|K2_GRAPH|K3_EAGER|K3_GRAPH|K4_EAGER|K4_GRAPH) ;;
+    *) echo "P19_DIAG_ARM invalid: $P19_DIAG_ARM" >&2; exit 2 ;;
+  esac
+  DEPTH="${P19_DIAG_DEPTH:-1}"
+  if [[ ! "$DEPTH" =~ ^[0-9]+$ ]] || (( DEPTH < 1 || DEPTH > 14 )); then
+    echo "P19_DIAG_DEPTH must be 1..14" >&2; exit 2
+  fi
+  if [[ "$P19_DIAG_ARM" == K2_* && "$DEPTH" -gt 13 ]] ||
+     [[ "$P19_DIAG_ARM" == K3_* && "$DEPTH" -gt 12 ]] ||
+     [[ "$P19_DIAG_ARM" == K4_* && "$DEPTH" -gt 11 ]]; then
+    echo "P19 diagnostic requested an unavailable bonus head" >&2; exit 2
+  fi
+  FENCE="${P19_DIAG_FENCE:-0}"
+  if [[ "$FENCE" != 0 && "$FENCE" != 1 ]]; then
+    echo "P19_DIAG_FENCE must be 0 or 1" >&2; exit 2
+  fi
+  export SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM="$P19_DIAG_ARM"
+  export SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH="$DEPTH"
+  export SGLANG_OMNI_QTTS_CP_P19_DIAG_FENCE="$FENCE"
+else
+  unset SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM
+  unset SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH
+  unset SGLANG_OMNI_QTTS_CP_P19_DIAG_FENCE
+fi
+
 # Force spawn children to import this dedicated worktree. No global pip edits.
 export PYTHONPATH="$WORKTREE${PYTHONPATH:+:$PYTHONPATH}"
 python - <<'PY'
@@ -43,6 +71,7 @@ for name in (
     "sglang_omni.models.qwen3_tts.sglang_model",
     "sglang_omni.models.qwen3_tts.code_predictor_spec_p18_census",
     "sglang_omni.models.qwen3_tts.code_predictor_spec_p19_cost",
+    "sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag",
 ):
     module = importlib.import_module(name)
     file = Path(module.__file__).resolve()
@@ -68,6 +97,9 @@ PY
 
 mkdir -p "$ROOT/census/rows" "$ROOT/census/failures"
 mkdir -p "$ROOT/matched_cost/rows" "$ROOT/matched_cost/failures"
+if [[ -n "${P19_DIAG_ARM:-}" ]]; then
+  mkdir -p "$ROOT/matched_cost/diagnostic"
+fi
 SHA="$(git rev-parse HEAD)"
 printf '%s\n' "$SHA" > "$ROOT/source.sha"
 python - "$ROOT" "$SHA" "$FRAMES" <<'PY'
@@ -124,13 +156,26 @@ echo "P18_SOURCE_SHA=$SHA"
 echo "P18_NATIVE_EAGER_CENSUS_ROOT=$ROOT"
 echo "P18_CAPTURE_FRAMES=$FRAMES"
 echo "P19_MATCHED_COST_FRAMES=$COST_FRAMES"
+if [[ -n "${P19_DIAG_ARM:-}" ]]; then
+  echo "P19_DIAGNOSTIC_ONLY arm=$P19_DIAG_ARM depth=$DEPTH fence=$FENCE"
+fi
 python - "$ROOT" "$SHA" "$FRAMES" "$COST_FRAMES" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 root, sha = Path(sys.argv[1]), sys.argv[2]
 frames, cost_frames = int(sys.argv[3]), int(sys.argv[4])
+diagnostic = None
+if os.environ.get("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM"):
+    diagnostic = {
+        "arm": os.environ["SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM"],
+        "depth": int(os.environ["SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH"]),
+        "fence": int(os.environ["SGLANG_OMNI_QTTS_CP_P19_DIAG_FENCE"]),
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
 (root / "matched_cost" / "config.json").write_text(json.dumps({
+    "diagnostic": diagnostic,
     "schema": "qwen3tts-p19a-matched-cost-config-v1",
     "source_sha": sha, "gpu": "NVIDIA H200",
     "trajectory": "P18_NATIVE_AR_EAGER_SAME_CHECKPOINT",
