@@ -19,6 +19,9 @@ from experiments.qwen3_tts_cp_spec_k2.p19_dp import (
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_cost import (
     BLOCKS, REPEATS, SCHEMA,
 )
+from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag import (
+    MODES as DIAG_MODES, diagnostic_config, event as diag_event,
+)
 
 SHA = "a" * 40
 
@@ -295,3 +298,65 @@ def test_p19_analysis_smoke_is_not_serving_go(tmp_path):
     assert dp_report["reference"]["native_whole_predictor_graph_compared"] is False
     assert dp_report["research_decision"] == "SMOKE_NO_SELECTION"
     assert dp_report["nominal_adaptive"]["nominal_improvement_vs_native_AR_components"] >= 0
+
+
+def test_p19_cuda700_diag_modes_gate_and_legal_depth(monkeypatch):
+    for key in (
+        "SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM",
+        "SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    assert diagnostic_config() is None
+    assert len(DIAG_MODES) == 9
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH", "1")
+    for mode in DIAG_MODES:
+        monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", mode)
+        assert diagnostic_config() == (mode, 1)
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", "K4_GRAPH")
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH", "12")
+    with pytest.raises(RuntimeError, match="ILLEGAL_K_AT_DEPTH"):
+        diagnostic_config()
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", "K2_GRAPH")
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH", "14")
+    with pytest.raises(RuntimeError, match="ILLEGAL_K_AT_DEPTH"):
+        diagnostic_config()
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", "AR_GRAPH")
+    assert diagnostic_config() == ("AR_GRAPH", 14)
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", "GRAPH_ALL")
+    with pytest.raises(RuntimeError, match="UNKNOWN_DIAGNOSTIC_ARM"):
+        diagnostic_config()
+
+
+def test_p19_diag_cpu_only_durable_phase_trace(tmp_path, monkeypatch):
+    from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag import (
+        SCHEMA as DIAG_SCHEMA,
+    )
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", "AR_GRAPH")
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH", "9")
+    monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_COST_DIR", str(tmp_path))
+    diag_event("P19_ARM_CAPTURE_BEGIN", depth=9, frame=17, arm="AR")
+    diag_event("P19_ARM_FIRST_REPLAY_SYNC_PASS", depth=9, frame=17, arm="AR")
+    files = list((tmp_path / "diagnostic").glob("worker_pid*.jsonl"))
+    assert len(files) == 1
+    rows = [json.loads(x) for x in files[0].read_text().splitlines()]
+    assert [r["stage"] for r in rows] == [
+        "P19_ARM_CAPTURE_BEGIN", "P19_ARM_FIRST_REPLAY_SYNC_PASS",
+    ]
+    assert all(r["schema"] == DIAG_SCHEMA for r in rows)
+    assert all(r["depth"] == 9 and r["arm"] == "AR" for r in rows)
+    assert rows[1]["monotonic_ns"] >= rows[0]["monotonic_ns"]
+
+
+def test_p19a_formal_analyzer_refuses_diagnostic_root(tmp_path):
+    root = _fake_source_locked_run(tmp_path)
+    cfg_path = root / "matched_cost" / "config.json"
+    config = json.loads(cfg_path.read_text())
+    config["diagnostic"] = {
+        "arm": "AR_GRAPH", "depth": 1, "fence": 0,
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    cfg_path.write_text(json.dumps(config))
+    with pytest.raises(
+        RuntimeError, match="DIAGNOSTIC_MODE_NO_FORMAL_COST",
+    ):
+        validate_costs(root)
