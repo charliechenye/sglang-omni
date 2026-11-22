@@ -361,3 +361,50 @@ Do not run `p17_activation_smoke` yet. Interpret exactly:
   before any real multiwidth experiments.
 
 This canary is not a correctness, acceptance or performance result.
+
+### P17 fresh-host startup: source binding and terminated server (activation-005)
+
+At `activation-005`, the HTTP health endpoint was no longer reachable
+(`curl: (7)`) when checked, and the server log still showed the
+`Qwen3-TTS KV pool holds ...` message but **no**
+`P17_ENGINE_BUILDER_SOURCE_CANARY`. The unconditional source canary
+is immediately before that KV log in this branch. If those two lines
+really belong to the same fresh process/run, this strongly indicates the
+worker executed a *different* module version, not that K2 failed parity.
+
+The P17 launcher now prepends the exact experiment worktree to
+`PYTHONPATH` **before importing Omni**. It then checks that all
+four imported Python modules (`sglang_omni`,
+`qwen3_tts.engine_builder`, `model_runner`, and `sglang_model`)
+come from this worktree, and that the engine builder actually contains
+the canary. Failure raises `P17_SOURCE_IMPORT_MISMATCH` or
+`P17_CURRENT_WORKTREE_MISSING_SOURCE_CANARY` before model startup.
+
+First preserve/check the failed run, which has NO performance evidence:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p17-multiwidth
+ROOT="$HOME/results/qwen3tts-p17-activation-005"
+echo "local HEAD: $(git rev-parse HEAD)"
+echo "server pin:"; cat "$ROOT/source.sha"
+grep -nE 'P17_ENGINE_BUILDER_SOURCE_CANARY|Qwen3-TTS KV pool holds' \
+  "$ROOT/server.log" | tail -n 8
+tail -n 100 "$ROOT/server.log"
+nvidia-smi --query-compute-apps=pid,used_gpu_memory \
+  --format=csv,noheader
+~~~
+
+Then stop any old TTS server and update the P17 worktree. Re-run
+`P17_ACTIVATION_DIAG=1 bash p17_launch.sh "$HOME/results/qwen3tts-p17-activation-006"`.
+Look first for the **four** `P17_IMPORT_PREFLIGHT` messages and
+`P17_IMPORT_PREFLIGHT_PASS`. The new strict worktree binding applies
+to the launcher and Python spawned workers. Do not run HTTP requests
+until startup completes and the canary is present, with the exact P17
+worktree `module=` and non-null activation directory.
+
+Do not confuse unrelated Nemotron P40 scripts and outputs with this
+Qwen3-TTS P17 worktree. Do not run memory-intensive Nemotron training/
+serving concurrently on the same H200: this Qwen3-TTS config has a
+~110.7 GiB static KV pool alone. If the server exits, the **last 100
+log lines** are required to distinguish shutdown, CUDA OOM, port
+conflict or an unexpected worker crash.
