@@ -274,7 +274,10 @@ def make_wide_round(
         p_logits[n:n+1], uniforms[4*n:4*n+1],
         temperature=temperature, top_p=top_p,
     )
-    full_accept = survived[-1].reshape(())
+    # cumprod on Long flags returns an int64 tensor. torch.where requires
+    # a boolean condition on both the bonus-code and bonus-embedding paths.
+    # Keep this as a device scalar; never synchronize to the host.
+    full_accept = survived[-1].to(dtype=torch.bool).reshape(())
     code_list = torch.cat((
         chosen,
         torch.where(full_accept, bonus[0], torch.full_like(bonus[0], -1))
