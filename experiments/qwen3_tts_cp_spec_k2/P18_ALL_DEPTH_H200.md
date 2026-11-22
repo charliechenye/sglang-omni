@@ -167,6 +167,10 @@ The main gate requires 24 distinct worker request IDs,
 the correct eligible width set at EVERY depth, and all independent
 P17 oracle parity checks. Case ID alone is insufficient:
 a request ID collision or swapped source/seed fails closed.
+The gate also records the actual native codebook sampler seed and
+requires it to remain constant within each request and to differ
+between requested seeds for the same prompt. If the API ignores
+`seed`, the "independent seeds" claim fails explicitly.
 
 ## 3. P18B paired adaptive width screen (OFFLINE)
 
