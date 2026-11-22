@@ -1422,6 +1422,22 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
 
             record("code_predictor_forward_enter", caller_module=__file__)
 
+        # P18A: opt-in native-AR eager trajectories for all-depth
+        # counterfactual acceptance census. Do not run native Predictor
+        # CUDA Graph here: replay hides intermediate on-policy checkpoints.
+        # Unarmed requests keep their original Graph-ON production path.
+        p18_root = os.environ.get("SGLANG_OMNI_QTTS_CP_P18_DIR")
+        p18_arm = os.environ.get("SGLANG_OMNI_QTTS_CP_P18_ARM_FILE")
+        if p18_root and p18_arm and os.path.isfile(p18_arm):
+            if (int(os.environ.get("SGLANG_OMNI_QTTS_CP_SPEC_K", "0")) != 0
+                    or torch.cuda.is_current_stream_capturing()):
+                raise RuntimeError("P18_REQUIRES_NATIVE_AR_EAGER_K2_DISABLED")
+            self.predictor_eager_count += 1
+            return self.code_predictor_forward_incremental(
+                layer0_codes=layer0_codes,
+                talker_hidden=talker_hidden,
+                semantic_positions=semantic_positions,
+            )
         # Research-only CodePredictor speculation. Never intercept startup
         # warmup or normal traffic without explicit post-health ARM file.
         # Unarmed and K=0 are the exact unchanged production code path.
@@ -1982,6 +1998,23 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                         )
                     else:
                         new_predictor_embed = projected_embed.unsqueeze(1)
+                    # Native AR has just sampled code_{layer_idx+1}.
+                    # The newly sampled embedding is NOT in KV yet, so
+                    # this is the exact P17-style frozen checkpoint:
+                    # q-old-hidden, last-embedding, committed KV prefix.
+                    if os.environ.get("SGLANG_OMNI_QTTS_CP_P18_DIR"):
+                        from .code_predictor_spec_p18_census import maybe_census
+
+                        maybe_census(
+                            self,
+                            depth=layer_idx + 1,
+                            cache_len=cache_len,
+                            old_hidden=last_hidden,
+                            last_embedding=new_predictor_embed,
+                            accumulated=pos_summed,
+                            native_code=pos_codes[:, layer_idx + 1],
+                            semantic_position=semantic_positions[:, pos],
+                        )
                     last_hidden = self.predictor_forward_tokens(
                         token_embeds=new_predictor_embed,
                         batch_size=batch_size,
