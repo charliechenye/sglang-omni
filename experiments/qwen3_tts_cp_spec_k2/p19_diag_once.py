@@ -27,6 +27,9 @@ from experiments.qwen3_tts_cp_spec_k2.quality_smoke import (
 STATUS_OK = "P19_SINGLE_REQUEST_COMPLETED_DIAGNOSTIC_ONLY_NO_COST_SELECTION"
 STATUS_BAD = "P19_CUDA700_OR_OTHER_DIAGNOSTIC_FAILURE_NO_SELECTION"
 STATUS_NO_ARM = "P19_DIAGNOSTIC_ARM_NOT_EXECUTED_NO_SELECTION"
+STATUS_POST_FRAME = (
+    "P19_NEXT_FRAME_REQUEST_FAILED_AFTER_FULL_PROBE_CAUSE_UNVERIFIED"
+)
 STATUS_ALL_DEPTHS = (
     "P19_ALL_DEPTHS_GRAPH_SINGLE_FRAME_LIFECYCLE_PASS_NOT_COST_OR_SERVING"
 )
@@ -140,6 +143,17 @@ def run(root: Path, base_url: str) -> dict:
         ))
         all_trace = trace_tail(root, count=100000)
         result["trace_tail"] = all_trace[-40:]
+        native_next = [
+            ev for ev in all_trace if ev.get(
+                "stage", ""
+            ).startswith("P19_NATIVE_NEXT_")
+        ]
+        result["native_next_frame_phases"] = [
+            ev.get("stage") for ev in native_next
+        ]
+        result["last_native_next_frame_stage"] = (
+            native_next[-1]["stage"] if native_next else None
+        )
         try:
             result["trace_coverage"] = validate_diagnostic_trace(
                 all_trace, diagnostic
@@ -164,6 +178,34 @@ def run(root: Path, base_url: str) -> dict:
                 result["status"] = STATUS_ALL_DEPTHS
             elif diagnostic["arm"] == "ALL_DEPTHS_EAGER":
                 result["status"] = STATUS_ALL_DEPTHS_EAGER
+        # A 50-arm frame-local coverage PASS is not yet an HTTP PASS.
+        # The following native frame must return normally and at least
+        # two genuine P18 frame snapshots must exist in a successful run.
+        if (result["status"] in (STATUS_ALL_DEPTHS, STATUS_ALL_DEPTHS_EAGER)
+                and (result["census_rows"] < 28
+                     or "P19_NATIVE_NEXT_NATIVE_PREDICTOR_RETURNED"
+                     not in result["native_next_frame_phases"])):
+            result["status"] = STATUS_NO_ARM
+            result["error"] = (
+                "P19_NO_POST_PROBE_NATIVE_FRAME_RETURN_EVIDENCE: "
+                f"rows={result['census_rows']} "
+                f"last={result['last_native_next_frame_stage']}"
+            )
+            failure = RuntimeError(result["error"])
+        if (result["status"] == STATUS_BAD
+                and diagnostic["arm"] in (
+                    "ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER"
+                )
+                and "trace_coverage" in result
+                and (result["trace_coverage"].get(
+                    "graph_arms_verified", 0
+                ) + result["trace_coverage"].get(
+                    "eager_arms_verified", 0
+                )) == 50):
+            result["status"] = STATUS_POST_FRAME
+            result["failure_window"] = (
+                "AFTER_50_ARMS_RESTORED_BEFORE_NATIVE_REQUEST_FINISHED"
+            )
         if result["P19_full_cost_rows_should_be_zero"] != 0:
             result["status"] = STATUS_BAD
             result["error"] = "P19_DIAGNOSTIC_ILLEGAL_FORMAL_COST_RECORD"
@@ -188,6 +230,14 @@ def run(root: Path, base_url: str) -> dict:
                 f"P19_DIAG_COVERAGE_ERROR={result['trace_coverage_error']}",
                 flush=True,
             )
+        if result.get("native_next_frame_phases"):
+            print(
+                "P19_NATIVE_LAST_STAGE="
+                f"{result['last_native_next_frame_stage']}",
+                flush=True,
+            )
+            for stage in result["native_next_frame_phases"][-20:]:
+                print(f"P19_NATIVE_PHASE={stage}", flush=True)
         # The original tail often contained only P18 frame observations.
         # Explicitly print the latest graph lifecycle phases as well.
         phases = [
