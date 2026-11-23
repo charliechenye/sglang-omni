@@ -50,8 +50,7 @@ if [[ "$NSYS" == 1 ]]; then
 fi
 # Do not inherit old experimental instrumentation or speculative arm flags.
 while IFS='=' read -r key _; do
-  if [[ "$key" == SGLANG_OMNI_QTTS_CP_* ||
-        "$key" == SGLANG_OMNI_STRICT_PORT ]]; then
+  if [[ "$key" == SGLANG_OMNI_QTTS_CP_* || "$key" == SGLANG_OMNI_STRICT_PORT ]]; then
     unset "$key"
   fi
 done < <(env)
