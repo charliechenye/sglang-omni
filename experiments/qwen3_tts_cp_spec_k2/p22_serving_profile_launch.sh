@@ -138,7 +138,7 @@ root,sha,nsys = Path(sys.argv[1]),sys.argv[2],bool(int(sys.argv[3]))
     "candidate":"P21 committed K2 wide verifier C1 serving (private draft RNG)",
     "sampling":{"subtalker_dosample":True,
                 "temperature":0.9,"top_k":50,"top_p":1.0},
-    "P18_P19":"DISABLED", "profiler":"OFF",
+    "P18_P19":"DISABLED", "profiler":"P22_NVTX_CUDA_API",
     "candidate_default":"OFF_UNTIL_POST_HEALTH_ARM",
     "quality":"NATURAL_STOP_WAV_ONLY_NOT_ASR_OR_SPEAKER_PARITY",
     "performance_claim":"NONE_PROFILER_CONTAMINATED",
