@@ -228,7 +228,7 @@ def test_p22_launch_script_parses_before_any_gpu_activity():
     assert "--capture-range-end=stop" in source
     # --target-processes=all is a Nsight Compute (ncu) flag,
     # not supported by the Nsight Systems 2024.6 CLI.
-    profile_invocation = source.split('  nsys profile \\\n', 1)[1]
+    profile_invocation = source.split("  nsys profile ", 1)[1]
     assert "--target-processes=all" not in profile_invocation
     assert "--capture-range=cudaProfilerApi" in profile_invocation
     assert "--capture-range-end=stop" in profile_invocation
