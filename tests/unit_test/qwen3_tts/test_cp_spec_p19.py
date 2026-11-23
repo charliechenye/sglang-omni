@@ -723,6 +723,7 @@ def test_p19_tail_native_code15_and_feedback_hooks_present():
         ("post_process_outputs", "POST_PROCESS_CODES_EVENT_RECORDED"),
         ("write_feedback_buffers", "WRITE_FEEDBACK_ROW_IDS_READY"),
         ("custom_decode_forward", "MAIN_TALKER_FORWARD_BEGIN"),
+        ("post_decode", "MAIN_TALKER_STEP_RETURNED_BEFORE_COLLECT"),
         ("sample_next_token_ids", "MAIN_TALKER_FORWARD_RETURNED_BEFORE_SAMPLE"),
         ("sample_next_token_ids", "MAIN_SEMANTIC_SAMPLER_RETURNED"),
         ("collect_codes", "NEXT_FRAME_BEFORE_CODE_PREDICTOR"),
