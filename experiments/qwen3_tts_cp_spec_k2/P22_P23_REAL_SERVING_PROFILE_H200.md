@@ -82,6 +82,35 @@ python -m py_compile \
 STOP if any test/compile/preflight fails. `bash -n` is required.
 Do not rebase onto latest main while comparing with P21 data.
 
+### New-machine / detached-HEAD worktree check
+
+The P22 launcher requires the *actual local branch name*
+`experiment/qwen3-tts-p22-serving-profile`, a clean tracked worktree,
+and execution from the physical repository root. A matching short SHA
+(e.g., 13f1461e) alone does **not** prove that the branch is selected.
+Before starting a new profiler root:
+
+```bash
+cd "$HOME/sglang-omni-worktrees/p22-serving-profile"
+git branch --show-current
+git status -sb
+pwd -P
+git rev-parse --show-toplevel
+```
+
+If the branch name is different or HEAD is detached, switch using an
+existing local experiment branch with
+`git switch experiment/qwen3-tts-p22-serving-profile`.
+If the local branch is missing, fetch the fork branch then use
+`git switch -c experiment/qwen3-tts-p22-serving-profile FETCH_HEAD`
+**only when that branch is not already checked out by another worktree**.
+Do not reset, force-switch or replace an active experiment worktree.
+
+The launcher now reports distinct
+`P22_PROFILE_NOT_AT_REPOSITORY_ROOT` (physical paths) and
+`P22_PROFILE_BRANCH_MISMATCH` (actual branch or DETACHED_HEAD).
+This check happens before GPU imports and evidence-root creation.
+
 ## 1 — Terminal A: one Nsight Systems session, H200, profiler OFF until armed
 
 Port 8000 must be free. Do NOT share the H200 or use the P21 worker.
