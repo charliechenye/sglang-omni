@@ -17,7 +17,11 @@ from experiments.qwen3_tts_cp_spec_k2.p19_dp import (
     RESULT, _case_tables, analyze as analyze_dp, bellman, fixed_width_policy,
 )
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_cost import (
-    BLOCKS, REPEATS, SCHEMA, select_cost_frame,
+    BLOCKS, REPEATS, SCHEMA, select_cost_frame, _matched_eager_arm,
+)
+from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_profile import (
+    PROFILE_ENV, PROFILES, DEFAULT_OPS, DEFAULT_REPLAYS, MIN_REPLAY_OPS,
+    current_profile, profile_counts, validate_profile,
 )
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag import (
     MODES as DIAG_MODES, diagnostic_config, event as diag_event,
@@ -25,7 +29,7 @@ from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag import (
 )
 from experiments.qwen3_tts_cp_spec_k2.p19_diag_coverage import (
     GRAPH_STAGES, EAGER_STAGES, DEPTH_STAGES,
-    arms_at_depth, validate_diagnostic_trace,
+    arms_at_depth, validate_diagnostic_trace, stages_for_profile,
 )
 
 SHA = "a" * 40
@@ -783,3 +787,160 @@ def test_p19_collector_boundaries_guard_next_frame_before_predictor():
     assert source.index('"NEXT_FRAME_BEFORE_CODE_PREDICTOR"') < (
         source.index("self.model.code_predictor_forward(")
     )
+
+
+def test_p19_lifecycle_profile_counts_and_fail_closed_validation(monkeypatch):
+    assert DEFAULT_REPLAYS == 61
+    assert DEFAULT_OPS == 65
+    assert MIN_REPLAY_OPS == 5
+    assert profile_counts("ALL_DEPTHS_GRAPH", "DEFAULT") == {
+        "eager_operations": 3, "captures": 1,
+        "graph_replays": 61, "operation_equivalents": 65,
+    }
+    assert profile_counts("ALL_DEPTHS_GRAPH", "MIN_REPLAY") == {
+        "eager_operations": 3, "captures": 1,
+        "graph_replays": 1, "operation_equivalents": 5,
+    }
+    assert profile_counts("ALL_DEPTHS_EAGER", "MATCHED_EAGER") == {
+        "eager_operations": 65, "captures": 0,
+        "graph_replays": 0, "operation_equivalents": 65,
+    }
+    assert len(PROFILES) == 5
+    for profile in ("GC_GUARD", "RETAIN_GRAPH"):
+        assert validate_profile("ALL_DEPTHS_GRAPH", 14, profile) == profile
+    with pytest.raises(RuntimeError, match="PROFILE_MODE_MISMATCH"):
+        validate_profile("ALL_DEPTHS_GRAPH", 14, "MATCHED_EAGER")
+    with pytest.raises(RuntimeError, match="PROFILE_MODE_MISMATCH"):
+        validate_profile("ALL_DEPTHS_EAGER", 14, "GC_GUARD")
+    with pytest.raises(RuntimeError, match="TERMINAL_DEPTH14"):
+        validate_profile("ALL_DEPTHS_GRAPH", 9, "MIN_REPLAY")
+    with pytest.raises(RuntimeError, match="UNKNOWN_PROFILE"):
+        validate_profile("ALL_DEPTHS_GRAPH", 14, "SILENT_UNKNOWN")
+    monkeypatch.setenv(PROFILE_ENV, "GC_GUARD")
+    with pytest.raises(RuntimeError, match="REQUIRES_DIAGNOSTIC_MODE"):
+        current_profile(None)
+    assert current_profile(("ALL_DEPTHS_GRAPH", 14)) == "GC_GUARD"
+    monkeypatch.delenv(PROFILE_ENV)
+    assert current_profile(None) == "DEFAULT"
+
+
+def test_p19_matched_eager_executes_exact_65_real_calls(monkeypatch):
+    """CPU mock: no Graph or CUDA is required for exact invocation count."""
+    import torch
+    calls, restores, events = [], [], []
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    def op():
+        calls.append(len(calls))
+        return {"not_gpu": len(calls)}
+
+    def restore():
+        restores.append(len(calls))
+
+    _matched_eager_arm(
+        operation=op, restore=restore, device="cpu", mark=events.append
+    )
+    assert len(calls) == DEFAULT_OPS == 65
+    assert len(restores) == 1 + 1 + 2 + 1 + 1 + 4
+    assert events[0] == "P19_ARM_MATCHED_EAGER_REFERENCE_SYNC_PASS"
+    assert events[-1] == "P19_ARM_MATCHED_EAGER_TOTAL_65_SYNC_PASS"
+    assert [e for e in events if "BLOCK_" in e] == [
+        f"P19_ARM_MATCHED_EAGER_BLOCK_{i}_SYNC_PASS" for i in range(4)
+    ]
+
+
+def _p19_profile_trace(mode, profile):
+    """Fully ordered synthetic trace, exactly one real frame/worker."""
+    n, events = 0, []
+
+    def add(stage, depth, arm):
+        nonlocal n
+        n += 1
+        events.append({
+            "stage": stage, "depth": depth, "arm": arm,
+            "frame": 37, "case_id": "p00_s20261123",
+            "pid": 123, "monotonic_ns": n,
+        })
+
+    for depth in range(1, 15):
+        add(DEPTH_STAGES[0], depth, mode)
+        for arm in arms_at_depth(depth):
+            for stage in stages_for_profile(mode, profile):
+                add(stage, depth, arm)
+        if profile == "RETAIN_GRAPH" and depth == 14:
+            add("P19_RETAINED_50_GRAPHS_LIVE_UNTIL_WORKER_EXIT",
+                depth, mode)
+        add(DEPTH_STAGES[1], depth, mode)
+        add(DEPTH_STAGES[2], depth, mode)
+    return events
+
+
+@pytest.mark.parametrize(
+    "mode,profile,eager,capture,replays",
+    [
+        ("ALL_DEPTHS_GRAPH", "DEFAULT", 150, 50, 3050),
+        ("ALL_DEPTHS_GRAPH", "MIN_REPLAY", 150, 50, 50),
+        ("ALL_DEPTHS_GRAPH", "GC_GUARD", 150, 50, 3050),
+        ("ALL_DEPTHS_GRAPH", "RETAIN_GRAPH", 150, 50, 3050),
+        ("ALL_DEPTHS_EAGER", "MATCHED_EAGER", 3250, 0, 0),
+    ],
+)
+def test_p19_lifecycle_coverage_exact_profile_markers(
+    mode, profile, eager, capture, replays,
+):
+    cfg = {
+        "arm": mode, "depth": 14, "profile": profile,
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    events = _p19_profile_trace(mode, profile)
+    got = validate_diagnostic_trace(events, cfg)
+    assert got["profile"] == profile
+    assert got["expected_eager_operations"] == eager
+    assert got["expected_captures"] == capture
+    assert got["expected_graph_replays"] == replays
+    assert got["expected_total_arm_operations"] == eager + capture + replays
+    assert got["graph_arms_verified"] + got["eager_arms_verified"] == 50
+    # Fail closed when the profile-specific evidence is absent.
+    unique = {
+        "DEFAULT": "P19_ARM_TIMING_BLOCK_3_SYNC_PASS",
+        "MIN_REPLAY": "P19_ARM_MIN_REPLAY_NO_TIMING_PASS",
+        "GC_GUARD": "P19_ARM_GC_CAPTURE_GUARD_EXIT",
+        "RETAIN_GRAPH": "P19_ARM_GRAPH_RETAINED_AND_SYNC_PASS",
+        "MATCHED_EAGER": "P19_ARM_MATCHED_EAGER_TOTAL_65_SYNC_PASS",
+    }[profile]
+    missing = [
+        e for e in events
+        if not (e["depth"] == 9 and e["arm"] == "AR"
+                and e["stage"] == unique)
+    ]
+    with pytest.raises(RuntimeError, match="PHASE_COVERAGE_INCOMPLETE"):
+        validate_diagnostic_trace(missing, cfg)
+
+
+def test_p19_retained_graph_count_requires_proven_50_refs():
+    cfg = {
+        "arm": "ALL_DEPTHS_GRAPH", "depth": 14,
+        "profile": "RETAIN_GRAPH",
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    traces = [
+        e for e in _p19_profile_trace("ALL_DEPTHS_GRAPH", "RETAIN_GRAPH")
+        if e["stage"] != "P19_RETAINED_50_GRAPHS_LIVE_UNTIL_WORKER_EXIT"
+    ]
+    with pytest.raises(RuntimeError, match="PHASE_COVERAGE_INCOMPLETE"):
+        validate_diagnostic_trace(traces, cfg)
+
+
+def test_p19_lifecycle_shell_and_client_stay_no_cost_and_source_locked():
+    import inspect
+    from experiments.qwen3_tts_cp_spec_k2 import p19_diag_once
+    from sglang_omni.models.qwen3_tts import code_predictor_spec_p19_cost
+
+    src = inspect.getsource(code_predictor_spec_p19_cost.maybe_measure)
+    assert 'profile = current_profile(diagnostic)' in src
+    assert 'if diagnostic is not None:' in src
+    assert 'return\n        report = {' in src
+    once = inspect.getsource(p19_diag_once.run)
+    assert 'P19_PROFILE_UNMATCHED_LAUNCH_CONSTRAINTS' in once
+    assert 'P19_full_cost_rows_should_be_zero' in once
+    assert 'PROFILE_PASS[profile]' in once
