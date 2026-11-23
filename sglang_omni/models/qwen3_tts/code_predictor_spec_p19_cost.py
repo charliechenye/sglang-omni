@@ -202,7 +202,8 @@ def maybe_measure(
     if not armed():
         return
     diagnostic = diagnostic_config()
-    cumulative = diagnostic is not None and diagnostic[0] == "ALL_DEPTHS_GRAPH"
+    cumulative = (diagnostic is not None and diagnostic[0] in
+                  ("ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER"))
     # Targeted diagnostics run ONE depth; cumulative diagnostics run
     # each native depth 1..terminal on ONE already selected frame.
     if diagnostic is not None and (
