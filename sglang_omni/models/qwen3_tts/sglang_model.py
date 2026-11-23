@@ -1912,17 +1912,68 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             pass
 
         batch_size, seq_len = layer0_codes.shape
+        # P19 diagnostic ONLY: when 50 Graph arms finished on a real
+        # native frame, trace each GPU operation of the NEXT genuine
+        # native frame. This never runs in regular serving/cost mode.
+        p19_next_probe = False
+        p19_pending = getattr(self, "_p19_native_boundary_next_req", None)
+        if (p19_pending is not None and os.environ.get(
+            "SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM"
+        ) in ("ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER")):
+            if (p19_pending != getattr(self, "_p18_current_request_id", None)
+                    or (batch_size, seq_len) != (1, 1)):
+                raise RuntimeError(
+                    "P19_NATIVE_NEXT_FRAME_REQUEST_OR_SHAPE_DRIFT"
+                )
+            p19_next_probe = True
+            self._p19_native_boundary_next_req = None
+            from .code_predictor_spec_p19_diag import event as p19_boundary_event
+
+            p19_from_frame = getattr(
+                self, "_p19_native_boundary_from_frame", None
+            )
+            p19_case_id = getattr(
+                self, "_p19_native_boundary_case_id", None
+            )
+            if not isinstance(p19_from_frame, int) or not p19_case_id:
+                raise RuntimeError("P19_NATIVE_BOUNDARY_SOURCE_MISSING")
+
+            def p19_mark(phase: str, *, fence: bool = False) -> None:
+                # In the trace, frame refers to the already measured
+                # source frame, NOT a speculative GPU read of next-frame
+                # semantic_position. No .item() is performed here.
+                kw = dict(
+                    depth=0, frame=p19_from_frame, arm="NATIVE_NEXT_FRAME",
+                    case_id=p19_case_id,
+                )
+                p19_boundary_event("P19_NATIVE_NEXT_" + phase, **kw)
+                if (fence and os.environ.get(
+                    "SGLANG_OMNI_QTTS_CP_P19_NATIVE_FENCE", "0"
+                ) == "1"):
+                    p19_boundary_event(
+                        "P19_NATIVE_NEXT_" + phase + "_SYNC_BEGIN", **kw
+                    )
+                    torch.cuda.synchronize(layer0_codes.device)
+                    p19_boundary_event(
+                        "P19_NATIVE_NEXT_" + phase + "_SYNC_PASS", **kw
+                    )
+
+            p19_mark("FORWARD_ENTER_BEFORE_GPU", fence=True)
         semantic_positions = self.normalize_semantic_positions(
             semantic_positions,
             batch_size=batch_size,
             seq_len=seq_len,
             device=layer0_codes.device,
         )
+        if p19_next_probe:
+            p19_mark("NORMALIZE_POSITIONS_RETURNED", fence=True)
         predictor_dtype = self.predictor_k_cache.dtype
         num_groups = self.config.num_code_groups
         result_codes = self.output_codes[:batch_size].unsqueeze(-1)
         summed_embeddings = self.output_embeds[:batch_size].unsqueeze(1)
         summed_embeddings.zero_()
+        if p19_next_probe:
+            p19_mark("OUTPUT_EMBED_ZERO_RETURNED", fence=True)
         embedding_buffer = getattr(self, "predictor_embedding_buffer", None)
         if embedding_buffer is not None:
             embedding_buffer = embedding_buffer[:batch_size]
@@ -1939,10 +1990,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             layer0_embed = self.get_input_embeddings()(layer0_code).to(
                 dtype=predictor_dtype
             )
+            if p19_next_probe:
+                p19_mark("LAYER0_EMBED_RETURNED", fence=True)
             pos_codes = result_codes[:, :, pos]
             pos_summed = summed_embeddings[:, pos, :]
             pos_codes[:, 0].copy_(layer0_code[:, 0])
             pos_summed.add_(layer0_embed[:, 0, :])
+            if p19_next_probe:
+                p19_mark("LAYER0_CODE_SUM_RETURNED", fence=True)
 
             # note(ratish): the talker hidden and the layer 0 embedding are the
             # first two tokens; one causal pass reads the predictor weights once.
@@ -1955,6 +2010,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     dim=1,
                 )
             )
+            if p19_next_probe:
+                p19_mark("PAIR_PROJECT_INPUT_RETURNED", fence=True)
             # note(ratish): dense rows, the gemv and cutedsl lm_head GEMMs view
             # their input as 2D and read it with a fixed row stride.
             last_hidden = self.predictor_forward_tokens(
@@ -1963,14 +2020,22 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 cache_len=0,
             )[:, 1:, :].contiguous()
             cache_len = pair_embeds.shape[1]
+            if p19_next_probe:
+                p19_mark("PAIR_PREDICTOR_FORWARD_RETURNED", fence=True)
 
             sub_positions = (
                 self.sub_seed_positions(semantic_positions[:, pos])
                 if self.sub_has_sampled_rows
                 else None
             )
+            if p19_next_probe:
+                p19_mark("SUB_POSITIONS_RETURNED", fence=True)
             for layer_idx in range(num_groups - 1):
+                if p19_next_probe and layer_idx == 0:
+                    p19_mark("CODE1_LMHEAD_BEGIN")
                 logits, _ = self.code_predictor.lm_head[layer_idx](last_hidden)
+                if p19_next_probe and layer_idx == 0:
+                    p19_mark("CODE1_LMHEAD_RETURNED", fence=True)
                 layer_sub_positions = (
                     None if sub_positions is None else sub_positions[layer_idx]
                 )
@@ -1981,6 +2046,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 should_gather_projection = (
                     projected_tables is not None and has_next_step
                 )
+                if p19_next_probe and layer_idx == 0:
+                    p19_mark("CODE1_SAMPLER_BEGIN")
                 new_embed, projected_embed = self.sample_subtalker_embedding(
                     logits[:, -1, :],
                     codec_table,
@@ -1991,6 +2058,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     projected_buffer if should_gather_projection else None,
                     layer_sub_positions,
                 )
+                if p19_next_probe and layer_idx == 0:
+                    p19_mark("CODE1_SAMPLER_RETURNED", fence=True)
                 if has_next_step:
                     if projected_tables is None:
                         new_predictor_embed = self.code_predictor.project_input(
@@ -1998,10 +2067,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                         )
                     else:
                         new_predictor_embed = projected_embed.unsqueeze(1)
+                    if p19_next_probe and layer_idx == 0:
+                        p19_mark("CODE1_PROJECTED_EMBED_RETURNED", fence=True)
                     # Native AR has just sampled code_{layer_idx+1}.
                     # The newly sampled embedding is NOT in KV yet, so
                     # this is the exact P17-style frozen checkpoint:
                     # q-old-hidden, last-embedding, committed KV prefix.
+                    if p19_next_probe and layer_idx == 0:
+                        p19_mark("BEFORE_P18_DEPTH1_ITEM", fence=True)
                     if os.environ.get("SGLANG_OMNI_QTTS_CP_P18_DIR"):
                         from .code_predictor_spec_p18_census import maybe_census
 
@@ -2023,6 +2096,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     cache_len += 1
                 else:
                     pass
+        if p19_next_probe:
+            p19_mark("NATIVE_PREDICTOR_RETURNED", fence=True)
         return result_codes, summed_embeddings
 
     def sample_subtalker_embedding(
