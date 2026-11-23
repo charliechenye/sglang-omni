@@ -28,6 +28,7 @@ from .code_predictor_spec_p14_causal_round import (
     single_support, gpu_accept,
 )
 from .code_predictor_spec_p15_two_round import _project
+from .code_predictor_spec_p22_profile import span as p22_span
 
 WIDTHS = (2, 3, 4)
 VOCAB = 2048
@@ -230,105 +231,108 @@ def make_wide_round(
 ) -> dict[str, torch.Tensor]:
     """Real parallel q heads + ONE causal wide verify + exact GPU residual."""
     n = width - 1
-    q_logits, q_ids, q_probs, drafts, draft_embeddings = make_q_proposals(
-        model, depth=depth, width=width, old_hidden=old_hidden,
-        head_bank=head_bank, uniforms=uniforms,
-        temperature=temperature, top_p=top_p,
-        accumulation_dtype=accumulated.dtype,
-    )
-    packed = torch.cat((last_embedding, draft_embeddings), dim=1)
-    verified = wide_device_fused_predictor(
-        model, packed=packed, cache_len_gpu=cache_len_gpu,
-        offsets_gpu=offset_ids,
-    )
-    p_logits = batched_head_logits(
-        verified[0].unsqueeze(1), head_bank,
-    )
-    target_ids, target_probs, accepts, candidates = [], [], [], []
-    for j in range(n):
-        pids, probs = single_support(
-            p_logits[j:j+1],
-            temperature=temperature, top_p=top_p, fast=True,
+    with p22_span(model, "Q_PROPOSALS"):
+        q_logits, q_ids, q_probs, drafts, draft_embeddings = make_q_proposals(
+            model, depth=depth, width=width, old_hidden=old_hidden,
+            head_bank=head_bank, uniforms=uniforms,
+            temperature=temperature, top_p=top_p,
+            accumulation_dtype=accumulated.dtype,
         )
-        result = gpu_accept(
-            pids, probs, q_ids[j:j+1], q_probs[j:j+1],
-            uniforms[4*j:4*j+4], drafts[j:j+1],
+        packed = torch.cat((last_embedding, draft_embeddings), dim=1)
+    with p22_span(model, "WIDE_VERIFIER"):
+        verified = wide_device_fused_predictor(
+            model, packed=packed, cache_len_gpu=cache_len_gpu,
+            offsets_gpu=offset_ids,
         )
-        target_ids.append(pids[0])
-        target_probs.append(probs[0])
-        accepts.append(result["accepted"][0])
-        candidates.append(result["committed"][0])
-    flags = torch.stack(accepts)
-    survived = torch.cumprod(flags.to(torch.long), dim=0)
-    active = torch.cat((torch.ones_like(survived[:1]), survived[:-1]))
-    accepted_prefix = survived.sum()
-    committed_count = accepted_prefix + 1
-    candidates = torch.stack(candidates)
-    negative = torch.full_like(candidates, -1)
-    chosen = torch.where(active.bool(), candidates, negative)
+    with p22_span(model, "TARGET_SUPPORT_ACCEPT_BONUS"):
+        p_logits = batched_head_logits(
+            verified[0].unsqueeze(1), head_bank,
+        )
+        target_ids, target_probs, accepts, candidates = [], [], [], []
+        for j in range(n):
+            pids, probs = single_support(
+                p_logits[j:j+1],
+                temperature=temperature, top_p=top_p, fast=True,
+            )
+            result = gpu_accept(
+                pids, probs, q_ids[j:j+1], q_probs[j:j+1],
+                uniforms[4*j:4*j+4], drafts[j:j+1],
+            )
+            target_ids.append(pids[0])
+            target_probs.append(probs[0])
+            accepts.append(result["accepted"][0])
+            candidates.append(result["committed"][0])
+        flags = torch.stack(accepts)
+        survived = torch.cumprod(flags.to(torch.long), dim=0)
+        active = torch.cat((torch.ones_like(survived[:1]), survived[:-1]))
+        accepted_prefix = survived.sum()
+        committed_count = accepted_prefix + 1
+        candidates = torch.stack(candidates)
+        negative = torch.full_like(candidates, -1)
+        chosen = torch.where(active.bool(), candidates, negative)
 
-    # Bonus head at the verifier's trailing row, only LOGICALLY committed
-    # after every draft is accepted. Physical work is unconditional, like
-    # the NVIDIA wide verifier's already-computed final p row.
-    _, _, _, bonus = fast_selector(
-        p_logits[n:n+1], uniforms[4*n:4*n+1],
-        temperature=temperature, top_p=top_p,
-    )
-    # cumprod on Long flags returns an int64 tensor. torch.where requires
-    # a boolean condition on both the bonus-code and bonus-embedding paths.
-    # Keep this as a device scalar; never synchronize to the host.
-    full_accept = survived[-1].to(dtype=torch.bool).reshape(())
-    code_list = torch.cat((
-        chosen,
-        torch.where(full_accept, bonus[0], torch.full_like(bonus[0], -1))
-        .reshape(1),
-    ))
-    raw_sum = accumulated
-    projected_options = []
-    for j in range(n):
-        raw, projection = _project(
-            model, depth+j, candidates[j:j+1], accumulated.dtype,
+        # Bonus head at the verifier's trailing row, only LOGICALLY committed
+        # after every draft is accepted. Physical work is unconditional, like
+        # the NVIDIA wide verifier's already-computed final p row.
+        _, _, _, bonus = fast_selector(
+            p_logits[n:n+1], uniforms[4*n:4*n+1],
+            temperature=temperature, top_p=top_p,
+        )
+        # cumprod on Long flags returns an int64 tensor. torch.where requires
+        # a boolean condition on both the bonus-code and bonus-embedding paths.
+        # Keep this as a device scalar; never synchronize to the host.
+        full_accept = survived[-1].to(dtype=torch.bool).reshape(())
+        code_list = torch.cat((
+            chosen,
+            torch.where(full_accept, bonus[0], torch.full_like(bonus[0], -1))
+            .reshape(1),
+        ))
+        raw_sum = accumulated
+        projected_options = []
+        for j in range(n):
+            raw, projection = _project(
+                model, depth+j, candidates[j:j+1], accumulated.dtype,
+            )
+            raw_sum = raw_sum + torch.where(
+                active[j].reshape(()).bool(), raw,
+                torch.zeros_like(raw),
+            )
+            projected_options.append(projection[0, 0])
+        bonus_raw, bonus_projection = _project(
+            model, depth+n, bonus, accumulated.dtype,
         )
         raw_sum = raw_sum + torch.where(
-            active[j].reshape(()).bool(), raw,
-            torch.zeros_like(raw),
+            full_accept, bonus_raw, torch.zeros_like(bonus_raw),
         )
-        projected_options.append(projection[0, 0])
-    bonus_raw, bonus_projection = _project(
-        model, depth+n, bonus, accumulated.dtype,
-    )
-    raw_sum = raw_sum + torch.where(
-        full_accept, bonus_raw, torch.zeros_like(bonus_raw),
-    )
-    projected_options.append(bonus_projection[0, 0])
-    chosen_pos = (committed_count - 1).reshape(1, 1).expand(
-        1, projected_options[0].numel()
-    )
-    projected_next = torch.gather(
-        torch.stack(projected_options), 0, chosen_pos,
-    ).reshape(1, 1, -1)
-    # A rejection at draft j leaves the verifier row j as next draft
-    # hidden. Full acceptance leaves the final verifier row n.
-    next_hidden = torch.gather(
-        verified[0], 0, chosen_pos,
-    ).reshape(1, 1, -1)
-    return {
-        "drafts": drafts,
-        "accepted_flags": flags,
-        "accepted_prefix": accepted_prefix,
-        "committed_count": committed_count,
-        "committed_codes": code_list,
-        "bonus_code": bonus,
-        "q_logits": q_logits,
-        "p_logits": p_logits,
-        "q_ids": q_ids,
-        "q_probs": q_probs,
-        "p_ids": torch.stack(target_ids),
-        "p_probs": torch.stack(target_probs),
-        "verified_hidden": verified,
-        "next_hidden": next_hidden,
-        "next_embedding": projected_next,
-        "next_sum": raw_sum,
-        "next_depth": cache_len_gpu - 1 + committed_count,
-        "next_cache_len": cache_len_gpu + committed_count,
-    }
+        projected_options.append(bonus_projection[0, 0])
+        chosen_pos = (committed_count - 1).reshape(1, 1).expand(
+            1, projected_options[0].numel()
+        )
+        projected_next = torch.gather(
+            torch.stack(projected_options), 0, chosen_pos,
+        ).reshape(1, 1, -1)
+        # A rejection at draft j leaves the verifier row j as next draft
+        # hidden. Full acceptance leaves the final verifier row n.
+        next_hidden = torch.gather(
+            verified[0], 0, chosen_pos,
+        ).reshape(1, 1, -1)
+        return {
+            "drafts": drafts,
+            "accepted_flags": flags,
+            "accepted_prefix": accepted_prefix,
+            "committed_count": committed_count,
+            "committed_codes": code_list,
+            "bonus_code": bonus,
+            "q_logits": q_logits,
+            "p_logits": p_logits,
+            "q_ids": q_ids,
+            "q_probs": q_probs,
+            "p_ids": torch.stack(target_ids),
+            "p_probs": torch.stack(target_probs),
+            "verified_hidden": verified,
+            "next_hidden": next_hidden,
+            "next_embedding": projected_next,
+            "next_sum": raw_sum,
+            "next_depth": cache_len_gpu - 1 + committed_count,
+            "next_cache_len": cache_len_gpu + committed_count,
+        }
