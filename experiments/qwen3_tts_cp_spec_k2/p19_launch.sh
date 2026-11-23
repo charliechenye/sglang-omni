@@ -33,7 +33,7 @@ fi
 # One worker per diagnostic arm, no multi-arm evidence or DP claim.
 if [[ -n "${P19_DIAG_ARM:-}" ]]; then
   case "$P19_DIAG_ARM" in
-    OFF|AR_EAGER|AR_GRAPH|K2_EAGER|K2_GRAPH|K3_EAGER|K3_GRAPH|K4_EAGER|K4_GRAPH|ALL_GRAPH) ;;
+    OFF|AR_EAGER|AR_GRAPH|K2_EAGER|K2_GRAPH|K3_EAGER|K3_GRAPH|K4_EAGER|K4_GRAPH|ALL_GRAPH|ALL_DEPTHS_GRAPH) ;;
     *) echo "P19_DIAG_ARM invalid: $P19_DIAG_ARM" >&2; exit 2 ;;
   esac
   DEPTH="${P19_DIAG_DEPTH:-1}"
@@ -44,6 +44,9 @@ if [[ -n "${P19_DIAG_ARM:-}" ]]; then
      [[ "$P19_DIAG_ARM" == K3_* && "$DEPTH" -gt 12 ]] ||
      [[ "$P19_DIAG_ARM" == K4_* && "$DEPTH" -gt 11 ]]; then
     echo "P19 diagnostic requested an unavailable bonus head" >&2; exit 2
+  fi
+  if [[ "$P19_DIAG_ARM" == "ALL_DEPTHS_GRAPH" && "$COST_FRAMES" != 1 ]]; then
+    echo "P19 ALL_DEPTHS_GRAPH requires exactly one P19_COST_FRAMES" >&2; exit 2
   fi
   FENCE="${P19_DIAG_FENCE:-0}"
   if [[ "$FENCE" != 0 && "$FENCE" != 1 ]]; then
