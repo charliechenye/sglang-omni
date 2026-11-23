@@ -978,6 +978,8 @@ def _fake_lifecycle_root(tmp_path, *, mode, profile, sha="a" * 40):
         "trace_coverage": {
             "profile": profile, "mode": mode,
             "depths_verified": list(range(1, 15)),
+            "frame": 37,
+            "case_id": "p00_s20261123",
             "graph_arms_verified": amounts,
             "eager_arms_verified": 50 - amounts,
         },
@@ -1008,7 +1010,7 @@ def test_p19_lifecycle_compare_rejects_cross_source_and_seed(tmp_path):
     assert "NO_P19A_COST_SELECTION" in report["decision"]
     assert "ONE_REQUEST_PASS_NOT_SAFETY_PROOF" in to_markdown(report)
     assert "P19_SOURCE_MATCHED" in report["status"]
-    with pytest.raises(RuntimeError, match="DUPLICATE_PROFILE"):
+    with pytest.raises(RuntimeError, match="DUPLICATE_ROOT"):
         compare([minimum, minimum])
     config = minimum / "matched_cost/config.json"
     altered = json.loads(config.read_text())
@@ -1016,3 +1018,32 @@ def test_p19_lifecycle_compare_rejects_cross_source_and_seed(tmp_path):
     config.write_text(json.dumps(altered))
     with pytest.raises(RuntimeError, match="SOURCE_SHA_MISMATCH"):
         compare([eager, minimum])
+
+
+def test_p19_lifecycle_comparator_allows_both_default_baselines(
+    tmp_path,
+):
+    from experiments.qwen3_tts_cp_spec_k2.p19_lifecycle_compare import (
+        compare,
+    )
+    a = _fake_lifecycle_root(
+        tmp_path / "base-eager", mode="ALL_DEPTHS_EAGER",
+        profile="DEFAULT",
+    )
+    b = _fake_lifecycle_root(
+        tmp_path / "base-graph", mode="ALL_DEPTHS_GRAPH",
+        profile="DEFAULT",
+    )
+    report = compare([a, b])
+    assert {r["mode"] for r in report["runs"]} == {
+        "ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER"
+    }
+    assert {r["selected_frame"] for r in report["runs"]} == {37}
+    report_cfg = b / "matched_cost/diagnostic/client.json"
+    body = json.loads(report_cfg.read_text())
+    body["trace_coverage"]["frame"] = 99
+    report_cfg.write_text(json.dumps(body))
+    with pytest.raises(
+        RuntimeError, match="SELECTED_FRAME_OR_CASE_DRIFT"
+    ):
+        compare([a, b])
