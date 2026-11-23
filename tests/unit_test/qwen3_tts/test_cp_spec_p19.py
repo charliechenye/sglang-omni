@@ -944,3 +944,75 @@ def test_p19_lifecycle_shell_and_client_stay_no_cost_and_source_locked():
     assert 'P19_PROFILE_UNMATCHED_LAUNCH_CONSTRAINTS' in once
     assert 'P19_full_cost_rows_should_be_zero' in once
     assert 'PROFILE_PASS[profile]' in once
+
+
+def _fake_lifecycle_root(tmp_path, *, mode, profile, sha="a" * 40):
+    from experiments.qwen3_tts_cp_spec_k2.p19_lifecycle_compare import (
+        PASS_STATUSES,
+    )
+    root = tmp_path
+    (root / "matched_cost/diagnostic").mkdir(parents=True)
+    (root / "source.sha").write_text(sha + "\n")
+    diag = {
+        "arm": mode, "depth": 14, "profile": profile,
+        "fence": 0, "native_fence": 0, "tail_fence": 1,
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    (root / "matched_cost/config.json").write_text(json.dumps({
+        "diagnostic": diag, "source_sha": sha,
+        "p18_frames_per_request": 2,
+        "p19_cost_frames_per_request": 1,
+    }))
+    amounts = 50 if mode == "ALL_DEPTHS_GRAPH" else 0
+    payload = {
+        "status": PASS_STATUSES[(mode, profile)],
+        "source_sha": sha, "diagnostic": diag,
+        "P19_full_cost_rows_should_be_zero": 0,
+        "no_cost_or_dp_selection": True,
+        "finish_reason": "stop", "census_rows": 28,
+        "case": {"prompt_id": "engineering", "seed": 20261123},
+        "request": {"input": "fixed sample"},
+        "native_next_frame_phases": [
+            "P19_NATIVE_NEXT_NATIVE_PREDICTOR_RETURNED"
+        ],
+        "trace_coverage": {
+            "profile": profile, "mode": mode,
+            "depths_verified": list(range(1, 15)),
+            "graph_arms_verified": amounts,
+            "eager_arms_verified": 50 - amounts,
+        },
+    }
+    (root / "matched_cost/diagnostic/client.json").write_text(
+        json.dumps(payload)
+    )
+    (root / "server.log").write_text("clean run\n")
+    return root
+
+
+def test_p19_lifecycle_compare_rejects_cross_source_and_seed(tmp_path):
+    from experiments.qwen3_tts_cp_spec_k2.p19_lifecycle_compare import (
+        compare, to_markdown,
+    )
+    eager = _fake_lifecycle_root(
+        tmp_path / "eager", mode="ALL_DEPTHS_EAGER",
+        profile="MATCHED_EAGER",
+    )
+    minimum = _fake_lifecycle_root(
+        tmp_path / "minimum", mode="ALL_DEPTHS_GRAPH",
+        profile="MIN_REPLAY",
+    )
+    report = compare([eager, minimum])
+    assert len(report["runs"]) == 2
+    assert report["runs"][0]["expected_operations"] == 3250
+    assert report["runs"][1]["expected_operations"] == 250
+    assert "NO_P19A_COST_SELECTION" in report["decision"]
+    assert "ONE_REQUEST_PASS_NOT_SAFETY_PROOF" in to_markdown(report)
+    assert "P19_SOURCE_MATCHED" in report["status"]
+    with pytest.raises(RuntimeError, match="DUPLICATE_PROFILE"):
+        compare([minimum, minimum])
+    config = minimum / "matched_cost/config.json"
+    altered = json.loads(config.read_text())
+    altered["source_sha"] = "b" * 40
+    config.write_text(json.dumps(altered))
+    with pytest.raises(RuntimeError, match="SOURCE_SHA_MISMATCH"):
+        compare([eager, minimum])
