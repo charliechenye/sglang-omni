@@ -1,0 +1,172 @@
+# SPDX-License-Identifier: Apache-2.0
+"""Fail-closed P19 diagnostic phase coverage validation (CPU only).
+
+A completed HTTP request is NOT evidence a selected diagnostic arm ran.
+This validates exactly ONE real selected native frame and EVERY requested
+depth/arm stage, using fsynced worker traces; never generates GPU cost
+or production-performance claims.
+"""
+from __future__ import annotations
+
+from collections import Counter
+
+GRAPH_STAGES = (
+    "P19_ARM_SELECTED",
+    "P19_ARM_EAGER_AND_WARMUP_SYNC_PASS",
+    "P19_ARM_GRAPH_CAPTURE_SYNC_PASS",
+    "P19_ARM_FIRST_REPLAY_SYNC_PASS",
+    "P19_ARM_REPLAY_EAGER_PARITY_PASS",
+    "P19_ARM_TIMING_BLOCK_0_SYNC_PASS",
+    "P19_ARM_TIMING_BLOCK_1_SYNC_PASS",
+    "P19_ARM_TIMING_BLOCK_2_SYNC_PASS",
+    "P19_ARM_TIMING_BLOCK_3_SYNC_PASS",
+    "P19_ARM_GRAPH_RELEASE_AND_SYNC_PASS",
+)
+EAGER_STAGES = (
+    "P19_ARM_SELECTED",
+    "P19_EAGER_ONLY_DEVICE_SYNC_PASS",
+)
+DEPTH_STAGES = (
+    "P19_COST_TARGET_FRAME_SELECTED",
+    "P19_DIAGNOSTIC_ARM_RETURNED_NO_COST_SELECTION",
+    "P19_DIAGNOSTIC_FINAL_RESTORE_SYNC_PASS",
+)
+
+
+def arms_at_depth(depth: int) -> tuple[str, ...]:
+    if not 1 <= depth <= 14:
+        raise ValueError("P19_COVERAGE_INVALID_DEPTH")
+    return ("AR", *(str(k) for k in (2, 3, 4)
+                    if depth + k - 1 <= 14))
+
+
+def _require_single(
+    counts: Counter, depth: int, arm: str | None, stage: str,
+) -> None:
+    count = counts[(depth, arm, stage)]
+    if count != 1:
+        raise RuntimeError(
+            "P19_DIAGNOSTIC_PHASE_COVERAGE_INCOMPLETE "
+            f"depth={depth} arm={arm} stage={stage} count={count}"
+        )
+
+
+def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
+    """Validates exactly requested depth/arms in one native frame and worker.
+
+    Raises instead of claiming a pass when any expected phase is missing,
+    duplicate, mixed between workers/frames, or no arm was actually executed.
+    """
+    if not isinstance(diagnostic, dict):
+        raise RuntimeError("P19_DIAG_INVALID_LAUNCH_CONFIG")
+    arm = diagnostic.get("arm")
+    depth = diagnostic.get("depth")
+    if arm not in (
+        "OFF", "AR_EAGER", "AR_GRAPH",
+        "K2_EAGER", "K2_GRAPH", "K3_EAGER", "K3_GRAPH",
+        "K4_EAGER", "K4_GRAPH", "ALL_GRAPH", "ALL_DEPTHS_GRAPH",
+    ) or type(depth) is not int or not 1 <= depth <= 14:
+        raise RuntimeError("P19_DIAG_INVALID_MODE_OR_DEPTH")
+    if not events:
+        raise RuntimeError("P19_DIAG_NO_WORKER_TRACE")
+    # Depth/arm boundaries never depend on CUDA tensor reads.
+    if arm == "OFF":
+        skips = [
+            ev for ev in events
+            if ev.get("stage") == "P19_COST_PROBE_SKIPPED_OFF"
+            and ev.get("depth") == depth and ev.get("arm") == "OFF"
+        ]
+        any_arms = any(
+            ev.get("stage") == "P19_ARM_SELECTED" for ev in events
+        )
+        if not skips or any_arms:
+            raise RuntimeError("P19_DIAG_OFF_ARM_NOT_PROVEN")
+        return {
+            "mode": arm, "terminal_depth": depth,
+            "diagnostic_frame": None, "depths_verified": [depth],
+            "graph_arms_verified": 0, "off_events": len(skips),
+            "result": "P19_OFF_P18_ONLY_CHECKPOINT_OBSERVED_NOT_COST",
+        }
+
+    if arm == "ALL_DEPTHS_GRAPH":
+        expected_depths = tuple(range(1, depth + 1))
+        if diagnostic.get("policy") != "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION":
+            raise RuntimeError("P19_DIAG_ALL_DEPTHS_POLICY_GATE")
+    else:
+        expected_depths = (depth,)
+
+    targets = [
+        ev for ev in events
+        if ev.get("stage") == "P19_COST_TARGET_FRAME_SELECTED"
+    ]
+    if len(targets) != len(expected_depths):
+        raise RuntimeError(
+            "P19_DIAG_SELECTED_DEPTH_COUNT_MISMATCH "
+            f"actual={len(targets)} wanted={len(expected_depths)}"
+        )
+    if set(ev.get("depth") for ev in targets) != set(expected_depths):
+        raise RuntimeError("P19_DIAG_SELECTED_DEPTH_SET_DRIFT")
+    frames = {(ev.get("case_id"), ev.get("frame"), ev.get("pid"))
+              for ev in targets}
+    if len(frames) != 1:
+        raise RuntimeError("P19_DIAG_MIXED_NATIVE_FRAME_OR_WORKER")
+    case_id, frame, pid = next(iter(frames))
+    if (not isinstance(case_id, str) or not case_id
+            or type(frame) is not int or type(pid) is not int):
+        raise RuntimeError("P19_DIAG_INVALID_NATIVE_FRAME_IDENTITY")
+    scoped = [
+        ev for ev in events if ev.get("stage", "").startswith("P19_")
+    ]
+    if any(ev.get("case_id") != case_id
+           or ev.get("frame") != frame
+           or ev.get("pid") != pid
+           for ev in scoped):
+        raise RuntimeError("P19_DIAG_UNEXPECTED_FRAME_OR_WORKER_PHASE")
+    counts = Counter(
+        (ev.get("depth"), ev.get("arm"), ev.get("stage"))
+        for ev in scoped
+    )
+    verified_arms = 0
+    for d in expected_depths:
+        _require_single(counts, d, arm, DEPTH_STAGES[0])
+        _require_single(counts, d, arm, DEPTH_STAGES[1])
+        _require_single(counts, d, arm, DEPTH_STAGES[2])
+        if arm in ("ALL_GRAPH", "ALL_DEPTHS_GRAPH"):
+            arms = arms_at_depth(d)
+        else:
+            chosen = arm.split("_", 1)[0]
+            wanted = "AR" if chosen == "AR" else chosen[1:]
+            if wanted not in arms_at_depth(d):
+                raise RuntimeError("P19_DIAG_ILLEGAL_ARM_AT_TARGET_DEPTH")
+            arms = (wanted,)
+        phases = EAGER_STAGES if arm.endswith("_EAGER") else GRAPH_STAGES
+        for selected_arm in arms:
+            for stage in phases:
+                _require_single(counts, d, selected_arm, stage)
+            verified_arms += 1
+
+    expected_selected = verified_arms
+    selected_count = sum(
+        count for (_, _, stage), count in counts.items()
+        if stage == "P19_ARM_SELECTED"
+    )
+    if selected_count != expected_selected:
+        raise RuntimeError(
+            "P19_DIAG_UNEXPECTED_EXTRA_ARM_SELECTED "
+            f"actual={selected_count} expected={expected_selected}"
+        )
+    return {
+        "mode": arm,
+        "terminal_depth": depth,
+        "case_id": case_id,
+        "frame": frame,
+        "worker_pid": pid,
+        "depths_verified": list(expected_depths),
+        "graph_arms_verified": (
+            verified_arms if not arm.endswith("_EAGER") else 0
+        ),
+        "eager_arms_verified": (
+            verified_arms if arm.endswith("_EAGER") else 0
+        ),
+        "result": "P19_DIAGNOSTIC_TRACE_COVERAGE_PASS_NO_COST_SELECTION",
+    }
