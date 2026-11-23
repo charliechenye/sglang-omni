@@ -23,6 +23,9 @@ from experiments.qwen3_tts_cp_spec_k2.p19_diag_coverage import (
 from experiments.qwen3_tts_cp_spec_k2.quality_smoke import (
     MODEL, _http_call, wav_info,
 )
+from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_profile import (
+    validate_profile,
+)
 
 STATUS_OK = "P19_SINGLE_REQUEST_COMPLETED_DIAGNOSTIC_ONLY_NO_COST_SELECTION"
 STATUS_BAD = "P19_CUDA700_OR_OTHER_DIAGNOSTIC_FAILURE_NO_SELECTION"
@@ -36,6 +39,12 @@ STATUS_ALL_DEPTHS = (
 STATUS_ALL_DEPTHS_EAGER = (
     "P19_ALL_DEPTHS_EAGER_SINGLE_FRAME_CONTROL_PASS_NOT_GRAPH_OR_SERVING"
 )
+PROFILE_PASS = {
+    "MIN_REPLAY": "P19_MIN_REPLAY_ONE_FRAME_NEXT_NATIVE_PASS_NOT_COST",
+    "MATCHED_EAGER": "P19_MATCHED_EAGER_65_OPS_ONE_FRAME_NEXT_NATIVE_PASS",
+    "GC_GUARD": "P19_GC_CAPTURE_GUARD_ONE_FRAME_NEXT_NATIVE_PASS_NOT_COST",
+    "RETAIN_GRAPH": "P19_RETAINED_GRAPH_ONE_FRAME_NEXT_NATIVE_PASS_NOT_COST",
+}
 SCHEMA = "qwen3tts-p19-cuda700-one-request-v1"
 
 
@@ -70,6 +79,18 @@ def run(root: Path, base_url: str) -> dict:
             or local_sha != sha
             or len(sha) != 40):
         raise RuntimeError("P19_DIAGNOSTIC_SOURCE_OR_LAUNCH_MISMATCH")
+    profile = validate_profile(
+        diagnostic.get("arm"), diagnostic.get("depth"),
+        diagnostic.get("profile", "DEFAULT"),
+    )
+    if profile != "DEFAULT" and (
+        diagnostic.get("fence") != 0
+        or diagnostic.get("native_fence") != 0
+        or diagnostic.get("tail_fence") != 1
+        or config.get("p18_frames_per_request") != 2
+        or config.get("p19_cost_frames_per_request") != 1
+    ):
+        raise RuntimeError("P19_PROFILE_UNMATCHED_LAUNCH_CONSTRAINTS")
     arm_path = root / "ARM_P18"
     case_path = root / "ACTIVE_CASE.json"
     diag_path = root / "matched_cost" / "diagnostic" / "client.json"
@@ -114,7 +135,7 @@ def run(root: Path, base_url: str) -> dict:
         arm_path.touch(exist_ok=False)
         print(
             f"P19_DIAG_HTTP_BEGIN mode={diagnostic['arm']} "
-            f"depth={diagnostic['depth']}", flush=True,
+            f"depth={diagnostic['depth']} profile={profile}", flush=True,
         )
         wav, finish, wall = _http_call(base_url, payload)
         if finish != "stop":
@@ -203,6 +224,13 @@ def run(root: Path, base_url: str) -> dict:
                 f"last={result['last_native_next_frame_stage']}"
             )
             failure = RuntimeError(result["error"])
+        if result["status"] in (STATUS_ALL_DEPTHS, STATUS_ALL_DEPTHS_EAGER):
+            if profile in PROFILE_PASS:
+                result["status"] = PROFILE_PASS[profile]
+            if profile == "RETAIN_GRAPH":
+                result["graph_retention"] = (
+                    "EXPERIMENTAL_KEEPALIVE_UNTIL_WORKER_PROCESS_EXIT"
+                )
         if (result["status"] == STATUS_BAD
                 and diagnostic["arm"] in (
                     "ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER"
@@ -227,6 +255,7 @@ def run(root: Path, base_url: str) -> dict:
             out.write("\n")
         print(f"P19_DIAG_STATUS={result['status']}", flush=True)
         print(f"P19_DIAG_REPORT={diag_path}", flush=True)
+        print(f"P19_DIAG_PROFILE={profile}", flush=True)
         if "trace_coverage" in result:
             coverage = result["trace_coverage"]
             print(
@@ -237,6 +266,15 @@ def run(root: Path, base_url: str) -> dict:
                 f"frame={coverage.get('frame')}",
                 flush=True,
             )
+            if "expected_total_arm_operations" in coverage:
+                print(
+                    "P19_DIAG_WORKLOAD="
+                    f"arm_ops={coverage['expected_total_arm_operations']} "
+                    f"eager={coverage['expected_eager_operations']} "
+                    f"capture={coverage['expected_captures']} "
+                    f"replays={coverage['expected_graph_replays']}",
+                    flush=True,
+                )
         if "trace_coverage_error" in result:
             print(
                 f"P19_DIAG_COVERAGE_ERROR={result['trace_coverage_error']}",
