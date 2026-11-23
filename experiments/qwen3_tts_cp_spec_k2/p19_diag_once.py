@@ -23,6 +23,7 @@ from experiments.qwen3_tts_cp_spec_k2.quality_smoke import (
 
 STATUS_OK = "P19_SINGLE_REQUEST_COMPLETED_DIAGNOSTIC_ONLY_NO_COST_SELECTION"
 STATUS_BAD = "P19_CUDA700_OR_OTHER_DIAGNOSTIC_FAILURE_NO_SELECTION"
+STATUS_NO_ARM = "P19_DIAGNOSTIC_ARM_NOT_EXECUTED_NO_SELECTION"
 SCHEMA = "qwen3tts-p19-cuda700-one-request-v1"
 
 
@@ -139,7 +140,9 @@ def run(root: Path, base_url: str) -> dict:
         if result["status"] == STATUS_OK and (
             result["census_rows"] == 0 or required not in phase_names
         ):
-            result["status"] = STATUS_BAD
+            # HTTP success without a targeted GPU arm is NOT a CUDA700.
+            # Preserve a separate, explicit fail-closed status.
+            result["status"] = STATUS_NO_ARM
             result["error"] = (
                 "P19_DIAGNOSTIC_HTTP_STOP_WITHOUT_ACTUAL_ARM_EVIDENCE: "
                 f"missing={required} rows={result['census_rows']}"
