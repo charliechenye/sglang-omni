@@ -222,6 +222,7 @@ def run(root: Path, base_url: str) -> dict:
                 "P19_DIAG_COVERAGE="
                 f"depths={coverage['depths_verified']} "
                 f"graph_arms={coverage['graph_arms_verified']} "
+                f"eager_arms={coverage.get('eager_arms_verified', 0)} "
                 f"frame={coverage.get('frame')}",
                 flush=True,
             )
