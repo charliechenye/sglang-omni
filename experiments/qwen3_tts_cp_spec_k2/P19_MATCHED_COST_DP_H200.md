@@ -514,3 +514,157 @@ source but cannot alone prove the first kernel fault if timing or
 memory reuse is nondeterministic. Use targeted synchronization or
 sanitizer tools only after the smallest reliable failing prefix
 is identified.
+
+
+## P19 post-50-arm native next-frame failure (one real H200 request)
+
+Source `a3a4a0d5d8a9dd470cb0271038679e4b4241fe38`,
+`ALL_DEPTHS_GRAPH` d1..14, 1 selected frame, 50 legitimate AR/K2/3/4
+Graph arms: all captured replay/eager, full KV restore and
+per-arm synchronizations passed in native frame 37. CPU trace shows
+`P19_DIAGNOSTIC_FINAL_RESTORE_SYNC_PASS` at depth14; the NEXT
+native frame entered P18 d1 but did not produce
+`P18_CENSUS_FRAME_ITEM_PASS`. Only 14 census rows were committed.
+Client saw `Dead stage process(es)` exit=-6. The attached client
+output does not contain the original CUDA worker traceback, so do
+NOT claim the latest failure is conclusively CUDA700 until
+`server.log` confirms it. This is NOT a successful P19A/B run.
+
+**Interpretation:** 50 frame-local Graph arms were correct **at their
+time of synchronous parity checks**, but the native request failed
+afterwards. It could be graph/captured-tensor lifetime, a non-KV
+scratch side effect, or a later native GPU kernel; this evidence
+does not prove which.
+
+### New controlled experiment: same full-depth work, EAGER vs GRAPH
+
+Two mutually exclusive modes, one fresh server and source-locked root
+per mode:
+
+- `ALL_DEPTHS_EAGER`: same ONE native frame, same 14 depth checkpoints
+  and all 50 legal P19 arms, **without** CUDA Graph capture or replay.
+  Each eager arm synchronizes; all checks in P18 remain. This is a
+  control for sheer repeated extra GPU compute / state side effects.
+- `ALL_DEPTHS_GRAPH`: same 50 capture/replay/restore lifecycles as
+  the failing experiment.
+
+The new `sglang_model.py` diagnostic hook records the next real
+native frame's entry, pair embedding, projection, pair predictor
+forward, seed positions, code1 LM head, code1 sampler, projected
+embedding, entry into P18 d1 census, and complete native return.
+It does not read the next frame's GPU position with `.item()`;
+event identity is tied to the preceding selected frame/case on
+the same worker. All traces are fsynced CPU-only append records.
+
+`P19_DIAG_NATIVE_FENCE=0` (default) preserves the original asynchronous
+execution and records CPU stage-return boundaries; a CUDA700 can still
+be reported at a later host synchronization. On a fresh reproduction,
+`P19_DIAG_NATIVE_FENCE=1` performs an explicit full-device synchronize
+AFTER each instrumented native stage, in order to localize the first
+stage with a sticky error. This changes scheduling/performance and
+could MASK a race. **Neither variant produces performance data.**
+
+### 1. Confirm source and first failure
+
+Preserve the original root `qwen3tts-p19-diag-alldepths-d14-001`.
+
+~~~bash
+ROOT="$HOME/results/qwen3tts-p19-diag-alldepths-d14-001"
+cat "$ROOT/source.sha"
+grep -nE 'CUDA_ERROR_ILLEGAL_ADDRESS|illegal memory access|700|Sticky error|P19_' \
+  "$ROOT/server.log" | tail -n 70
+cat "$ROOT/matched_cost/diagnostic/client.json" | \
+  grep -E '"status"|"census_rows"|"graph_arms_verified"'
+~~~
+
+A worker exit code alone is NOT proof of CUDA700. Capture the
+**first native worker traceback**, not allocator shutdown fallout.
+
+### 2. EAGER control, new worker and root
+
+Stop any old server, update the dedicated P19 worktree and run
+`test_cp_spec_p19.py` (all new CPU tests must pass).
+
+Terminal A:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+P19_DIAG_ARM=ALL_DEPTHS_EAGER P19_DIAG_DEPTH=14 \
+P19_DIAG_FENCE=0 P19_DIAG_NATIVE_FENCE=0 \
+P18_CAPTURE_FRAMES=2 P19_COST_FRAMES=1 \
+bash experiments/qwen3_tts_cp_spec_k2/p19_launch.sh \
+  "$HOME/results/qwen3tts-p19-diag-alldepths-eager-d14-001"
+~~~
+
+Terminal B after `/health`:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p19-diag-alldepths-eager-d14-001"
+curl -fsS http://127.0.0.1:8000/health
+python -m experiments.qwen3_tts_cp_spec_k2.p19_diag_once --root "$ROOT"
+~~~
+
+A real successful request requires **50 eager arm phase pairs**,
+one real frame, the NEXT native predictor return, at least
+28 P18 census rows, and a natural HTTP stop. The special status
+is `P19_ALL_DEPTHS_EAGER_SINGLE_FRAME_CONTROL_PASS_NOT_GRAPH_OR_SERVING`.
+
+### 3. Reproduce GRAPH with native-phase breadcrumbs, async unchanged
+
+Only after the EAGER control. Stop its server, use a fresh worker/root:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+P19_DIAG_ARM=ALL_DEPTHS_GRAPH P19_DIAG_DEPTH=14 \
+P19_DIAG_FENCE=0 P19_DIAG_NATIVE_FENCE=0 \
+P18_CAPTURE_FRAMES=2 P19_COST_FRAMES=1 \
+bash experiments/qwen3_tts_cp_spec_k2/p19_launch.sh \
+  "$HOME/results/qwen3tts-p19-diag-alldepths-graph-boundary-001"
+~~~
+
+Client Terminal B:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p19-diag-alldepths-graph-boundary-001"
+python -m experiments.qwen3_tts_cp_spec_k2.p19_diag_once --root "$ROOT"
+~~~
+
+Important result fields are `trace_coverage`,
+`last_native_next_frame_stage`, `native_next_frame_phases`,
+`census_rows`, `status`. A complete Graph phase trace plus a
+failed HTTP request now gives
+`P19_NEXT_FRAME_REQUEST_FAILED_AFTER_FULL_PROBE_CAUSE_UNVERIFIED`,
+not a misleading full PASS. The actual CUDA cause must come from
+`server.log`.
+
+To inspect the first unfinished next-frame stage:
+
+~~~bash
+ROOT="$HOME/results/qwen3tts-p19-diag-alldepths-graph-boundary-001"
+grep -h 'P19_NATIVE_NEXT_' \
+  "$ROOT"/matched_cost/diagnostic/worker_pid*.jsonl | tail -n 80
+grep -nE 'CUDA_ERROR_ILLEGAL_ADDRESS|illegal memory access|700|Sticky' \
+  "$ROOT/server.log" | head -n 45
+~~~
+
+### 4. If GRAPH fails but EAGER passes
+
+Repeat `ALL_DEPTHS_GRAPH` in a **new** root/worker using
+`P19_DIAG_NATIVE_FENCE=1` while leaving `P19_DIAG_FENCE=0`.
+The first `P19_NATIVE_NEXT_*_SYNC_BEGIN` without the paired
+`*_SYNC_PASS` narrows the offending native stage (or the
+preceding asynchronous work). If this run passes, the extra
+synchronization may have masked the race; do not declare safe.
+
+If both EAGER and GRAPH fail, focus on persistent scratch buffers,
+non-KV state ownership, and native reuse after repeated independent
+oracle calls, rather than assuming Graph capture is to blame.
+
+All diagnostic modes remain **NO COST/DP SELECTION**. The 50-arm
+capture is NOT actual speculative serving, and P19A/B/production
+claims remain blocked.
