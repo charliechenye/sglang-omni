@@ -81,6 +81,29 @@ Port 8000 must be unused. The helper refuses to kill an already running
 server; it only tears down the **new session it started**. Do not share the
 GPU with unrelated workloads.
 
+### If a result root is absent but BASE_GRAPH says overwrite
+
+The one-leg launcher redirects output to `ROOT.launcher.log` **before**
+`p19_launch.sh` creates `ROOT/`. An early preflight failure may leave
+the sibling log, while `ls ROOT` correctly reports no directory.
+The log is previous evidence; never silently overwrite it.
+
+The launcher now reports `P19_LIFECYCLE_ORPHAN_LAUNCH_LOG` with the exact
+log path and a short tail. To inspect a prior `-001` attempt:
+
+```bash
+ROOT="$HOME/results/qwen3tts-p19-p20-base-graph-001"
+ls -ld "$ROOT" "${ROOT}.launcher.log" 2>&1
+tail -n 100 "${ROOT}.launcher.log"
+```
+
+Fix the FIRST preflight error if one exists, then use a brand-new absent
+root such as `qwen3tts-p19-p20-base-graph-002` (or higher). Do not
+delete the earlier log, bypass the source/branch/health checks, or reuse
+an old worker. A result root and its sibling `.launcher.log` are both
+reserved by one attempt, regardless of whether that attempt got past
+startup.
+
 ## Recommended experiment order — one process per leg
 
 ```bash
