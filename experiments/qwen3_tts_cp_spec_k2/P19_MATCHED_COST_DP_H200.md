@@ -792,3 +792,140 @@ Predictor entry, including scheduler kernels/streams.
 **Do not change kernel code or run P19B/Main based on this diagnostic.**
 No completed request, matched full native serving speedup, causal
 speculative policy or production race-safety is proven.
+
+
+## P19 main Talker boundary after feedback fence
+
+Confirmed fresh-source H200 evidence under `ALL_DEPTHS_GRAPH`,
+`P19_DIAG_DEPTH=14`, `P19_DIAG_TAIL_FENCE=1`,
+`P19_DIAG_NATIVE_FENCE=0`:
+
+- The selected frame 37 completed ALL 50 Graph arms, captured replay/eager
+  parity and physical KV restoration.
+- Every D14-native-tail and scheduler phase passed `torch.cuda.synchronize`,
+  through `P19_NATIVE_TAIL_WRITE_FEEDBACK_ROW_IDS_READY_SYNC_PASS`.
+- The next genuine native CodePredictor entered and the error was
+  reported by P18 `semantic_position.item()`. This run's server log
+  confirms `CUDA_ERROR_ILLEGAL_ADDRESS (700)`.
+- Therefore the first failing GPU work must be investigated after the
+  LAST successful feedback fence and before the next CodePredictor
+  depth-1 observation. This includes main Talker forward/replay and
+  the semantic token sampler. The P19 Graph pool may have left an
+  invalid address used LATER, and a tail `SYNC_PASS` is NOT an
+  all-possible-future-access memory safety proof.
+
+### New same-request, opt-in main Talker boundary fences
+
+No generic engine runner or production kernel changes are made.
+The Qwen3-TTS runner now emits native-tail events at the actual
+`prepare_and_forward` entry point via `custom_decode_forward`,
+without intercepting the existing `tp_worker.forward_batch_generation`
+(i.e. `return None`). It wraps the pre-existing
+`super().sample_next_token_ids(...)` on that same request and adds
+fences at collection boundaries:
+
+1. `P19_NATIVE_TAIL_MAIN_TALKER_FORWARD_BEGIN` — after
+   `before_decode()` and feedback staging, immediately BEFORE the
+   base runner's standard `tp_worker.forward_batch_generation()`.
+2. `P19_NATIVE_TAIL_MAIN_TALKER_FORWARD_RETURNED_BEFORE_SAMPLE` —
+   after main Talker forward, before semantic sampler.
+3. `P19_NATIVE_TAIL_MAIN_SEMANTIC_SAMPLER_RETURNED` — after sampled
+   layer-0 audio/semantic token.
+4. `P19_NATIVE_TAIL_COLLECT_CODES_BEGIN`,
+   `NEXT_FRAME_TOKEN_IDS_STAGED`,
+   `NEXT_FRAME_SAMPLE_POSITIONS_READY`,
+   `NEXT_FRAME_BEFORE_CODE_PREDICTOR` — before the native subcode
+   Predictor entry.
+
+When `P19_DIAG_TAIL_FENCE=1`, each stage emits
+`*_SYNC_BEGIN` then a device-wide synchronization then
+`*_SYNC_PASS`; when 0, it only records CPU events. Source/case/real
+scheduler request identity remain required; NONE of these probes are
+enabled in regular serving.
+
+### Next experiment: same 50 Graph arms, main Talker fencing
+
+Stop old server. Update the existing P19 branch and run its CPU
+regressions before a fresh worker/root.
+
+Terminal A:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+P19_DIAG_ARM=ALL_DEPTHS_GRAPH \
+P19_DIAG_DEPTH=14 \
+P19_DIAG_FENCE=0 \
+P19_DIAG_NATIVE_FENCE=0 \
+P19_DIAG_TAIL_FENCE=1 \
+P18_CAPTURE_FRAMES=2 \
+P19_COST_FRAMES=1 \
+bash experiments/qwen3_tts_cp_spec_k2/p19_launch.sh \
+  "$HOME/results/qwen3tts-p19-main-talker-fence-001"
+~~~
+
+Terminal B:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p19-main-talker-fence-001"
+curl -fsS http://127.0.0.1:8000/health
+python -m experiments.qwen3_tts_cp_spec_k2.p19_diag_once --root "$ROOT"
+~~~
+
+Extract the first failing synchronous boundary:
+
+~~~bash
+ROOT="$HOME/results/qwen3tts-p19-main-talker-fence-001"
+python - "$ROOT" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+events = []
+for path in (root / "matched_cost/diagnostic").glob("worker_pid*.jsonl"):
+    for line in path.read_text().splitlines():
+        event = json.loads(line)
+        if event["stage"].startswith("P19_NATIVE_TAIL_"):
+            events.append(event)
+events.sort(key=lambda e: e["monotonic_ns"])
+seen = {e["stage"] for e in events}
+for ev in events:
+    if ev["stage"].endswith("_SYNC_BEGIN"):
+        missing = ev["stage"][:-len("_SYNC_BEGIN")] + "_SYNC_PASS"
+        if missing not in seen:
+            print("FIRST_MISSING_TAIL_SYNC_PASS=", missing)
+            break
+print("LAST_TAIL=", events[-1]["stage"] if events else "NONE")
+for ev in events[-45:]:
+    print(ev["stage"])
+PY
+grep -nE 'CUDA_ERROR_ILLEGAL_ADDRESS|illegal memory access|Sticky' \
+  "$ROOT/server.log" | head -n 35
+~~~
+
+Interpretation:
+
+- `MAIN_TALKER_FORWARD_BEGIN_SYNC_PASS` then
+  `MAIN_TALKER_FORWARD_RETURNED_BEFORE_SAMPLE_SYNC_BEGIN` with NO
+  PASS: the main Talker forward is the first failing synchronized
+  interval. Investigate main Talker CUDA Graph replay, its buffers
+  and launch stream, or prior P19 Graph-lifetime corruption exposed by
+  that forward. **Do not claim the main model itself has a bug.**
+- A failure immediately BEFORE main forward (at
+  `MAIN_TALKER_FORWARD_BEGIN`) points to work after feedback staging
+  and before the main forward; inspect `before_decode` and upstream
+  launcher/scheduler.
+- A failure at `MAIN_SEMANTIC_SAMPLER_RETURNED_SYNC_BEGIN` focuses
+  on token sampling.
+- A failure before `NEXT_FRAME_BEFORE_CODE_PREDICTOR_SYNC_PASS` focuses
+  on token staging, position calculation, or model-to-code Predictor
+  handoff.
+- If ALL new fences pass, but next Predictor still crashes, set
+  `P19_DIAG_NATIVE_FENCE=1` in a **fresh worker** to inspect its
+  pair input, LM head, sampler and P18 `.item()` sequence.
+- A passing synchronized run is a diagnosis of execution order,
+  NOT a production fix or Graph race-safety proof.
+
+P19A/P19B remain blocked until this safety problem is explained and
+a fresh complete smoke under exact source SHA passes.
