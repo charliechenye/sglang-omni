@@ -143,6 +143,17 @@ def run(root: Path, base_url: str) -> dict:
         ))
         all_trace = trace_tail(root, count=100000)
         result["trace_tail"] = all_trace[-40:]
+        tail = [
+            ev for ev in all_trace if ev.get(
+                "stage", ""
+            ).startswith("P19_NATIVE_TAIL_")
+        ]
+        result["native_tail_phases"] = [
+            ev.get("stage") for ev in tail
+        ]
+        result["last_native_tail_stage"] = (
+            tail[-1]["stage"] if tail else None
+        )
         native_next = [
             ev for ev in all_trace if ev.get(
                 "stage", ""
@@ -231,6 +242,14 @@ def run(root: Path, base_url: str) -> dict:
                 f"P19_DIAG_COVERAGE_ERROR={result['trace_coverage_error']}",
                 flush=True,
             )
+        if result.get("native_tail_phases"):
+            print(
+                "P19_TAIL_LAST_STAGE="
+                f"{result['last_native_tail_stage']}",
+                flush=True,
+            )
+            for stage in result["native_tail_phases"][-25:]:
+                print(f"P19_TAIL_PHASE={stage}", flush=True)
         if result.get("native_next_frame_phases"):
             print(
                 "P19_NATIVE_LAST_STAGE="
