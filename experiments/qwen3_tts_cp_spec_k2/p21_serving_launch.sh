@@ -32,6 +32,8 @@ with socket.socket() as sock:
         raise SystemExit("P21_ABBA_PORT_8000_ALREADY_OCCUPIED")
 PY
 export PYTHONPATH="$WORKTREE${PYTHONPATH:+:$PYTHONPATH}"
+# Pin the same physical H200 for BOTH preflight and the serving process.
+export CUDA_VISIBLE_DEVICES=0
 python - <<'PY'
 from pathlib import Path
 import importlib
