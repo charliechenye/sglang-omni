@@ -292,6 +292,7 @@ def maybe_measure(
     if not armed():
         return
     diagnostic = diagnostic_config()
+    profile = current_profile(diagnostic)
     cumulative = (diagnostic is not None and diagnostic[0] in
                   ("ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER"))
     # Targeted diagnostics run ONE depth; cumulative diagnostics run
@@ -443,6 +444,17 @@ def maybe_measure(
 
     records = {}
     failed = False
+    retained = None
+    if profile == "RETAIN_GRAPH":
+        held_hash = getattr(model, "_p19_diag_retained_req_hash", None)
+        if held_hash is None:
+            model._p19_diag_retained_req_hash = req_hash
+            model._p19_diag_retained_graphs = []
+        elif held_hash != req_hash:
+            raise RuntimeError("P19_RETAINED_GRAPHS_CROSS_REQUEST")
+        retained = model._p19_diag_retained_graphs
+        if len(retained) >= MAX_RETAINED_GRAPHS:
+            raise RuntimeError("P19_RETAINED_GRAPHS_EXCEED_MAXIMUM")
     try:
         candidate_arms = ("AR", *(str(w) for w in feasible_widths(depth)))
         if diagnostic is not None and diagnostic[0] not in (
@@ -487,11 +499,17 @@ def maybe_measure(
             if diagnostic is not None and diagnostic[0].endswith("_EAGER"):
                 # Diagnostic ONLY: never create full P19 matched cost rows.
                 phase("P19_EAGER_ONLY_OPERATION_BEGIN")
-                restore()
-                result = operation()
-                torch.cuda.synchronize(device)
-                if not isinstance(result, dict) or not result:
-                    raise RuntimeError("P19_EAGER_ONLY_EMPTY_ARM_RESULT")
+                if profile == "MATCHED_EAGER":
+                    _matched_eager_arm(
+                        operation=operation, restore=restore,
+                        device=device, mark=phase,
+                    )
+                else:
+                    restore()
+                    result = operation()
+                    torch.cuda.synchronize(device)
+                    if not isinstance(result, dict) or not result:
+                        raise RuntimeError("P19_EAGER_ONLY_EMPTY_ARM_RESULT")
                 phase("P19_EAGER_ONLY_DEVICE_SYNC_PASS")
                 restore()
             else:
@@ -499,6 +517,7 @@ def maybe_measure(
                     operation=operation, restore=restore, model=model,
                     arm=arm, device=device, old_k=old_k, old_v=old_v,
                     prefix_len=cache_len, trace=phase,
+                    profile=profile, keepalive=retained,
                 )
             if not all(torch.equal(x, y) for x, y in zip(
                 (old_hidden, last_embedding, accumulated, uniform_input),
@@ -509,6 +528,17 @@ def maybe_measure(
                 )
         restore()
         if diagnostic is not None:
+            if (profile == "RETAIN_GRAPH"
+                    and depth == diagnostic[1]):
+                if retained is None or len(retained) != MAX_RETAINED_GRAPHS:
+                    raise RuntimeError(
+                        "P19_RETAIN_GRAPH_EXPECTED_50_LIVE_GRAPHS"
+                    )
+                diag_event(
+                    "P19_RETAINED_50_GRAPHS_LIVE_UNTIL_WORKER_EXIT",
+                    depth=depth, arm=diagnostic[0], frame=frame,
+                    case_id=case["case_id"],
+                )
             diag_event(
                 "P19_DIAGNOSTIC_ARM_RETURNED_NO_COST_SELECTION",
                 depth=depth, arm=diagnostic[0], frame=frame,
