@@ -68,3 +68,44 @@ def event(stage: str, *, depth: int | None = None, arm: str | None = None,
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def maybe_tail_runner_event(
+    model, stage: str, *, device,
+    request_id: str | None = None,
+) -> bool:
+    """Instrument scheduler-side work AFTER measured code15 and BEFORE next frame.
+
+    No GPU tensor reads. Full-device fence is diagnostic opt-in only.
+    Source/worker identity must be pinned to the selected native request.
+    """
+    if os.environ.get(ARM_ENV) not in (
+        "ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER",
+    ):
+        return False
+    pending = getattr(model, "_p19_native_boundary_next_req", None)
+    if pending is None:
+        return False
+    if request_id is not None and pending != request_id:
+        raise RuntimeError("P19_TAIL_RUNNER_REQUEST_ID_DRIFT")
+    frame = getattr(model, "_p19_native_boundary_from_frame", None)
+    case_id = getattr(model, "_p19_native_boundary_case_id", None)
+    if type(frame) is not int or not isinstance(case_id, str) or not case_id:
+        raise RuntimeError("P19_TAIL_RUNNER_SOURCE_ID_MISSING")
+    kwargs = {
+        "depth": 15, "frame": frame, "arm": "NATIVE_TAIL",
+        "case_id": case_id,
+    }
+    stage = "P19_NATIVE_TAIL_" + stage
+    event(stage, **kwargs)
+    tail_fence = os.environ.get("SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE", "0")
+    if tail_fence not in ("0", "1"):
+        raise RuntimeError("P19_TAIL_FENCE_MUST_BE_0_OR_1")
+    if tail_fence == "1":
+        # Import only in an explicitly armed research diagnostic; no
+        # overhead and no synchronizations in production.
+        import torch
+        event(stage + "_SYNC_BEGIN", **kwargs)
+        torch.cuda.synchronize(device)
+        event(stage + "_SYNC_PASS", **kwargs)
+    return True
