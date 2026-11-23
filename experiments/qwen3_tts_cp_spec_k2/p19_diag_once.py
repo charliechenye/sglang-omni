@@ -159,9 +159,11 @@ def run(root: Path, base_url: str) -> dict:
             result["status"] = STATUS_NO_ARM
             result["error"] = "P19_DIAGNOSTIC_NO_NATIVE_CENSUS_ROWS"
             failure = RuntimeError(result["error"])
-        if (result["status"] == STATUS_OK
-                and diagnostic["arm"] == "ALL_DEPTHS_GRAPH"):
-            result["status"] = STATUS_ALL_DEPTHS
+        if result["status"] == STATUS_OK:
+            if diagnostic["arm"] == "ALL_DEPTHS_GRAPH":
+                result["status"] = STATUS_ALL_DEPTHS
+            elif diagnostic["arm"] == "ALL_DEPTHS_EAGER":
+                result["status"] = STATUS_ALL_DEPTHS_EAGER
         if result["P19_full_cost_rows_should_be_zero"] != 0:
             result["status"] = STATUS_BAD
             result["error"] = "P19_DIAGNOSTIC_ILLEGAL_FORMAL_COST_RECORD"
