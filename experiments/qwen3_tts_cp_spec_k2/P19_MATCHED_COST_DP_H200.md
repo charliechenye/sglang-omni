@@ -388,3 +388,38 @@ and cost provenance. No DIL/HTTP trace alone proves the fault's first
 GPU instruction. Add CUDA_LAUNCH_BLOCKING or Compute Sanitizer as a
 subsequent *targeted* step only when the failing arm is identified
 and the environment supports it.
+
+
+## P19 Depth9 ALL_GRAPH false-negative: diagnostic frame not selected
+
+The first `P19_DIAG_ARM=ALL_GRAPH P19_DIAG_DEPTH=9` diagnostic
+completed its HTTP request and wrote 28 P18 census depth rows, but
+reported `P19_DIAGNOSTIC_HTTP_STOP_WITHOUT_ACTUAL_ARM_EVIDENCE`.
+There was **no evidence of CUDA700**. No P19_ARM_SELECTED or
+P19_ARM_GRAPH_CAPTURE_BEGIN event at the requested depth existed.
+
+**Confirmed source bug:** `maybe_measure()` returned early at all
+depths other than the requested diagnostic depth (9), but its
+frame-selection code still required `depth == 1` for the first
+selection. This made D9 diagnostics **unreachable** on all frames.
+D1 arm passes were real; the D9 result was a no-arm false-negative.
+
+Now `select_cost_frame()` chooses the first frame at the configured
+`diagnostic_depth` for isolated diagnostics. In ordinary formal P19A
+mode, selection remains fixed at depth1 and subsequent selected-frame
+depths 1..14 are unchanged. A CPU regression exercises D9, D14 AR-only,
+formal D1 and max-frame gating.
+
+If the request completes without actual arm evidence, the client now
+reports `P19_DIAGNOSTIC_ARM_NOT_EXECUTED_NO_SELECTION` rather than
+labeling it a possible CUDA700. Such results remain invalid.
+
+**Re-run only after updating source and stopping the old server**:
+new HEAD must match new worker source SHA. Use a brand-new directory,
+e.g. `$HOME/results/qwen3tts-p19-diag-allgraph-d09-002`,
+with `P19_DIAG_ARM=ALL_GRAPH P19_DIAG_DEPTH=9`. Do NOT reuse
+`...-d09-001` or pretend its 28 census rows prove P19A Graph safety.
+The new trace must contain `P19_COST_TARGET_FRAME_SELECTED` and,
+for each of AR/K2/K3/K4, `P19_ARM_REPLAY_EAGER_PARITY_PASS` and
+`P19_ARM_GRAPH_RELEASE_AND_SYNC_PASS`, then
+`P19_DIAGNOSTIC_FINAL_RESTORE_SYNC_PASS`. Stop on first failure.
