@@ -12,6 +12,7 @@ Predictor Graph-ON, not causal speculative serving and NOT E2E speedup.
 """
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
@@ -21,6 +22,11 @@ from pathlib import Path
 from typing import Callable
 
 from .code_predictor_spec_p19_diag import diagnostic_config, event as diag_event
+from .code_predictor_spec_p19_profile import (
+    CAPTURES, DEFAULT_OPS, EAGER_REFERENCE, EAGER_WARMUPS,
+    FIRST_GRAPH_REPLAYS, MAX_RETAINED_GRAPHS, MIN_REPLAY_OPS,
+    current_profile,
+)
 
 import torch
 
@@ -64,6 +70,7 @@ def _one_arm(
     restore: Callable[[], None], model, arm: str,
     device: torch.device, old_k: torch.Tensor, old_v: torch.Tensor,
     prefix_len: int, trace: Callable[[str], None] | None = None,
+    profile: str = "DEFAULT", keepalive: list | None = None,
 ) -> dict:
     """Compile -> capture -> exact eager-vs-replay -> timed replay blocks."""
     def mark(stage: str) -> None:
@@ -89,10 +96,21 @@ def _one_arm(
     graph = torch.cuda.CUDAGraph()
     restore()
     mark("P19_ARM_GRAPH_CAPTURE_BEGIN")
-    with torch.cuda.graph(
-        graph, stream=capture_stream, capture_error_mode="thread_local"
-    ), torch.inference_mode():
-        outputs = operation()
+    gc_guard = profile == "GC_GUARD"
+    old_gc = gc.isenabled()
+    if gc_guard:
+        mark("P19_ARM_GC_CAPTURE_GUARD_ENTER")
+        gc.disable()
+    try:
+        with torch.cuda.graph(
+            graph, stream=capture_stream, capture_error_mode="thread_local"
+        ), torch.inference_mode():
+            outputs = operation()
+    finally:
+        if gc_guard:
+            if old_gc:
+                gc.enable()
+            mark("P19_ARM_GC_CAPTURE_GUARD_EXIT")
     mark("P19_ARM_GRAPH_CAPTURE_RETURNED")
     torch.cuda.synchronize(device)
     mark("P19_ARM_GRAPH_CAPTURE_SYNC_PASS")
@@ -127,37 +145,109 @@ def _one_arm(
 
     mark("P19_ARM_REPLAY_EAGER_PARITY_PASS")
     records = []
-    for block in range(BLOCKS):
-        mark(f"P19_ARM_TIMING_BLOCK_{block}_BEGIN")
-        restore()
-        for _ in range(WARM_REPLAYS):
-            graph.replay()
+    if profile == "MIN_REPLAY":
+        # One replay with exact parity, but NO timed/warmup replays.
+        # Still capture and retire 50 graphs at the 14 native depths.
+        mark("P19_ARM_MIN_REPLAY_NO_TIMING_PASS")
+    else:
+        for block in range(BLOCKS):
+            mark(f"P19_ARM_TIMING_BLOCK_{block}_BEGIN")
+            restore()
+            for _ in range(WARM_REPLAYS):
+                graph.replay()
+            torch.cuda.synchronize(device)
+            start = torch.cuda.Event(enable_timing=True)
+            stop = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(REPEATS):
+                graph.replay()
+            stop.record()
+            stop.synchronize()
+            mark(f"P19_ARM_TIMING_BLOCK_{block}_SYNC_PASS")
+            duration = start.elapsed_time(stop) / REPEATS
+            if not math.isfinite(duration) or duration <= 0:
+                raise RuntimeError(f"P19_{arm}_INVALID_GRAPH_EVENT")
+            records.append({
+                "block": block, "replays": REPEATS, "cuda_event_ms": duration,
+            })
+    if profile == "RETAIN_GRAPH":
+        if keepalive is None or len(keepalive) >= MAX_RETAINED_GRAPHS:
+            raise RuntimeError("P19_RETAIN_GRAPH_OWNERSHIP_CAP_INVALID")
+        # Keep graph AND capture-backed output tensors/stream alive until
+        # this disposable one-request H200 WORKER exits. No later replay.
+        # Intentionally diagnostic-only; never retain graphs in serving.
+        keepalive.append((graph, outputs, capture_stream))
         torch.cuda.synchronize(device)
-        start = torch.cuda.Event(enable_timing=True)
-        stop = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(REPEATS):
-            graph.replay()
-        stop.record()
-        stop.synchronize()
-        mark(f"P19_ARM_TIMING_BLOCK_{block}_SYNC_PASS")
-        duration = start.elapsed_time(stop) / REPEATS
-        if not math.isfinite(duration) or duration <= 0:
-            raise RuntimeError(f"P19_{arm}_INVALID_GRAPH_EVENT")
-        records.append({
-            "block": block, "replays": REPEATS, "cuda_event_ms": duration,
-        })
-    del graph
-    torch.cuda.synchronize(device)
-    mark("P19_ARM_GRAPH_RELEASE_AND_SYNC_PASS")
+        mark("P19_ARM_GRAPH_RETAINED_AND_SYNC_PASS")
+    else:
+        del graph
+        torch.cuda.synchronize(device)
+        mark("P19_ARM_GRAPH_RELEASE_AND_SYNC_PASS")
     return {
         "parity": "CAPTURED_REPLAY_VS_EAGER_OUTPUT_AND_FULL_KV_PASS",
         "cuda_graph_event_ms_blocks": records,
-        "median_cuda_event_ms": statistics.median(
-            r["cuda_event_ms"] for r in records
+        "median_cuda_event_ms": (
+            statistics.median(r["cuda_event_ms"] for r in records)
+            if records else None
         ),
-        "replays_per_block": REPEATS,
+        "replays_per_block": REPEATS if records else 0,
     }
+
+
+def _matched_eager_arm(
+    *, operation: Callable[[], dict[str, torch.Tensor]],
+    restore: Callable[[], None], device: torch.device,
+    mark: Callable[[str], None],
+) -> None:
+    """65 real eager invocations matching original 3+1+61 graph-arm calls.
+
+    Preserve the original restore cadence: reference; two warmups;
+    capture-surrogate; first-replay surrogate; four blocks each with
+    a single restore, three warm calls and twelve more calls.
+    This is WORKLOAD count matching, NOT an equivalent GPU allocator,
+    kernel launch overhead, CUDA graph memory pool or performance result.
+    """
+    count = 0
+    restore()
+    reference = operation()
+    if not isinstance(reference, dict) or not reference:
+        raise RuntimeError("P19_MATCHED_EAGER_REFERENCE_EMPTY")
+    count += EAGER_REFERENCE
+    torch.cuda.synchronize(device)
+    mark("P19_ARM_MATCHED_EAGER_REFERENCE_SYNC_PASS")
+    restore()
+    for _ in range(EAGER_WARMUPS):
+        operation()
+        count += 1
+        restore()
+    torch.cuda.synchronize(device)
+    mark("P19_ARM_MATCHED_EAGER_WARMUPS_SYNC_PASS")
+    restore()
+    operation()
+    count += CAPTURES
+    torch.cuda.synchronize(device)
+    mark("P19_ARM_MATCHED_EAGER_CAPTURE_SURROGATE_SYNC_PASS")
+    restore()
+    operation()
+    count += FIRST_GRAPH_REPLAYS
+    torch.cuda.synchronize(device)
+    mark("P19_ARM_MATCHED_EAGER_FIRST_SURROGATE_SYNC_PASS")
+    for block in range(BLOCKS):
+        restore()
+        for _ in range(WARM_REPLAYS):
+            operation()
+            count += 1
+        torch.cuda.synchronize(device)
+        for _ in range(REPEATS):
+            operation()
+            count += 1
+        torch.cuda.synchronize(device)
+        mark(f"P19_ARM_MATCHED_EAGER_BLOCK_{block}_SYNC_PASS")
+    if count != DEFAULT_OPS:
+        raise RuntimeError(
+            f"P19_MATCHED_EAGER_WRONG_OPERATION_COUNT {count}"
+        )
+    mark("P19_ARM_MATCHED_EAGER_TOTAL_65_SYNC_PASS")
 
 
 def select_cost_frame(
