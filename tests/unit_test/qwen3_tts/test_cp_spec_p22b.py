@@ -202,3 +202,75 @@ def test_p22b_bash_launcher_parses_and_keeps_native_arm_absent():
     assert 'SGLANG_OMNI_QTTS_CP_SPEC_K=0' in src
     assert 'SGLANG_OMNI_QTTS_CP_P22_PROFILE=0' in src
     assert "P21_ARM_STAYS_ABSENT" in src
+
+
+def test_p22b_nvidia_gap_report_uses_verified_evidence_and_no_perf_claim():
+    from experiments.qwen3_tts_cp_spec_k2.p22b_nvidia_gap_report import (
+        report as build_gap, STATUS as GAP_STATUS,
+    )
+    from experiments.qwen3_tts_cp_spec_k2.p22b_cuda_api_nvtx import (
+        STATUS as API_STATUS,
+    )
+    sha_b, sha_a = "a" * 40, "b" * 40
+    k2_api = {
+        "status": API_STATUS, "source_sha": sha_b,
+        "real_frames": 143, "real_k2_rounds": 1270,
+        "stages": {
+            "P22_Q_PROPOSALS": {
+                "kernel_launch": {"calls": 6350, "summed_cpu_api_ms": 25.0},
+                "memcpy": {"calls": 2, "summed_cpu_api_ms": 0.01},
+            },
+            "P22_WIDE_VERIFIER": {
+                "kernel_launch": {"calls": 35560, "summed_cpu_api_ms": 150.0},
+            },
+        },
+    }
+    native_api = {
+        "status": (
+            "P22B_NATIVE_GRAPH_LAUNCH_API_CAPTURED_GPU_WORK_"
+            "NOT_CODEPREDICTOR_ISOLATED"
+        ),
+        "source_sha": sha_a,
+        "native_graph_frames": 159,
+        "native_graph_launch_api_calls": 159,
+        "native_graph_launch_api_cpu_per_frame_ms": 0.085,
+        "native_graph_cpu_predictor_per_frame_ms": 0.13,
+    }
+    p22 = {
+        "status": "P22_ATTRIBUTION_COMPLETE_NOT_PERFORMANCE_BENCHMARK",
+        "source_sha": sha_b,
+        "candidate_frames": 143, "k2_rounds": 1270,
+    }
+    gpu = {
+        "status": (
+            "P22_NSYS_SOURCE_SCOPED_KERNEL_WORK_ATTRIBUTION_NOT_GPU_ELAPSED"
+        ),
+        "source_sha": sha_b,
+        "profiled_candidate_frames": 143,
+        "profiled_k2_rounds": 1270,
+        "stage_sums": {
+            name: {"summed_gpu_work_ms_per_frame": 0.1}
+            for name in (
+                "P22_Q_PROPOSALS", "P22_WIDE_VERIFIER",
+                "P22_TARGET_SUPPORT_ACCEPT_BONUS",
+            )
+        },
+    }
+    result = build_gap(k2_api, native_api, p22, None, gpu)
+    assert result["status"] == GAP_STATUS
+    assert result["evidence"]["native_vs_k2_is_not_same_sha"]
+    assert (
+        result["evidence"]["k2_gpu_kernel_work"][
+            "assigned_kernel_work_ms_per_k2_frame"
+        ]
+        == pytest.approx(0.3)
+    )
+    assert result["nvidia_source"]["benchmarked_on_our_H200"] is False
+    assert any(
+        "C++ host loop" in item["nvidia"]
+        for item in result["source_verified_differences"]
+    )
+    invalid = dict(gpu)
+    invalid["source_sha"] = "c" * 40
+    with pytest.raises(RuntimeError, match="SOURCE_OR_SCOPE_MISMATCH"):
+        build_gap(k2_api, native_api, p22, None, invalid)
