@@ -15,6 +15,7 @@ from pathlib import Path
 
 PROFILE_ENV = "SGLANG_OMNI_QTTS_CP_P22_PROFILE"
 CAPTURE_ARM_ENV = "SGLANG_OMNI_QTTS_CP_P22_CAPTURE_ARM"
+DIR_ENV = "SGLANG_OMNI_QTTS_CP_P22_PROFILE_DIR"
 SCHEMA = "qwen3tts-p22-real-serving-k2-nvtx-attribution-v1"
 STAGES = frozenset((
     "INIT_CPU_PARAMS",
@@ -57,6 +58,9 @@ def validate_environment() -> None:
     path = os.environ.get(CAPTURE_ARM_ENV, "")
     if not path or not os.path.isabs(path):
         raise RuntimeError("P22_REQUIRES_ABSOLUTE_CAPTURE_ARM_PATH")
+    output_dir = os.environ.get(DIR_ENV, "")
+    if not output_dir or not os.path.isabs(output_dir):
+        raise RuntimeError("P22_REQUIRES_ABSOLUTE_PROFILE_DIR")
 
 
 @contextmanager
@@ -131,13 +135,21 @@ def finish_request(model, *, request_hash: str, candidate_frames: int) -> dict |
         )
     info = {
         "schema": SCHEMA,
+        "monotonic_ns": time.monotonic_ns(),
         "request_hash": request_hash,
         "candidate_frames": candidate_frames,
         "cuda_profiler_capture": capturing,
         "timer_semantics": "CPU_WALL_NVTX_REGION_NOT_GPU_KERNEL_TIME",
         "stage_totals": totals,
     }
-    # Synchronous one-line durable stdout for worker-side activity evidence.
-    print("P22_REAL_REQUEST_PROFILE "
-          + json.dumps(info, sort_keys=True), flush=True)
+    # Worker writes durable, non-overwriteable evidence, rather than
+    # relying on a potentially wrapped/truncated >1000-character log line.
+    directory = Path(os.environ[DIR_ENV])
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    evidence = directory / f"request_{request_hash}.json"
+    with evidence.open("x", encoding="utf-8") as out:
+        json.dump(info, out, sort_keys=True, indent=2)
+        out.write("\n")
+    print("P22_REAL_REQUEST_PROFILE_FILE="
+          + str(evidence) + " captured=" + str(capturing), flush=True)
     return info
