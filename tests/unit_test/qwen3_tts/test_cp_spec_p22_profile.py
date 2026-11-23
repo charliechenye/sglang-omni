@@ -222,7 +222,10 @@ def test_p22_launch_script_parses_before_any_gpu_activity():
     )
     assert p.returncode == 0, p.stderr
     source = script.read_text()
-    assert 'BRANCH="$(git branch --show-current)"' in source
+    assert 'BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"' in source
+    assert "P22_PROFILE_BRANCH_MISMATCH" in source
+    assert "P22_PROFILE_NOT_AT_REPOSITORY_ROOT" in source
+    assert 'WORKTREE_PHYSICAL="$(cd "$WORKTREE" && pwd -P)"' in source
     assert "experiment/qwen3-tts-p22-serving-profile" in source
     assert "--capture-range=cudaProfilerApi" in source
     assert "--capture-range-end=stop" in source
@@ -237,6 +240,38 @@ def test_p22_launch_script_parses_before_any_gpu_activity():
     assert source.index("NSYS_PROFILE_HELP=") < source.index('mkdir -m 700 -p "$ROOT"')
     assert "SGLANG_OMNI_QTTS_CP_P22_PROFILE_DIR" in source
     assert 'SGLANG_OMNI_QTTS_CP_SPEC_K=0' in source
+
+
+def test_p22_launcher_wrong_branch_reports_actual_before_GPU(tmp_path):
+    """Mismatched local branch must fail with evidence, before GPU setup."""
+    repo_root = Path(__file__).resolve().parents[3]
+    script = (
+        repo_root / "experiments/qwen3_tts_cp_spec_k2/"
+        "p22_serving_profile_launch.sh"
+    )
+    fake_repo = tmp_path / "repo"
+    fake_repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", str(fake_repo)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(fake_repo), "symbolic-ref",
+         "HEAD", "refs/heads/other-local-branch"],
+        check=True,
+    )
+    root = tmp_path / "new-absent-output"
+    result = subprocess.run(
+        ["bash", str(script), str(root)],
+        cwd=fake_repo, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 2
+    assert "P22_PROFILE_BRANCH_MISMATCH" in result.stderr
+    assert "P22_PROFILE_ACTUAL_BRANCH=other-local-branch" in result.stderr
+    assert (
+        "P22_PROFILE_EXPECTED_BRANCH=experiment/"
+        "qwen3-tts-p22-serving-profile"
+    ) in result.stderr
+    assert not root.exists()
 
 
 def test_p22_real_serving_nvtx_marks_host_wait_and_gpu_launches():
