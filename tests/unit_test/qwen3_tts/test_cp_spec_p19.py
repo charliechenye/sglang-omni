@@ -722,7 +722,63 @@ def test_p19_tail_native_code15_and_feedback_hooks_present():
         ("collect_codes", "COLLECT_CODES_PREDICTOR_RETURNED"),
         ("post_process_outputs", "POST_PROCESS_CODES_EVENT_RECORDED"),
         ("write_feedback_buffers", "WRITE_FEEDBACK_ROW_IDS_READY"),
+        ("custom_decode_forward", "MAIN_TALKER_FORWARD_BEGIN"),
+        ("sample_next_token_ids", "MAIN_TALKER_FORWARD_RETURNED_BEFORE_SAMPLE"),
+        ("sample_next_token_ids", "MAIN_SEMANTIC_SAMPLER_RETURNED"),
+        ("collect_codes", "NEXT_FRAME_BEFORE_CODE_PREDICTOR"),
     ):
         assert stage in inspect.getsource(
             getattr(Qwen3TTSModelRunner, method)
         )
+
+
+def test_p19_main_talker_instrumentation_preserves_default_forward_dispatch():
+    """Qwen runner must still use the ORIGINAL tp_worker forward path.
+
+    Only source-locked diagnostic hooks are allowed, not a new model backend.
+    """
+    import inspect
+    from types import SimpleNamespace
+    from sglang_omni.models.qwen3_tts.model_runner import (
+        Qwen3TTSModelRunner,
+    )
+    observed = []
+
+    class FakeSelf:
+        def _p19_native_tail_mark(self, stage, *, device, requests):
+            observed.append((stage, device, requests))
+
+    forward_batch = SimpleNamespace(
+        input_ids=SimpleNamespace(device="cpu")
+    )
+    requests = []
+    ret = Qwen3TTSModelRunner.custom_decode_forward(
+        FakeSelf(), forward_batch, None, requests
+    )
+    assert ret is None
+    assert observed == [("MAIN_TALKER_FORWARD_BEGIN", "cpu", requests)]
+
+    source = inspect.getsource(
+        Qwen3TTSModelRunner.sample_next_token_ids
+    )
+    assert "super().sample_next_token_ids(" in source
+    assert '"MAIN_TALKER_FORWARD_RETURNED_BEFORE_SAMPLE"' in source
+    assert '"MAIN_SEMANTIC_SAMPLER_RETURNED"' in source
+    assert "return sampled" in source
+
+
+def test_p19_collector_boundaries_guard_next_frame_before_predictor():
+    import inspect
+    from sglang_omni.models.qwen3_tts.model_runner import (
+        Qwen3TTSModelRunner,
+    )
+    source = inspect.getsource(Qwen3TTSModelRunner.collect_codes)
+    assert source.index('"NEXT_FRAME_TOKEN_IDS_STAGED"') < source.index(
+        '"NEXT_FRAME_SAMPLE_POSITIONS_READY"'
+    )
+    assert source.index('"NEXT_FRAME_SAMPLE_POSITIONS_READY"') < (
+        source.index('"NEXT_FRAME_BEFORE_CODE_PREDICTOR"')
+    )
+    assert source.index('"NEXT_FRAME_BEFORE_CODE_PREDICTOR"') < (
+        source.index("self.model.code_predictor_forward(")
+    )
