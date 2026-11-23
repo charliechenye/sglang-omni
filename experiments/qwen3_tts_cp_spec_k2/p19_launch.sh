@@ -60,11 +60,17 @@ if [[ -n "${P19_DIAG_ARM:-}" ]]; then
     echo "P19_DIAG_NATIVE_FENCE must be 0 or 1" >&2; exit 2
   fi
   export SGLANG_OMNI_QTTS_CP_P19_NATIVE_FENCE="$NATIVE_FENCE"
+  TAIL_FENCE="${P19_DIAG_TAIL_FENCE:-0}"
+  if [[ "$TAIL_FENCE" != 0 && "$TAIL_FENCE" != 1 ]]; then
+    echo "P19_DIAG_TAIL_FENCE must be 0 or 1" >&2; exit 2
+  fi
+  export SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE="$TAIL_FENCE"
 else
   unset SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM
   unset SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH
   unset SGLANG_OMNI_QTTS_CP_P19_DIAG_FENCE
   unset SGLANG_OMNI_QTTS_CP_P19_NATIVE_FENCE
+  unset SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE
 fi
 
 # Force spawn children to import this dedicated worktree. No global pip edits.
@@ -166,7 +172,7 @@ echo "P18_NATIVE_EAGER_CENSUS_ROOT=$ROOT"
 echo "P18_CAPTURE_FRAMES=$FRAMES"
 echo "P19_MATCHED_COST_FRAMES=$COST_FRAMES"
 if [[ -n "${P19_DIAG_ARM:-}" ]]; then
-  echo "P19_DIAGNOSTIC_ONLY arm=$P19_DIAG_ARM depth=$DEPTH fence=$FENCE native_fence=$NATIVE_FENCE"
+  echo "P19_DIAGNOSTIC_ONLY arm=$P19_DIAG_ARM depth=$DEPTH fence=$FENCE native_fence=$NATIVE_FENCE tail_fence=$TAIL_FENCE"
 fi
 python - "$ROOT" "$SHA" "$FRAMES" "$COST_FRAMES" <<'PY'
 import json
@@ -183,6 +189,9 @@ if os.environ.get("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM"):
         "fence": int(os.environ["SGLANG_OMNI_QTTS_CP_P19_DIAG_FENCE"]),
         "native_fence": int(
             os.environ["SGLANG_OMNI_QTTS_CP_P19_NATIVE_FENCE"]
+        ),
+        "tail_fence": int(
+            os.environ["SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE"]
         ),
         "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
     }
