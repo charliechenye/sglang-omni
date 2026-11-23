@@ -33,7 +33,7 @@ fi
 # One worker per diagnostic arm, no multi-arm evidence or DP claim.
 if [[ -n "${P19_DIAG_ARM:-}" ]]; then
   case "$P19_DIAG_ARM" in
-    OFF|AR_EAGER|AR_GRAPH|K2_EAGER|K2_GRAPH|K3_EAGER|K3_GRAPH|K4_EAGER|K4_GRAPH|ALL_GRAPH|ALL_DEPTHS_GRAPH) ;;
+    OFF|AR_EAGER|AR_GRAPH|K2_EAGER|K2_GRAPH|K3_EAGER|K3_GRAPH|K4_EAGER|K4_GRAPH|ALL_GRAPH|ALL_DEPTHS_GRAPH|ALL_DEPTHS_EAGER) ;;
     *) echo "P19_DIAG_ARM invalid: $P19_DIAG_ARM" >&2; exit 2 ;;
   esac
   DEPTH="${P19_DIAG_DEPTH:-1}"
