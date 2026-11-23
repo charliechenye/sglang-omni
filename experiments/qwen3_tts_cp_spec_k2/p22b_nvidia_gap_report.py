@@ -37,7 +37,7 @@ def _load(path: Path) -> dict:
     return d
 
 
-def report(k2_api: dict, native_api: dict, p22: dict, p21: dict | None) -> dict:
+def report(k2_api: dict, native_api: dict, p22: dict, p21: dict | None, k2_gpu: dict | None = None) -> dict:
     if (k2_api.get("status") != OUR_API_STATUS
             or native_api.get("status") != NATIVE_API_STATUS
             or p22.get("status") !=
@@ -82,6 +82,30 @@ def report(k2_api: dict, native_api: dict, p22: dict, p21: dict | None) -> dict:
         "host_predictor_cpu_ms_per_frame":
             native_api["native_graph_cpu_predictor_per_frame_ms"],
     }
+    k2_gpu_summary = None
+    if k2_gpu is not None:
+        if (k2_gpu.get("source_sha") != k2_api.get("source_sha")
+                or k2_gpu.get("profiled_candidate_frames") != frames
+                or k2_gpu.get("profiled_k2_rounds") != rounds
+                or k2_gpu.get("status") !=
+                   "P22_NSYS_SOURCE_SCOPED_KERNEL_WORK_ATTRIBUTION_NOT_GPU_ELAPSED"):
+            raise RuntimeError("P22B_K2_GPU_KERNEL_SOURCE_OR_SCOPE_MISMATCH")
+        stages = k2_gpu.get("stage_sums", {})
+        if not all(name in stages for name in (
+            "P22_Q_PROPOSALS", "P22_WIDE_VERIFIER",
+            "P22_TARGET_SUPPORT_ACCEPT_BONUS"
+        )):
+            raise RuntimeError("P22B_K2_GPU_REQUIRED_STAGES_MISSING")
+        k2_gpu_summary = {
+            "assigned_kernel_work_ms_per_k2_frame": sum(
+                x["summed_gpu_work_ms_per_frame"] for x in stages.values()
+            ),
+            "stage_kernel_work_ms_per_frame": {
+                name: row["summed_gpu_work_ms_per_frame"]
+                for name, row in stages.items()
+            },
+            "scope": "SUMMED_ASSIGNED_GPU_KERNEL_DURATIONS_NOT_GPU_ELAPSED",
+        }
     p21_summary = None
     if p21 is not None:
         if (p21.get("status") !=
@@ -110,10 +134,7 @@ def report(k2_api: dict, native_api: dict, p22: dict, p21: dict | None) -> dict:
             "real_k2_frames": frames,
             "real_k2_rounds": rounds,
             "rounds_per_frame": rounds / frames,
-            "k2_gpu_kernel_work_per_frame_ms": sum(
-                x["summed_gpu_work_ms_per_frame"]
-                for x in p22.get("stage_sums", {}).values()
-            ) if "stage_sums" in p22 else None,
+            "k2_gpu_kernel_work": k2_gpu_summary,
             "native_gpu_kernel_work_scope":
                 "WHOLE_CAPTURE_NOT_ISOLATED_TO_CODEPREDICTOR",
             "P21_historical_unprofiled_http": p21_summary,
@@ -176,9 +197,14 @@ def markdown(d):
         "",
         "**Source-audited implementation gap; NOT a direct NVIDIA H200 benchmark.**",
         "",
-        f"Omni K2 profile SHA: \`{d['evidence']['k2_source_sha']}\`",
-        f"Native A profile SHA: \`{d['evidence']['native_source_sha']}\`",
+        f"Omni K2 profile SHA: `{d['evidence']['k2_source_sha']}`",
+        f"Native A profile SHA: `{d['evidence']['native_source_sha']}`",
         f"K2 rounds/frame: **{d['evidence']['rounds_per_frame']:.3f}**",
+        "",
+        ("K2 attributed GPU kernel work/frame (summed, NOT elapsed): "
+         + f"**{d['evidence']['k2_gpu_kernel_work']['assigned_kernel_work_ms_per_k2_frame']:.3f}ms**"
+         if d['evidence']['k2_gpu_kernel_work'] is not None
+         else "No separate K2 GPU kernel-work JSON was supplied."),
         "",
         "| Feature | NVIDIA TensorRT Edge-LLM | Omni P21/P22 |",
         "|---|---|---|",
@@ -225,6 +251,7 @@ def main():
     ap.add_argument("--k2-api", type=Path, required=True)
     ap.add_argument("--native-api", type=Path, required=True)
     ap.add_argument("--p22-analysis", type=Path, required=True)
+    ap.add_argument("--k2-gpu", type=Path)
     ap.add_argument("--p21-abba", type=Path)
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
@@ -234,6 +261,7 @@ def main():
     result = report(
         _load(args.k2_api), _load(args.native_api), _load(args.p22_analysis),
         _load(args.p21_abba) if args.p21_abba is not None else None,
+        _load(args.k2_gpu) if args.k2_gpu is not None else None,
     )
     output.mkdir(parents=True, exist_ok=False)
     (output / "report.json").write_text(
