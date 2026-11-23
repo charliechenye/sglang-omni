@@ -374,12 +374,25 @@ class Qwen3TTSModelRunner(ModelRunner):
         # P21 request-scoped serving observability, NOT a per-frame log.
         # The same binary runs A (normal Predictor Graph-ON) and B (K2),
         # with the only difference an explicit post-health ARM marker.
-        p21_on = os.environ.get(
+        p21_enabled = os.environ.get(
             "SGLANG_OMNI_QTTS_CP_P21_SERVING_K2"
         ) == "1"
+        p21_candidate_armed = (
+            p21_enabled
+            and os.path.isfile(os.environ.get(
+                "SGLANG_OMNI_QTTS_CP_P21_ARM_FILE", ""
+            ))
+        )
+        # Startup warmups and other unrelated scheduler requests must
+        # retain the normal path before ARM. The actual sampled C1 HTTP
+        # request is proved separately by p21_serving_abba.py.
+        p21_on = (
+            p21_enabled and len(requests) == 1
+            and bool(requests[0].request_id)
+        )
+        if p21_candidate_armed and not p21_on:
+            raise RuntimeError("P21_ARMED_CANDIDATE_REQUIRES_REAL_C1_REQUEST")
         if p21_on:
-            if len(requests) != 1 or not requests[0].request_id:
-                raise RuntimeError("P21_SERVING_OBSERVABILITY_C1_ONLY")
             rid = str(requests[0].request_id)
             graph_before = self.model.predictor_graph_replay_count
             eager_before = self.model.predictor_eager_count
@@ -502,7 +515,10 @@ class Qwen3TTSModelRunner(ModelRunner):
             "_p21_request_stats", {}
         ).pop(str(request_id), None)
         if stats is None:
-            raise RuntimeError("P21_REQUEST_FINISHED_WITHOUT_CODE_STATISTICS")
+            # Startup and prefill-only scheduling can finish without a
+            # CodePredictor call. Actual HTTP A/B requests must emit a
+            # nonempty record, enforced by the fail-closed ABBA client.
+            return
         request_hash = hashlib.sha256(str(request_id).encode()).hexdigest()[:12]
         print(
             "P21_REAL_SERVING_REQUEST "
