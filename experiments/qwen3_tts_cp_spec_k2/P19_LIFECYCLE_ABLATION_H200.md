@@ -139,6 +139,16 @@ The comparator prints expected eager/capture/replay calls, 50-arm
 coverage, the latest native tail boundary, HTTP status and independent
 server-log CUDA700 detection. It never reports QPS or speedup.
 
+Retained-Graph mode has a fail-fast GPU free-memory floor: after each
+retained arm it refuses to proceed if H200 free memory drops below
+max(12 GiB, 10% of total memory). This is an intentional stress diagnostic,
+not a suggested serving allocation policy. Kill the disposable worker
+between runs. Never run this control on a shared/production GPU.
+
+`p19_lifecycle_compare.py` may include both BASE_EAGER and BASE_GRAPH
+(their mode/profile pairs differ), but it requires the same actual
+selected frame ID and P18 case ID in addition to source SHA/prompt/seed.
+
 ## Interpretation / next action
 
 - BASE_GRAPH fails, MIN_REPLAY passes: suspect sustained Graph replay
