@@ -1422,6 +1422,19 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
 
             record("code_predictor_forward_enter", caller_module=__file__)
 
+        # P21: separate SERVING-INTEGRATED K2 candidate, not P17/P19
+        # counterfactual measurement. Default OFF. The same real HTTP
+        # request gets the committed speculative codes and codec embedding.
+        # The external ARM must be created only after /health.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P21_SERVING_K2") is not None:
+            from .code_predictor_spec_serving_p21 import (
+                armed as p21_armed, serving_k2 as p21_serving_k2,
+            )
+            if p21_armed():
+                return p21_serving_k2(
+                    self, layer0_codes, talker_hidden, semantic_positions
+                )
+
         # P18A: opt-in native-AR eager trajectories for all-depth
         # counterfactual acceptance census. Do not run native Predictor
         # CUDA Graph here: replay hides intermediate on-policy checkpoints.
