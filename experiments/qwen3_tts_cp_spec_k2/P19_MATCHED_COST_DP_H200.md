@@ -423,3 +423,94 @@ The new trace must contain `P19_COST_TARGET_FRAME_SELECTED` and,
 for each of AR/K2/K3/K4, `P19_ARM_REPLAY_EAGER_PARITY_PASS` and
 `P19_ARM_GRAPH_RELEASE_AND_SYNC_PASS`, then
 `P19_DIAGNOSTIC_FINAL_RESTORE_SYNC_PASS`. Stop on first failure.
+
+
+## P19 cumulative native-frame lifecycle: ALL_DEPTHS_GRAPH
+
+The isolated D1 and D9 `ALL_GRAPH` diagnostics passed all four
+arms, the replay/eager and physical KV checks, and the native request
+completed. This **does not** address repeated Graph capture/release
+over all depths. The original P19 smoke CUDA700 remains unresolved.
+
+### Single real frame, all 14 depths and 50 legal Graph arms
+
+New mode `ALL_DEPTHS_GRAPH` measures **one selected native frame**
+across successive actual native AR checkpoints. It runs all legal arms:
+d1..11 AR+K2+K3+K4 (44 arms), d12 AR+K2+K3 (3), d13 AR+K2
+(2), d14 AR only (1). Total: **50 Graph arm lifecycles**.
+
+The diagnostic depth flag is now the INCLUSIVE terminal depth;
+`P19_DIAG_DEPTH=14` runs the full residual frame. For a bisect
+use e.g. `P19_DIAG_DEPTH=8` to run the first 8 depths, not one
+isolated D8. This mode requires `P19_COST_FRAMES=1` and uses
+`P18_CAPTURE_FRAMES=2` to preserve P18's two independently
+validated native frames. Only one of those gets Graph costs.
+
+Before starting, stop the previous server, update P19 worktree and
+run the CPU tests.
+
+Terminal A:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+P19_DIAG_ARM=ALL_DEPTHS_GRAPH \
+P19_DIAG_DEPTH=14 \
+P19_DIAG_FENCE=0 \
+P18_CAPTURE_FRAMES=2 \
+P19_COST_FRAMES=1 \
+bash experiments/qwen3_tts_cp_spec_k2/p19_launch.sh \
+  "$HOME/results/qwen3tts-p19-diag-alldepths-d14-001"
+~~~
+
+Terminal B, once healthy:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p19-diag-alldepths-d14-001"
+curl -fsS http://127.0.0.1:8000/health
+python -m experiments.qwen3_tts_cp_spec_k2.p19_diag_once \
+  --root "$ROOT"
+~~~
+
+Expected if ALL 50 arm traces and full worker restores are present:
+
+`P19_ALL_DEPTHS_GRAPH_SINGLE_FRAME_LIFECYCLE_PASS_NOT_COST_OR_SERVING`
+
+`P19_DIAG_COVERAGE=depths=[1,...,14] graph_arms=50 frame=37`
+(the actual frame index may differ).
+
+If the HTTP request finishes but any phase is missing, it fails closed
+with `P19_DIAGNOSTIC_ARM_NOT_EXECUTED_NO_SELECTION`, not a
+CUDA700 label. An actual illegal-address error is distinct and
+requires a brand-new CUDA worker for a repeat.
+
+The client writes
+`matched_cost/diagnostic/client.json` with strict
+`trace_coverage`, and phase events are fsync'ed in
+`matched_cost/diagnostic/worker_pid*.jsonl`. To see the earliest
+incomplete boundary rather than the final P18-only tail:
+
+~~~bash
+ROOT="$HOME/results/qwen3tts-p19-diag-alldepths-d14-001"
+grep -hE \
+  'P19_COST_TARGET_FRAME_SELECTED|P19_ARM_SELECTED|P19_ARM_GRAPH_CAPTURE_BEGIN|P19_ARM_REPLAY_EAGER_PARITY_PASS|P19_ARM_GRAPH_RELEASE_AND_SYNC_PASS|P19_DIAGNOSTIC_FINAL_RESTORE_SYNC_PASS' \
+  "$ROOT"/matched_cost/diagnostic/worker_pid*.jsonl \
+  | tail -n 70
+cat "$ROOT/matched_cost/diagnostic/client.json"
+~~~
+
+This intentionally never emits formal
+`matched_cost/rows/*.json`. No P19A cost table, P19B DP selection,
+native full-frame Graph-ON benchmark, HTTP QPS, or quality improvement
+can be claimed even on a complete 50-arm PASS.
+
+If the 1..14 frame FAILS, use a fresh worker/root with an inclusive
+`P19_DIAG_DEPTH=7` or `9` to find the first failing prefix; each
+prefix run retains all earlier arm interactions, unlike isolated
+`ALL_GRAPH`. A pass at D8 plus a fail at D14 can narrow the
+source but cannot alone prove the first kernel fault if timing or
+memory reuse is nondeterministic. Use targeted synchronization or
+sanitizer tools only after the smallest reliable failing prefix
+is identified.
