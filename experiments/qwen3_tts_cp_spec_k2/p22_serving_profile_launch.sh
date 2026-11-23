@@ -167,9 +167,9 @@ echo "P22_PROFILE_POST_WARMUP_CAPTURE_ARM=$SGLANG_OMNI_QTTS_CP_P22_CAPTURE_ARM"
 if [[ "$NSYS" == 1 ]]; then
   # Only the actual B request after B warmup is CUDA-traced. The
   # child TTS worker calls cudaProfilerStart/Stop under a real ARM file.
+  # nsys profiles the target and child TTS worker without extra flags.
   nsys profile \
     --trace=cuda,nvtx \
-    # Process-tree child tracing is the nsys default on Linux. \
     --capture-range=cudaProfilerApi \
     --capture-range-end=stop \
     --sample=none --cpuctxsw=none \
