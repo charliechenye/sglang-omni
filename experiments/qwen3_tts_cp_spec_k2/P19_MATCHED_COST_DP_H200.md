@@ -668,3 +668,127 @@ oracle calls, rather than assuming Graph capture is to blame.
 All diagnostic modes remain **NO COST/DP SELECTION**. The 50-arm
 capture is NOT actual speculative serving, and P19A/B/production
 claims remain blocked.
+
+
+## P19 terminal code15 and feedback-stage boundary diagnosis
+
+**New evidence** (Graph full-depth native fence reproduction):
+
+- `ALL_DEPTHS_EAGER` one-frame, 50 eager arms: HTTP natural stop;
+  next native Predictor returned.
+- `ALL_DEPTHS_GRAPH` one-frame, 50 graph arms: every arm passed
+  eager/replay parity and final per-depth restoration, but subsequent
+  native frame failed, and server log confirmed CUDA 700.
+- With `P19_DIAG_NATIVE_FENCE=1`, the NEXT native Predictor's
+  **first** `torch.cuda.synchronize()`, before any next-frame model
+  computation, raised `CUDA_ERROR_ILLEGAL_ADDRESS`.
+  Thus the fault was ALREADY sticky before that next Predictor
+  invocation. Do not misattribute it to the next frame sampler
+  or the P18 `semantic_position.item()` report site.
+
+**Remaining unprobed window:** after `P19_DIAGNOSTIC_FINAL_RESTORE_SYNC_PASS`
+at the selected frame's D14, the real native
+`predictor_forward_tokens(cache_len=15)`, final code15 LM head,
+code15 sampler/embedding sum, model runner output snapshots/event
+record, feedback enqueue, and next frame's feedback buffer
+staging. These may execute asynchronously before the next-frame
+entry. The Graph allocation/lifetime could also have corrupted
+an address earlier, but that is still a HYPOTHESIS.
+
+### Opt-in tail fence
+
+New switch **`P19_DIAG_TAIL_FENCE=1`**: inserts a full-device
+synchronize AFTER each stage in that narrow post-D14 native and
+scheduler window. Default **0** emits durable CPU-only phase
+breadcrumbs with no additional GPU synchronization.
+
+The instrumented original native steps include:
+`P19_NATIVE_TAIL_D14_P19_PROBE_RETURNED`,
+`P19_NATIVE_TAIL_FINAL_PREDICTOR_RETURNED`,
+`P19_NATIVE_TAIL_CODE15_LMHEAD_RETURNED`,
+`P19_NATIVE_TAIL_CODE15_SAMPLER_RETURNED`,
+and `P19_NATIVE_TAIL_NATIVE_PREDICTOR_OUTPUT_READY`.
+The runner also marks predictor return, code and embedding
+snapshots, output ready event, queued feedback, feedback target
+history and feedback row-id staging.
+
+A failed synchronous phase is the first pair
+`P19_NATIVE_TAIL_<STAGE>_SYNC_BEGIN` without matching
+`P19_NATIVE_TAIL_<STAGE>_SYNC_PASS`. Because previous stages
+synchronize, this narrows the error window substantially. A pass
+does not prove absence of races or Graph lifetime hazards: fences
+change scheduling.
+
+Stop the previous worker; source-lock a fresh root. Run CPU tests
+before starting.
+
+Terminal A:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+
+P19_DIAG_ARM=ALL_DEPTHS_GRAPH \
+P19_DIAG_DEPTH=14 \
+P19_DIAG_FENCE=0 \
+P19_DIAG_NATIVE_FENCE=0 \
+P19_DIAG_TAIL_FENCE=1 \
+P18_CAPTURE_FRAMES=2 \
+P19_COST_FRAMES=1 \
+bash experiments/qwen3_tts_cp_spec_k2/p19_launch.sh \
+  "$HOME/results/qwen3tts-p19-tail-fence-001"
+~~~
+
+Terminal B:
+
+~~~bash
+cd ~/sglang-omni-worktrees/p19-matched-dp
+source ~/.venv/bin/activate
+ROOT="$HOME/results/qwen3tts-p19-tail-fence-001"
+curl -fsS http://127.0.0.1:8000/health
+python -m experiments.qwen3_tts_cp_spec_k2.p19_diag_once --root "$ROOT"
+~~~
+
+Inspect:
+
+~~~bash
+ROOT="$HOME/results/qwen3tts-p19-tail-fence-001"
+grep -h '"stage": "P19_NATIVE_TAIL_' \
+  "$ROOT"/matched_cost/diagnostic/worker_pid*.jsonl | tail -n 100
+
+grep -nE 'CUDA_ERROR_ILLEGAL_ADDRESS|illegal memory access|Sticky error' \
+  "$ROOT/server.log" | head -n 30
+
+python - "$ROOT" <<'PY'
+import json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+report = json.loads(
+    (root / "matched_cost/diagnostic/client.json").read_text()
+)
+print("P19_STATUS=", report["status"])
+print("LAST_TAIL=", report.get("last_native_tail_stage"))
+print("LAST_NEXT=", report.get("last_native_next_frame_stage"))
+events = report.get("native_tail_phases", [])
+names = set(events)
+for stage in events:
+    if stage.endswith("_SYNC_BEGIN") and (
+        stage[:-len("_SYNC_BEGIN")] + "_SYNC_PASS"
+    ) not in names:
+        print("FIRST_MISSING_TAIL_SYNC_PASS=", stage)
+        break
+PY
+~~~
+
+If the first failed sync follows `FINAL_PREDICTOR_RETURNED`,
+inspect the real code15 hidden-state write and its input pointers.
+If it follows `CODE15_SAMPLER_RETURNED`, inspect the native seeded
+sampler and its output/scratch aliasing. If every terminal model
+stage succeeds, inspect the runner's snapshots, event recording
+and feedback-buffer writes. If all tail stages pass but the next
+frame still fails, inspect work between feedback write and next
+Predictor entry, including scheduler kernels/streams.
+
+**Do not change kernel code or run P19B/Main based on this diagnostic.**
+No completed request, matched full native serving speedup, causal
+speculative policy or production race-safety is proven.
