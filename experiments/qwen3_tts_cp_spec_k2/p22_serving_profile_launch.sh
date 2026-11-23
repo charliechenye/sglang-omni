@@ -108,6 +108,21 @@ if [[ "$NSYS" == 1 ]]; then
     echo "P22_NSIGHT_SYSTEMS_CLI_NOT_FOUND" >&2; exit 2;
   }
   nsys --version
+  # Nsight Systems (nsys) automatically follows the launched process
+  # tree, including the TTS worker spawned by the Omni launcher.
+  # --target-processes=all belongs to Nsight Compute (ncu), NOT nsys.
+  # Fail BEFORE reserving a new evidence root if this installed nsys
+  # lacks a capture flag that P22 depends on.
+  NSYS_PROFILE_HELP="$(nsys profile --help 2>&1 || true)"
+  for needed in --trace --capture-range --capture-range-end \
+                --sample --cpuctxsw --output; do
+    if [[ "$NSYS_PROFILE_HELP" != *"$needed"* ]]; then
+      echo "P22_NSYS_PROFILE_OPTION_UNSUPPORTED: $needed" >&2
+      echo "P22_NSYS_HELP_VERSION_CHECK_FAILED_BEFORE_ROOT_CREATION" >&2
+      exit 2
+    fi
+  done
+  unset NSYS_PROFILE_HELP
 fi
 mkdir -m 700 -p "$ROOT"
 SHA="$(git rev-parse HEAD)"
@@ -154,7 +169,7 @@ if [[ "$NSYS" == 1 ]]; then
   # child TTS worker calls cudaProfilerStart/Stop under a real ARM file.
   nsys profile \
     --trace=cuda,nvtx \
-    --target-processes=all \
+    # Process-tree child tracing is the nsys default on Linux. \
     --capture-range=cudaProfilerApi \
     --capture-range-end=stop \
     --sample=none --cpuctxsw=none \
