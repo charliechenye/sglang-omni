@@ -202,7 +202,13 @@ def maybe_measure(
     if not armed():
         return
     diagnostic = diagnostic_config()
-    if diagnostic is not None and depth != diagnostic[1]:
+    cumulative = diagnostic is not None and diagnostic[0] == "ALL_DEPTHS_GRAPH"
+    # Targeted diagnostics run ONE depth; cumulative diagnostics run
+    # each native depth 1..terminal on ONE already selected frame.
+    if diagnostic is not None and (
+        (cumulative and depth > diagnostic[1])
+        or (not cumulative and depth != diagnostic[1])
+    ):
         return
     if diagnostic is not None and diagnostic[0] == "OFF":
         diag_event(
@@ -226,7 +232,10 @@ def maybe_measure(
     chosen = req_select.setdefault(req_hash, set())
     if not select_cost_frame(
         chosen, frame=frame, depth=depth, max_frames=max_frames,
-        diagnostic_depth=(diagnostic[1] if diagnostic is not None else None),
+        diagnostic_depth=(
+            diagnostic[1] if diagnostic is not None and not cumulative
+            else None
+        ),
     ):
         return
     if diagnostic is not None:
@@ -345,7 +354,9 @@ def maybe_measure(
     failed = False
     try:
         candidate_arms = ("AR", *(str(w) for w in feasible_widths(depth)))
-        if diagnostic is not None and diagnostic[0] != "ALL_GRAPH":
+        if diagnostic is not None and diagnostic[0] not in (
+            "ALL_GRAPH", "ALL_DEPTHS_GRAPH"
+        ):
             requested = diagnostic[0].split("_", 1)[0]
             wanted = "AR" if requested == "AR" else requested[1:]
             if wanted not in candidate_arms:
