@@ -22,8 +22,7 @@ fi
 if [[ -n "$(git status --porcelain)" ]]; then
   echo "P22B_DIRTY_WORKTREE" >&2; exit 2
 fi
-if [[ -n "${SGLANG_OMNI_QTTS_CP_P21_ARM_FILE:-}" ||
-      -n "${SGLANG_OMNI_QTTS_CP_P22B_NATIVE_ARM_FILE:-}" ]]; then
+if [[ -n "${SGLANG_OMNI_QTTS_CP_P21_ARM_FILE:-}" || -n "${SGLANG_OMNI_QTTS_CP_P22B_NATIVE_ARM_FILE:-}" ]]; then
   echo "P22B_REFUSES_EXTERNAL_ARM_CONFIG" >&2; exit 2
 fi
 python - <<'PY'
