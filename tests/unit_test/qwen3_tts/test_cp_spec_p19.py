@@ -23,7 +23,8 @@ from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag import (
     MODES as DIAG_MODES, diagnostic_config, event as diag_event,
 )
 from experiments.qwen3_tts_cp_spec_k2.p19_diag_coverage import (
-    GRAPH_STAGES, DEPTH_STAGES, arms_at_depth, validate_diagnostic_trace,
+    GRAPH_STAGES, EAGER_STAGES, DEPTH_STAGES,
+    arms_at_depth, validate_diagnostic_trace,
 )
 
 SHA = "a" * 40
@@ -310,7 +311,7 @@ def test_p19_cuda700_diag_modes_gate_and_legal_depth(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     assert diagnostic_config() is None
-    assert len(DIAG_MODES) == 11
+    assert len(DIAG_MODES) == 12
     monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH", "1")
     for mode in DIAG_MODES:
         monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", mode)
@@ -451,7 +452,7 @@ def test_p19_all_depths_graph_has_50_legal_arms_and_ar_only_tail():
     assert arms_at_depth(12) == ("AR", "2", "3")
     assert arms_at_depth(13) == ("AR", "2")
     assert arms_at_depth(14) == ("AR",)
-    assert len(DIAG_MODES) == 11
+    assert len(DIAG_MODES) == 12
     assert "ALL_DEPTHS_GRAPH" in DIAG_MODES
 
 
@@ -540,3 +541,86 @@ def test_p19_all_depths_prefix_trace_can_bisect_without_faking_full_14():
         validate_diagnostic_trace(_synthetic_cumulative_trace(8), {
             **config, "depth": 14,
         })
+
+
+def test_p19_all_depths_eager_control_has_50_native_arms_no_graph():
+    config = {
+        "arm": "ALL_DEPTHS_EAGER", "depth": 14,
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    events = []
+    counter = 0
+    for depth in range(1, 15):
+        for stage in (DEPTH_STAGES[0],):
+            counter += 1
+            events.append({
+                "stage": stage, "depth": depth,
+                "arm": "ALL_DEPTHS_EAGER", "pid": 321,
+                "case_id": "p00_s20261123", "frame": 37,
+                "monotonic_ns": counter,
+            })
+        for arm in arms_at_depth(depth):
+            for phase in EAGER_STAGES:
+                counter += 1
+                events.append({
+                    "stage": phase, "depth": depth, "arm": arm,
+                    "pid": 321, "case_id": "p00_s20261123",
+                    "frame": 37, "monotonic_ns": counter,
+                })
+        for stage in DEPTH_STAGES[1:]:
+            counter += 1
+            events.append({
+                "stage": stage, "depth": depth,
+                "arm": "ALL_DEPTHS_EAGER", "pid": 321,
+                "case_id": "p00_s20261123", "frame": 37,
+                "monotonic_ns": counter,
+            })
+    result = validate_diagnostic_trace(events, config)
+    assert result["graph_arms_verified"] == 0
+    assert result["eager_arms_verified"] == 50
+    assert result["depths_verified"] == list(range(1, 15))
+    omitted = [
+        event for event in events if not (
+            event["stage"] == "P19_EAGER_ONLY_DEVICE_SYNC_PASS"
+            and event["depth"] == 8 and event["arm"] == "3"
+        )
+    ]
+    with pytest.raises(RuntimeError, match="PHASE_COVERAGE_INCOMPLETE"):
+        validate_diagnostic_trace(omitted, config)
+
+
+def test_p19_native_next_frame_trace_does_not_forge_50_graph_arms():
+    cfg = {
+        "arm": "ALL_DEPTHS_GRAPH", "depth": 14,
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    events = _synthetic_cumulative_trace()
+    copied = dict(events[-1])
+    copied.update({
+        "stage": "P19_NATIVE_NEXT_PAIR_PREDICTOR_FORWARD_RETURNED",
+        "depth": 0, "arm": "NATIVE_NEXT_FRAME",
+        "monotonic_ns": events[-1]["monotonic_ns"] + 1,
+    })
+    events.append(copied)
+    validated = validate_diagnostic_trace(events, cfg)
+    assert validated["graph_arms_verified"] == 50
+    # The next-frame marker is evidence of execution, not a Graph arm.
+    assert sum(e["stage"] == "P19_ARM_SELECTED" for e in events) == 50
+
+
+def test_p19_native_next_frame_hooks_wired_under_diagnostic_only():
+    import inspect
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+    from sglang_omni.models.qwen3_tts import code_predictor_spec_p19_cost
+
+    source = inspect.getsource(
+        Qwen3TTSTalker.code_predictor_forward_incremental
+    )
+    assert 'p19_pending = getattr(' in source
+    assert 'p19_mark("PAIR_PREDICTOR_FORWARD_RETURNED", fence=True)' in source
+    assert 'p19_mark("CODE1_SAMPLER_RETURNED", fence=True)' in source
+    assert 'p19_mark("BEFORE_P18_DEPTH1_ITEM", fence=True)' in source
+    assert '"SGLANG_OMNI_QTTS_CP_P19_NATIVE_FENCE"' in source
+    cost = inspect.getsource(code_predictor_spec_p19_cost.maybe_measure)
+    assert 'model._p19_native_boundary_next_req = request_id' in cost
+    assert 'model._p19_native_boundary_case_id = case["case_id"]' in cost
