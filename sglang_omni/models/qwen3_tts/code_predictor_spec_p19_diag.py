@@ -97,10 +97,10 @@ def maybe_tail_runner_event(
         "case_id": case_id,
     }
     stage = "P19_NATIVE_TAIL_" + stage
-    event(stage, **kwargs)
     tail_fence = os.environ.get("SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE", "0")
     if tail_fence not in ("0", "1"):
         raise RuntimeError("P19_TAIL_FENCE_MUST_BE_0_OR_1")
+    event(stage, **kwargs)
     if tail_fence == "1":
         # Import only in an explicitly armed research diagnostic; no
         # overhead and no synchronizations in production.
