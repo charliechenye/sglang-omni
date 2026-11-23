@@ -485,6 +485,31 @@ def maybe_measure(
                     depth=depth, arm=diagnostic[0], frame=frame,
                     case_id=case["case_id"],
                 )
+                if (not failed
+                        and cumulative and depth == diagnostic[1]):
+                    request_id = getattr(
+                        model, "_p18_current_request_id", None
+                    )
+                    if not isinstance(request_id, str) or not request_id:
+                        raise RuntimeError(
+                            "P19_NATIVE_NEXT_FRAME_REQUEST_ID_MISSING"
+                        )
+                    if getattr(
+                        model, "_p19_native_boundary_next_req", None
+                    ) is not None:
+                        raise RuntimeError(
+                            "P19_NATIVE_NEXT_FRAME_PREVIOUS_PROBE_PENDING"
+                        )
+                    # CPU-only flag. The next genuine native Predictor
+                    # invocation traces its initial GPU operations before
+                    # P18 .item() can surface an asynchronous CUDA fault.
+                    model._p19_native_boundary_next_req = request_id
+                    model._p19_native_boundary_from_frame = frame
+                    diag_event(
+                        "P19_SELECTED_FRAME_WAITING_NEXT_NATIVE",
+                        depth=depth, frame=frame, arm=diagnostic[0],
+                        case_id=case["case_id"],
+                    )
         except BaseException:
             if not failed:
                 raise
