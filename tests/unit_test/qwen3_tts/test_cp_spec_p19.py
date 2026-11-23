@@ -21,6 +21,7 @@ from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_cost import (
 )
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag import (
     MODES as DIAG_MODES, diagnostic_config, event as diag_event,
+    maybe_tail_runner_event,
 )
 from experiments.qwen3_tts_cp_spec_k2.p19_diag_coverage import (
     GRAPH_STAGES, EAGER_STAGES, DEPTH_STAGES,
@@ -624,3 +625,104 @@ def test_p19_native_next_frame_hooks_wired_under_diagnostic_only():
     cost = inspect.getsource(code_predictor_spec_p19_cost.maybe_measure)
     assert 'model._p19_native_boundary_next_req = request_id' in cost
     assert 'model._p19_native_boundary_case_id = case["case_id"]' in cost
+
+
+def test_p19_tail_runner_no_gpu_durable_phase_and_request_gate(
+    tmp_path, monkeypatch,
+):
+    """CPU-only test: phase events are fsynced and request-scoped."""
+    class MinimalModel:
+        _p19_native_boundary_next_req = "engine-request-1"
+        _p19_native_boundary_from_frame = 37
+        _p19_native_boundary_case_id = "p00_s20261123"
+
+    model = MinimalModel()
+    monkeypatch.setenv(
+        "SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", "ALL_DEPTHS_GRAPH"
+    )
+    monkeypatch.setenv(
+        "SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH", "14"
+    )
+    monkeypatch.setenv(
+        "SGLANG_OMNI_QTTS_CP_P19_COST_DIR", str(tmp_path)
+    )
+    monkeypatch.setenv(
+        "SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE", "0"
+    )
+    assert maybe_tail_runner_event(
+        model, "CODE15_SAMPLER_RETURNED",
+        device="cpu", request_id="engine-request-1",
+    )
+    files = list((tmp_path / "diagnostic").glob("worker_pid*.jsonl"))
+    assert len(files) == 1
+    record = json.loads(files[0].read_text().splitlines()[0])
+    assert record["stage"] == "P19_NATIVE_TAIL_CODE15_SAMPLER_RETURNED"
+    assert record["depth"] == 15
+    assert record["frame"] == 37
+    assert record["arm"] == "NATIVE_TAIL"
+    assert record["case_id"] == "p00_s20261123"
+    with pytest.raises(RuntimeError, match="TAIL_RUNNER_REQUEST_ID_DRIFT"):
+        maybe_tail_runner_event(
+            model, "BAD_REQUEST", device="cpu", request_id="another"
+        )
+    assert len(files[0].read_text().splitlines()) == 1
+    monkeypatch.setenv(
+        "SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE", "not-a-valid-option"
+    )
+    with pytest.raises(RuntimeError, match="TAIL_FENCE_MUST_BE_0_OR_1"):
+        maybe_tail_runner_event(model, "BAD_ENV", device="cpu")
+    assert len(files[0].read_text().splitlines()) == 1
+
+
+def test_p19_tail_runner_disabled_without_graph_diagnostic(
+    tmp_path, monkeypatch,
+):
+    class MinimalModel:
+        _p19_native_boundary_next_req = "engine-request-1"
+        _p19_native_boundary_from_frame = 37
+        _p19_native_boundary_case_id = "p00_s20261123"
+
+    monkeypatch.delenv(
+        "SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", raising=False
+    )
+    monkeypatch.setenv(
+        "SGLANG_OMNI_QTTS_CP_P19_COST_DIR", str(tmp_path)
+    )
+    assert not maybe_tail_runner_event(
+        MinimalModel(), "NO_RESEARCH_ENV", device="cpu"
+    )
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
+def test_p19_tail_native_code15_and_feedback_hooks_present():
+    """Confirm instrumentation stays behind explicit research-only gates."""
+    import inspect
+    from sglang_omni.models.qwen3_tts.model_runner import (
+        Qwen3TTSModelRunner,
+    )
+    from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+
+    native = inspect.getsource(
+        Qwen3TTSTalker.code_predictor_forward_incremental
+    )
+    assert '"SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE"' in native
+    for stage in (
+        "D14_P19_PROBE_RETURNED",
+        "FINAL_PREDICTOR_RETURNED",
+        "CODE15_LMHEAD_RETURNED",
+        "CODE15_SAMPLER_RETURNED",
+        "NATIVE_PREDICTOR_OUTPUT_READY",
+    ):
+        assert f'"{stage}"' in native
+    runner = inspect.getsource(
+        Qwen3TTSModelRunner._p19_native_tail_mark
+    )
+    assert '"ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER"' in runner
+    for method, stage in (
+        ("collect_codes", "COLLECT_CODES_PREDICTOR_RETURNED"),
+        ("post_process_outputs", "POST_PROCESS_CODES_EVENT_RECORDED"),
+        ("write_feedback_buffers", "WRITE_FEEDBACK_ROW_IDS_READY"),
+    ):
+        assert stage in inspect.getsource(
+            getattr(Qwen3TTSModelRunner, method)
+        )
