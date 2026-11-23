@@ -65,12 +65,30 @@ if [[ -n "${P19_DIAG_ARM:-}" ]]; then
     echo "P19_DIAG_TAIL_FENCE must be 0 or 1" >&2; exit 2
   fi
   export SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE="$TAIL_FENCE"
+  PROFILE="${P19_DIAG_PROFILE:-DEFAULT}"
+  case "$PROFILE" in
+    DEFAULT|MIN_REPLAY|MATCHED_EAGER|GC_GUARD|RETAIN_GRAPH) ;;
+    *) echo "P19 unknown diagnostic profile: $PROFILE" >&2; exit 2 ;;
+  esac
+  if [[ "$PROFILE" != DEFAULT ]]; then
+    if [[ "$DEPTH" != 14 || "$FRAMES" != 2 || "$COST_FRAMES" != 1 ||
+          "$FENCE" != 0 || "$NATIVE_FENCE" != 0 || "$TAIL_FENCE" != 1 ]]; then
+      echo "P19 lifecycle profile requires depth=14 frames=2 cost_frames=1 fence=0 native_fence=0 tail_fence=1" >&2
+      exit 2
+    fi
+    if [[ "$PROFILE" == MATCHED_EAGER && "$P19_DIAG_ARM" != ALL_DEPTHS_EAGER ]] ||
+       [[ "$PROFILE" != MATCHED_EAGER && "$P19_DIAG_ARM" != ALL_DEPTHS_GRAPH ]]; then
+      echo "P19 lifecycle profile/arm combination invalid" >&2; exit 2
+    fi
+  fi
+  export SGLANG_OMNI_QTTS_CP_P19_DIAG_PROFILE="$PROFILE"
 else
   unset SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM
   unset SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH
   unset SGLANG_OMNI_QTTS_CP_P19_DIAG_FENCE
   unset SGLANG_OMNI_QTTS_CP_P19_NATIVE_FENCE
   unset SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE
+  unset SGLANG_OMNI_QTTS_CP_P19_DIAG_PROFILE
 fi
 
 # Force spawn children to import this dedicated worktree. No global pip edits.
@@ -87,6 +105,7 @@ for name in (
     "sglang_omni.models.qwen3_tts.code_predictor_spec_p18_census",
     "sglang_omni.models.qwen3_tts.code_predictor_spec_p19_cost",
     "sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag",
+    "sglang_omni.models.qwen3_tts.code_predictor_spec_p19_profile",
 ):
     module = importlib.import_module(name)
     file = Path(module.__file__).resolve()
@@ -172,7 +191,7 @@ echo "P18_NATIVE_EAGER_CENSUS_ROOT=$ROOT"
 echo "P18_CAPTURE_FRAMES=$FRAMES"
 echo "P19_MATCHED_COST_FRAMES=$COST_FRAMES"
 if [[ -n "${P19_DIAG_ARM:-}" ]]; then
-  echo "P19_DIAGNOSTIC_ONLY arm=$P19_DIAG_ARM depth=$DEPTH fence=$FENCE native_fence=$NATIVE_FENCE tail_fence=$TAIL_FENCE"
+  echo "P19_DIAGNOSTIC_ONLY arm=$P19_DIAG_ARM depth=$DEPTH profile=$PROFILE fence=$FENCE native_fence=$NATIVE_FENCE tail_fence=$TAIL_FENCE"
 fi
 python - "$ROOT" "$SHA" "$FRAMES" "$COST_FRAMES" <<'PY'
 import json
@@ -193,6 +212,7 @@ if os.environ.get("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM"):
         "tail_fence": int(
             os.environ["SGLANG_OMNI_QTTS_CP_P19_TAIL_FENCE"]
         ),
+        "profile": os.environ["SGLANG_OMNI_QTTS_CP_P19_DIAG_PROFILE"],
         "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
     }
 (root / "matched_cost" / "config.json").write_text(json.dumps({
