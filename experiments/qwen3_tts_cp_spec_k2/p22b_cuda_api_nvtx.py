@@ -66,7 +66,7 @@ def _nvtx_index(db: sqlite3.Connection) -> dict:
     )
     ranges = defaultdict(list)
     for start, end, tid, name in db.execute(sql):
-        if (not isinstance(name, str) or not name.startswith("P22_")
+        if (not isinstance(name, str) or not name.startswith(("P22_", "P22B_"))
                 or type(start) is not int or type(end) is not int
                 or end < start):
             continue
@@ -121,7 +121,7 @@ def _api_rows(db: sqlite3.Connection, table: str):
     return db.execute(sql)
 
 
-def analyze_sqlite(db_path: Path) -> dict:
+def analyze_sqlite(db_path: Path, *, required_stages=REQUIRED) -> dict:
     # Immutable, read-only sqlite. No accidental export/overwrite.
     p = db_path.expanduser().resolve(strict=True)
     if not p.is_file() or p.stat().st_size <= 0:
@@ -192,13 +192,14 @@ def analyze_sqlite(db_path: Path) -> dict:
                 counts["driver_duplicate_runtime_skipped"] += 1
                 continue
             consume(start, end, tid, cid, name, "driver")
-        for stage in REQUIRED:
+        for stage in required_stages:
             if stage not in by_stage:
                 raise RuntimeError("P22B_MISSING_CUDA_API_STAGE_" + stage)
         if counts["assigned_p22_nvtx_calls"] < 1:
             raise RuntimeError("P22B_NO_ATTRIBUTED_REAL_CUDA_APIS")
         return {
             "schema": SCHEMA, "status": STATUS,
+            "required_stages": list(required_stages),
             "semantics": (
                 "CPU CUDA API duration summed within NVTX launch scopes, "
                 "not GPU elapsed, critical path, or achievable savings"
