@@ -178,6 +178,11 @@ def _one_arm(
         # Intentionally diagnostic-only; never retain graphs in serving.
         keepalive.append((graph, outputs, capture_stream))
         torch.cuda.synchronize(device)
+        # Fail fast before exhausting H200 memory. Retained graphs are
+        # deliberately released only by this disposable worker exiting.
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device)
+        if free_bytes < max(12 * 1024**3, total_bytes // 10):
+            raise RuntimeError("P19_RETAIN_GRAPH_H200_FREE_MEMORY_FLOOR")
         mark("P19_ARM_GRAPH_RETAINED_AND_SYNC_PASS")
     else:
         del graph
