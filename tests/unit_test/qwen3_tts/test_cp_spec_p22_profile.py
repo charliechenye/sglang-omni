@@ -226,7 +226,15 @@ def test_p22_launch_script_parses_before_any_gpu_activity():
     assert "experiment/qwen3-tts-p22-serving-profile" in source
     assert "--capture-range=cudaProfilerApi" in source
     assert "--capture-range-end=stop" in source
-    assert "--target-processes=all" in source
+    # --target-processes=all is a Nsight Compute (ncu) flag,
+    # not supported by the Nsight Systems 2024.6 CLI.
+    profile_invocation = source.split('  nsys profile \\\n', 1)[1]
+    assert "--target-processes=all" not in profile_invocation
+    assert "--capture-range=cudaProfilerApi" in profile_invocation
+    assert "--capture-range-end=stop" in profile_invocation
+    assert "P22_NSYS_PROFILE_OPTION_UNSUPPORTED" in source
+    assert 'NSYS_PROFILE_HELP="$(nsys profile --help 2>&1 || true)"' in source
+    assert source.index("NSYS_PROFILE_HELP=") < source.index('mkdir -m 700 -p "$ROOT"')
     assert "SGLANG_OMNI_QTTS_CP_P22_PROFILE_DIR" in source
     assert 'SGLANG_OMNI_QTTS_CP_SPEC_K=0' in source
 
