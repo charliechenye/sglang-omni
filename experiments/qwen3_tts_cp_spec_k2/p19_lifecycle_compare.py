@@ -100,6 +100,8 @@ def inspect(root: Path) -> dict:
         "prompt_id": result.get("case", {}).get("prompt_id"),
         "seed": result.get("case", {}).get("seed"),
         "input": result.get("request", {}).get("input"),
+        "selected_frame": cov.get("frame"),
+        "case_id": cov.get("case_id"),
         "status": status, "client_status": result.get("status"),
         "census_rows": result.get("census_rows", 0),
         "arms_verified": cov.get("graph_arms_verified", 0)
@@ -120,8 +122,8 @@ def compare(roots: list[Path]) -> dict:
     runs = [inspect(root) for root in roots]
     if len({run["root"] for run in runs}) != len(runs):
         raise RuntimeError("P19_COMPARISON_DUPLICATE_ROOT")
-    if len({run["profile"] for run in runs}) != len(runs):
-        raise RuntimeError("P19_COMPARISON_DUPLICATE_PROFILE")
+    if len({(run["mode"], run["profile"]) for run in runs}) != len(runs):
+        raise RuntimeError("P19_COMPARISON_DUPLICATE_MODE_AND_PROFILE")
     if len({run["source_sha"] for run in runs}) != 1:
         raise RuntimeError("P19_COMPARISON_CROSS_SHA_FORBIDDEN")
     requests = {
@@ -129,6 +131,9 @@ def compare(roots: list[Path]) -> dict:
     }
     if len(requests) != 1 or any(None in req for req in requests):
         raise RuntimeError("P19_COMPARISON_REQUEST_IDENTITY_DRIFT")
+    frames = {(run["selected_frame"], run["case_id"]) for run in runs}
+    if len(frames) != 1 or any(None in identity for identity in frames):
+        raise RuntimeError("P19_COMPARISON_SELECTED_FRAME_OR_CASE_DRIFT")
     return {
         "status": "P19_SOURCE_MATCHED_DIAGNOSTIC_COMPARISON_NOT_CAUSAL_PROOF",
         "source_sha": runs[0]["source_sha"],
