@@ -193,14 +193,15 @@ def load_nsight(db_path: Path) -> tuple[dict, dict]:
             kernel_names[(label, name or "UNNAMED")] += end - start
         if not counts["all_cuda_kernels"]:
             raise RuntimeError("P22_NSYS_NO_CUDA_KERNELS_CAPTURED")
-        if not any(
-            by_stage.get(label, {}).get("kernels", 0) > 0
-            for label in ("P22_WIDE_VERIFIER", "P22_Q_PROPOSALS",
-                          "P22_TARGET_SUPPORT_ACCEPT_BONUS")
+        for required_stage in (
+            "P22_Q_PROPOSALS", "P22_WIDE_VERIFIER",
+            "P22_TARGET_SUPPORT_ACCEPT_BONUS",
         ):
-            raise RuntimeError(
-                "P22_NSYS_NO_REAL_WIDE_K2_KERNEL_STAGE_CORRELATION"
-            )
+            if by_stage.get(required_stage, {}).get("kernels", 0) < 1:
+                raise RuntimeError(
+                    "P22_NSYS_REQUIRED_REAL_K2_KERNEL_GROUP_MISSING "
+                    + required_stage
+                )
         return {
             "schema": "p22-nsys-cuda-kernel-work-attribution-v1",
             "status": SUCCESS,
