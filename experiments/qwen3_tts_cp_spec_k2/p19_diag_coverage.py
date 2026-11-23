@@ -64,7 +64,8 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
     if arm not in (
         "OFF", "AR_EAGER", "AR_GRAPH",
         "K2_EAGER", "K2_GRAPH", "K3_EAGER", "K3_GRAPH",
-        "K4_EAGER", "K4_GRAPH", "ALL_GRAPH", "ALL_DEPTHS_GRAPH",
+        "K4_EAGER", "K4_GRAPH", "ALL_GRAPH",
+        "ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER",
     ) or type(depth) is not int or not 1 <= depth <= 14:
         raise RuntimeError("P19_DIAG_INVALID_MODE_OR_DEPTH")
     if not events:
