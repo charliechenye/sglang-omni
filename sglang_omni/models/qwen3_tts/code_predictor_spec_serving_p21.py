@@ -173,8 +173,12 @@ def serving_k2(
             continue
 
         check_wide_backend(model, width=2, cache_len=cache_len)
+        # P17 K2 consumes 4 uniforms for one q/p accept-residual
+        # decision PLUS one separate bonus draw at index 4.
+        # Using four silently leaves the bonus selector with an empty
+        # [4:5] slice. Exact shape is an ABI invariant.
         uniforms = torch.rand(
-            (4,), device=dev, dtype=torch.float32, generator=generator
+            (5,), device=dev, dtype=torch.float32, generator=generator
         ).clamp(1e-4, 1.0 - 1e-4)
         step = make_wide_round(
             model, depth=depth, width=2,
