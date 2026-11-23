@@ -12,9 +12,22 @@ if [[ "$1" != /* || "$ROOT" != "$1" || -e "$ROOT" ]]; then
   exit 2
 fi
 WORKTREE="$(git rev-parse --show-toplevel)"
-BRANCH="$(git branch --show-current)"
-if [[ "$(pwd -P)" != "$WORKTREE" || "$BRANCH" != "experiment/qwen3-tts-p22-serving-profile" ]]; then
-  echo "P22_PROFILE_REQUIRES_DEDICATED_EXPERIMENT_WORKTREE" >&2
+WORKTREE_PHYSICAL="$(cd "$WORKTREE" && pwd -P)"
+PWD_PHYSICAL="$(pwd -P)"
+EXPECTED_BRANCH="experiment/qwen3-tts-p22-serving-profile"
+BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+if [[ "$PWD_PHYSICAL" != "$WORKTREE_PHYSICAL" ]]; then
+  echo "P22_PROFILE_NOT_AT_REPOSITORY_ROOT" >&2
+  echo "P22_PROFILE_PWD=$PWD_PHYSICAL" >&2
+  echo "P22_PROFILE_GIT_TOP=$WORKTREE_PHYSICAL" >&2
+  exit 2
+fi
+if [[ "$BRANCH" != "$EXPECTED_BRANCH" ]]; then
+  echo "P22_PROFILE_BRANCH_MISMATCH" >&2
+  echo "P22_PROFILE_ACTUAL_BRANCH=${BRANCH:-DETACHED_HEAD}" >&2
+  echo "P22_PROFILE_EXPECTED_BRANCH=$EXPECTED_BRANCH" >&2
+  echo "P22_PROFILE_HEAD=$(git rev-parse HEAD)" >&2
+  echo "Select the expected local experiment branch before launching; do not reset or force-switch an active worktree." >&2
   exit 2
 fi
 if ! git diff --quiet || ! git diff --cached --quiet; then
