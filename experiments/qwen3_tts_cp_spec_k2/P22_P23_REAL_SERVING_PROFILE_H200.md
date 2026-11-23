@@ -89,7 +89,7 @@ Port 8000 must be free. Do NOT share the H200 or use the P21 worker.
 ```bash
 cd ~/sglang-omni-worktrees/p22-serving-profile
 source ~/.venv/bin/activate
-ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-001"
+ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-002"
 test ! -e "$ROOT"
 P22_NSYS=1 bash \
   experiments/qwen3_tts_cp_spec_k2/p22_serving_profile_launch.sh "$ROOT"
@@ -97,7 +97,20 @@ P22_NSYS=1 bash \
 
 Nsight Systems CLI must be present. The launcher uses:
 `--capture-range=cudaProfilerApi --capture-range-end=stop
---trace=cuda,nvtx --target-processes=all --sample=none`.
+--trace=cuda,nvtx --sample=none --cpuctxsw=none`.
+On Linux, `nsys` traces its launched process and child processes by
+default. **Do not pass `--target-processes=all`**: that flag belongs to
+Nsight **Compute** (`ncu`), not Nsight **Systems** (`nsys`).
+The P22 launcher now checks the installed `nsys profile --help` for
+required flags **before creating the evidence directory**.
+
+If a previous attempt on Nsight Systems 2024.6.2 printed
+`unrecognised option '--target-processes=all'`, no inference or CUDA
+profile was collected. Preserve its already-created `-001` result root
+(and `run.json`), fetch the updated P22 branch, run `bash -n`, then
+choose a fresh `-002` root. Never reuse or delete a prior evidence
+root simply to make an experiment run.
+
 On a no-root H200 machine disable CPU sampling and CPU context-switch
 tracking; this run targets GPU kernels and host launch NVTX.
 
@@ -115,7 +128,7 @@ can collect CPU-region evidence only. Do NOT classify that as GPU data.
 ```bash
 cd ~/sglang-omni-worktrees/p22-serving-profile
 source ~/.venv/bin/activate
-ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-001"
+ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-002"
 curl -fsS http://127.0.0.1:8000/health
 
 python -m experiments.qwen3_tts_cp_spec_k2.p22_profile_once \
@@ -140,7 +153,7 @@ that the real `.nsys-rep` exists and is non-empty. An absent report
 is incomplete GPU evidence and must NOT be invented.
 
 ```bash
-ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-001"
+ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-002"
 ls -lh "$ROOT/p22_measured_b.nsys-rep"
 nsys stats --report cuda_gpu_kern_sum --report nvtx_sum \
   "$ROOT/p22_measured_b.nsys-rep" \
@@ -161,7 +174,7 @@ NVTX ranges would falsely miss async kernels.
 
 ```bash
 cd ~/sglang-omni-worktrees/p22-serving-profile
-ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-001"
+ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-002"
 
 python -m experiments.qwen3_tts_cp_spec_k2.p22_nsys_sqlite \
   --root "$ROOT" \
@@ -186,7 +199,7 @@ Once both P21 unprofiled ABBA and P22 actual B profile exist:
 
 ```bash
 cd ~/sglang-omni-worktrees/p22-serving-profile
-ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-001"
+ROOT="$HOME/results/qwen3tts-p22-real-serving-profile-002"
 
 python -m experiments.qwen3_tts_cp_spec_k2.p23_full_gpu_feasibility \
   --p21-report \
