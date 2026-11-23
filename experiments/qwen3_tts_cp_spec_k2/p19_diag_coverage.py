@@ -89,7 +89,7 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
             "result": "P19_OFF_P18_ONLY_CHECKPOINT_OBSERVED_NOT_COST",
         }
 
-    if arm == "ALL_DEPTHS_GRAPH":
+    if arm in ("ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER"):
         expected_depths = tuple(range(1, depth + 1))
         if diagnostic.get("policy") != "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION":
             raise RuntimeError("P19_DIAG_ALL_DEPTHS_POLICY_GATE")
