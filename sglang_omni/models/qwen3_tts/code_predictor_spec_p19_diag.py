@@ -18,7 +18,7 @@ DEPTH_ENV = "SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH"
 DIR_ENV = "SGLANG_OMNI_QTTS_CP_P19_COST_DIR"
 MODES = ("OFF", "AR_EAGER", "AR_GRAPH", "K2_EAGER", "K2_GRAPH",
          "K3_EAGER", "K3_GRAPH", "K4_EAGER", "K4_GRAPH",
-         "ALL_GRAPH")
+         "ALL_GRAPH", "ALL_DEPTHS_GRAPH")
 
 
 def diagnostic_config() -> tuple[str, int] | None:
@@ -31,6 +31,8 @@ def diagnostic_config() -> tuple[str, int] | None:
     if not raw_depth.isdecimal() or not 1 <= int(raw_depth) <= 14:
         raise RuntimeError("P19_DIAGNOSTIC_DEPTH_MUST_BE_1_TO_14")
     depth = int(raw_depth)
+    # ALL_DEPTHS_GRAPH interprets depth as the last measured depth:
+    # perform every legal Graph arm at d=1..depth for ONE selected frame.
     if (arm.startswith("K4") and depth > 11
             or arm.startswith("K3") and depth > 12
             or arm.startswith("K2") and depth > 13):
