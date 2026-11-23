@@ -26,7 +26,7 @@ if [[ "$BRANCH" != "$EXPECTED_BRANCH" ]]; then
   echo "P22_PROFILE_BRANCH_MISMATCH" >&2
   echo "P22_PROFILE_ACTUAL_BRANCH=${BRANCH:-DETACHED_HEAD}" >&2
   echo "P22_PROFILE_EXPECTED_BRANCH=$EXPECTED_BRANCH" >&2
-  echo "P22_PROFILE_HEAD=$(git rev-parse HEAD)" >&2
+  echo "P22_PROFILE_HEAD=$(git rev-parse --verify HEAD 2>/dev/null || printf UNBORN_HEAD)" >&2
   echo "Select the expected local experiment branch before launching; do not reset or force-switch an active worktree." >&2
   exit 2
 fi
