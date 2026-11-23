@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from collections import Counter
 
+from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_profile import (
+    DEFAULT_OPS, profile_counts, validate_profile,
+)
+
 GRAPH_STAGES = (
     "P19_ARM_SELECTED",
     "P19_ARM_EAGER_AND_WARMUP_SYNC_PASS",
@@ -26,6 +30,44 @@ EAGER_STAGES = (
     "P19_ARM_SELECTED",
     "P19_EAGER_ONLY_DEVICE_SYNC_PASS",
 )
+GC_GRAPH_STAGES = (
+    GRAPH_STAGES[:2]
+    + ("P19_ARM_GC_CAPTURE_GUARD_ENTER",
+       "P19_ARM_GC_CAPTURE_GUARD_EXIT")
+    + GRAPH_STAGES[2:]
+)
+MIN_GRAPH_STAGES = (
+    GRAPH_STAGES[:5]
+    + ("P19_ARM_MIN_REPLAY_NO_TIMING_PASS",)
+    + GRAPH_STAGES[-1:]
+)
+RETAIN_GRAPH_STAGES = (
+    GRAPH_STAGES[:-1] + ("P19_ARM_GRAPH_RETAINED_AND_SYNC_PASS",)
+)
+MATCHED_EAGER_STAGES = (
+    "P19_ARM_SELECTED",
+    "P19_ARM_MATCHED_EAGER_REFERENCE_SYNC_PASS",
+    "P19_ARM_MATCHED_EAGER_WARMUPS_SYNC_PASS",
+    "P19_ARM_MATCHED_EAGER_CAPTURE_SURROGATE_SYNC_PASS",
+    "P19_ARM_MATCHED_EAGER_FIRST_SURROGATE_SYNC_PASS",
+    *(f"P19_ARM_MATCHED_EAGER_BLOCK_{i}_SYNC_PASS" for i in range(4)),
+    "P19_ARM_MATCHED_EAGER_TOTAL_65_SYNC_PASS",
+    "P19_EAGER_ONLY_DEVICE_SYNC_PASS",
+)
+
+
+def stages_for_profile(mode: str, profile: str) -> tuple[str, ...]:
+    if profile == "MATCHED_EAGER":
+        return MATCHED_EAGER_STAGES
+    if mode.endswith("_EAGER"):
+        return EAGER_STAGES
+    return {
+        "MIN_REPLAY": MIN_GRAPH_STAGES,
+        "GC_GUARD": GC_GRAPH_STAGES,
+        "RETAIN_GRAPH": RETAIN_GRAPH_STAGES,
+    }.get(profile, GRAPH_STAGES)
+
+
 DEPTH_STAGES = (
     "P19_COST_TARGET_FRAME_SELECTED",
     "P19_DIAGNOSTIC_ARM_RETURNED_NO_COST_SELECTION",
@@ -61,6 +103,7 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
         raise RuntimeError("P19_DIAG_INVALID_LAUNCH_CONFIG")
     arm = diagnostic.get("arm")
     depth = diagnostic.get("depth")
+    profile = diagnostic.get("profile", "DEFAULT")
     if arm not in (
         "OFF", "AR_EAGER", "AR_GRAPH",
         "K2_EAGER", "K2_GRAPH", "K3_EAGER", "K3_GRAPH",
@@ -68,6 +111,7 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
         "ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER",
     ) or type(depth) is not int or not 1 <= depth <= 14:
         raise RuntimeError("P19_DIAG_INVALID_MODE_OR_DEPTH")
+    validate_profile(arm, depth, profile)
     if not events:
         raise RuntimeError("P19_DIAG_NO_WORKER_TRACE")
     # Depth/arm boundaries never depend on CUDA tensor reads.
@@ -148,7 +192,7 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
             if wanted not in arms_at_depth(d):
                 raise RuntimeError("P19_DIAG_ILLEGAL_ARM_AT_TARGET_DEPTH")
             arms = (wanted,)
-        phases = EAGER_STAGES if arm.endswith("_EAGER") else GRAPH_STAGES
+        phases = stages_for_profile(arm, profile)
         selected_time = timestamps[(d, arm, DEPTH_STAGES[0])]
         returned_time = timestamps[(d, arm, DEPTH_STAGES[1])]
         final_time = timestamps[(d, arm, DEPTH_STAGES[2])]
@@ -175,6 +219,11 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
             verified_arms += 1
         prior_final = final_time
 
+    if profile == "RETAIN_GRAPH":
+        _require_single(
+            counts, depth, arm,
+            "P19_RETAINED_50_GRAPHS_LIVE_UNTIL_WORKER_EXIT",
+        )
     expected_selected = verified_arms
     selected_count = sum(
         count for (_, _, stage), count in counts.items()
@@ -185,8 +234,17 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
             "P19_DIAG_UNEXPECTED_EXTRA_ARM_SELECTED "
             f"actual={selected_count} expected={expected_selected}"
         )
+    work = profile_counts(arm, profile)
     return {
         "mode": arm,
+        "profile": profile,
+        "expected_operations_per_arm": work["operation_equivalents"],
+        "expected_total_arm_operations": (
+            work["operation_equivalents"] * verified_arms
+        ),
+        "expected_graph_replays": work["graph_replays"] * verified_arms,
+        "expected_eager_operations": work["eager_operations"] * verified_arms,
+        "expected_captures": work["captures"] * verified_arms,
         "terminal_depth": depth,
         "case_id": case_id,
         "frame": frame,
