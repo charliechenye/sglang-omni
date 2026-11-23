@@ -512,6 +512,21 @@ def test_p19_all_depths_selects_only_one_initial_frame_across_14_depths():
     assert selected == {37}
 
 
+def test_p19_all_depths_rejects_nontemporal_capture_and_replay():
+    cfg = {
+        "arm": "ALL_DEPTHS_GRAPH", "depth": 14,
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    events = _synthetic_cumulative_trace()
+    for ev in events:
+        if (ev["depth"] == 9 and ev["arm"] == "3"
+                and ev["stage"] == "P19_ARM_REPLAY_EAGER_PARITY_PASS"):
+            ev["monotonic_ns"] = 1
+            break
+    with pytest.raises(RuntimeError, match="ARM_PHASE_ORDER_INVALID"):
+        validate_diagnostic_trace(events, cfg)
+
+
 def test_p19_all_depths_prefix_trace_can_bisect_without_faking_full_14():
     config = {
         "arm": "ALL_DEPTHS_GRAPH", "depth": 8,
