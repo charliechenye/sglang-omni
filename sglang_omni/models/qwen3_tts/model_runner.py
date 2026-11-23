@@ -371,6 +371,19 @@ class Qwen3TTSModelRunner(ModelRunner):
             if len(requests) != 1 or not requests[0].request_id:
                 raise RuntimeError("P18_REQUIRES_EXACTLY_ONE_SCHEDULER_REQUEST")
             self.model._p18_current_request_id = str(requests[0].request_id)
+        # P21 request-scoped serving observability, NOT a per-frame log.
+        # The same binary runs A (normal Predictor Graph-ON) and B (K2),
+        # with the only difference an explicit post-health ARM marker.
+        p21_on = os.environ.get(
+            "SGLANG_OMNI_QTTS_CP_P21_SERVING_K2"
+        ) == "1"
+        if p21_on:
+            if len(requests) != 1 or not requests[0].request_id:
+                raise RuntimeError("P21_SERVING_OBSERVABILITY_C1_ONLY")
+            rid = str(requests[0].request_id)
+            graph_before = self.model.predictor_graph_replay_count
+            eager_before = self.model.predictor_eager_count
+            self.model._p21_last_frame_stats = None
         try:
             self._p19_native_tail_mark(
                 "NEXT_FRAME_BEFORE_CODE_PREDICTOR",
@@ -386,6 +399,28 @@ class Qwen3TTSModelRunner(ModelRunner):
                     "COLLECT_CODES_PREDICTOR_RETURNED",
                     device=layer0_codes.device, requests=requests,
                 )
+            if p21_on:
+                stats = self.__dict__.setdefault(
+                    "_p21_request_stats", {}
+                ).setdefault(rid, {
+                    "predictor_calls": 0, "native_graph_replays": 0,
+                    "native_eager_calls": 0, "candidate_frames": 0,
+                    "k2_rounds": 0, "accepted_drafts": 0,
+                    "rejected_drafts": 0,
+                })
+                stats["predictor_calls"] += 1
+                stats["native_graph_replays"] += (
+                    self.model.predictor_graph_replay_count - graph_before
+                )
+                stats["native_eager_calls"] += (
+                    self.model.predictor_eager_count - eager_before
+                )
+                frame = getattr(self.model, "_p21_last_frame_stats", None)
+                if frame is not None:
+                    stats["candidate_frames"] += 1
+                    stats["k2_rounds"] += frame["rounds"]
+                    stats["accepted_drafts"] += frame["accepted_drafts"]
+                    stats["rejected_drafts"] += frame["rejected_drafts"]
         finally:
             if p18_on:
                 del self.model._p18_current_request_id
@@ -457,6 +492,23 @@ class Qwen3TTSModelRunner(ModelRunner):
             "POST_PROCESS_FEEDBACK_QUEUED",
             device=embeds_snap.device,
             requests=scheduler_output.requests,
+        )
+
+    def on_request_finished(self, request_id: str, req_data) -> None:
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P21_SERVING_K2") != "1":
+            return
+        import hashlib
+        stats = self.__dict__.setdefault(
+            "_p21_request_stats", {}
+        ).pop(str(request_id), None)
+        if stats is None:
+            raise RuntimeError("P21_REQUEST_FINISHED_WITHOUT_CODE_STATISTICS")
+        request_hash = hashlib.sha256(str(request_id).encode()).hexdigest()[:12]
+        print(
+            "P21_REAL_SERVING_REQUEST "
+            f"request_hash={request_hash} "
+            + " ".join(f"{k}={v}" for k, v in sorted(stats.items())),
+            flush=True,
         )
 
     def finalize_skip_rids(self, scheduler_output: SchedulerOutput) -> set[str]:
