@@ -17,6 +17,9 @@ from pathlib import Path
 from urllib.request import urlopen
 
 from experiments.qwen3_tts_cp_spec_k2.p18_run import PROMPTS, SEEDS_SMOKE
+from experiments.qwen3_tts_cp_spec_k2.p19_diag_coverage import (
+    validate_diagnostic_trace,
+)
 from experiments.qwen3_tts_cp_spec_k2.quality_smoke import (
     MODEL, _http_call, wav_info,
 )
@@ -24,6 +27,9 @@ from experiments.qwen3_tts_cp_spec_k2.quality_smoke import (
 STATUS_OK = "P19_SINGLE_REQUEST_COMPLETED_DIAGNOSTIC_ONLY_NO_COST_SELECTION"
 STATUS_BAD = "P19_CUDA700_OR_OTHER_DIAGNOSTIC_FAILURE_NO_SELECTION"
 STATUS_NO_ARM = "P19_DIAGNOSTIC_ARM_NOT_EXECUTED_NO_SELECTION"
+STATUS_ALL_DEPTHS = (
+    "P19_ALL_DEPTHS_GRAPH_SINGLE_FRAME_LIFECYCLE_PASS_NOT_COST_OR_SERVING"
+)
 SCHEMA = "qwen3tts-p19-cuda700-one-request-v1"
 
 
@@ -131,23 +137,28 @@ def run(root: Path, base_url: str) -> dict:
         ))
         all_trace = trace_tail(root, count=100000)
         result["trace_tail"] = all_trace[-40:]
-        phase_names = {entry.get("stage") for entry in all_trace}
-        required = (
-            "P19_COST_PROBE_SKIPPED_OFF"
-            if diagnostic["arm"] == "OFF"
-            else "P19_DIAGNOSTIC_FINAL_RESTORE_SYNC_PASS"
-        )
-        if result["status"] == STATUS_OK and (
-            result["census_rows"] == 0 or required not in phase_names
-        ):
-            # HTTP success without a targeted GPU arm is NOT a CUDA700.
-            # Preserve a separate, explicit fail-closed status.
-            result["status"] = STATUS_NO_ARM
-            result["error"] = (
-                "P19_DIAGNOSTIC_HTTP_STOP_WITHOUT_ACTUAL_ARM_EVIDENCE: "
-                f"missing={required} rows={result['census_rows']}"
+        try:
+            result["trace_coverage"] = validate_diagnostic_trace(
+                all_trace, diagnostic
             )
+        except (ValueError, RuntimeError, KeyError, TypeError) as exc:
+            result["trace_coverage_error"] = f"{type(exc).__name__}: {exc}"
+            if result["status"] == STATUS_OK:
+                # A natural HTTP finish without ALL required phases
+                # is a selection/coverage failure, never CUDA700 proof.
+                result["status"] = STATUS_NO_ARM
+                result["error"] = (
+                    "P19_DIAGNOSTIC_HTTP_STOP_WITHOUT_COMPLETE_ARM_EVIDENCE: "
+                    f"{exc}; census_rows={result['census_rows']}"
+                )
+                failure = RuntimeError(result["error"])
+        if result["status"] == STATUS_OK and result["census_rows"] == 0:
+            result["status"] = STATUS_NO_ARM
+            result["error"] = "P19_DIAGNOSTIC_NO_NATIVE_CENSUS_ROWS"
             failure = RuntimeError(result["error"])
+        if (result["status"] == STATUS_OK
+                and diagnostic["arm"] == "ALL_DEPTHS_GRAPH"):
+            result["status"] = STATUS_ALL_DEPTHS
         if result["P19_full_cost_rows_should_be_zero"] != 0:
             result["status"] = STATUS_BAD
             result["error"] = "P19_DIAGNOSTIC_ILLEGAL_FORMAL_COST_RECORD"
