@@ -43,7 +43,7 @@ def load_nsight(db_path: Path) -> tuple[dict, dict]:
         }
         if not {KERNEL_TABLE, NVTX_TABLE, STRING_TABLE}.issubset(tables):
             raise RuntimeError("P22_NSYS_SQLITE_REQUIRED_TABLES_MISSING")
-        if not {"start", "end", "correlationId", "shortName"}.issubset(
+        if not {"start", "end", "correlationId", "shortName", "globalPid"}.issubset(
             _columns(db, KERNEL_TABLE)
         ):
             raise RuntimeError("P22_NSYS_KERNEL_SCHEMA_CHANGED")
@@ -54,6 +54,8 @@ def load_nsight(db_path: Path) -> tuple[dict, dict]:
         if not {"id", "value"}.issubset(_columns(db, STRING_TABLE)):
             raise RuntimeError("P22_NSYS_STRINGIDS_SCHEMA_CHANGED")
         ncol = _columns(db, NVTX_TABLE)
+        if "text" not in ncol and "textId" not in ncol:
+            raise RuntimeError("P22_NSYS_NVTX_TEXT_SCHEMA_CHANGED")
         text_expr = (
             "coalesce(n.text, s.value)" if {"text", "textId"}.issubset(ncol)
             else ("s.value" if "textId" in ncol else "n.text")
@@ -96,9 +98,20 @@ def load_nsight(db_path: Path) -> tuple[dict, dict]:
         # CUDA graph nodes may have a correlationId shared by many kernels.
         # One API launch -> multiple GPU kernels is valid. A collision of
         # distinct API launches with the SAME correlationId is ambiguous.
+        # CUPTI correlationId can be reused across processes; key by
+        # (CUDA correlation ID, decoded PID) rather than correlation alone.
+        # Prefer runtime API when the same launch is also recorded at the
+        # driver level. Duplicate DIFFERENT events within the same API
+        # table remain ambiguous and must not be misattributed.
+        def serialized_pid(global_id):
+            if type(global_id) is not int:
+                return None
+            return (global_id >> 24) & 0xFFFFFF
+
         api = {}
+        priorities = {}
         ambiguous = set()
-        for table in API_TABLES:
+        for priority, table in enumerate(API_TABLES):
             if table not in tables:
                 continue
             if not {"start", "end", "globalTid", "correlationId"}.issubset(
@@ -109,14 +122,21 @@ def load_nsight(db_path: Path) -> tuple[dict, dict]:
                 f"SELECT correlationId,start,end,globalTid FROM {table} "
                 "WHERE correlationId IS NOT NULL"
             ):
+                pid = serialized_pid(tid)
+                if pid is None:
+                    continue
+                key = (cid, pid)
                 item = (begin, end, tid)
-                if cid in api and api[cid] != item:
-                    ambiguous.add(cid)
-                else:
-                    api[cid] = item
-
-        for cid in ambiguous:
-            api.pop(cid, None)
+                if key not in api:
+                    api[key] = item
+                    priorities[key] = priority
+                elif priority < priorities[key]:
+                    api[key] = item
+                    priorities[key] = priority
+                elif priority == priorities[key] and item != api[key]:
+                    ambiguous.add(key)
+        for key in ambiguous:
+            api.pop(key, None)
 
         def find_stage(item):
             begin, end, tid = item
@@ -132,10 +152,10 @@ def load_nsight(db_path: Path) -> tuple[dict, dict]:
             return None
 
         stage = {}
-        for cid, item in api.items():
+        for key, item in api.items():
             label = find_stage(item)
             if label is not None:
-                stage[cid] = label
+                stage[key] = label
 
         by_stage = defaultdict(
             lambda: {"kernels": 0, "sum_gpu_kernel_work_ns": 0}
@@ -143,21 +163,26 @@ def load_nsight(db_path: Path) -> tuple[dict, dict]:
         kernel_names = Counter()
         counts = Counter()
         query = (
-            f"SELECT k.start,k.end,k.correlationId,s.value "
+            f"SELECT k.start,k.end,k.correlationId,k.globalPid,s.value "
             f"FROM {KERNEL_TABLE} k LEFT JOIN StringIds s "
             "ON k.shortName=s.id"
         )
-        for start, end, cid, name in db.execute(query):
+        for start, end, cid, kernel_pid, name in db.execute(query):
             if end < start:
                 raise RuntimeError("P22_NSYS_INVALID_KERNEL_TIMESTAMP")
             counts["all_cuda_kernels"] += 1
-            if cid in ambiguous:
+            decoded_pid = serialized_pid(kernel_pid)
+            if decoded_pid is None:
+                counts["unknown_kernel_pid"] += 1
+                continue
+            key = (cid, decoded_pid)
+            if key in ambiguous:
                 counts["ambiguous_api_correlation"] += 1
                 continue
-            if cid not in api:
+            if key not in api:
                 counts["missing_cuda_api_correlation"] += 1
                 continue
-            label = stage.get(cid)
+            label = stage.get(key)
             if label is None:
                 counts["no_p22_nvtx_launch_range"] += 1
                 continue
