@@ -169,6 +169,33 @@ def run(root: Path, base_url: str) -> dict:
             out.write("\n")
         print(f"P19_DIAG_STATUS={result['status']}", flush=True)
         print(f"P19_DIAG_REPORT={diag_path}", flush=True)
+        if "trace_coverage" in result:
+            coverage = result["trace_coverage"]
+            print(
+                "P19_DIAG_COVERAGE="
+                f"depths={coverage['depths_verified']} "
+                f"graph_arms={coverage['graph_arms_verified']} "
+                f"frame={coverage.get('frame')}",
+                flush=True,
+            )
+        if "trace_coverage_error" in result:
+            print(
+                f"P19_DIAG_COVERAGE_ERROR={result['trace_coverage_error']}",
+                flush=True,
+            )
+        # The original tail often contained only P18 frame observations.
+        # Explicitly print the latest graph lifecycle phases as well.
+        phases = [
+            item for item in all_trace
+            if item.get("stage", "").startswith("P19_")
+        ]
+        for item in phases[-16:]:
+            print(
+                "P19_GRAPH_PHASE="
+                f"{item.get('stage')} depth={item.get('depth')} "
+                f"frame={item.get('frame')} arm={item.get('arm')}",
+                flush=True,
+            )
         for item in result["trace_tail"][-18:]:
             print(
                 "P19_DIAG_PHASE="
