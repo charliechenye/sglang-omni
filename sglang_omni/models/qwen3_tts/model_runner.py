@@ -174,6 +174,15 @@ class Qwen3TTSModelRunner(ModelRunner):
         schedule_batch: ScheduleBatch | None,
         requests: list[SchedulerRequest],
     ) -> None:
+        # Always reached after base prepare_and_forward returns. A backend
+        # may prepopulate next_token_ids and skip sample_next_token_ids,
+        # so this stage captures that alternate path as well.
+        if forward_batch is not None:
+            self._p19_native_tail_mark(
+                "MAIN_TALKER_STEP_RETURNED_BEFORE_COLLECT",
+                device=forward_batch.input_ids.device,
+                requests=requests,
+            )
         self.collect_codes(result, forward_batch, schedule_batch, requests)
 
     def sample_before_post_prefill(
