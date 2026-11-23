@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -184,3 +185,17 @@ def test_p21_reuses_actual_p17_wide_bonus_uniform_layout():
     assert 'next_depth(depth, committed)' in producer
     assert 'if cache_len != depth + 1:' in producer
     assert 'P21_TERMINAL_FRAME_CODE_OR_DEPTH_INVALID' in producer
+
+
+def test_p21_launch_script_bash_syntax_and_branch_guard():
+    """Guard startup: the launcher must parse before touching H200 or disk."""
+    root = Path(__file__).resolve().parents[3]
+    script = root / "experiments/qwen3_tts_cp_spec_k2/p21_serving_launch.sh"
+    result = subprocess.run(
+        ["bash", "-n", str(script)],
+        cwd=root, capture_output=True, text=True, check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    source = script.read_text()
+    assert 'BRANCH="$(git branch --show-current)"' in source
+    assert '"$BRANCH" != "experiment/qwen3-tts-serving-k2-abba-p21"' in source
