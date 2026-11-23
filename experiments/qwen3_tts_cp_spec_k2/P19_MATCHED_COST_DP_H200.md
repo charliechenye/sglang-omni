@@ -831,7 +831,11 @@ fences at collection boundaries:
    after main Talker forward, before semantic sampler.
 3. `P19_NATIVE_TAIL_MAIN_SEMANTIC_SAMPLER_RETURNED` — after sampled
    layer-0 audio/semantic token.
-4. `P19_NATIVE_TAIL_COLLECT_CODES_BEGIN`,
+4. `P19_NATIVE_TAIL_MAIN_TALKER_STEP_RETURNED_BEFORE_COLLECT` —
+   end of the model runner's entire `prepare_and_forward` call,
+   including cases where the backend itself already populated
+   the semantic token IDs and skipped `sample_next_token_ids`.
+5. `P19_NATIVE_TAIL_COLLECT_CODES_BEGIN`,
    `NEXT_FRAME_TOKEN_IDS_STAGED`,
    `NEXT_FRAME_SAMPLE_POSITIONS_READY`,
    `NEXT_FRAME_BEFORE_CODE_PREDICTOR` — before the native subcode
