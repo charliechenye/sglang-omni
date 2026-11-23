@@ -231,6 +231,28 @@ class Qwen3TTSModelRunner(ModelRunner):
             : len(requests)
         ]
 
+    def _p19_native_tail_mark(
+        self, stage: str, *, device: torch.device,
+        requests: list[SchedulerRequest] | None = None,
+    ) -> None:
+        """Research-only: attribute post-code15 scheduler GPU work."""
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM") not in (
+            "ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER",
+        ):
+            return
+        pending = getattr(self.model, "_p19_native_boundary_next_req", None)
+        if pending is None:
+            return
+        if (requests is not None
+                and (len(requests) != 1
+                     or str(requests[0].request_id) != pending)):
+            raise RuntimeError("P19_NATIVE_TAIL_SCHEDULER_REQUEST_DRIFT")
+        from .code_predictor_spec_p19_diag import maybe_tail_runner_event
+
+        maybe_tail_runner_event(
+            self.model, stage, device=device, request_id=pending,
+        )
+
     def collect_codes(
         self,
         result: GenerationBatchResult,
@@ -288,6 +310,11 @@ class Qwen3TTSModelRunner(ModelRunner):
                 hidden,
                 semantic_positions=semantic_positions,
             )
+            if p18_on:
+                self._p19_native_tail_mark(
+                    "COLLECT_CODES_PREDICTOR_RETURNED",
+                    device=layer0_codes.device, requests=requests,
+                )
         finally:
             if p18_on:
                 del self.model._p18_current_request_id
@@ -305,18 +332,38 @@ class Qwen3TTSModelRunner(ModelRunner):
         else:
             pass
         self.has_pending_code_step = False
+        self._p19_native_tail_mark(
+            "POST_PROCESS_BEGIN",
+            device=self.model.output_codes.device,
+            requests=scheduler_output.requests,
+        )
         eos_id = int(self.model.config.codec_eos_token_id)
         # Note: (Jiaxin Deng) per-row clones were a c32 decode-loop hot spot;
         # rows must stay views of a snapshot, never of the reused graph buffers.
         batch_size = len(scheduler_output.requests)
         codes_snap = self.model.output_codes[:batch_size].detach().clone()
+        self._p19_native_tail_mark(
+            "POST_PROCESS_CODES_SNAPSHOT",
+            device=codes_snap.device,
+            requests=scheduler_output.requests,
+        )
         embeds_snap = self.model.output_embeds[:batch_size].detach().clone()
+        self._p19_native_tail_mark(
+            "POST_PROCESS_EMBEDS_SNAPSHOT",
+            device=embeds_snap.device,
+            requests=scheduler_output.requests,
+        )
         codes_ready = None
         if self.codes_event_module is not None:
             codes_ready = self.codes_event_module.Event()
             codes_ready.record()
         else:
             pass
+        self._p19_native_tail_mark(
+            "POST_PROCESS_CODES_EVENT_RECORDED",
+            device=embeds_snap.device,
+            requests=scheduler_output.requests,
+        )
         for row_idx, sched_req in enumerate(scheduler_output.requests):
             req_output = outputs[sched_req.request_id]
             # note (ratish): a middle prefill chunk samples at a prompt row; SGLang drops
@@ -335,6 +382,11 @@ class Qwen3TTSModelRunner(ModelRunner):
             sched_req.data.latest_stream_code_chunk = code_chunk
             sched_req.data.codes_ready_event = codes_ready
             sched_req.data.pending_feedback_queue.append(embeds_snap[row_idx])
+        self._p19_native_tail_mark(
+            "POST_PROCESS_FEEDBACK_QUEUED",
+            device=embeds_snap.device,
+            requests=scheduler_output.requests,
+        )
 
     def finalize_skip_rids(self, scheduler_output: SchedulerOutput) -> set[str]:
         return {
@@ -360,6 +412,10 @@ class Qwen3TTSModelRunner(ModelRunner):
             return
         else:
             pass
+        self._p19_native_tail_mark(
+            "WRITE_FEEDBACK_ENTER",
+            device=forward_batch.input_ids.device, requests=requests,
+        )
         decode_feedback_embedding = self.model.decode_feedback_embedding
         input_ids = forward_batch.input_ids
         if input_ids.numel() < batch_size:
@@ -406,12 +462,20 @@ class Qwen3TTSModelRunner(ModelRunner):
             # note(ratish): the history outlives the buffer, a retracted request
             # replays it in its re-prefill.
             history = target.detach().clone()
+        self._p19_native_tail_mark(
+            "WRITE_FEEDBACK_TARGET_HISTORY_READY",
+            device=target.device, requests=requests,
+        )
         for row_idx, sched_req in enumerate(requests):
             QwenTalkerModelRunner.append_decode_input_history(
                 sched_req.data, history[row_idx]
             )
         # During graph decode, input_ids carries staged embedding row ids.
         input_ids[:batch_size].copy_(row_ids)
+        self._p19_native_tail_mark(
+            "WRITE_FEEDBACK_ROW_IDS_READY",
+            device=input_ids.device, requests=requests,
+        )
 
     def decode_row_ids(self, batch_size: int, input_ids: torch.Tensor) -> torch.Tensor:
         cached = self.row_ids_cache
