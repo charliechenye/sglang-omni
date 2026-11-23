@@ -526,6 +526,16 @@ class Qwen3TTSModelRunner(ModelRunner):
             + " ".join(f"{k}={v}" for k, v in sorted(stats.items())),
             flush=True,
         )
+        # P22 is a disposable profiling-only worker: stop the explicitly
+        # armed Nsight CUDA profiler range AFTER the actual B request has
+        # finished, then emit stage totals. No code executes when P22 OFF.
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P22_PROFILE") == "1":
+            from .code_predictor_spec_p22_profile import finish_request
+
+            finish_request(
+                self.model, request_hash=request_hash,
+                candidate_frames=stats["candidate_frames"],
+            )
 
     def finalize_skip_rids(self, scheduler_output: SchedulerOutput) -> set[str]:
         return {
