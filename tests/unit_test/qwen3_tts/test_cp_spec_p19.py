@@ -17,7 +17,7 @@ from experiments.qwen3_tts_cp_spec_k2.p19_dp import (
     RESULT, _case_tables, analyze as analyze_dp, bellman, fixed_width_policy,
 )
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_cost import (
-    BLOCKS, REPEATS, SCHEMA,
+    BLOCKS, REPEATS, SCHEMA, select_cost_frame,
 )
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag import (
     MODES as DIAG_MODES, diagnostic_config, event as diag_event,
@@ -345,6 +345,63 @@ def test_p19_diag_cpu_only_durable_phase_trace(tmp_path, monkeypatch):
     assert all(r["schema"] == DIAG_SCHEMA for r in rows)
     assert all(r["depth"] == 9 and r["arm"] == "AR" for r in rows)
     assert rows[1]["monotonic_ns"] >= rows[0]["monotonic_ns"]
+
+
+
+
+def test_p19_d09_diagnostic_selects_its_first_real_frame():
+    """Regression for D9 no-arm false failure: prior code hardcoded depth=1."""
+    selected = set()
+    assert not select_cost_frame(
+        selected, frame=37, depth=1, max_frames=1, diagnostic_depth=9
+    )
+    assert selected == set()
+    assert select_cost_frame(
+        selected, frame=37, depth=9, max_frames=1, diagnostic_depth=9
+    )
+    assert selected == {37}
+    assert not select_cost_frame(
+        selected, frame=38, depth=9, max_frames=1, diagnostic_depth=9
+    )
+    assert not select_cost_frame(
+        selected, frame=37, depth=10, max_frames=1, diagnostic_depth=9
+    )
+
+
+def test_p19_formal_cost_frame_selection_remains_depth1_anchored():
+    """No changes to full all-depth P19A cohort or 1/2 frame count."""
+    selected = set()
+    assert not select_cost_frame(
+        selected, frame=37, depth=9, max_frames=1
+    )
+    assert selected == set()
+    assert select_cost_frame(
+        selected, frame=37, depth=1, max_frames=1
+    )
+    assert select_cost_frame(
+        selected, frame=37, depth=9, max_frames=1
+    )
+    assert select_cost_frame(
+        selected, frame=37, depth=14, max_frames=1
+    )
+    assert not select_cost_frame(
+        selected, frame=38, depth=1, max_frames=1
+    )
+    assert selected == {37}
+
+
+def test_p19_diagnostic_depth_selection_supports_ar_tail_and_rejects_invalid():
+    selected = set()
+    assert select_cost_frame(
+        selected, frame=37, depth=14, max_frames=1, diagnostic_depth=14
+    )
+    assert selected == {37}
+    with pytest.raises(ValueError, match="INVALID_DIAGNOSTIC_TARGET_DEPTH"):
+        select_cost_frame(
+            set(), frame=37, depth=9, max_frames=1, diagnostic_depth=15
+        )
+    with pytest.raises(ValueError, match="INVALID_COST_FRAME_SELECTION"):
+        select_cost_frame(set(), frame=37, depth=0, max_frames=1)
 
 
 def test_p19a_formal_analyzer_refuses_diagnostic_root(tmp_path):
