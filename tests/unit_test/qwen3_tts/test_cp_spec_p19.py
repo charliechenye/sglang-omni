@@ -22,6 +22,9 @@ from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_cost import (
 from sglang_omni.models.qwen3_tts.code_predictor_spec_p19_diag import (
     MODES as DIAG_MODES, diagnostic_config, event as diag_event,
 )
+from experiments.qwen3_tts_cp_spec_k2.p19_diag_coverage import (
+    GRAPH_STAGES, DEPTH_STAGES, arms_at_depth, validate_diagnostic_trace,
+)
 
 SHA = "a" * 40
 
@@ -307,7 +310,7 @@ def test_p19_cuda700_diag_modes_gate_and_legal_depth(monkeypatch):
     ):
         monkeypatch.delenv(key, raising=False)
     assert diagnostic_config() is None
-    assert len(DIAG_MODES) == 10
+    assert len(DIAG_MODES) == 11
     monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_DEPTH", "1")
     for mode in DIAG_MODES:
         monkeypatch.setenv("SGLANG_OMNI_QTTS_CP_P19_DIAG_ARM", mode)
@@ -417,3 +420,108 @@ def test_p19a_formal_analyzer_refuses_diagnostic_root(tmp_path):
         RuntimeError, match="DIAGNOSTIC_MODE_NO_FORMAL_COST",
     ):
         validate_costs(root)
+
+
+def _synthetic_cumulative_trace(last_depth: int = 14) -> list[dict]:
+    """Strictly one frame, one worker, every expected depth/Graph phase."""
+    events = []
+    seq = 1
+    def add(stage, depth, arm):
+        nonlocal seq
+        events.append({
+            "stage": stage, "depth": depth, "arm": arm,
+            "frame": 37, "case_id": "p00_s20261123",
+            "pid": 12345, "monotonic_ns": seq,
+        })
+        seq += 1
+
+    for depth in range(1, last_depth + 1):
+        add(DEPTH_STAGES[0], depth, "ALL_DEPTHS_GRAPH")
+        for arm in arms_at_depth(depth):
+            for phase in GRAPH_STAGES:
+                add(phase, depth, arm)
+        add(DEPTH_STAGES[1], depth, "ALL_DEPTHS_GRAPH")
+        add(DEPTH_STAGES[2], depth, "ALL_DEPTHS_GRAPH")
+    return events
+
+
+def test_p19_all_depths_graph_has_50_legal_arms_and_ar_only_tail():
+    assert sum(len(arms_at_depth(d)) for d in range(1, 15)) == 50
+    assert arms_at_depth(11) == ("AR", "2", "3", "4")
+    assert arms_at_depth(12) == ("AR", "2", "3")
+    assert arms_at_depth(13) == ("AR", "2")
+    assert arms_at_depth(14) == ("AR",)
+    assert len(DIAG_MODES) == 11
+    assert "ALL_DEPTHS_GRAPH" in DIAG_MODES
+
+
+def test_p19_all_depths_full_trace_single_frame_complete():
+    config = {
+        "arm": "ALL_DEPTHS_GRAPH", "depth": 14,
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    events = _synthetic_cumulative_trace()
+    result = validate_diagnostic_trace(events, config)
+    assert result["depths_verified"] == list(range(1, 15))
+    assert result["graph_arms_verified"] == 50
+    assert result["frame"] == 37
+    assert result["worker_pid"] == 12345
+    assert result["result"] == "P19_DIAGNOSTIC_TRACE_COVERAGE_PASS_NO_COST_SELECTION"
+
+
+def test_p19_all_depths_trace_refuses_missing_arm_missing_depth_and_mixed_frame():
+    config = {
+        "arm": "ALL_DEPTHS_GRAPH", "depth": 14,
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    events = _synthetic_cumulative_trace()
+    absent_arm = [
+        ev for ev in events if not (
+            ev["depth"] == 9 and ev["arm"] == "4"
+            and ev["stage"] == "P19_ARM_GRAPH_RELEASE_AND_SYNC_PASS"
+        )
+    ]
+    with pytest.raises(RuntimeError, match="PHASE_COVERAGE_INCOMPLETE"):
+        validate_diagnostic_trace(absent_arm, config)
+    absent_depth = [ev for ev in events if ev["depth"] != 12]
+    with pytest.raises(RuntimeError, match="SELECTED_DEPTH_COUNT_MISMATCH"):
+        validate_diagnostic_trace(absent_depth, config)
+    mixed = [dict(ev) for ev in events]
+    for ev in mixed:
+        if ev["depth"] == 9 and ev["stage"] == "P19_COST_TARGET_FRAME_SELECTED":
+            ev["frame"] = 38
+            break
+    with pytest.raises(RuntimeError, match="MIXED_NATIVE_FRAME_OR_WORKER"):
+        validate_diagnostic_trace(mixed, config)
+    duplicate = events + [dict(events[0])]
+    with pytest.raises(RuntimeError, match="SELECTED_DEPTH_COUNT_MISMATCH"):
+        validate_diagnostic_trace(duplicate, config)
+
+
+def test_p19_all_depths_selects_only_one_initial_frame_across_14_depths():
+    selected = set()
+    for depth in range(1, 15):
+        assert select_cost_frame(
+            selected, frame=37, depth=depth, max_frames=1,
+            diagnostic_depth=None,
+        )
+        assert not select_cost_frame(
+            selected, frame=38, depth=depth, max_frames=1,
+            diagnostic_depth=None,
+        )
+    assert selected == {37}
+
+
+def test_p19_all_depths_prefix_trace_can_bisect_without_faking_full_14():
+    config = {
+        "arm": "ALL_DEPTHS_GRAPH", "depth": 8,
+        "policy": "SINGLE_REQUEST_TRACE_ONLY_NO_COST_SELECTION",
+    }
+    result = validate_diagnostic_trace(_synthetic_cumulative_trace(8), config)
+    assert result["depths_verified"] == list(range(1, 9))
+    assert result["graph_arms_verified"] == 32
+    # Running a partial prefix must not accidentally be reported as D1..14.
+    with pytest.raises(RuntimeError, match="SELECTED_DEPTH_COUNT_MISMATCH"):
+        validate_diagnostic_trace(_synthetic_cumulative_trace(8), {
+            **config, "depth": 14,
+        })
