@@ -111,16 +111,17 @@ def serving_k2(
         position = model.normalize_semantic_positions(
             semantic_positions, batch_size=1, seq_len=1, device=dev
         )
-        seed_positions = model.sub_seed_positions(position[:, 0])
-        native_seed = int(model.sub_sampling_seed_tensor[0].item())
-        semantic_pos = int(position[0, 0].item())
-        generator = torch.Generator(device=dev)
-        generator.manual_seed(_request_seed(native_seed, semantic_pos))
-        temp = float(model.sub_temperature_tensor[0].item())
-        k = int(model.sub_top_k_tensor[0].item())
-        p = float(model.sub_top_p_tensor[0].item())
-        if (abs(temp - 0.9) > 1e-5 or k != 50 or abs(p - 1.0) > 1e-6):
-            raise RuntimeError("P21_SAMPLING_SIGNATURE_ONLY_T09_TOPK50_TOPP1")
+        with p22_span(model, "INIT_CPU_PARAMS"):
+            seed_positions = model.sub_seed_positions(position[:, 0])
+            native_seed = int(model.sub_sampling_seed_tensor[0].item())
+            semantic_pos = int(position[0, 0].item())
+            generator = torch.Generator(device=dev)
+            generator.manual_seed(_request_seed(native_seed, semantic_pos))
+            temp = float(model.sub_temperature_tensor[0].item())
+            k = int(model.sub_top_k_tensor[0].item())
+            p = float(model.sub_top_p_tensor[0].item())
+            if (abs(temp - 0.9) > 1e-5 or k != 50 or abs(p - 1.0) > 1e-6):
+                raise RuntimeError("P21_SAMPLING_SIGNATURE_ONLY_T09_TOPK50_TOPP1")
 
         banks = getattr(model, "_p21_prepacked_head_banks", None)
         if banks is None:
@@ -144,28 +145,30 @@ def serving_k2(
         )
         embeddings.add_(code0_embedding[:, 0, :])
 
-        pair = model.code_predictor.project_input(torch.cat(
-            (talker_hidden.to(dtype=model_dtype), code0_embedding), dim=1,
-        ))
-        old_hidden = model.predictor_forward_tokens(
-            token_embeds=pair, batch_size=1, cache_len=0,
-        )[:, 1:, :].contiguous().clone()
-        first_logits, _ = model.code_predictor.lm_head[0](old_hidden)
-        first_embed, first_projected = model.sample_subtalker_embedding(
-            first_logits[:, -1, :], codec_tables[0],
-            embeddings, codes[:, 1],
-            projected_tables[0] if projected_tables is not None else None,
-            model.predictor_embedding_buffer[:1],
-            model.predictor_projected_buffer[:1]
-            if projected_tables is not None else None,
-            seed_positions[0],
-        )
-        if projected_tables is not None:
-            last_embedding = first_projected.unsqueeze(1).clone()
-        else:
-            last_embedding = model.code_predictor.project_input(
-                first_embed.unsqueeze(1)
-            ).clone()
+        with p22_span(model, "INIT_PAIR_FORWARD"):
+            pair = model.code_predictor.project_input(torch.cat(
+                (talker_hidden.to(dtype=model_dtype), code0_embedding), dim=1,
+            ))
+            old_hidden = model.predictor_forward_tokens(
+                token_embeds=pair, batch_size=1, cache_len=0,
+            )[:, 1:, :].contiguous().clone()
+        with p22_span(model, "INIT_CODE1_SAMPLER"):
+            first_logits, _ = model.code_predictor.lm_head[0](old_hidden)
+            first_embed, first_projected = model.sample_subtalker_embedding(
+                first_logits[:, -1, :], codec_tables[0],
+                embeddings, codes[:, 1],
+                projected_tables[0] if projected_tables is not None else None,
+                model.predictor_embedding_buffer[:1],
+                model.predictor_projected_buffer[:1]
+                if projected_tables is not None else None,
+                seed_positions[0],
+            )
+            if projected_tables is not None:
+                last_embedding = first_projected.unsqueeze(1).clone()
+            else:
+                last_embedding = model.code_predictor.project_input(
+                    first_embed.unsqueeze(1)
+                ).clone()
 
         offsets = torch.arange(2, device=dev, dtype=torch.long)
         depth, cache_len = 1, 2
@@ -173,65 +176,71 @@ def serving_k2(
 
         while depth < 15:
             if depth == 14:
-                # No two-row bonus head at the terminal codebook. Original
-                # native final AR step is the ONLY valid tail.
-                hidden = model.predictor_forward_tokens(
-                    token_embeds=last_embedding,
-                    batch_size=1, cache_len=cache_len,
-                )
-                logits, _ = model.code_predictor.lm_head[14](hidden)
-                model.sample_subtalker_embedding(
-                    logits[:, -1, :], codec_tables[14],
-                    embeddings, codes[:, 15],
-                    None, model.predictor_embedding_buffer[:1],
-                    None, seed_positions[14],
-                )
+                with p22_span(model, "NATIVE_FINAL_AR"):
+                    # No two-row bonus head at the terminal codebook. Original
+                    # native final AR step is the ONLY valid tail.
+                    hidden = model.predictor_forward_tokens(
+                        token_embeds=last_embedding,
+                        batch_size=1, cache_len=cache_len,
+                    )
+                    logits, _ = model.code_predictor.lm_head[14](hidden)
+                    model.sample_subtalker_embedding(
+                        logits[:, -1, :], codec_tables[14],
+                        embeddings, codes[:, 15],
+                        None, model.predictor_embedding_buffer[:1],
+                        None, seed_positions[14],
+                    )
                 depth += 1
                 continue
 
-            check_wide_backend(model, width=2, cache_len=cache_len)
-            # P17 K2 consumes 4 uniforms for one q/p accept-residual
-            # decision PLUS one separate bonus draw at index 4.
-            # Using four silently leaves the bonus selector with an empty
-            # [4:5] slice. Exact shape is an ABI invariant.
-            uniforms = torch.rand(
-                (5,), device=dev, dtype=torch.float32, generator=generator
-            ).clamp(1e-4, 1.0 - 1e-4)
-            step = make_wide_round(
-                model, depth=depth, width=2,
-                cache_len_gpu=torch.tensor(
-                    cache_len, device=dev, dtype=torch.long,
-                ),
-                old_hidden=old_hidden,
-                last_embedding=last_embedding,
-                accumulated=embeddings,
-                uniforms=uniforms,
-                head_bank=banks[depth],
-                offset_ids=offsets,
-                temperature=temp, top_p=p,
-            )
-            committed = int(step["committed_count"].item())
-            advanced_depth = next_depth(depth, committed)
-            candidate_codes = step["committed_codes"][:committed]
-            if candidate_codes.shape != (committed,):
-                raise RuntimeError("P21_INVALID_COMMITTED_CODES_SHAPE")
-            # Device-side assert for invalid -1 code; do not allow unknown
-            #/unaccepted speculative suffix into real returned output.
-            if bool((candidate_codes < 0).any().item()):
-                raise RuntimeError("P21_UNCOMMITTED_SPECULATIVE_CODE")
-            codes[:, depth + 1: depth + 1 + committed].copy_(
-                candidate_codes.view(1, committed)
-            )
-            embeddings.copy_(step["next_sum"])
-            old_hidden = step["next_hidden"].clone()
-            last_embedding = step["next_embedding"].clone()
-            rounds += 1
-            accepted += committed == 2
-            rejected += committed == 1
-            cache_len += committed
-            depth = advanced_depth
-            if cache_len != depth + 1:
-                raise RuntimeError("P21_CACHE_LEN_DEPTH_INVARIANT_FAILED")
+            with p22_span(model, "ROUND"):
+                check_wide_backend(model, width=2, cache_len=cache_len)
+                # P17 K2 consumes 4 uniforms for one q/p accept-residual
+                # decision PLUS one separate bonus draw at index 4.
+                # Using four silently leaves the bonus selector with an empty
+                # [4:5] slice. Exact shape is an ABI invariant.
+                with p22_span(model, "ROUND_UNIFORMS"):
+                    uniforms = torch.rand(
+                        (5,), device=dev, dtype=torch.float32, generator=generator
+                    ).clamp(1e-4, 1.0 - 1e-4)
+                step = make_wide_round(
+                    model, depth=depth, width=2,
+                    cache_len_gpu=torch.tensor(
+                        cache_len, device=dev, dtype=torch.long,
+                    ),
+                    old_hidden=old_hidden,
+                    last_embedding=last_embedding,
+                    accumulated=embeddings,
+                    uniforms=uniforms,
+                    head_bank=banks[depth],
+                    offset_ids=offsets,
+                    temperature=temp, top_p=p,
+                )
+                with p22_span(model, "ROUND_CPU_ACCEPT_LENGTH"):
+                    committed = int(step["committed_count"].item())
+                    advanced_depth = next_depth(depth, committed)
+                candidate_codes = step["committed_codes"][:committed]
+                if candidate_codes.shape != (committed,):
+                    raise RuntimeError("P21_INVALID_COMMITTED_CODES_SHAPE")
+                # Device-side assert for invalid -1 code; do not allow unknown
+                #/unaccepted speculative suffix into real returned output.
+                with p22_span(model, "ROUND_CPU_CODE_VALIDITY"):
+                    if bool((candidate_codes < 0).any().item()):
+                        raise RuntimeError("P21_UNCOMMITTED_SPECULATIVE_CODE")
+                with p22_span(model, "ROUND_GPU_COMMIT"):
+                    codes[:, depth + 1: depth + 1 + committed].copy_(
+                        candidate_codes.view(1, committed)
+                    )
+                    embeddings.copy_(step["next_sum"])
+                    old_hidden = step["next_hidden"].clone()
+                    last_embedding = step["next_embedding"].clone()
+                rounds += 1
+                accepted += committed == 2
+                rejected += committed == 1
+                cache_len += committed
+                depth = advanced_depth
+                if cache_len != depth + 1:
+                    raise RuntimeError("P21_CACHE_LEN_DEPTH_INVARIANT_FAILED")
 
         if depth != 15 or not torch.equal(codes[:, 0], layer0_codes[:, 0]):
             raise RuntimeError("P21_TERMINAL_FRAME_CODE_OR_DEPTH_INVALID")
