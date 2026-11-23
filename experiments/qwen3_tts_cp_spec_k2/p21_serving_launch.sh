@@ -13,9 +13,8 @@ if [[ "$1" != /* || "$ROOT" != "$1" || -e "$ROOT" ]]; then
   exit 2
 fi
 WORKTREE="$(git rev-parse --show-toplevel)"
-if [[ "$(pwd -P)" != "$WORKTREE" ||
-      "$(git branch --show-current)" !=
-        "experiment/qwen3-tts-serving-k2-abba-p21" ]]; then
+BRANCH="$(git branch --show-current)"
+if [[ "$(pwd -P)" != "$WORKTREE" || "$BRANCH" != "experiment/qwen3-tts-serving-k2-abba-p21" ]]; then
   echo "P21_ABBA_REQUIRES_DEDICATED_EXPERIMENT_WORKTREE" >&2
   exit 2
 fi
