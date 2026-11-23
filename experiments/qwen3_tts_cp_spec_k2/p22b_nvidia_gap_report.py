@@ -153,7 +153,7 @@ def report(k2_api: dict, native_api: dict, p22: dict, p21: dict | None, k2_gpu: 
         "source_verified_differences": [
             {
                 "feature": "control_loop",
-                "nvidia": "C++ host loop, one pinned host accept-length sync per round",
+                "nvidia": "C++ host loop, D2H accept-length transfer and one stream sync per round",
                 "omni": "Python dynamic-depth loop, multiple Python tensor operations",
             },
             {
