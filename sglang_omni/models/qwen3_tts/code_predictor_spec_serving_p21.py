@@ -58,6 +58,16 @@ def _request_seed(native_seed: int, semantic_position: int) -> int:
     return int.from_bytes(raw[:8], "little") & ((1 << 63) - 1)
 
 
+def next_depth(depth: int, committed: int) -> int:
+    """Host-side logical K2 offset; the physical second KV row is speculative."""
+    if (type(depth) is not int or type(committed) is not int
+            or depth not in range(1, 14)
+            or committed not in (1, 2)
+            or depth + committed > 15):
+        raise RuntimeError("P21_INVALID_COMMITTED_LENGTH_OR_DEPTH")
+    return depth + committed
+
+
 @torch.no_grad()
 def serving_k2(
     model, layer0_codes: torch.Tensor, talker_hidden: torch.Tensor,
@@ -194,8 +204,7 @@ def serving_k2(
             temperature=temp, top_p=p,
         )
         committed = int(step["committed_count"].item())
-        if committed not in (1, 2) or depth + committed > 15:
-            raise RuntimeError("P21_INVALID_COMMITTED_LENGTH")
+        advanced_depth = next_depth(depth, committed)
         candidate_codes = step["committed_codes"][:committed]
         if candidate_codes.shape != (committed,):
             raise RuntimeError("P21_INVALID_COMMITTED_CODES_SHAPE")
@@ -213,7 +222,9 @@ def serving_k2(
         accepted += committed == 2
         rejected += committed == 1
         cache_len += committed
-        depth += committed
+        depth = advanced_depth
+        if cache_len != depth + 1:
+            raise RuntimeError("P21_CACHE_LEN_DEPTH_INVARIANT_FAILED")
 
     if depth != 15 or not torch.equal(codes[:, 0], layer0_codes[:, 0]):
         raise RuntimeError("P21_TERMINAL_FRAME_CODE_OR_DEPTH_INVALID")
