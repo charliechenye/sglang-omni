@@ -184,6 +184,7 @@ python -m experiments.qwen3_tts_cp_spec_k2.p22b_nvidia_gap_report \
   --k2-api "$B/p22b-cuda-api-001/report.json" \
   --native-api "$A/p22b_native_api.json" \
   --p22-analysis "$B/p22-analysis/report.json" \
+  --k2-gpu "$B/p22_nsys_kernel_work.json" \
   --out "$A/nvidia-gap-001"
 
 cat "$A/nvidia-gap-001/summary.md"
