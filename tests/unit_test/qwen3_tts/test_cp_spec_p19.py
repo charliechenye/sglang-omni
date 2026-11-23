@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -1047,3 +1048,48 @@ def test_p19_lifecycle_comparator_allows_both_default_baselines(
         RuntimeError, match="SELECTED_FRAME_OR_CASE_DRIFT"
     ):
         compare([a, b])
+
+
+def test_p19_lifecycle_orphan_log_is_preserved_and_diagnosed(tmp_path):
+    """If preflight left only .launcher.log, never silently overwrite it."""
+    repo_root = Path(__file__).resolve().parents[3]
+    script = repo_root / (
+        "experiments/qwen3_tts_cp_spec_k2/p19_lifecycle_leg.sh"
+    )
+    missing_root = tmp_path / "p19-graph-001"
+    orphan_log = Path(str(missing_root) + ".launcher.log")
+    orphan_log.write_text(
+        "P19_IMPORT_SOURCE_MISMATCH: hypothetical prior preflight\n"
+    )
+    result = subprocess.run(
+        ["bash", str(script), "BASE_GRAPH", str(missing_root)],
+        capture_output=True, text=True, cwd=repo_root, check=False,
+    )
+    assert result.returncode == 2
+    assert "P19_LIFECYCLE_ORPHAN_LAUNCH_LOG" in result.stderr
+    assert str(orphan_log) in result.stderr
+    assert "P19_IMPORT_SOURCE_MISMATCH" in result.stderr
+    assert "choose a NEW root" in result.stderr
+    assert not missing_root.exists()
+    assert orphan_log.read_text().startswith(
+        "P19_IMPORT_SOURCE_MISMATCH"
+    )
+
+
+def test_p19_lifecycle_existing_root_fails_before_orphan_check(tmp_path):
+    """An existing evidence directory must remain intact."""
+    repo_root = Path(__file__).resolve().parents[3]
+    script = repo_root / (
+        "experiments/qwen3_tts_cp_spec_k2/p19_lifecycle_leg.sh"
+    )
+    root = tmp_path / "p19-graph-002"
+    root.mkdir()
+    evidence = root / "source.sha"
+    evidence.write_text("a" * 40 + "\n")
+    result = subprocess.run(
+        ["bash", str(script), "BASE_GRAPH", str(root)],
+        capture_output=True, text=True, cwd=repo_root, check=False,
+    )
+    assert result.returncode == 2
+    assert "P19_LIFECYCLE_REFUSES_OVERWRITE_ROOT" in result.stderr
+    assert evidence.read_text().strip() == "a" * 40
