@@ -160,6 +160,33 @@ def _one_arm(
     }
 
 
+def select_cost_frame(
+    chosen: set[int], *, frame: int, depth: int,
+    max_frames: int, diagnostic_depth: int | None = None,
+) -> bool:
+    """Choose real frames at depth 1 normally, at selected depth in diagnosis.
+
+    A targeted D9 diagnostic is not visited at D1 by maybe_measure,
+    so it MUST be able to select its first frame when D9 is reached.
+    In the formal all-depth cohort, selection remains anchored at D1
+    and every later depth of that chosen frame is measured.
+    """
+    if not 1 <= depth <= 14 or not 1 <= max_frames <= 2:
+        raise ValueError("P19_INVALID_COST_FRAME_SELECTION_CONTRACT")
+    if diagnostic_depth is not None:
+        if not 1 <= diagnostic_depth <= 14:
+            raise ValueError("P19_INVALID_DIAGNOSTIC_TARGET_DEPTH")
+        if depth != diagnostic_depth:
+            return False
+    if frame in chosen:
+        return True
+    entry_depth = diagnostic_depth if diagnostic_depth is not None else 1
+    if depth != entry_depth or len(chosen) >= max_frames:
+        return False
+    chosen.add(frame)
+    return True
+
+
 @torch.no_grad()
 def maybe_measure(
     model, *, case: dict, req_hash: str, frame: int, depth: int,
@@ -197,10 +224,17 @@ def maybe_measure(
         req_select = {}
         model._p19_selected_frames = req_select
     chosen = req_select.setdefault(req_hash, set())
-    if frame not in chosen:
-        if depth != 1 or len(chosen) >= max_frames:
-            return
-        chosen.add(frame)
+    if not select_cost_frame(
+        chosen, frame=frame, depth=depth, max_frames=max_frames,
+        diagnostic_depth=(diagnostic[1] if diagnostic is not None else None),
+    ):
+        return
+    if diagnostic is not None:
+        diag_event(
+            "P19_COST_TARGET_FRAME_SELECTED",
+            depth=depth, frame=frame, arm=diagnostic[0],
+            case_id=case["case_id"],
+        )
 
     source_sha = os.environ.get("SGLANG_OMNI_QTTS_CP_P18_SOURCE_SHA", "")
     if len(source_sha) != 40 or source_sha != os.environ.get(
