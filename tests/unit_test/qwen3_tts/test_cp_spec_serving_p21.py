@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from sglang_omni.models.qwen3_tts.code_predictor_spec_serving_p21 import (
-    _request_seed, armed,
+    _request_seed, armed, next_depth,
 )
 from experiments.qwen3_tts_cp_spec_k2.p21_serving_abba import (
     STATUS_PASS, compute_report, PHASES,
@@ -139,3 +139,48 @@ def test_p21_real_serving_hooks_before_all_p18_p19_probes():
     assert 'unset "$key"' in launcher
     assert 'SGLANG_OMNI_QTTS_CP_SPEC_K=0' in launcher
     assert 'SGLANG_OMNI_QTTS_CP_P21_SERVING_K2=1' in launcher
+
+
+def test_p21_real_k2_all_accept_and_reject_depth_trajectories():
+    # All accept: 7 two-code rounds reach terminal code15.
+    d = 1
+    visited = []
+    while d < 15:
+        visited.append(d)
+        d = next_depth(d, 2)
+    assert visited == [1, 3, 5, 7, 9, 11, 13]
+    assert d == 15
+    # All reject: 13 one-code rounds plus native final code15.
+    d = 1
+    visited = []
+    while d < 14:
+        visited.append(d)
+        d = next_depth(d, 1)
+    assert visited == list(range(1, 14))
+    assert d == 14
+    # Miscommitted code lengths cannot leak beyond code15.
+    for depth, count in (
+        (0, 1), (14, 1), (13, 3), (12, 0), (3, -1),
+        (1, True), (13, 2.0),
+    ):
+        with pytest.raises(
+            RuntimeError, match="INVALID_COMMITTED_LENGTH_OR_DEPTH"
+        ):
+            next_depth(depth, count)
+
+
+def test_p21_reuses_actual_p17_wide_bonus_uniform_layout():
+    import inspect
+    from sglang_omni.models.qwen3_tts import (
+        code_predictor_spec_serving_p21 as serving,
+        code_predictor_spec_p17_wide as p17,
+    )
+    producer = inspect.getsource(serving.serving_k2)
+    consumer = inspect.getsource(p17.make_wide_round)
+    assert 'uniforms = torch.rand(' in producer
+    assert '(5,), device=dev, dtype=torch.float32, generator=generator' in producer
+    assert 'uniforms[4*n:4*n+1]' in consumer
+    assert 'uniforms[4*j:4*j+4]' in consumer
+    assert 'next_depth(depth, committed)' in producer
+    assert 'if cache_len != depth + 1:' in producer
+    assert 'P21_TERMINAL_FRAME_CODE_OR_DEPTH_INVALID' in producer
