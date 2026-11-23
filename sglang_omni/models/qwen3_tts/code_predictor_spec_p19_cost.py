@@ -25,6 +25,7 @@ from .code_predictor_spec_p19_diag import diagnostic_config, event as diag_event
 from .code_predictor_spec_p19_profile import (
     CAPTURES, DEFAULT_OPS, EAGER_REFERENCE, EAGER_WARMUPS,
     FIRST_GRAPH_REPLAYS, MAX_RETAINED_GRAPHS, MIN_REPLAY_OPS,
+    TIMING_BLOCKS, TIMING_REPEATS, TIMING_WARM_REPLAYS,
     current_profile,
 )
 
@@ -42,6 +43,10 @@ REPEATS = 12
 BLOCKS = 4
 WARM_REPLAYS = 3
 COST_ARMS = ("AR", "2", "3", "4")
+if (BLOCKS, REPEATS, WARM_REPLAYS) != (
+    TIMING_BLOCKS, TIMING_REPEATS, TIMING_WARM_REPLAYS
+):
+    raise RuntimeError("P19_PROFILE_OPERATION_COUNT_SOURCE_DRIFT")
 
 
 def _clone(result: dict) -> dict[str, torch.Tensor]:
