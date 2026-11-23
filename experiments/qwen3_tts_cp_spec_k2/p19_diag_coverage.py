@@ -140,7 +140,7 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
         _require_single(counts, d, arm, DEPTH_STAGES[0])
         _require_single(counts, d, arm, DEPTH_STAGES[1])
         _require_single(counts, d, arm, DEPTH_STAGES[2])
-        if arm in ("ALL_GRAPH", "ALL_DEPTHS_GRAPH"):
+        if arm in ("ALL_GRAPH", "ALL_DEPTHS_GRAPH", "ALL_DEPTHS_EAGER"):
             arms = arms_at_depth(d)
         else:
             chosen = arm.split("_", 1)[0]
