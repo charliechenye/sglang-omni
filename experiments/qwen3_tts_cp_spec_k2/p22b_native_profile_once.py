@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import json
 import subprocess
+import time
 import traceback
 from pathlib import Path
 from urllib.request import urlopen
@@ -101,7 +102,12 @@ def run(root: Path, *, base_url: str, max_tokens: int) -> dict:
             base_url=base_url, server_log=log, phase="A",
             case=case, max_tokens=max_tokens,
         )
-        evidence = worker_files(directory)
+        evidence = []
+        for _ in range(50):
+            evidence = worker_files(directory)
+            if len(evidence) >= 1:
+                break
+            time.sleep(0.1)
         if len(evidence) != 1:
             raise RuntimeError("P22B_NATIVE_EXPECTED_ONE_WORKER_RECORD")
         validate_native_evidence(evidence[0], observed["worker"], sha)
