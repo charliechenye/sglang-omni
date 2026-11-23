@@ -14,8 +14,7 @@ WORKTREE="$(git rev-parse --show-toplevel)"
 PWD_PHYSICAL="$(pwd -P)"
 REPO_PHYSICAL="$(cd "$WORKTREE" && pwd -P)"
 BRANCH="$(git symbolic-ref --short -q HEAD || true)"
-if [[ "$PWD_PHYSICAL" != "$REPO_PHYSICAL" ||
-      "$BRANCH" != "experiment/qwen3-tts-p22b-nvidia-gap" ]]; then
+if [[ "$PWD_PHYSICAL" != "$REPO_PHYSICAL" || "$BRANCH" != "experiment/qwen3-tts-p22b-nvidia-gap" ]]; then
   echo "P22B_WRONG_ROOT_OR_LOCAL_BRANCH" >&2
   echo "PWD=$PWD_PHYSICAL TOP=$REPO_PHYSICAL BRANCH=${BRANCH:-DETACHED_HEAD}" >&2
   exit 2
