@@ -174,6 +174,13 @@ def compute_report(rows: list[dict], corpus: list[dict]) -> dict:
             "a_audio_s": each[0]["audio_duration_s"],
             "b_audio_s": each[1]["audio_duration_s"],
         })
+    if not all(
+        p["a_hash_repeatable"] and p["b_hash_repeatable"]
+        for p in paired
+    ):
+        raise RuntimeError(
+            "P21_WITHIN_ARM_SEEDED_WAV_DRIFT_NO_SPEEDUP_CLAIM"
+        )
     summaries = {
         phase: _summarize([r for r in rows if r["phase"] == phase])
         for phase in ("A", "B")
