@@ -25,19 +25,20 @@ from sglang_omni.models.qwen3_tts.code_predictor_spec_p22_profile import (
 STATUS = "P22_ONE_REAL_SERVING_B_REQUEST_PROFILE_CAPTURED_NOT_SPEEDUP"
 STATUS_NO_NSYS = "P22_ONE_REAL_SERVING_B_CPU_ATTRIBUTION_NOT_GPU_TIME"
 STATUS_FAIL = "P22_PROFILE_FAIL_CLOSED_NO_PERFORMANCE_CLAIM"
-PREFIX = "P22_REAL_REQUEST_PROFILE "
-
-
-def worker_profiles(log: Path) -> list[dict]:
+def worker_profiles(directory: Path) -> list[dict]:
+    """Read real worker JSON files, NOT potentially wrapped server logs."""
     found = []
-    for line in log.read_text(errors="replace").splitlines():
-        marker = line.find(PREFIX)
-        if marker == -1:
-            continue
-        item = json.loads(line[marker + len(PREFIX):])
-        if item.get("schema") != PROFILE_SCHEMA:
-            raise RuntimeError("P22_WORKER_PROFILE_SCHEMA_MISMATCH")
+    for file in directory.glob("request_*.json"):
+        item = json.loads(file.read_text())
+        if (item.get("schema") != PROFILE_SCHEMA
+                or file.stem != "request_" + str(item.get("request_hash"))):
+            raise RuntimeError("P22_WORKER_PROFILE_SCHEMA_OR_FILENAME_MISMATCH")
+        if type(item.get("monotonic_ns")) is not int:
+            raise RuntimeError("P22_WORKER_PROFILE_TIMESTAMP_MISSING")
         found.append(item)
+    found.sort(key=lambda e: e["monotonic_ns"])
+    if len({e["monotonic_ns"] for e in found}) != len(found):
+        raise RuntimeError("P22_DUPLICATE_WORKER_PROFILE_TIMESTAMP")
     return found
 
 
@@ -124,13 +125,16 @@ def run(root: Path, *, base_url: str, max_new_tokens: int) -> dict:
         "seed": 20261124,
     }
     log = root / "server.log"
+    profiles_dir = root / "p22_profiles"
+    if profiles_dir.exists() and list(profiles_dir.glob("request_*.json")):
+        raise RuntimeError("P22_PROFILE_REQUIRES_ABSENT_WORKER_EVIDENCE")
     result = {
         "schema": "qwen3tts-p22-one-serving-request-profile-v1",
         "status": STATUS_FAIL, "source_sha": source,
         "case": case, "nsys_capture_range": want_nsys,
         "no_perf_or_quality_claim": True, "visits": [],
     }
-    started_profiles = len(worker_profiles(log))
+    started_profiles = len(worker_profiles(profiles_dir))
     try:
         native = _http_with_proof(
             base_url=base_url, server_log=log, phase="A",
@@ -147,7 +151,7 @@ def run(root: Path, *, base_url: str, max_new_tokens: int) -> dict:
         )
         result["visits"].append({"name": "B_unprofiled_kernel_warmup",
                                  "worker": b_warm["worker"]})
-        warms = worker_profiles(log)
+        warms = worker_profiles(profiles_dir)
         if len(warms) != started_profiles + 1:
             raise RuntimeError("P22_WARMUP_PROFILE_COUNT_DRIFT")
         validate_profile(
@@ -168,7 +172,7 @@ def run(root: Path, *, base_url: str, max_new_tokens: int) -> dict:
                                  "finish_reason": measured["finish_reason"],
                                  "wav_sha256": measured["wav_sha256"],
                                  "audio_duration_s": measured["audio_duration_s"]})
-        profiles = worker_profiles(log)
+        profiles = worker_profiles(profiles_dir)
         if len(profiles) != started_profiles + 2:
             raise RuntimeError("P22_MEASURED_PROFILE_COUNT_DRIFT")
         report_stages = validate_profile(
