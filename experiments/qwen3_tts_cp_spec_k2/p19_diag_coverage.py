@@ -126,7 +126,15 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
         (ev.get("depth"), ev.get("arm"), ev.get("stage"))
         for ev in scoped
     )
+    if any(type(ev.get("monotonic_ns")) is not int
+           for ev in scoped):
+        raise RuntimeError("P19_DIAG_MISSING_CPU_MONOTONIC_EVENT_TIME")
+    timestamps = {
+        (ev.get("depth"), ev.get("arm"), ev.get("stage")):
+            ev["monotonic_ns"] for ev in scoped
+    }
     verified_arms = 0
+    prior_final = -1
     for d in expected_depths:
         _require_single(counts, d, arm, DEPTH_STAGES[0])
         _require_single(counts, d, arm, DEPTH_STAGES[1])
@@ -140,10 +148,31 @@ def validate_diagnostic_trace(events: list[dict], diagnostic: dict) -> dict:
                 raise RuntimeError("P19_DIAG_ILLEGAL_ARM_AT_TARGET_DEPTH")
             arms = (wanted,)
         phases = EAGER_STAGES if arm.endswith("_EAGER") else GRAPH_STAGES
+        selected_time = timestamps[(d, arm, DEPTH_STAGES[0])]
+        returned_time = timestamps[(d, arm, DEPTH_STAGES[1])]
+        final_time = timestamps[(d, arm, DEPTH_STAGES[2])]
+        if not prior_final < selected_time < returned_time < final_time:
+            raise RuntimeError(
+                f"P19_DIAG_NONMONOTONIC_DEPTH_BOUNDARY_DEPTH_{d}"
+            )
+        last_arm_finish = selected_time
         for selected_arm in arms:
             for stage in phases:
                 _require_single(counts, d, selected_arm, stage)
+            arm_times = [
+                timestamps[(d, selected_arm, stage)] for stage in phases
+            ]
+            if (arm_times != sorted(arm_times)
+                    or len(set(arm_times)) != len(arm_times)
+                    or not selected_time < arm_times[0]
+                    or not last_arm_finish < arm_times[0]
+                    or not arm_times[-1] < returned_time):
+                raise RuntimeError(
+                    f"P19_DIAG_ARM_PHASE_ORDER_INVALID_D{d}_{selected_arm}"
+                )
+            last_arm_finish = arm_times[-1]
             verified_arms += 1
+        prior_final = final_time
 
     expected_selected = verified_arms
     selected_count = sum(
