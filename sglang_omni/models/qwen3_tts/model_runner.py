@@ -114,6 +114,50 @@ class Qwen3TTSModelRunner(ModelRunner):
         self.model.prepare_decode_buffers(requests)
         self.write_feedback_buffers(forward_batch, requests)
 
+    def custom_decode_forward(
+        self,
+        forward_batch: ForwardBatch | None,
+        schedule_batch: ScheduleBatch,
+        requests: list[SchedulerRequest],
+    ) -> GenerationBatchResult | None:
+        # Base prepare_and_forward runs before_decode (including feedback
+        # staging) and then this hook IMMEDIATELY before the main Talker
+        # tp_worker.forward_batch_generation. Source-locked P19-only.
+        if forward_batch is not None:
+            self._p19_native_tail_mark(
+                "MAIN_TALKER_FORWARD_BEGIN",
+                device=forward_batch.input_ids.device,
+                requests=requests,
+            )
+        # Preserve normal Qwen3-TTS backend ownership. Returning None
+        # makes base dispatch the existing tp_worker CUDA Graph/eager path.
+        return None
+
+    def sample_next_token_ids(
+        self,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+        schedule_batch: ScheduleBatch | None,
+        requests: list[SchedulerRequest],
+    ) -> torch.Tensor:
+        # Main tp_worker forward is complete on the HOST, while the GPU
+        # may still have enqueued work. An opt-in full-device fence here
+        # separates its kernels from the native semantic sampler.
+        self._p19_native_tail_mark(
+            "MAIN_TALKER_FORWARD_RETURNED_BEFORE_SAMPLE",
+            device=forward_batch.input_ids.device,
+            requests=requests,
+        )
+        sampled = super().sample_next_token_ids(
+            logits_output, forward_batch, schedule_batch, requests
+        )
+        self._p19_native_tail_mark(
+            "MAIN_SEMANTIC_SAMPLER_RETURNED",
+            device=forward_batch.input_ids.device,
+            requests=requests,
+        )
+        return sampled
+
     def post_prefill(
         self,
         result: GenerationBatchResult,
@@ -275,6 +319,10 @@ class Qwen3TTSModelRunner(ModelRunner):
         else:
             pass
         layer0_codes = result.next_token_ids
+        self._p19_native_tail_mark(
+            "COLLECT_CODES_BEGIN",
+            device=layer0_codes.device, requests=requests,
+        )
         if layer0_codes.ndim == 1:
             layer0_codes = layer0_codes.unsqueeze(1)
         else:
@@ -282,13 +330,23 @@ class Qwen3TTSModelRunner(ModelRunner):
         # note(ratish): the layer 0 id is the step's only host read, staged ahead
         # of the predictor so the finalize wait covers the sample, not the predictor.
         self.stage_token_ids(result, result.next_token_ids)
+        self._p19_native_tail_mark(
+            "NEXT_FRAME_TOKEN_IDS_STAGED",
+            device=layer0_codes.device, requests=requests,
+        )
 
         hidden = result.logits_output.hidden_states
         if isinstance(hidden, torch.Tensor) and hidden.ndim == 2:
             hidden = hidden.unsqueeze(1)
         else:
             pass
-        semantic_positions = self.sample_positions(forward_batch, layer0_codes.device)
+        semantic_positions = self.sample_positions(
+            forward_batch, layer0_codes.device
+        )
+        self._p19_native_tail_mark(
+            "NEXT_FRAME_SAMPLE_POSITIONS_READY",
+            device=layer0_codes.device, requests=requests,
+        )
         if os.environ.get("SGLANG_OMNI_QTTS_CP_P17_ACTIVATION_DIR"):
             from .code_predictor_spec_p17_activation import record
 
@@ -305,6 +363,10 @@ class Qwen3TTSModelRunner(ModelRunner):
                 raise RuntimeError("P18_REQUIRES_EXACTLY_ONE_SCHEDULER_REQUEST")
             self.model._p18_current_request_id = str(requests[0].request_id)
         try:
+            self._p19_native_tail_mark(
+                "NEXT_FRAME_BEFORE_CODE_PREDICTOR",
+                device=layer0_codes.device, requests=requests,
+            )
             self.model.code_predictor_forward(
                 layer0_codes,
                 hidden,
