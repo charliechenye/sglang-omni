@@ -505,6 +505,7 @@ def maybe_measure(
                     # P18 .item() can surface an asynchronous CUDA fault.
                     model._p19_native_boundary_next_req = request_id
                     model._p19_native_boundary_from_frame = frame
+                    model._p19_native_boundary_case_id = case["case_id"]
                     diag_event(
                         "P19_SELECTED_FRAME_WAITING_NEXT_NATIVE",
                         depth=depth, frame=frame, arm=diagnostic[0],
