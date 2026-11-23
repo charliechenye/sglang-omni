@@ -13,8 +13,25 @@ if [[ "$2" != /* || "$ROOT" != "$2" ]]; then
   echo "P19_LIFECYCLE_REQUIRES_CANONICAL_ABSOLUTE_RESULT_ROOT" >&2
   exit 2
 fi
-if [[ -e "$ROOT" || -e "${ROOT}.launcher.log" ]]; then
-  echo "P19_LIFECYCLE_REFUSES_OVERWRITE: $ROOT" >&2
+LOG="${ROOT}.launcher.log"
+# Preserve BOTH evidence roots and their earlier launcher logs. A failed
+# preflight can create the redirected .launcher.log BEFORE p19_launch.sh
+# reaches its mkdir; therefore the absence of ROOT does not mean the
+# path is safe to reuse. Distinguish the two cases clearly.
+if [[ -e "$ROOT" || -L "$ROOT" ]]; then
+  echo "P19_LIFECYCLE_REFUSES_OVERWRITE_ROOT: $ROOT" >&2
+  echo "Use a new, absent result root; never delete prior evidence." >&2
+  exit 2
+fi
+if [[ -e "$LOG" || -L "$LOG" ]]; then
+  echo "P19_LIFECYCLE_ORPHAN_LAUNCH_LOG: $LOG" >&2
+  echo "Result root is absent but launcher log already exists." >&2
+  echo "This usually means a previous attempt failed BEFORE creating the result directory." >&2
+  echo "Inspect that log, preserve it, and choose a NEW root (e.g. next suffix)." >&2
+  if [[ -f "$LOG" && -r "$LOG" ]]; then
+    echo "=== P19 PREVIOUS LAUNCH LOG TAIL ===" >&2
+    tail -n 35 "$LOG" >&2 || true
+  fi
   exit 2
 fi
 case "$LEG" in
@@ -72,14 +89,14 @@ P19_DIAG_TAIL_FENCE=1 \
 P18_CAPTURE_FRAMES=2 \
 P19_COST_FRAMES=1 \
   setsid bash experiments/qwen3_tts_cp_spec_k2/p19_launch.sh "$ROOT" \
-    > "${ROOT}.launcher.log" 2>&1 &
+    > "$LOG" 2>&1 &
 SERVER_PGID=$!
 # A bounded startup probe: do not issue HTTP requests before /health.
 healthy=0
 for ((i=0; i<180; i++)); do
   if ! kill -0 "$SERVER_PGID" 2>/dev/null; then
-    echo "P19_LIFECYCLE_SERVER_EXITED_EARLY: ${ROOT}.launcher.log" >&2
-    tail -n 75 "${ROOT}.launcher.log" >&2 || true
+    echo "P19_LIFECYCLE_SERVER_EXITED_EARLY: $LOG" >&2
+    tail -n 75 "$LOG" >&2 || true
     exit 1
   fi
   if [[ -f "$ROOT/source.sha" ]] &&
