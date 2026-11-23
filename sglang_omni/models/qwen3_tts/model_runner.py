@@ -397,16 +397,34 @@ class Qwen3TTSModelRunner(ModelRunner):
             graph_before = self.model.predictor_graph_replay_count
             eager_before = self.model.predictor_eager_count
             self.model._p21_last_frame_stats = None
+        p22b_native = os.environ.get(
+            "SGLANG_OMNI_QTTS_CP_P22B_NATIVE_PROFILE"
+        ) == "1"
+        if p22b_native:
+            if not p21_on:
+                raise RuntimeError("P22B_NATIVE_REQUIRES_EXACTLY_ONE_REAL_REQUEST")
+            from .code_predictor_spec_p22b_native import (
+                start_if_armed as p22b_start,
+                predictor_span as p22b_span,
+            )
         try:
             self._p19_native_tail_mark(
                 "NEXT_FRAME_BEFORE_CODE_PREDICTOR",
                 device=layer0_codes.device, requests=requests,
             )
-            self.model.code_predictor_forward(
-                layer0_codes,
-                hidden,
-                semantic_positions=semantic_positions,
-            )
+            if p22b_native:
+                p22b_start(self.model, rid)
+                with p22b_span(self.model, rid):
+                    self.model.code_predictor_forward(
+                        layer0_codes, hidden,
+                        semantic_positions=semantic_positions,
+                    )
+            else:
+                self.model.code_predictor_forward(
+                    layer0_codes,
+                    hidden,
+                    semantic_positions=semantic_positions,
+                )
             if p18_on:
                 self._p19_native_tail_mark(
                     "COLLECT_CODES_PREDICTOR_RETURNED",
@@ -535,6 +553,12 @@ class Qwen3TTSModelRunner(ModelRunner):
             finish_request(
                 self.model, request_hash=request_hash,
                 candidate_frames=stats["candidate_frames"],
+            )
+        if os.environ.get("SGLANG_OMNI_QTTS_CP_P22B_NATIVE_PROFILE") == "1":
+            from .code_predictor_spec_p22b_native import stop_if_captured
+
+            stop_if_captured(
+                self.model, request_id=str(request_id), stats=stats,
             )
 
     def finalize_skip_rids(self, scheduler_output: SchedulerOutput) -> set[str]:
