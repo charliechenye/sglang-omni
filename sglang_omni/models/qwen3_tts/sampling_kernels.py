@@ -91,6 +91,95 @@ if has_triton_runtime():
         return h
 
     @triton.jit
+    def speculative_uniform_hash(
+        seed,
+        position,
+        columns,
+        salt: tl.constexpr,
+    ):
+        mixed_seed = seed ^ tl.cast(salt, tl.uint64)
+        hash_value: tl.uint32 = 0
+        hash_value = murmur3_mix(hash_value, (mixed_seed & 0xFFFFFFFF).to(tl.uint32))
+        hash_value = murmur3_mix(
+            hash_value, ((mixed_seed >> 32) & 0xFFFFFFFF).to(tl.uint32)
+        )
+        hash_value = murmur3_mix(hash_value, position.to(tl.uint32))
+        hash_value = murmur3_mix(hash_value, columns.to(tl.uint32))
+        return fmix32(hash_value ^ 16)
+
+    @triton.jit
+    def speculative_uniforms_four_purpose_kernel(
+        seeds,
+        semantic_positions,
+        round_index,
+        output,
+        OUTPUT_STRIDE_ROW: tl.constexpr,
+        OUTPUT_STRIDE_PURPOSE: tl.constexpr,
+        OUTPUT_STRIDE_COLUMN: tl.constexpr,
+        NUM_CODE_GROUPS: tl.constexpr,
+        PROPOSAL_WIDTH: tl.constexpr,
+        VERIFY_WIDTH: tl.constexpr,
+        MAX_COLUMNS: tl.constexpr,
+        BLOCK_COLUMNS: tl.constexpr,
+        PROPOSAL_SALT: tl.constexpr,
+        ACCEPTANCE_SALT: tl.constexpr,
+        CORRECTION_SALT: tl.constexpr,
+        BONUS_SALT: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        columns = tl.arange(0, BLOCK_COLUMNS)
+        seed = tl.load(seeds + row).to(tl.uint64)
+        semantic_position = tl.load(semantic_positions + row).to(tl.uint64)
+        current_round = tl.load(round_index).to(tl.uint64)
+        position = semantic_position * (2 * NUM_CODE_GROUPS) + current_round
+
+        proposal_hash = speculative_uniform_hash(seed, position, columns, PROPOSAL_SALT)
+        acceptance_hash = speculative_uniform_hash(
+            seed, position, columns, ACCEPTANCE_SALT
+        )
+        correction_hash = speculative_uniform_hash(
+            seed, position, columns, CORRECTION_SALT
+        )
+        bonus_hash = speculative_uniform_hash(seed, position, columns, BONUS_SALT)
+        proposal_uniforms = tl.minimum(
+            ((proposal_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        acceptance_uniforms = tl.minimum(
+            ((acceptance_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        correction_uniforms = tl.minimum(
+            ((correction_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        bonus_uniforms = tl.minimum(
+            ((bonus_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        output_base = output + row * OUTPUT_STRIDE_ROW
+        tl.store(
+            output_base + columns * OUTPUT_STRIDE_COLUMN,
+            tl.where(columns < PROPOSAL_WIDTH, proposal_uniforms, 0.0),
+            mask=columns < MAX_COLUMNS,
+        )
+        tl.store(
+            output_base + OUTPUT_STRIDE_PURPOSE + columns * OUTPUT_STRIDE_COLUMN,
+            tl.where(columns < PROPOSAL_WIDTH, acceptance_uniforms, 0.0),
+            mask=columns < MAX_COLUMNS,
+        )
+        tl.store(
+            output_base + 2 * OUTPUT_STRIDE_PURPOSE + columns * OUTPUT_STRIDE_COLUMN,
+            tl.where(columns < VERIFY_WIDTH, correction_uniforms, 0.0),
+            mask=columns < MAX_COLUMNS,
+        )
+        tl.store(
+            output_base + 3 * OUTPUT_STRIDE_PURPOSE + columns * OUTPUT_STRIDE_COLUMN,
+            tl.where(columns < VERIFY_WIDTH, bonus_uniforms, 0.0),
+            mask=columns < MAX_COLUMNS,
+        )
+
+    @triton.jit
     def gumbel_from_hash(h: tl.uint32):
         """Match SGLang multinomial_with_seed float64 endpoint handling.
 
@@ -906,6 +995,7 @@ if has_triton_runtime():
 
 else:
     seeded_gumbel_sample_sorted_kernel = None
+    speculative_uniforms_four_purpose_kernel = None
     bitonic_compare_selected_32_desc = None
     bitonic_sort_selected_32_desc = None
     seeded_top_k_top_p_sample_kernel = None

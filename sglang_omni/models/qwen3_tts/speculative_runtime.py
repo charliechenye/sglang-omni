@@ -3,18 +3,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
-
-@dataclass(frozen=True)
-class SpeculativeAcceptanceBatch:
-    committed_tokens: torch.Tensor
-    accepted_draft_counts: torch.Tensor
-    committed_token_counts: torch.Tensor
-    rejected_rows: torch.Tensor
-    bonus_rows: torch.Tensor
+from sglang_omni.models.qwen3_tts.speculative_acceptance import (
+    SpeculativeAcceptanceBatch,
+)
 
 
 def speculative_sampling_fallback_reason(
@@ -198,9 +191,13 @@ def accept_speculative_candidates(
         draft_token_probabilities,
         torch.ones_like(draft_token_probabilities),
     )
-    acceptance_ratio = torch.minimum(
-        torch.ones_like(target_token_probabilities),
-        target_token_probabilities / safe_draft_probabilities,
+    acceptance_ratio = torch.where(
+        draft_token_probabilities > 0,
+        torch.minimum(
+            torch.ones_like(target_token_probabilities),
+            target_token_probabilities / safe_draft_probabilities,
+        ),
+        torch.zeros_like(target_token_probabilities),
     )
     valid_drafts = (
         torch.arange(draft_width, device=draft_tokens.device)[None, :]

@@ -72,14 +72,16 @@ from sglang_omni.models.qwen3_tts.sampling_kernels import (
 from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
     Qwen3TTSSpeakerEncoderCudaGraphRunner,
 )
+from sglang_omni.models.qwen3_tts.speculative_acceptance import (
+    sample_compact_probability_rows_fused,
+)
 from sglang_omni.models.qwen3_tts.speculative_rng import (
     derive_speculative_request_seed,
-    speculative_uniforms,
+    speculative_uniforms_all_purposes,
 )
 from sglang_omni.models.qwen3_tts.speculative_runtime import (
-    accept_speculative_candidates,
-    expand_compact_probability_rows,
-    sample_compact_probability_rows,
+    accept_speculative_candidates_compact,
+    commit_speculative_codes,
     speculative_sampling_fallback_reason,
 )
 from sglang_omni.platforms import current_platform
@@ -101,6 +103,7 @@ from sglang_omni.utils.predictor_layers import (
     resolve_fused_predictor_width,
 )
 from sglang_omni.utils.predictor_speculation import (
+    is_fatal_cuda_capture_error,
     resolve_speculative_capability,
     speculative_resources_requested,
 )
@@ -377,7 +380,7 @@ class PredictorDecodeGraph:
 
 
 class PredictorSpeculativeVerifyGraph:
-    """Persistent graph for the compute-heavy packed Predictor verifier."""
+    """Persistent graph for packed verification and grouped target heads."""
 
     def __init__(
         self,
@@ -405,12 +408,28 @@ class PredictorSpeculativeVerifyGraph:
             device=device,
             dtype=torch.long,
         )
+        self.target_head_indices = (
+            torch.arange(1, verify_width + 1, device=device, dtype=torch.long)
+            .expand(batch_size, verify_width)
+            .contiguous()
+        )
+        self.target_valid_queries = torch.ones(
+            (batch_size, verify_width), device=device, dtype=torch.bool
+        )
+        self.target_hidden_rows = torch.arange(
+            batch_size * verify_width, device=device, dtype=torch.long
+        )
         self.graph: ReplayableGraph | None = None
         self.hidden_states: torch.Tensor | None = None
+        self.target_logits: torch.Tensor | None = None
 
     @torch.no_grad()
     def replay(
-        self, token_embeds: torch.Tensor, positions: torch.Tensor
+        self,
+        token_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        target_head_indices: torch.Tensor,
+        target_valid_queries: torch.Tensor,
     ) -> torch.Tensor:
         live = int(token_embeds.shape[0])
         if live > self.batch_size or token_embeds.shape[1] != self.verify_width:
@@ -419,19 +438,30 @@ class PredictorSpeculativeVerifyGraph:
             pass
         if positions.shape != (live * self.verify_width,):
             raise ValueError("packed Predictor graph positions have an invalid shape")
+        elif target_head_indices.shape != (live, self.verify_width):
+            raise ValueError(
+                "packed Predictor graph target heads have an invalid shape"
+            )
+        elif target_valid_queries.shape != (live, self.verify_width):
+            raise ValueError("packed Predictor graph target mask has an invalid shape")
         else:
             pass
         with self.device_module.device(self.device):
             self.token_embeds[:live].copy_(token_embeds)
             self.positions[: live * self.verify_width].copy_(positions)
+            self.target_head_indices[:live].copy_(target_head_indices)
+            self.target_valid_queries[:live].copy_(target_valid_queries)
             if live < self.batch_size:
                 self.token_embeds[live:].zero_()
                 self.positions[live * self.verify_width :].fill_(-1)
+                self.target_head_indices[live:].zero_()
+                self.target_valid_queries[live:].zero_()
             else:
                 pass
             assert self.graph is not None
             self.graph.replay()
         assert self.hidden_states is not None
+        assert self.target_logits is not None
         return self.hidden_states[:live]
 
 
@@ -1333,6 +1363,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             max_batch_size, device=device, dtype=torch.long
         )
         self.sub_speculative_seed_tensor: torch.Tensor | None = None
+        self.sub_speculative_round_index_tensor: torch.Tensor | None = None
+        self.sub_speculative_uniforms_tensor: torch.Tensor | None = None
         self.sub_do_sample_tensor = torch.zeros(
             max_batch_size, device=device, dtype=torch.bool
         )
@@ -1379,6 +1411,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_graph_capture_time_ms = 0.0
         self.code_predictor_spec_configuration_time_ms = 0.0
         self.code_predictor_spec_fused_predictor_forward_count = 0
+        self.code_predictor_generic_forward_count = 0
+        self.code_predictor_spec_standalone_correction_forward_count = 0
+        self.code_predictor_spec_correction_forward_watch = False
         self.code_predictor_spec_draft_head_evaluation_count = 0
         self.code_predictor_spec_target_head_evaluation_count = 0
         self.code_predictor_spec_requested_width = 0
@@ -1433,6 +1468,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             pass
         self.decode_prep_rids = None
 
+        speculative_resources_configured = self.sub_speculative_seed_tensor is not None
         semantic_seeds: list[int] = []
         speculative_seeds: list[int] = []
         request_ids: list[str] = []
@@ -1452,7 +1488,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 subtalker_top_p = float(data.subtalker_top_p)
                 subtalker_top_k = int(data.subtalker_top_k)
                 subtalker_seed = int(data.subtalker_sampling_seed)
-                user_seed_provided = data.user_seed_provided
+                if speculative_resources_configured:
+                    user_seed_provided = data.user_seed_provided
+                else:
+                    user_seed_provided = False
             except AttributeError as exc:
                 raise TypeError(
                     "Qwen3-TTS decode buffers require request data with semantic "
@@ -1463,20 +1502,26 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     "Qwen3-TTS decode buffers require numeric semantic and "
                     "subtalker sampling fields"
                 ) from exc
-            if not isinstance(user_seed_provided, bool):
+            if speculative_resources_configured and not isinstance(
+                user_seed_provided, bool
+            ):
                 raise TypeError("user_seed_provided must be a boolean")
             else:
                 pass
             semantic_seeds.append(semantic_seed)
-            request_id = sched_req.request_id
-            if request_id:
-                request_ids.append(request_id)
-                speculative_seeds.append(
-                    derive_speculative_request_seed(subtalker_seed, request_id)
-                )
+            if speculative_resources_configured:
+                request_id = sched_req.request_id
+                if request_id:
+                    request_ids.append(request_id)
+                    speculative_seeds.append(
+                        derive_speculative_request_seed(subtalker_seed, request_id)
+                    )
+                else:
+                    request_ids.append("")
+                    speculative_seeds.append(0)
+                user_seed_rows.append(user_seed_provided)
             else:
-                request_ids.append("")
-                speculative_seeds.append(0)
+                pass
             sub_do_samples.append(do_sample)
             # note(ratish): the sampler divides by the temperature, staged clamped
             # so the sub-steps read it without a kernel.
@@ -1488,7 +1533,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             # which would otherwise hit the full-sort branch.
             sub_top_ks.append(subtalker_top_k if do_sample else 1)
             sub_seeds.append(subtalker_seed)
-            user_seed_rows.append(user_seed_provided)
             if do_sample:
                 sample_rows.append(row_idx)
             else:
@@ -1774,6 +1818,11 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         else:
             pass
         verify_width, verify_graph = frame_path
+        packed_head_weights = self.code_predictor_spec_lm_head_weights
+        if packed_head_weights is None:
+            raise RuntimeError("grouped Predictor head weights are unavailable")
+        else:
+            pass
         proposal_width = verify_width - 1
         num_groups = int(self.config.num_code_groups)
         vocab_size = int(self.config.code_predictor_config.vocab_size)
@@ -1860,7 +1909,13 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         top_ks = self.sub_top_k_tensor[:batch_size]
         top_ps = self.sub_top_p_tensor[:batch_size]
         speculative_seed_buffer = self.sub_speculative_seed_tensor
-        if speculative_seed_buffer is None:
+        round_index_buffer = self.sub_speculative_round_index_tensor
+        uniform_buffer = self.sub_speculative_uniforms_tensor
+        if (
+            speculative_seed_buffer is None
+            or round_index_buffer is None
+            or uniform_buffer is None
+        ):
             raise RuntimeError("speculative request seeds were not configured")
         else:
             pass
@@ -1911,26 +1966,27 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             else:
                 pass
             proposal_probabilities_compact, proposal_ids_compact = proposal_candidates
-            proposal_uniforms = speculative_uniforms(
+            round_index_buffer.fill_(round_index)
+            (
+                proposal_uniforms,
+                acceptance_uniforms,
+                correction_uniforms,
+                bonus_uniforms,
+            ) = speculative_uniforms_all_purposes(
                 speculative_seeds,
                 semantic_positions,
-                round_index,
+                round_index_buffer,
                 num_groups,
                 proposal_width,
-                "proposal",
+                verify_width,
+                uniform_buffer[:batch_size],
             )
-            draft_tokens = sample_compact_probability_rows(
+            draft_tokens = sample_compact_probability_rows_fused(
                 proposal_probabilities_compact,
                 proposal_ids_compact,
-                proposal_uniforms.reshape(-1),
-                active_proposals.reshape(-1),
-            ).view(batch_size, proposal_width)
-            draft_probabilities = expand_compact_probability_rows(
-                proposal_probabilities_compact,
-                proposal_ids_compact,
-                vocab_size,
-            ).view(batch_size, proposal_width, vocab_size)
-
+                proposal_uniforms,
+                active_proposals,
+            )
             valid_query_counts = torch.where(
                 active_rows,
                 proposal_counts + 1,
@@ -1943,8 +1999,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 min=0, max=codec_tables.shape[0] - 1
             )
             safe_query_tokens = query_tokens.clamp(min=0, max=vocab_size - 1)
-            raw_query_embeddings = codec_tables[safe_query_depths, safe_query_tokens]
             if projected_tables is None:
+                raw_query_embeddings = codec_tables[
+                    safe_query_depths, safe_query_tokens
+                ]
                 query_embeddings = self.code_predictor.project_input(
                     raw_query_embeddings
                 )
@@ -1978,20 +2036,27 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     positions=packed_positions,
                     batch_size=batch_size,
                 )
+                target_logits = grouped_lm_head_linear(
+                    verified_hiddens.reshape(-1, verified_hiddens.shape[-1]),
+                    packed_head_weights,
+                    target_hidden_rows,
+                    query_depths.reshape(-1),
+                    valid_queries.reshape(-1).contiguous(),
+                )
             else:
                 verified_hiddens = verify_graph.replay(
                     query_embeddings,
                     packed_positions,
+                    query_depths,
+                    valid_queries,
                 )
+                if verify_graph.target_logits is None:
+                    raise RuntimeError("speculative graph has no target logits")
+                else:
+                    pass
+                target_logits = verify_graph.target_logits[: batch_size * verify_width]
                 self.code_predictor_spec_graph_replay_count += 1
-            target_head_indices = query_depths.reshape(-1)
-            target_logits = grouped_lm_head_linear(
-                verified_hiddens.reshape(-1, verified_hiddens.shape[-1]),
-                self.code_predictor_spec_lm_head_weights,
-                target_hidden_rows,
-                target_head_indices,
-                valid_queries.reshape(-1).contiguous(),
-            ).view(batch_size, verify_width, vocab_size)
+            target_logits = target_logits.view(batch_size, verify_width, vocab_size)
             flat_target_temperatures = temperatures.repeat_interleave(verify_width)
             flat_target_top_ks = top_ks.repeat_interleave(verify_width)
             flat_target_top_ps = top_ps.repeat_interleave(verify_width)
@@ -2012,39 +2077,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             else:
                 pass
             target_probabilities_compact, target_ids_compact = target_candidates
-            target_probabilities = expand_compact_probability_rows(
+            decision = accept_speculative_candidates_compact(
+                draft_tokens,
+                proposal_probabilities_compact,
+                proposal_ids_compact,
                 target_probabilities_compact,
                 target_ids_compact,
-                vocab_size,
-            ).view(batch_size, verify_width, vocab_size)
-            acceptance_uniforms = speculative_uniforms(
-                speculative_seeds,
-                semantic_positions,
-                round_index,
-                num_groups,
-                proposal_width,
-                "acceptance",
-            )
-            correction_uniforms = speculative_uniforms(
-                speculative_seeds,
-                semantic_positions,
-                round_index,
-                num_groups,
-                verify_width,
-                "correction",
-            )
-            bonus_uniforms = speculative_uniforms(
-                speculative_seeds,
-                semantic_positions,
-                round_index,
-                num_groups,
-                verify_width,
-                "bonus",
-            )
-            decision = accept_speculative_candidates(
-                draft_tokens,
-                draft_probabilities,
-                target_probabilities,
                 proposal_counts,
                 active_rows,
                 acceptance_uniforms,
@@ -2052,41 +2090,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 bonus_uniforms,
             )
 
-            commit_offsets = query_offsets
-            valid_commits = commit_offsets.unsqueeze(
-                0
-            ) < decision.committed_token_counts.unsqueeze(1)
-            valid_commits = valid_commits & active_rows.unsqueeze(1)
-            output_depths = (
-                committed_depths.unsqueeze(1) + 1 + commit_offsets.unsqueeze(0)
+            commit_speculative_codes(
+                decision.committed_tokens,
+                decision.committed_token_counts,
+                committed_depths,
+                codec_tables,
+                code_outputs,
+                summed_embeddings[:, 0, :],
             )
-            safe_output_depths = output_depths.clamp(max=num_groups - 1)
-            safe_table_depths = (safe_output_depths - 1).clamp(
-                min=0, max=codec_tables.shape[0] - 1
-            )
-            committed_tokens = decision.committed_tokens[:, :verify_width]
-            for commit_offset in range(verify_width):
-                token_at_offset = committed_tokens[:, commit_offset].clamp(
-                    min=0, max=vocab_size - 1
-                )
-                output_depth_at_offset = safe_output_depths[:, commit_offset]
-                previous_code = code_outputs[batch_rows, output_depth_at_offset]
-                code_outputs[batch_rows, output_depth_at_offset] = torch.where(
-                    valid_commits[:, commit_offset],
-                    token_at_offset,
-                    previous_code,
-                )
-                table_depth_at_offset = safe_table_depths[:, commit_offset]
-                committed_embedding = codec_tables[
-                    table_depth_at_offset, token_at_offset
-                ]
-                summed_embeddings[:, 0, :].add_(
-                    torch.where(
-                        valid_commits[:, commit_offset, None],
-                        committed_embedding,
-                        torch.zeros_like(committed_embedding),
-                    )
-                )
 
             previous_depths = committed_depths
             previous_kv_lengths = logical_kv_lengths
@@ -2127,6 +2138,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             current_stream.synchronize()
             round_metadata = metadata_host[:batch_size]
             active_count = int(round_metadata[:, 1].sum())
+            self.code_predictor_spec_correction_forward_watch = bool(
+                round_metadata[:, 5].sum()
+            )
             self.code_predictor_spec_round_count += 1
             self.code_predictor_spec_proposed_count += int(round_metadata[:, 2].sum())
             self.code_predictor_spec_accepted_count += int(round_metadata[:, 0].sum())
@@ -2159,6 +2173,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             else:
                 pass
 
+        self.code_predictor_spec_correction_forward_watch = False
         self.code_predictor_spec_frame_count += batch_size
         return result_codes, summed_embeddings
 
@@ -2196,6 +2211,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_graphs.clear()
         if requested_width == 0:
             self.sub_speculative_seed_tensor = None
+            self.sub_speculative_round_index_tensor = None
+            self.sub_speculative_uniforms_tensor = None
             self.code_predictor_spec_lm_head_weights = None
             self.code_predictor_spec_metadata_device = None
             self.code_predictor_spec_metadata_host = None
@@ -2211,6 +2228,27 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 self.predictor_max_batch_size,
                 device=self.predictor_device,
                 dtype=torch.long,
+            )
+        else:
+            pass
+        if self.sub_speculative_round_index_tensor is None:
+            self.sub_speculative_round_index_tensor = torch.zeros(
+                (), device=self.predictor_device, dtype=torch.long
+            )
+        else:
+            pass
+        if (
+            self.sub_speculative_uniforms_tensor is None
+            or self.sub_speculative_uniforms_tensor.shape[2] < requested_width
+        ):
+            self.sub_speculative_uniforms_tensor = torch.empty(
+                (
+                    self.predictor_max_batch_size,
+                    4,
+                    requested_width,
+                ),
+                device=self.predictor_device,
+                dtype=torch.float32,
             )
         else:
             pass
@@ -2403,7 +2441,11 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     graph = self.capture_code_predictor_speculative_verify_graph(
                         bucket_size, verify_width, backend
                     )
-                except Exception:
+                except Exception as error:
+                    if is_fatal_cuda_capture_error(error):
+                        raise
+                    else:
+                        pass
                     self.code_predictor_spec_graph_capture_failure_count += 1
                     logger.warning(
                         "Failed to capture CodePredictor verifier graph for batch=%d width=%d",
@@ -2427,12 +2469,17 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
     def capture_code_predictor_speculative_verify_graph(
         self, batch_size: int, verify_width: int, backend: DeviceGraphBackend
     ) -> PredictorSpeculativeVerifyGraph:
-        """Capture a packed verifier over stable graph-owned input buffers."""
+        """Capture packed verification and indexed target heads on stable buffers."""
+        packed_head_weights = self.code_predictor_spec_lm_head_weights
+        if packed_head_weights is None:
+            raise RuntimeError("grouped Predictor head weights are unavailable")
+        else:
+            pass
         graph = PredictorSpeculativeVerifyGraph(
             batch_size,
             verify_width,
             device=self.predictor_device,
-            hidden_size=int(self.output_embeds.shape[-1]),
+            hidden_size=int(self.predictor_fused_layers.shape.hidden_size),
             hidden_dtype=self.output_embeds.dtype,
         )
         graph.positions.view(batch_size, verify_width).copy_(
@@ -2450,28 +2497,42 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         capture_stream.wait_stream(current_stream)
         memory_before = torch.cuda.memory_allocated(self.predictor_device)
         captured = None
+        fatal_capture_error = False
+
+        def run_once() -> tuple[torch.Tensor, torch.Tensor]:
+            hidden_states = self.predictor_forward_packed_tokens(
+                token_embeds=graph.token_embeds,
+                positions=graph.positions,
+                batch_size=batch_size,
+            )
+            target_logits = grouped_lm_head_linear(
+                hidden_states.reshape(batch_size * verify_width, -1),
+                packed_head_weights,
+                graph.target_hidden_rows,
+                graph.target_head_indices.reshape(-1),
+                graph.target_valid_queries.reshape(-1),
+            )
+            return hidden_states, target_logits
+
         try:
             with (
                 module.device(self.predictor_device),
                 current_platform.graph_capture_attention(),
                 module.stream(capture_stream),
             ):
-                self.predictor_forward_packed_tokens(
-                    token_embeds=graph.token_embeds,
-                    positions=graph.positions,
-                    batch_size=batch_size,
-                )
+                run_once()
                 with backend.capture(
                     pool=self.predictor_graph_memory_pool(),
                     stream=capture_stream,
                     thread_local_errors=True,
                 ) as captured:
-                    graph.hidden_states = self.predictor_forward_packed_tokens(
-                        token_embeds=graph.token_embeds,
-                        positions=graph.positions,
-                        batch_size=batch_size,
-                    )
-        except Exception:
+                    graph.hidden_states, graph.target_logits = run_once()
+        except Exception as error:
+            if is_fatal_cuda_capture_error(error):
+                fatal_capture_error = True
+                raise
+            else:
+                pass
             if captured is not None:
                 try:
                     captured.reset()
@@ -2481,13 +2542,16 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 pass
             raise
         finally:
-            current_stream.wait_stream(capture_stream)
+            if fatal_capture_error:
+                pass
+            else:
+                current_stream.wait_stream(capture_stream)
         memory_after = torch.cuda.memory_allocated(self.predictor_device)
         self.code_predictor_spec_graph_memory_delta_bytes += max(
             memory_after - memory_before, 0
         )
         graph.graph = captured
-        if graph.hidden_states is None:
+        if graph.hidden_states is None or graph.target_logits is None:
             raise RuntimeError("CodePredictor verifier graph captured no outputs")
         else:
             pass
@@ -2533,8 +2597,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             "draft_head_evaluations": self.code_predictor_spec_draft_head_evaluation_count,
             "target_head_evaluations": self.code_predictor_spec_target_head_evaluation_count,
             "fused_predictor_forwards": self.code_predictor_spec_fused_predictor_forward_count,
-            "generic_predictor_forwards": 0,
-            "standalone_correction_forward_count": 0,
+            "generic_predictor_forwards": self.code_predictor_generic_forward_count,
+            "standalone_correction_forward_count": (
+                self.code_predictor_spec_standalone_correction_forward_count
+            ),
             "graph_replays": self.code_predictor_spec_graph_replay_count,
             "graph_capture_failures": (
                 self.code_predictor_spec_graph_capture_failure_count
@@ -3385,7 +3451,27 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
     ) -> torch.Tensor:
         """Run the predictor stack on token_embeds [batch, tokens, hidden] at slots
         cache_len onward: one token at any slot, or the pair at slots 0 and 1."""
+        if token_embeds.ndim != 3 or token_embeds.shape[0] != batch_size:
+            raise ValueError(
+                "Predictor embeddings must have shape [batch, tokens, hidden]"
+            )
+        else:
+            pass
+        if self.code_predictor_spec_correction_forward_watch:
+            self.code_predictor_spec_standalone_correction_forward_count += 1
+            self.code_predictor_spec_correction_forward_watch = False
+        else:
+            pass
         num_tokens, hidden_size = token_embeds.shape[1:]
+        expected_hidden_size = int(
+            self.code_predictor.model.layers[0].input_layernorm.weight.shape[0]
+        )
+        if hidden_size != expected_hidden_size:
+            raise ValueError(
+                "Predictor embedding hidden size does not match model layer weights"
+            )
+        else:
+            pass
         if num_tokens == 1:
             positions = self.predictor_position_rows[cache_len, :batch_size]
             cache_slots = self.predictor_cache_slots[cache_len, :batch_size]
@@ -3435,12 +3521,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 final_norm=self.code_predictor.model.norm,
                 token_embeds=token_embeds,
                 batch_size=batch_size,
+                cache_len=cache_len,
                 positions=positions,
                 k_cache=self.predictor_k_cache,
                 v_cache=self.predictor_v_cache,
             )
         else:
             pass
+        self.code_predictor_generic_forward_count += 1
         # note(ratish): 2D rows for the fused add and norm, which every
         # backend's kernel expects and which writes both operands in place.
         residual = token_embeds.reshape(num_rows, 1, hidden_size)
@@ -3489,6 +3577,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             pass
         if positions.shape != (batch_size * token_embeds.shape[1],):
             raise ValueError("packed Predictor positions must align with query rows")
+        elif positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError("packed Predictor positions must use an integer dtype")
         else:
             pass
         if (
@@ -3504,6 +3594,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             raise RuntimeError("packed Predictor fused scratch capacity is unavailable")
         else:
             pass
+        if token_embeds.shape[2] != fused.shape.hidden_size:
+            raise ValueError(
+                "packed Predictor hidden size does not match fused layer weights"
+            )
+        else:
+            pass
         attention = self.code_predictor.model.layers[0].self_attn
         if (
             token_embeds.shape[1]
@@ -3513,7 +3609,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             raise RuntimeError("packed Predictor exceeds fused attention tile capacity")
         else:
             pass
-        return fused.forward(
+        return fused.forward_packed(
             layers=self.code_predictor.model.layers,
             final_norm=self.code_predictor.model.norm,
             token_embeds=token_embeds,

@@ -190,6 +190,8 @@ if HAS_TRITON:
         PARTIALS,
         SUM_SQ_PARTIALS,
         COUNTERS,
+        CACHE_SIZE: tl.constexpr,
+        ROPE_POSITION_COUNT: tl.constexpr,
         T: tl.constexpr,
         K: tl.constexpr,
         HEAD_DIM: tl.constexpr,
@@ -276,8 +278,9 @@ if HAS_TRITON:
             lo = (acc_lo * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
             hi = (acc_hi * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
             pos = tl.load(POS + rm, mask=row_mask, other=-1)
-            position_valid = pos >= 0
-            safe_pos = tl.maximum(pos, 0)
+            position_limit: tl.constexpr = min(CACHE_SIZE, ROPE_POSITION_COUNT)
+            position_valid = (pos >= 0) & (pos < position_limit)
+            safe_pos = tl.minimum(tl.maximum(pos, 0), position_limit - 1)
             cache_rows = rm // T * cache_stride_row + safe_pos * cache_stride_slot
             if head < NUM_Q_HEADS + NUM_KV_HEADS:
                 if head < NUM_Q_HEADS:
@@ -392,7 +395,9 @@ if HAS_TRITON:
             )
         else:
             query_positions = end - T + token
-        position_valid = is_query & (query_positions >= 0)
+        position_valid = (
+            is_query & (query_positions >= 0) & (query_positions < cache_size)
+        )
         max_position = tl.max(tl.where(position_valid, query_positions, -1), 0)
         q_offsets = (
             (row_group * T + token)[:, None] * Q_ROW_STRIDE
@@ -904,6 +909,10 @@ def attention_inputs(
     into the caches at each row's position. x is (rows, hidden) with unit column stride;
     the caches are (rows // tokens_per_row, slots, kv heads, head dim)."""
     rows = x.shape[0]
+    if k_cache.shape[1] <= 0 or attention.rotary_emb.cos_sin_cache.shape[0] <= 0:
+        raise ValueError("Predictor KV and RoPE position capacities must be positive")
+    else:
+        pass
     block_m = block_rows(rows)
     heads = shape.num_q_heads + 2 * shape.num_kv_heads
     use_gdc = is_arch_support_pdl()
@@ -932,6 +941,8 @@ def attention_inputs(
                 partials,
                 sum_sq_partials,
                 counters,
+                CACHE_SIZE=k_cache.shape[1],
+                ROPE_POSITION_COUNT=attention.rotary_emb.cos_sin_cache.shape[0],
                 T=tokens_per_row,
                 K=shape.hidden_size,
                 HEAD_DIM=shape.head_dim,
@@ -1240,15 +1251,109 @@ class FusedPredictorLayers:
         final_norm: torch.nn.Module,
         token_embeds: torch.Tensor,
         batch_size: int,
+        cache_len: int,
         positions: torch.Tensor,
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
     ) -> torch.Tensor:
-        """Run packed tokens at their row-specific absolute positions; -1 pads a row.
+        """Run consecutive tokens at one scalar cache end, preserving native fast path.
+
+        The caches are (layer, row, slot, kv head, head dim), with the scalar
+        ``cache_len`` as the first slot. Returns final-normalized residuals as
+        (batch, tokens, hidden).
+        """
+        if token_embeds.ndim != 3 or token_embeds.shape[0] != batch_size:
+            raise ValueError(
+                "Predictor embeddings must have shape [batch, tokens, hidden]"
+            )
+        else:
+            pass
+        num_tokens = token_embeds.shape[1]
+        if token_embeds.shape[2] != self.shape.hidden_size:
+            raise ValueError(
+                "Predictor embedding hidden size does not match fused layer weights"
+            )
+        else:
+            pass
+        if positions.ndim != 1 or positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "Predictor positions must be a one-dimensional integer tensor"
+            )
+        else:
+            pass
+        if cache_len < 0 or cache_len + num_tokens > k_cache.shape[2]:
+            raise ValueError("Predictor scalar KV range is outside the cache")
+        else:
+            pass
+        return self.forward_with_attention_bounds(
+            layers=layers,
+            final_norm=final_norm,
+            token_embeds=token_embeds,
+            batch_size=batch_size,
+            positions=positions,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_end=cache_len + num_tokens,
+        )
+
+    def forward_packed(
+        self,
+        *,
+        layers: torch.nn.ModuleList,
+        final_norm: torch.nn.Module,
+        token_embeds: torch.Tensor,
+        batch_size: int,
+        positions: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run packed tokens at row-specific absolute positions; -1 pads a row.
 
         The caches are (layer, row, slot, kv head, head dim), indexed by those
         positions. Returns final-normalized residuals as (batch, tokens, hidden).
         """
+        if token_embeds.ndim != 3 or token_embeds.shape[0] != batch_size:
+            raise ValueError(
+                "packed Predictor embeddings must have shape [batch, tokens, hidden]"
+            )
+        else:
+            pass
+        if token_embeds.shape[2] != self.shape.hidden_size:
+            raise ValueError(
+                "packed Predictor hidden size does not match fused layer weights"
+            )
+        else:
+            pass
+        if positions.ndim != 1 or positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "packed Predictor positions must be a one-dimensional integer tensor"
+            )
+        else:
+            pass
+        return self.forward_with_attention_bounds(
+            layers=layers,
+            final_norm=final_norm,
+            token_embeds=token_embeds,
+            batch_size=batch_size,
+            positions=positions,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_end=None,
+        )
+
+    def forward_with_attention_bounds(
+        self,
+        *,
+        layers: torch.nn.ModuleList,
+        final_norm: torch.nn.Module,
+        token_embeds: torch.Tensor,
+        batch_size: int,
+        positions: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cache_end: int | None,
+    ) -> torch.Tensor:
+        """Run the shared fused stack with scalar or row-specific attention bounds."""
         shape = self.shape
         num_tokens, hidden_size = token_embeds.shape[1:]
         rows = batch_size * num_tokens
@@ -1265,8 +1370,10 @@ class FusedPredictorLayers:
             )
         else:
             pass
-        if positions.numel() != rows:
+        if positions.ndim != 1 or positions.numel() != rows:
             raise ValueError("positions must contain one entry per packed query")
+        elif positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Predictor positions must use an integer dtype")
         else:
             pass
         positions = positions.reshape(-1).contiguous()
@@ -1294,14 +1401,25 @@ class FusedPredictorLayers:
                 shape=shape,
                 fitted_stages=self.fitted_stages,
             )
-            decode_attention(
-                q=q_out,
-                tokens_per_row=num_tokens,
-                k_cache=layer_k_cache,
-                v_cache=layer_v_cache,
-                positions=positions,
-                attention_output=attention_output,
-            )
+            if cache_end is None:
+                decode_attention(
+                    q=q_out,
+                    tokens_per_row=num_tokens,
+                    k_cache=layer_k_cache,
+                    v_cache=layer_v_cache,
+                    positions=positions,
+                    attention_output=attention_output,
+                )
+            else:
+                decode_attention(
+                    q=q_out,
+                    tokens_per_row=num_tokens,
+                    k_cache=layer_k_cache,
+                    v_cache=layer_v_cache,
+                    end=cache_end,
+                    attention_output=attention_output,
+                )
+
             o_proj_add(
                 attention_output=attention_output.view(
                     batch_size, num_tokens, shape.num_q_heads, shape.head_dim

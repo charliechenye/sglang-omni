@@ -72,6 +72,30 @@ class SpeculativeCapabilityResolution:
     fallback_reason: str | None
 
 
+def is_fatal_cuda_capture_error(error: Exception) -> bool:
+    """Identify capture errors that leave the CUDA context unsafe to reuse."""
+    error_message = f"{type(error).__name__}: {error}".lower()
+    fatal_markers = (
+        "illegal memory access",
+        "illegal address",
+        "misaligned address",
+        "device-side assert",
+        "device assert",
+        "unspecified launch failure",
+        "cudaerrorillegaladdress",
+        "cudaerrorlaunchfailure",
+        "error code 700",
+        "error code 719",
+        "error 700",
+        "error 719",
+        "cuda error 700",
+        "cuda error 719",
+        "context is destroyed",
+        "context has been destroyed",
+    )
+    return any(marker in error_message for marker in fatal_markers)
+
+
 def resolve_speculative_capability(
     requested_width: int,
     *,
