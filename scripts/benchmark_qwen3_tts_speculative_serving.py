@@ -44,9 +44,12 @@ def main() -> None:
     parser.add_argument("--voice", default="Ryan")
     parser.add_argument("--language", default="English")
     parser.add_argument("--api-key", default="EMPTY")
+    parser.add_argument("--max-new-tokens", type=positive_integer, default=256)
     parser.add_argument("--request-count", type=positive_integer, default=32)
     parser.add_argument("--warmup-requests", type=nonnegative_integer, default=2)
     parser.add_argument("--concurrency", type=positive_integer, default=4)
+    parser.add_argument("--expected-width", type=nonnegative_integer)
+    parser.add_argument("--result-file")
     parser.add_argument("--minimum-speedup", type=float, default=1.0)
     arguments = parser.parse_args()
     if not math.isfinite(arguments.minimum_speedup) or arguments.minimum_speedup < 0.0:

@@ -2,11 +2,11 @@
 
 ## Status
 
-The model-connected frame runner, grouped LM-head projection, production Top-K probability output, request-isolated RNG, packed fused verification, logical KV commitment, and persistent verifier CUDA Graph capture are implemented. The feature remains opt-in and GPU correctness and speed are unverified on this development machine.
+The opt-in model-connected frame runner now has dynamic tail widths, target-only W1 rounds, compact in-kernel acceptance, fused verification input preparation, fused state transition, and a histogram/compaction radix probability candidate. Warp-oriented grouped GEMV and frame-level RNG pooling are selectable research candidates. The required persistent full-round graph and real frozen-frame runner are still missing. GPU compilation, correctness, and speed remain unverified here.
 
 The runner is reachable through `Qwen3TTSTalker.code_predictor_forward`. It first processes the opening pair and samples codebook 1, then generates future-head proposals, verifies the pending code plus drafts in one packed `FusedPredictorLayers` call, applies the target heads once to verified hidden rows, accepts the draft prefix, samples a residual correction or bonus, commits outputs and embeddings, and repeats until all Predictor codebooks are complete. The normal carry-forward path has no standalone correction forward.
 
-Backend `cuda_graph` is the default when a nonzero width is configured. It captures a persistent verifier for supported batch buckets during model setup. Backend `eager` is an explicit CUDA correctness and debugging path; it still uses the production fused Predictor and GPU sampling kernels. Width 0 remains the default and allocates no speculative seed, head, metadata, or graph buffers. Width 1 is rejected; widths 2 through 8 are requested verify widths.
+Backend `cuda_graph` captures the packed verifier and target heads for supported batch buckets and widths 1 through the backend capacity. It does not capture a complete speculative round. Backend `eager` is an explicit CUDA correctness and debugging path; it still uses the fused Predictor and GPU sampling kernels. Width 0 remains the default and allocates no speculative seed, head, metadata, or graph buffers. Configuration accepts widths 2 through 8; W1 is selected internally for the final target-only tail.
 
 An example opt-in configuration is [qwen3_tts_1_7b_customvoice_speculative.yaml](../../examples/configs/qwen3_tts_1_7b_customvoice_speculative.yaml). The native-off configuration remains [qwen3_tts_1_7b_customvoice.yaml](../../examples/configs/qwen3_tts_1_7b_customvoice.yaml).
 
@@ -18,21 +18,21 @@ Each round verifies the pending input and up to `verify_width - 1` drafts. After
 
 Rows close to the end of a frame can have zero proposals while other rows verify a full window. They still receive one valid query if active; finished rows have zero valid queries. Inactive embeddings, LM-head selectors, positions, and output stores use safe staged values or masks before access. Positions at `-1` do not write KV and do not participate in attention. Rejected physical KV suffixes may remain in cache but are outside the logical prefix and are overwritten before reuse.
 
-The fixed-width policy reduces width to fit `min(batch_size * verify_width, MAX_FUSED_ROWS)`, the graph bucket, and `verify_width * GQA_group <= ATTENTION_ROWS`. A failed graph capture retries narrower widths before decoding. If no supported width remains, the request uses native decoding with a reason in model info. Generic attention is not used for packed verification.
+Each round uses the already-staged host metadata to choose `min(configured_width, backend_capacity, max_remaining_depth)` without another synchronization. The batch width shrinks as active rows reach the frame tail; finished rows are masked. If the exact-width graph is unavailable, that round runs eagerly at the safe width. Graph keys are bounded by batch bucket and width. Generic attention is not used for packed verification.
 
 ## Sampling, RNG, and precision
 
-The speculative probability builder reuses Omni's score packing, temperature scaling, top-k ordering, FP32 normalization, and top-p boundary rule. It returns candidate probabilities and IDs for proposal, target, and residual calculations. On SM90 it uses the existing split chunk/merge selection infrastructure. The NVIDIA-style radix selector is present as a parity candidate for larger top-k values; it is not the default sampler. An accelerator parity test compares it with the production split path.
+The speculative probability builder reuses Omni's score packing, temperature scaling, top-k ordering, FP32 normalization, and top-p boundary rule. The production split chunk/merge path remains the default. The selectable `radix_compact` candidate uses 8-bit MSB histogram passes over the full 64-bit score/token key, compacts the boundary set, and sorts only that compacted set. Its CUDA test covers the full Top-K 50/64/128 by C1/C8/C16 matrix; it still requires H200 compilation and runtime validation.
 
-For top-k values up to 32, the production probability kernel reconstructs the native PyTorch gather order and bitonic sort order. For larger top-k values, packed score keys order score ties by token ID, matching the split selector contract. The grouped Triton LM-head kernel accumulates BF16 products in FP32 and rounds logits to BF16. Its output may differ from the native GEMM at rounding boundaries, so exact target-distribution parity must be established by the H200 tests before claiming mathematical output equivalence.
+For top-k values up to 32, the production probability kernel reconstructs the native PyTorch gather order and bitonic sort order. For larger top-k values, packed score keys order score ties by token ID, matching the split selector contract. Compact acceptance matches supports inside one Triton program and sorts only the selected draft row for residual lookup; bonus sampling keeps the target candidate order. Invalid mass is reported through the batched round metadata. The grouped Triton LM-head remains the default; `warp_gemv` selects an eight-output CTA candidate with the same FP32 accumulation and BF16 output. Both kernels may differ from the native GEMM at rounding boundaries.
 
-Ordinary sampled requests are eligible even though the request builder generated internal sampler seeds. Explicit user seeds, deterministic mode, greedy or mixed-sampling batches, unbounded or unsupported top-k settings, missing request identity, unsupported vocabulary or dtype, tensor parallelism, and missing fused capacity use native decoding. A batch containing any explicit-seed or greedy row falls back as a whole. Speculative uniforms are namespaced by request seed, semantic position, round, and draw purpose; GPU generation is stateless and graph-safe.
+Ordinary sampled requests are eligible even though the request builder generated internal sampler seeds. Explicit user seeds, deterministic mode, greedy or mixed-sampling batches, unbounded or unsupported top-k settings, missing request identity, unsupported vocabulary or dtype, tensor parallelism, and missing fused capacity use native decoding. A batch containing any explicit-seed or greedy row falls back as a whole. `per_round` RNG remains the default; `frame_pool` precomputes all per-request draw-purpose domains for the frame and indexes them by round and proposal offset. Neither backend uses a shared fixed seed.
 
 ## Metrics
 
-`/model_info` includes `predictor_speculative` metrics. `frames` counts successful request-row frames; `committed_codes` includes every Predictor code committed in those frames; `round_committed_codes` counts codes committed after the initial codebook-1 sample. Draft, accepted, bonus, rejection, packed forward, valid query, and padded query counts are separate. The effective-width histogram counts batch-rounds. `generic_predictor_forwards` and `standalone_correction_forward_count` must remain zero for completed speculative frames.
+`/model_info` includes `predictor_speculative` metrics, including the selected probability, LM-head, and RNG backends. `graph_mode` distinguishes `disabled`, `eager`, and `verifier_only`; `verifier_graph_replays` never implies full-round capture. `frames` counts successful request-row frames; `output_code_frames` counts all native and speculative output rows; `committed_codes` includes every Predictor code committed in speculative frames; `round_committed_codes` counts codes committed after the initial codebook-1 sample. Draft, accepted, bonus, rejection, packed forward, valid query, and padded query counts are separate. The effective-width histogram counts batch-rounds. `generic_predictor_forwards` and `standalone_correction_forward_count` must remain zero for completed speculative frames.
 
-`configuration_time_ms` measures speculative setup, including opt-in buffers, head packing, and graph capture; the serving benchmark prints this field for the native width-0 server and the enabled server so their feature setup costs can be compared. It does not measure total process launch-to-ready time. `graph_capture_time_ms` isolates verifier capture wall time, and `graph_capture_memory_delta_bytes` is the approximate CUDA allocator increase during capture, not total model memory. `native_fallback_fraction` is computed over attempted frame rows. A successful performance run must show positive frame and packed-forward deltas and zero fallback delta for its unseeded workload. The benchmark reports full fused stack traversals per frame and packed query padding fraction.
+`configuration_time_ms` measures speculative setup, including opt-in buffers, head packing, and verifier capture. `graph_capture_time_ms` isolates verifier capture wall time, and `graph_capture_memory_delta_bytes` is the approximate CUDA allocator increase during capture, not total model memory. `native_fallback_fraction` is computed over attempted frame rows. These counters do not establish a full-round graph replay or performance gain.
 
 ## H200 test commands
 
@@ -96,41 +96,47 @@ Run the mixed explicit-seed batch safety case, then verify that a later fully un
 pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k mixed_explicit_seed_batch
 ```
 
-Run graph replay and ragged cache accesses under Compute Sanitizer:
+Run the narrow acceptance padding case under Compute Sanitizer before the larger CUDA suite:
 
 ```bash
-compute-sanitizer --tool memcheck --error-exitcode 1 python -m pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py
+compute-sanitizer --tool memcheck --error-exitcode 1 python -m pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k compact_acceptance_top_k50_padding
+```
+
+Then run the fused input and state memory checks:
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode 1 python -m pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k 'fused_verifier_preparation or fused_state_transition or fused_commit'
 ```
 
 ## H200 single-GPU serving comparison
 
-Use one H200 for both runs. Keep the request payload, model revision, concurrency, clocks, and process environment fixed. The native phase requires positive replays of the full Predictor CUDA Graph. The speculative phase requires positive verifier graph replays, positive speculative frame counts, and zero native fallbacks. The current speculative graph captures the packed verifier; proposal generation, acceptance, and commitment still run outside that graph.
+Use one H200 and one local checkpoint snapshot. The sweep starts and stops one fresh server process group at a time, checks port release, runs the mirrored width order `0,2,3,4,4,3,2,0` at concurrency 1, 8, and 16, omits explicit seed fields, and refuses to overwrite a nonempty output directory. Each response is parsed as PCM WAV and checked for nonempty, nonsilent samples. Results include E2E latency, QPS, audio duration, real-time factor, PCM integrity measurements, output code-frame counts, Predictor counters, and per-request measurements. TTFA is explicitly unmeasured because these requests are nonstreaming.
 
-Start the native server with speculative decoding disabled:
-
-```bash
-sgl-omni serve --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --config examples/configs/qwen3_tts_1_7b_customvoice.yaml --port 8000
-```
-
-In a second terminal, warm up and measure the fixed payload. This writes the native baseline and graph replay counters to `/tmp/qwen3-tts-native-baseline.json`.
+Run from a Linux host with `sgl-omni`, `curl`, `ss`, `pgrep`, `setsid`, and `nvidia-smi` installed:
 
 ```bash
-python scripts/benchmark_qwen3_tts_speculative_serving.py --phase native --base-url http://127.0.0.1:8000 --baseline-file /tmp/qwen3-tts-native-baseline.json --request-count 32 --warmup-requests 2 --concurrency 4
+MODEL_PATH="$HOME/hf-cache/hub/models--Qwen--Qwen3-TTS-12Hz-1.7B-CustomVoice/snapshots/0c0e3051f131929182e2c023b9537f8b1c68adfe"
+RUN="$HOME/results/qtts-specdec-serving-$(date -u +%Y%m%dT%H%M%SZ)"
+bash scripts/benchmark_qwen3_tts_speculative_serving_sweep.sh "$MODEL_PATH" "$RUN" 51231
 ```
 
-Stop the native server before starting the speculative server on the same GPU and port:
+The output root contains one `server.log` and one result JSON per arm under `c1`, `c8`, and `c16`, plus the first native baseline for each concurrency. The repeated final native arm is retained separately for drift inspection. A nonzero exit means an arm failed validation; do not report the partial matrix as a pass. The speculative CUDA graph in this branch is verifier-only, so this sweep does not satisfy the requested full-round graph replay gate.
+
+## Frozen-frame H200 artifacts
+
+The referenced pilot dataset is expected at `~/results/qtts-specdec-r2e0-pilot-001/{capture,dataset}`. Its dataset contract uses `r2e0-depth-transitions-v1` shards with `hidden[N,15,H]`, `projected_embed[N,14,H]`, `logits[N,15,V]`, `codes[N,16]`, `semantic_positions[N,1]`, and six named sampling tensors. The upstream diagnostic kit is pinned to Omni commit `caf13d4d4bd0eab7edb7186675fb7307a5a0ecdc` and checkpoint snapshot `0c0e3051f131929182e2c023b9537f8b1c68adfe`; its [README](https://github.com/charliechenye/sglang-scripts/blob/exp/qwen3-tts-spec-r2e/experiments/qwen3_tts_spec_r2e/README.md) documents capture/extraction and its source manifest.
+
+Audit the existing dataset on H200 and require the pilot marker before using it:
 
 ```bash
-sgl-omni serve --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --config examples/configs/qwen3_tts_1_7b_customvoice_speculative.yaml --port 8000
+source "$HOME/sglang-omni-env.sh"
+KIT="$HOME/sglang-scripts/experiments/qwen3_tts_spec_r2e"
+RUN="$HOME/results/qtts-specdec-r2e0-pilot-001"
+python -u "$KIT/audit_dataset.py" "$RUN/dataset" | tee "$RUN/dataset/dataset-audit.log"
+grep -q 'R2E1_PILOT_DATASET_PASS' "$RUN/dataset/dataset-audit.log"
 ```
 
-Run the same workload against that process. The benchmark omits the `seed` request field so speculative decoding remains eligible, reads actual model counters around the measured requests, and exits nonzero if speculative frames or graph replays are missing, if any frame falls back, or if the configured serving speedup is missed.
-
-```bash
-python scripts/benchmark_qwen3_tts_speculative_serving.py --phase speculative --base-url http://127.0.0.1:8000 --baseline-file /tmp/qwen3-tts-native-baseline.json --request-count 32 --warmup-requests 2 --concurrency 4 --minimum-speedup 1.0
-```
-
-The output includes request latency, committed codes, accepted drafts, bonus tokens, effective widths, valid and padded query counts, head evaluations, generic forward counts, standalone correction forward counts, and graph replay counts. The API benchmark measures full speech-request latency; it does not substitute a verifier-only timing for full-frame serving latency. The current speculative CUDA Graph is verifier-only, so this benchmark does not yet meet a round-level graph comparison gate.
+The full frozen-frame correctness and benchmark runner is not implemented in this branch. Dataset audit is only an artifact integrity gate; it does not compare this branch's native/eager/verifier/full-round paths. The current checkout has no pilot data at the referenced user path, and this branch has no full-round graph backend, so no full-frame H200 result can be claimed yet.
 
 ## Push commands for a personal fork
 
