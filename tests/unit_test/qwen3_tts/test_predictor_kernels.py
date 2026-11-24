@@ -30,6 +30,7 @@ from sglang_omni.models.qwen3_tts.sglang_model import (
     predictor_gqa_attention,
 )
 from sglang_omni.platforms import current_platform
+from sglang_omni.utils.predictor_layers import HAS_TRITON, decode_attention
 
 if find_spec("cutlass") is not None:
     from sglang_omni.models.qwen3_tts.cutedsl.api import (
@@ -51,6 +52,90 @@ def rounded_rmsnorm(values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         values.float().square().mean(-1, keepdim=True) + 1e-6
     )
     return normalized.to(values.dtype) * weight
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAS_TRITON,
+    reason="requires CUDA and Triton",
+)
+@pytest.mark.parametrize("tokens_per_row", [2, 4, 8])
+@torch.inference_mode()
+def test_packed_predictor_attention_masks_per_row_absolute_positions(
+    tokens_per_row: int,
+) -> None:
+    """Packed queries with different offsets cannot attend to stale KV suffixes."""
+    batch_size = 3
+    query_heads = 4
+    kv_heads = 2
+    head_dim = 16
+    cache_slots = 16
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(781 + tokens_per_row)
+    query = torch.randn(
+        batch_size * tokens_per_row,
+        query_heads * head_dim,
+        generator=generator,
+        device=device,
+    ).to(torch.bfloat16)
+    keys = torch.randn(
+        batch_size,
+        cache_slots,
+        kv_heads,
+        head_dim,
+        generator=generator,
+        device=device,
+    ).to(torch.bfloat16)
+    values = torch.randn_like(keys)
+    row_starts = (1, 3, 5)
+    valid_counts = (tokens_per_row, max(1, tokens_per_row // 2), tokens_per_row - 1)
+    positions = torch.full(
+        (batch_size, tokens_per_row), -1, dtype=torch.long, device=device
+    )
+    for row in range(batch_size):
+        valid_count = valid_counts[row]
+        positions[row, :valid_count] = row_starts[row] + torch.arange(
+            valid_count, device=device
+        )
+        last_valid_slot = row_starts[row] + valid_count - 1
+        keys[row, last_valid_slot + 1 :] = 32.0
+        values[row, last_valid_slot + 1 :] = 32.0
+
+    output = torch.empty_like(query)
+    decode_attention(
+        q=query,
+        tokens_per_row=tokens_per_row,
+        k_cache=keys,
+        v_cache=values,
+        positions=positions,
+        attention_output=output,
+    )
+
+    query_rows = query.view(batch_size, tokens_per_row, query_heads, head_dim)
+    actual = output.view(batch_size, tokens_per_row, query_heads, head_dim)
+    expected = torch.zeros_like(actual, dtype=torch.float32)
+    group_size = query_heads // kv_heads
+    for row in range(batch_size):
+        for token in range(tokens_per_row):
+            position = int(positions[row, token])
+            if position < 0:
+                continue
+            else:
+                pass
+            for head in range(query_heads):
+                kv_head = head // group_size
+                scores = (
+                    query_rows[row, token, head].float()
+                    @ keys[row, : position + 1, kv_head].float().T
+                ) / head_dim**0.5
+                weights = torch.softmax(scores, dim=-1)
+                rounded_weighted_values = weights.to(torch.bfloat16).float() @ values[
+                    row, : position + 1, kv_head
+                ].float()
+                expected[row, token, head] = rounded_weighted_values / weights.sum()
+    torch.testing.assert_close(
+        actual.float(), expected, atol=0.04, rtol=0.02
+    )
 
 
 @pytest.mark.accelerator
