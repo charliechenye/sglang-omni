@@ -37,6 +37,27 @@ def test_vocoder_platform_default_keeps_npu_opt_in(
     assert config.stage_factory_kwargs("vocoder") == expected
 
 
+@pytest.mark.parametrize("width", [0, 2, 8])
+def test_speculative_verify_width_is_wired_to_the_engine_stage(width: int) -> None:
+    config = Qwen3TTSPipelineConfig(
+        model_path="model",
+        code_predictor_spec_verify_size=width,
+    )
+
+    assert config.stage_factory_kwargs("tts_engine") == {
+        "code_predictor_spec_verify_size": width
+    }
+
+
+@pytest.mark.parametrize("width", [1, 9, -1])
+def test_speculative_verify_width_rejects_invalid_values(width: int) -> None:
+    with pytest.raises(ValueError, match="code_predictor_spec_verify_size"):
+        Qwen3TTSPipelineConfig(
+            model_path="model",
+            code_predictor_spec_verify_size=width,
+        )
+
+
 @pytest.mark.parametrize(
     ("engine_args", "factory_overrides", "vocoder_process", "processes"),
     [

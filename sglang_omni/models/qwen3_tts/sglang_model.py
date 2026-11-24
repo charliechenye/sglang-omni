@@ -75,8 +75,13 @@ from sglang_omni.sampling.sampler_compile import (
 )
 from sglang_omni.scheduling.types import SchedulerRequest
 from sglang_omni.utils.predictor_layers import (
+    ATTENTION_ROWS,
     decode_attention,
     resolve_fused_predictor_layers,
+)
+from sglang_omni.utils.predictor_speculation import (
+    resolve_speculative_capability,
+    speculative_resources_requested,
 )
 from sglang_omni.vendor.sglang.core import ForwardBatch
 from sglang_omni.vendor.sglang.distributed import get_group_rank_size
@@ -241,6 +246,25 @@ class PredictorGraphStats(TypedDict):
     eager_runs: int
     capacity_fallbacks: int
     capture_failures: int
+
+
+class PredictorSpeculativeStats(TypedDict):
+    requested_width: int
+    effective_width: int
+    fallback_reason: str | None
+    frames: int
+    rounds: int
+    proposed_draft_tokens: int
+    accepted_draft_tokens: int
+    committed_codes: int
+    bonus_tokens: int
+    rejections: int
+    average_codes_per_round: float
+    packed_transformer_forwards: int
+    standalone_correction_forward_count: int
+    graph_replays: int
+    graph_capture_failures: int
+    native_fallback_count: int
 
 
 class PredictorDecodeGraph:
@@ -1243,6 +1267,20 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.predictor_eager_count = 0
         self.predictor_graph_pool = None
         self.predictor_capture_stream: torch.Stream | None = None
+        self.code_predictor_spec_requested_width = 0
+        self.code_predictor_spec_effective_width = 0
+        self.code_predictor_spec_fallback_reason: str | None = None
+        self.code_predictor_spec_native_fallback_count = 0
+        self.code_predictor_spec_frame_count = 0
+        self.code_predictor_spec_round_count = 0
+        self.code_predictor_spec_proposed_count = 0
+        self.code_predictor_spec_accepted_count = 0
+        self.code_predictor_spec_committed_count = 0
+        self.code_predictor_spec_bonus_count = 0
+        self.code_predictor_spec_rejection_count = 0
+        self.code_predictor_spec_packed_forward_count = 0
+        self.code_predictor_spec_graph_replay_count = 0
+        self.code_predictor_spec_graph_capture_failure_count = 0
         bind_default_weight_loaders(self)
         self.cached_params_dict = dict(self.named_parameters())
         self.sampler = None
@@ -1416,6 +1454,13 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             talker_hidden = talker_hidden.unsqueeze(1)
         else:
             pass
+        if (
+            self.code_predictor_spec_requested_width > 0
+            and self.code_predictor_spec_effective_width == 0
+        ):
+            self.code_predictor_spec_native_fallback_count += 1
+        else:
+            pass
         graph_result = self.predictor_forward_graphed(
             layer0_codes,
             talker_hidden,
@@ -1443,6 +1488,83 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             "eager_runs": self.predictor_eager_count,
             "capacity_fallbacks": self.predictor_graph_capacity_fallback_count,
             "capture_failures": self.predictor_graph_failure_count,
+        }
+
+    def configure_code_predictor_speculation(self, requested_width: int) -> None:
+        """Resolve startup support before allocating or mutating speculative state."""
+        speculative_resources_requested(requested_width)
+        self.code_predictor_spec_requested_width = requested_width
+        self.code_predictor_spec_effective_width = 0
+        self.code_predictor_spec_fallback_reason = None
+        if requested_width == 0:
+            return
+        else:
+            pass
+        attention = self.code_predictor.model.layers[0].self_attn
+        resolution = resolve_speculative_capability(
+            requested_width,
+            is_cuda=current_platform.is_cuda(),
+            is_bfloat16=self.predictor_k_cache.dtype == torch.bfloat16,
+            tensor_parallel_size=int(get_parallel().tp_size),
+            fused_predictor_available=self.predictor_fused_layers is not None,
+            batch_size=1,
+            packed_row_capacity=(
+                0
+                if self.predictor_fused_layers is None
+                else self.predictor_fused_layers.max_rows
+            ),
+            query_heads=int(attention.num_heads),
+            kv_heads=int(attention.num_kv_heads),
+            attention_tile_capacity=ATTENTION_ROWS,
+            vocab_size=int(self.config.code_predictor_config.vocab_size),
+            graph_available=False,
+            sampling_supported=False,
+            has_explicit_seed=False,
+            has_greedy_rows=False,
+            deterministic_mode=bool(
+                get_exec().deterministic.enable_deterministic_inference
+            ),
+        )
+        self.code_predictor_spec_effective_width = resolution.effective_width
+        self.code_predictor_spec_fallback_reason = resolution.fallback_reason
+        if resolution.fallback_reason is not None:
+            logger.warning(
+                "Qwen3-TTS CodePredictor speculative decoding requested at width %d "
+                "but will use native decoding: %s",
+                requested_width,
+                resolution.fallback_reason,
+            )
+        else:
+            pass
+
+    def predictor_speculative_stats(self) -> PredictorSpeculativeStats:
+        average_codes_per_round = (
+            self.code_predictor_spec_committed_count
+            / self.code_predictor_spec_round_count
+            if self.code_predictor_spec_round_count > 0
+            else 0.0
+        )
+        return {
+            "requested_width": self.code_predictor_spec_requested_width,
+            "effective_width": self.code_predictor_spec_effective_width,
+            "fallback_reason": self.code_predictor_spec_fallback_reason,
+            "frames": self.code_predictor_spec_frame_count,
+            "rounds": self.code_predictor_spec_round_count,
+            "proposed_draft_tokens": self.code_predictor_spec_proposed_count,
+            "accepted_draft_tokens": self.code_predictor_spec_accepted_count,
+            "committed_codes": self.code_predictor_spec_committed_count,
+            "bonus_tokens": self.code_predictor_spec_bonus_count,
+            "rejections": self.code_predictor_spec_rejection_count,
+            "average_codes_per_round": average_codes_per_round,
+            "packed_transformer_forwards": (
+                self.code_predictor_spec_packed_forward_count
+            ),
+            "standalone_correction_forward_count": 0,
+            "graph_replays": self.code_predictor_spec_graph_replay_count,
+            "graph_capture_failures": (
+                self.code_predictor_spec_graph_capture_failure_count
+            ),
+            "native_fallback_count": self.code_predictor_spec_native_fallback_count,
         }
 
     @staticmethod
@@ -2315,7 +2437,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 final_norm=self.code_predictor.model.norm,
                 token_embeds=token_embeds,
                 batch_size=batch_size,
-                cache_len=cache_len,
                 positions=positions,
                 k_cache=self.predictor_k_cache,
                 v_cache=self.predictor_v_cache,

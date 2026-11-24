@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSSGLangRequestData
     from sglang_omni.models.qwen3_tts.sglang_model import (
         PredictorGraphStats,
+        PredictorSpeculativeStats,
         Qwen3TTSTalker,
     )
     from sglang_omni.scheduling.sglang_backend.output_processor import (
@@ -45,6 +46,7 @@ QWEN3_TTS_MIN_NEW_FRAMES = 2
 
 class Qwen3TTSModelInfo(TypedDict):
     predictor_cuda_graph: PredictorGraphStats
+    predictor_speculative: PredictorSpeculativeStats
 
 
 class Qwen3TTSModelRunner(ModelRunner):
@@ -76,7 +78,10 @@ class Qwen3TTSModelRunner(ModelRunner):
         )
 
     def model_info(self) -> Qwen3TTSModelInfo:
-        return {"predictor_cuda_graph": self.model.predictor_graph_stats()}
+        return {
+            "predictor_cuda_graph": self.model.predictor_graph_stats(),
+            "predictor_speculative": self.model.predictor_speculative_stats(),
+        }
 
     def before_prefill(
         self,

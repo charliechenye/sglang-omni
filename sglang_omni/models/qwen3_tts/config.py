@@ -9,6 +9,8 @@ import re
 from pathlib import Path
 from typing import ClassVar, TypedDict
 
+from pydantic import field_validator
+
 from sglang_omni.config import (
     CustomVoiceConfig,
     EngineStageConfig,
@@ -52,6 +54,7 @@ class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
     max_in_flight: int | None
     codec_state_slots: int | None
     shares_engine_speech_tokenizer: bool
+    code_predictor_spec_verify_size: int
 
 
 class Qwen3TTSPipelineConfig(PipelineConfig):
@@ -75,11 +78,23 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             "max_queued_requests": QWEN3_TTS_MAX_QUEUED_REQUESTS,
         }
 
+    @field_validator("code_predictor_spec_verify_size")
+    @classmethod
+    def validate_code_predictor_spec_verify_size(cls, value: int) -> int:
+        if isinstance(value, bool) or value not in range(0, 9) or value == 1:
+            raise ValueError(
+                "code_predictor_spec_verify_size must be 0 or an integer in [2, 8]"
+            )
+        else:
+            pass
+        return value
+
     model_path: str
     # note (0xtoward): Keep deterministic inference opt-in because it serializes
     # preprocessing and vocoder decoding and disables the vocoder CUDA graphs,
     # reducing throughput.
     enable_deterministic_inference: bool = False
+    code_predictor_spec_verify_size: int = 0
     stages: list[StageConfig] = [
         StageConfig(
             name="preprocessing",
@@ -119,6 +134,12 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
 
     def stage_factory_kwargs(self, stage_name: str) -> Qwen3TTSStageFactoryKwargs:
         kwargs: Qwen3TTSStageFactoryKwargs = {}
+        if stage_name == "tts_engine":
+            kwargs["code_predictor_spec_verify_size"] = (
+                self.code_predictor_spec_verify_size
+            )
+        else:
+            pass
         # Note (Jiaxin Deng): outside the engine process the preprocessing stage
         # loads its own prompt frontend and ships prepared tensors in the payload.
         if stage_name == "preprocessing" and self.preprocessing_in_own_process():

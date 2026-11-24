@@ -145,6 +145,8 @@ See [Qwen3-TTS parameters](qwen3_tts/reference.md#generation-parameters) for def
 
 - [Tuning](qwen3_tts/tuning.md): concurrency, streaming continuity, CUDA graphs, deterministic inference, and optional CuTeDSL kernels.
 
+- [CodePredictor speculative decoding](../developer_reference/qwen3_tts_code_predictor_speculative.md): opt-in width configuration, current fallback status, state invariants, NVIDIA parity, and H200 validation gates.
+
 - [Reference](qwen3_tts/reference.md): full parameter defaults, precomputed embeddings, speaker behavior, and dependency troubleshooting.
 
 - [Platform deployment](qwen3_tts/platforms.md): Ascend NPU and native Apple Silicon, with links to other installation guides.
