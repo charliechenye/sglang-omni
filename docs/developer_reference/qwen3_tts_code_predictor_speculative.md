@@ -1,92 +1,136 @@
 # Qwen3-TTS CodePredictor speculative decoding
 
-## Current implementation status
+## Status
 
-The configuration, capability resolver, per-row CPU reference state machine, opt-in fused scratch sizing, explicit-seed request marker, observability shape, and row-position attention interface are present on this branch. The speculative CUDA round runner is not implemented. A nonzero request therefore logs `speculative-graph-unavailable`, reports effective width 0, and uses the native Predictor path. Unseeded requests do not yet enter speculation because no speculative execution path exists.
+The model-connected frame runner, grouped LM-head projection, production Top-K probability output, request-isolated RNG, packed fused verification, logical KV commitment, and persistent verifier CUDA Graph capture are implemented. The feature remains opt-in and GPU correctness and speed are unverified on this development machine.
 
-The default remains disabled. Width 0 allocates no speculative buffers. Width 1 is invalid. Widths 2 through 8 are accepted as requests, but currently fall back before speculative frame state is created.
+The runner is reachable through `Qwen3TTSTalker.code_predictor_forward`. It first processes the opening pair and samples codebook 1, then generates future-head proposals, verifies the pending code plus drafts in one packed `FusedPredictorLayers` call, applies the target heads once to verified hidden rows, accepts the draft prefix, samples a residual correction or bonus, commits outputs and embeddings, and repeats until all Predictor codebooks are complete. The normal carry-forward path has no standalone correction forward.
 
-Example pipeline YAML:
+Backend `cuda_graph` is the default when a nonzero width is configured. It captures a persistent verifier for supported batch buckets during model setup. Backend `eager` is an explicit CUDA correctness and debugging path; it still uses the production fused Predictor and GPU sampling kernels. Width 0 remains the default and allocates no speculative seed, head, metadata, or graph buffers. Width 1 is rejected; widths 2 through 8 are requested verify widths.
 
-```yaml
-config_cls: Qwen3TTSPipelineConfig
-model_path: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
-code_predictor_spec_verify_size: 4
-```
+An example opt-in configuration is [qwen3_tts_1_7b_customvoice_speculative.yaml](../../examples/configs/qwen3_tts_1_7b_customvoice_speculative.yaml). The native-off configuration remains [qwen3_tts_1_7b_customvoice.yaml](../../examples/configs/qwen3_tts_1_7b_customvoice.yaml).
 
-The current model-info payload includes `predictor_speculative.requested_width`, `effective_width`, `fallback_reason`, counters, and `native_fallback_count`. With width 4 today, expect effective width 0 and native output.
+## State and cache contract
 
-## State and cache invariants in the CPU reference
+Let `m` be the number of committed Predictor codes after codebook 0. At frame start, codebook 1 has been committed to output but is pending in the Predictor input; the opening talker-hidden/codebook-0 pair occupies two KV slots, so the logical KV length is `m + 1 = 2`. The carried hidden row is immediately before the pending code.
 
-The initial state contains codebook 0 and the natively sampled codebook 1; the Predictor KV prefix contains the opening pair and codebook 1 is pending. For proposal count `n`, the packed verifier receives the pending token followed by up to `n` drafts and returns target distributions for all `n + 1` query rows.
+Each round verifies the pending input and up to `verify_width - 1` drafts. After accepting `k` drafts and committing one correction or bonus, `m` and the logical KV length both advance by `k + 1`. The last new code becomes pending, and its preceding hidden row is selected from the verifier output at offset `k`. The invariant remains `logical_kv_length = m + 1`.
 
-Let `m` count committed Predictor codes after codebook 0. The opening state has `m = 1` because codebook 1 is committed but pending, and its valid KV length is `m + 1 = 2` for the talker-hidden/codebook-0 opening pair. After accepting `k` drafts, the next state commits `k + 1` Predictor codes and advances the valid KV prefix by `k + 1`; the invariant remains `valid_kv_length = m + 1`. The correction or bonus token is committed to output but remains pending. The carried hidden state is the verifier hidden row at index `k`, immediately before that pending token. Active rows with no proposals have one valid query row. Finished rows have zero proposals and zero valid queries and do not advance.
+Rows close to the end of a frame can have zero proposals while other rows verify a full window. They still receive one valid query if active; finished rows have zero valid queries. Inactive embeddings, LM-head selectors, positions, and output stores use safe staged values or masks before access. Positions at `-1` do not write KV and do not participate in attention. Rejected physical KV suffixes may remain in cache but are outside the logical prefix and are overwritten before reuse.
 
-The CPU reference implements inverse-CDF sampling, first-rejection acceptance, normalized `max(p-q, 0)` correction, the trailing bonus, a deterministic lower-token-ID tie policy, and the current nucleus-filter boundary rule. That lower-ID policy is a generic CPU reference; it is not evidence of CUDA native tie parity. The reference also accepts a caller-supplied native candidate order so a CUDA selection result can be checked against the CPU FP64 probability calculation. No production CUDA probability output is wired to supply that order yet. An empty residual falls back to `p`; under valid uniforms that case cannot be reached by a mathematically valid rejection when `p == q`.
+The fixed-width policy reduces width to fit `min(batch_size * verify_width, MAX_FUSED_ROWS)`, the graph bucket, and `verify_width * GQA_group <= ATTENTION_ROWS`. A failed graph capture retries narrower widths before decoding. If no supported width remains, the request uses native decoding with a reason in model info. Generic attention is not used for packed verification.
 
-## Supplemental request-seed and capacity audit
+## Sampling, RNG, and precision
 
-`Qwen3TTSSGLangRequestData.user_seed_provided` preserves `Qwen3TTSState.seed is not None` through request construction. Internal semantic and subtalker seeds remain present for ordinary unseeded requests, so their presence is not used to classify explicit-seed requests. Decode-buffer staging keeps this flag aligned with request rows and restages it on reorder or request-ID reuse. `derive_qwen3_tts_speculative_draw_seed` creates a stable draw key from the internal row seed, request ID, semantic position, RVQ depth, round, purpose, and draw index. The helper is not connected to a graph-safe GPU RNG; all requests still use native decoding because there is no speculative runner.
+The speculative probability builder reuses Omni's score packing, temperature scaling, top-k ordering, FP32 normalization, and top-p boundary rule. It returns candidate probabilities and IDs for proposal, target, and residual calculations. On SM90 it uses the existing split chunk/merge selection infrastructure. The NVIDIA-style radix selector is present as a parity candidate for larger top-k values; it is not the default sampler. The candidate is tested against the production split path on SM90.
 
-`fused_predictor_scratch_rows` sizes opt-in packed scratch to `min(max_batch_size * verify_width, MAX_FUSED_ROWS)`. The default width of two preserves the existing opening-pair capacity, and width zero creates no additional scratch. A nonzero requested width can expand scratch before native Predictor graph capture. `resolve_fused_predictor_width` uses the largest configured graph bucket, the candidate allocation, the GQA group, and the attention tile to reduce unsupported widths before allocating. Register pressure and architecture-specific resource limits have not been validated. These sizing helpers do not establish a production effective width until a speculative graph runner consumes them. Since the runner is absent, an opt-in width can allocate scratch and still fall back to native decoding.
+For top-k values up to 32, the production probability kernel reconstructs the native PyTorch gather order and bitonic sort order. For larger top-k values, packed score keys order score ties by token ID, matching the split selector contract. The grouped Triton LM-head kernel accumulates BF16 products in FP32 and rounds logits to BF16. Its output may differ from the native GEMM at rounding boundaries, so exact target-distribution parity must be established by the H200 tests before claiming mathematical output equivalence.
 
-## Existing native sampler and probability parity
+Ordinary sampled requests are eligible even though the request builder generated internal sampler seeds. Explicit user seeds, deterministic mode, greedy or mixed-sampling batches, unbounded or unsupported top-k settings, missing request identity, unsupported vocabulary or dtype, tensor parallelism, and missing fused capacity use native decoding. A batch containing any explicit-seed or greedy row falls back as a whole. Speculative uniforms are namespaced by request seed, semantic position, round, and draw purpose; GPU generation is stateless and graph-safe.
 
-The Qwen3-TTS native path in `sglang_omni/models/qwen3_tts/sampling_kernels.py` first tries `sample_from_logits_with_seed_top_k_top_p`. Its single-kernel path packs FP32-scaled score bits with token IDs and selects candidates with `tl.topk`; for `max_top_k <= 32`, it reconstructs the selected order used by the pinned PyTorch `topk` gather and the 32-entry bitonic sort. The SM90 split path uses `seeded_top_k_chunk_kernel` followed by `seeded_top_k_merge_sample_kernel`. The selected scores are normalized in FP32, nucleus filtering removes a token when `cdf - probability >= top_p`, and seeded Gumbel sampling hashes the row seed, semantic position, and candidate rank. `sample_codes_and_gather_codec_embedding` fuses embedding accumulation only for its supported split-sampler contract.
+## Metrics
 
-These kernels return sampled IDs and optionally gather embeddings; they do not expose the row distribution needed for `p(x)`, `q(x)`, or `max(p-q, 0)`. The current CPU lower-ID tie policy is therefore insufficient for exact speculative parity. A speculative probability kernel must reuse the native selection order, FP32 temperature/filtering arithmetic, and top-p boundary rule. A separate radix selector is not implemented or compared with the native split top-k path. No exact distribution-equivalence claim is made.
+`/model_info` includes `predictor_speculative` metrics. `frames` counts successful request-row frames; `committed_codes` includes every Predictor code committed in those frames; `round_committed_codes` counts codes committed after the initial codebook-1 sample. Draft, accepted, bonus, rejection, packed forward, valid query, and padded query counts are separate. The effective-width histogram counts batch-rounds. `generic_predictor_forwards` and `standalone_correction_forward_count` must remain zero for completed speculative frames.
 
-## NVIDIA-to-Omni parity matrix
+`configuration_time_ms` measures speculative setup, including opt-in buffers, head packing, and graph capture; the serving benchmark prints this field for the native width-0 server and the enabled server so their feature setup costs can be compared. It does not measure total process launch-to-ready time. `graph_capture_time_ms` isolates verifier capture wall time, and `graph_capture_memory_delta_bytes` is the approximate CUDA allocator increase during capture, not total model memory. `native_fallback_fraction` is computed over attempted frame rows. A successful performance run must show positive frame and packed-forward deltas and zero fallback delta for its unseeded workload. The benchmark reports full fused stack traversals per frame and packed query padding fraction.
 
-The reference is NVIDIA TensorRT-Edge-LLM revision `513dcd18291e587c80928911a480761352f3c2d8`. Source paths below are relative to that repository.
+## H200 test commands
 
-| NVIDIA implementation | Omni status on this branch | Notes |
-|---|---|---|
-| `cpp/multimodal/qwen3_omni/codePredictor.cpp:resolveSpeculation` | Implemented but needs extension | Width validation and a startup capability resolver exist; GPU round resources and effective execution are still missing. |
-| `runSpecDecodeFrame` | Implemented but needs extension | `sglang_omni/utils/predictor_speculation.py` defines the CPU round and frame reference; there is no model-connected CUDA runner. |
-| `uploadRowSelectors`, `applyRowLmHeads` | Missing | Per-row hidden/head selector buffers and grouped LM-head projection are not implemented. |
-| `buildVerifyInput`, `invokeGatherCodecEmbedRows` | Implemented but needs extension | Existing Qwen3-TTS has codebook-specific embedding gathers and preprojected tables. There is no packed per-depth input gather or committed-prefix output kernel. |
-| `executeVerifyStep` | Implemented but needs extension | `FusedPredictorLayers` now accepts absolute per-query positions and masks padded rows; no speculative call site stages those positions. CUDA parity is unverified. |
-| `cpSpecTopKTopPProbs`, `cpSpecSampleRows` | Missing | The CPU FP64 probability reference exists. No production p/q distribution or independent speculative RNG kernel exists. |
-| `cpSpecProbabilisticAccept` | Implemented but needs extension | The CPU reference covers first rejection, correction, bonus, zero proposals, and edge cases. There is no GPU implementation. |
-| `storeCodecHiddensForAccepted`, `commitSequenceLength` | Implemented but needs extension | The CPU state machine commits only accepted outputs and tracks logical prefix length. Persistent GPU commit buffers and KV-length staging are absent. |
-| `dsparkFillUniforms` | Missing | No graph-safe request-isolated speculative RNG stream is integrated. |
-| `captureDecodeGraphs` speculative verify graph ladder | Missing | Native graph capture is unchanged. There is no speculative graph owner or capture/replay path. |
-| Generation-profile widening for verify windows | Not applicable to Omni | Omni uses a frame-local Predictor cache with a fixed code-group bound, not TensorRT generation token profiles. |
-
-NVIDIA call-site map at the pinned revision: `runSpecDecodeFrame` calls `buildVerifyInput`, `executeVerifyStep`, `applyRowLmHeads`, `cpSpecTopKTopPProbs`, `cpSpecSampleRows`, `cpSpecProbabilisticAccept`, `storeCodecHiddensForAccepted`, and `commitSequenceLength`. `resolveSpeculation` configures widths and buffers. `uploadRowSelectors` prepares grouped head selectors. `invokeGroupedHeadLinear` is defined in `cpp/kernels/talkerMLPKernels/talkerMLPKernels.cu` and declared in `cpp/kernels/talkerMLPKernels/talkerMLPKernels.h`. `invokeGatherCodecEmbedRows` is in the same kernel pair. `dsparkFillUniforms` is in `cpp/kernels/speculative/dsparkKernels.cu` and declared in its header. Sampling kernels are in `cpp/kernels/speculative/cpSpecKernels.cu` and `.h`.
-
-The reference execution also widens CodePredictor generation profiles in `cpp/builder/llmBuilder.cpp` and captures decode graphs from the builder's `captureDecodeGraphs` path. The two model export files inspected are `tensorrt_edgellm/builder/models/qwen3_tts/modeling_qwen3_tts_code_predictor.py` and `tensorrt_edgellm/builder/models/qwen3_omni/modeling_qwen3_omni_code_predictor.py`.
-
-## Quantization and hardware gap
-
-The pinned NVIDIA Qwen3-TTS export keeps the stacked codec embeddings and LM heads in FP16 in `tensorrt_edgellm/builder/models/qwen3_tts/embeddings.py`. The Qwen3-TTS `weights.py` loader discards its `quant_type` argument for this component. The Predictor model files declare FP16 LM-head inputs and select FP8 KV cache only when `kv_cache_quant == "fp8"`; otherwise KV is FP16. The model emits logits as FP32 after its selected LM-head projection.
-
-The inspected Qwen3-TTS CodePredictor files do not establish an NVFP4 CodePredictor path. The Qwen3-Omni talker has separate MoE quantization/export logic; it is not evidence that Qwen3-TTS Predictor heads or embeddings run NVFP4. NVFP4 kernels and TensorRT's grouped GEMV/attention implementation remain backend-specific. H200 must not be described as providing Blackwell NVFP4 acceleration.
-
-This branch makes no quantization change. Its existing fused Predictor path is single-rank BF16 and has backend-specific rounding behavior documented in `sglang_omni/utils/predictor_layers.py`. The new position-mask behavior has not been validated on H200. FP8 KV and NVFP4 remain independent work with separate output-quality and performance gates.
-
-## H200 validation commands
-
-Run the CPU reference tests and packed attention kernel tests from the repository root:
+Run CPU reference and RNG tests:
 
 ```bash
-pytest -q tests/unit_test/qwen3_tts/test_predictor_speculation.py
-pytest -q tests/unit_test/qwen3_tts/test_predictor_kernels.py -k packed_predictor_attention_masks_per_row_absolute_positions
+pytest -q tests/unit_test/qwen3_tts/test_predictor_speculation.py tests/unit_test/qwen3_tts/test_speculative_rng.py
 ```
 
-The first command is CPU-only. The second requires CUDA and Triton; it explicitly skips on unsupported hosts. A skip is not a GPU pass.
-
-To check the requested-width plumbing and current fallback on an H200, start a server from a YAML file containing the example above:
+Run packed attention positions, C1/C8/C16 capacity, and tail-mask checks:
 
 ```bash
-sgl-omni serve --config /tmp/qwen3-tts-spec-width-4.yaml --port 8000
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_kernels.py
 ```
 
-The log and `/model_info` should report effective width 0 and `speculative-graph-unavailable`. This validates fallback only; it is not a speculative benchmark.
+Run grouped LM-head and target-distribution parity:
 
-No matched speculative H200 benchmark command is ready because the round executor is missing. The existing SeedTTS serving benchmark can compare a future completed implementation at C1/C8/C16 with identical model and sampling settings, but running it against this branch now would measure the native fallback in every case. Do not report those timings as speculative performance.
+```bash
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_grouped_heads.py
+```
 
-## Known blockers
+Run native probability, SM90 split Top-K, radix-candidate, and tie-order tests:
 
-The remaining P0 item is the missing CUDA execution path: grouped future/target heads, compact native-parity probability construction and speculative sampling, request-isolated graph-safe RNG, packed codec gathers, logical KV commit staging, and a graph-owned speculative round runner are not connected to `code_predictor_forward`. Ordinary unseeded requests therefore cannot enter a speculative path yet. The H200 hidden/logit/KV parity, graph lifecycle, mixed native/speculative stress, full serving benchmark, compute-sanitizer checks, and audio-quality checks have not run. No production-readiness or speedup claim is justified.
+```bash
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_sampling_kernels.py -k speculative
+```
+
+Run a complete unseeded eager CUDA frame and verify all codebooks and accumulated codec embeddings:
+
+```bash
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k unseeded_eager
+```
+
+Run persistent verifier graph capture/replay correctness:
+
+```bash
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k verifier_graph
+```
+
+Run the checkpoint-shaped frozen-frame timing gate. It compares four fixed-input frames through the five-layer Predictor, asserts a positive speculative frame count, and fails if any frame falls back. The weights are synthetic; use the serving benchmark below for real-checkpoint timing.
+
+```bash
+pytest -q -s -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k frozen_frame_benchmark
+```
+
+Run explicit-seed fallback followed by an unseeded speculative frame:
+
+```bash
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k explicit_seed_fallback
+```
+
+Run the mixed explicit-seed batch safety case, then verify that a later fully unseeded batch enters speculation:
+
+```bash
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k mixed_explicit_seed_batch
+```
+
+Run graph replay and ragged cache accesses under Compute Sanitizer:
+
+```bash
+compute-sanitizer --tool memcheck --error-exitcode 1 python -m pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py
+```
+
+## H200 serving comparison
+
+Start a native server with speculation disabled:
+
+```bash
+sgl-omni serve --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --config examples/configs/qwen3_tts_1_7b_customvoice.yaml --port 8000
+```
+
+Start a second server with verifier width 4:
+
+```bash
+sgl-omni serve --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --config examples/configs/qwen3_tts_1_7b_customvoice_speculative.yaml --port 8001
+```
+
+Compare fixed, unseeded serving requests and require at least parity with native latency:
+
+```bash
+python scripts/benchmark_qwen3_tts_speculative_serving.py --native-url http://127.0.0.1:8000 --speculative-url http://127.0.0.1:8001 --request-count 32 --warmup-requests 2 --concurrency 4 --minimum-speedup 1.0
+```
+
+The benchmark omits the `seed` request field, reads speculative counters before and after the measured workload, and exits nonzero if the speculative frame delta or packed verifier count is zero, if any measured frame falls back, or if the configured speedup gate is missed. Run the two servers on matched hardware and with the same software, model revision, GPU clocks, and concurrency. End-to-end audio latency includes preprocessing and vocoding; the frozen-frame test isolates the Predictor path.
+
+## Push commands for a personal fork
+
+After adding your fork as a Git remote, push the current branch without opening a PR:
+
+```bash
+git remote add fork git@github.com:<your-user>/sglang-omni.git
+git push fork HEAD:refs/heads/feat/qwen3-tts-codepredictor-specdec
+```
+
+If the `fork` remote already exists, omit the `git remote add` command.
+
+## NVIDIA parity reference
+
+The parity audit was anchored to NVIDIA TensorRT-Edge-LLM revision `513dcd18291e587c80928911a480761352f3c2d8`. Its frame loop applies future RVQ heads to the carried hidden state, verifies the pending token plus drafts in one pass, and commits the correction or bonus as a pending token. NVIDIA's public overview describes the same shared-residual-stream rationale and round semantics in its [CodePredictor speculative decoding guide](https://github.com/NVIDIA/TensorRT-Edge-LLM/blob/main/docs/source/user_guide/features/codepredictor-speculative-decoding.md).
+
+This implementation does not establish NVIDIA-matched performance. The NVIDIA exporter uses a different FP16 model and TensorRT kernel stack, while this Omni path currently accepts single-rank BF16 heads and uses Omni's fused Predictor. H200 correctness, output-distribution parity, graph lifecycle, serving speedup, and audio quality remain required validation gates.
