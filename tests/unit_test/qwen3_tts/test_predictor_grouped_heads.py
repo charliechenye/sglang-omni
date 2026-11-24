@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU and CUDA parity tests for row-selected CodePredictor LM heads."""
+"""CUDA parity tests for row-selected CodePredictor LM heads."""
 
 from __future__ import annotations
 
@@ -14,46 +14,6 @@ from sglang_omni.utils.predictor_grouped_heads import (
     grouped_lm_head_cuda_available,
     grouped_lm_head_linear,
 )
-
-
-def reference_grouped_logits(
-    hidden: torch.Tensor,
-    weights: torch.Tensor,
-    hidden_indices: torch.Tensor,
-    head_indices: torch.Tensor,
-    active_rows: torch.Tensor,
-) -> torch.Tensor:
-    rows = []
-    for hidden_index, head_index, active in zip(
-        hidden_indices, head_indices, active_rows
-    ):
-        if bool(active):
-            rows.append(F.linear(hidden[hidden_index], weights[head_index]))
-        else:
-            rows.append(torch.zeros(weights.shape[1], dtype=hidden.dtype))
-    if not rows:
-        return torch.empty((0, weights.shape[1]), dtype=hidden.dtype)
-    else:
-        pass
-    return torch.stack(rows)
-
-
-def test_grouped_lm_head_cpu_selects_rows_heads_and_masks_padding() -> None:
-    torch.manual_seed(5)
-    hidden = torch.randn(3, 7)
-    weights = torch.randn(4, 11, 7)
-    hidden_indices = torch.tensor([2, 0, 1, 99])
-    head_indices = torch.tensor([1, 3, 0, 99])
-    active_rows = torch.tensor([True, True, False, False])
-
-    actual = grouped_lm_head_linear(
-        hidden, weights, hidden_indices, head_indices, active_rows
-    )
-    expected = reference_grouped_logits(
-        hidden, weights, hidden_indices, head_indices, active_rows
-    )
-
-    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.accelerator
@@ -130,4 +90,11 @@ def test_grouped_lm_head_cuda_matches_native_linear(verify_width: int) -> None:
     )
     torch.testing.assert_close(
         grouped_probabilities, native_probabilities, atol=3e-5, rtol=3e-4
+    )
+    temperatures = torch.tensor(
+        [0.7 + 0.1 * (row % 3) for row in range(row_count)], device="cuda"
+    )
+    top_ks = torch.full((row_count,), 4, device="cuda", dtype=torch.long)
+    top_ps = torch.tensor(
+        [0.6 if row % 2 == 0 else 1.0 for row in range(row_count)], device="cuda"
     )

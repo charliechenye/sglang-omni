@@ -34,6 +34,8 @@ from sglang_omni.utils.predictor_layers import (
     ATTENTION_ROWS,
     HAS_TRITON,
     MAX_FUSED_ROWS,
+    FusedPredictorLayers,
+    PredictorLayerShape,
     decode_attention,
     fused_predictor_scratch_rows,
     resolve_fused_predictor_width,
@@ -122,6 +124,48 @@ def test_speculative_fused_capacity_respects_gqa_attention_tile() -> None:
         )
         == 0
     )
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_fused_predictor_rejects_hidden_size_mismatch_before_kernel_launch(
+    packed: bool,
+) -> None:
+    shape = PredictorLayerShape(
+        hidden_size=64,
+        head_dim=16,
+        num_q_heads=4,
+        num_kv_heads=2,
+        intermediate_size=128,
+        split_qkv=1,
+        split_hidden=1,
+    )
+    fused = FusedPredictorLayers(shape, 2, torch.device("cpu"), torch.bfloat16)
+    token_embeds = torch.zeros((1, 1, 32), dtype=torch.bfloat16)
+    positions = torch.zeros((1,), dtype=torch.long)
+    cache = torch.zeros((1, 1, 3, 2, 16), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="hidden size"):
+        if packed:
+            fused.forward_packed(
+                layers=torch.nn.ModuleList(),
+                final_norm=torch.nn.Identity(),
+                token_embeds=token_embeds,
+                batch_size=1,
+                positions=positions,
+                k_cache=cache,
+                v_cache=cache,
+            )
+        else:
+            fused.forward(
+                layers=torch.nn.ModuleList(),
+                final_norm=torch.nn.Identity(),
+                token_embeds=token_embeds,
+                batch_size=1,
+                cache_len=0,
+                positions=positions,
+                k_cache=cache,
+                v_cache=cache,
+            )
 
 
 @pytest.mark.accelerator

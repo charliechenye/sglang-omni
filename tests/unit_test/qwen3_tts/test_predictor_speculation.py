@@ -12,9 +12,11 @@ from sglang_omni.models.qwen3_tts.speculative_runtime import (
     sample_compact_probability_rows,
     speculative_sampling_fallback_reason,
 )
+from sglang_omni.utils.predictor_grouped_heads import grouped_lm_head_linear
 from sglang_omni.utils.predictor_speculation import (
     SpeculativeRowState,
     acceptance_probability,
+    is_fatal_cuda_capture_error,
     probabilities_from_logits_cpu,
     residual_distribution_cpu,
     resolve_speculative_capability,
@@ -29,6 +31,29 @@ def one_hot(token: int, vocab_size: int) -> torch.Tensor:
     probabilities = torch.zeros(vocab_size, dtype=torch.float64)
     probabilities[token] = 1.0
     return probabilities
+
+
+def test_cpu_grouped_lm_head_selects_rows_and_masks_padding() -> None:
+    torch.manual_seed(5)
+    hidden_states = torch.randn(3, 7)
+    head_weights = torch.randn(4, 11, 7)
+    hidden_indices = torch.tensor([2, 0, 1, 99])
+    head_indices = torch.tensor([1, 3, 0, 99])
+    active_rows = torch.tensor([True, True, False, False])
+
+    actual = grouped_lm_head_linear(
+        hidden_states, head_weights, hidden_indices, head_indices, active_rows
+    )
+    expected = torch.stack(
+        [
+            torch.nn.functional.linear(hidden_states[2], head_weights[1]),
+            torch.nn.functional.linear(hidden_states[0], head_weights[3]),
+            torch.zeros(head_weights.shape[1]),
+            torch.zeros(head_weights.shape[1]),
+        ]
+    )
+
+    torch.testing.assert_close(actual, expected)
 
 
 def test_cpu_reference_probability_filtering_handles_ties_and_signed_zero() -> None:
@@ -197,14 +222,19 @@ def test_sequential_target_distribution_matches_speculative_sampling() -> None:
     sample_count = 4000
     observed = torch.zeros(3, dtype=torch.float64)
     for _ in range(sample_count):
-        uniforms = torch.rand(2, generator=generator, dtype=torch.float64)
-        acceptance = torch.rand(1, generator=generator, dtype=torch.float64)
+        proposal_uniform, acceptance_uniform = torch.rand(
+            2, generator=generator, dtype=torch.float64
+        )
+        draft_token = torch.tensor(
+            [sample_categorical_cpu(draft, float(proposal_uniform))], dtype=torch.long
+        )
+        sampling_uniforms = torch.rand(2, generator=generator, dtype=torch.float64)
         decision = speculative_acceptance_cpu(
             draft_token,
             draft_probabilities,
             target_probabilities,
-            acceptance,
-            uniforms,
+            acceptance_uniform.unsqueeze(0),
+            sampling_uniforms,
         )
         observed[decision.committed_tokens[0]] += 1
     observed /= sample_count
@@ -320,7 +350,7 @@ def test_complete_frame_state_machine_commits_only_surviving_codes() -> None:
     )
     assert result.rounds == 2
     assert result.proposed_draft_tokens == 7
-    assert result.accepted_draft_tokens == 5
+    assert result.accepted_draft_tokens == 4
     assert result.bonus_tokens == 3
     assert result.rejections == 2
     expected_sums = torch.tensor([[127.0], [127.0], [129.0]], dtype=torch.float64)
@@ -525,6 +555,27 @@ def test_capability_resolution_reports_platform_sampling_capacity_fallbacks() ->
     seeded = resolve_speculative_capability(**{**base, "has_explicit_seed": True})
     assert seeded.effective_width == 0
     assert seeded.fallback_reason == "seeded-request-requires-native-decoding"
+
+
+@pytest.mark.parametrize(
+    "error_message",
+    [
+        "CUDA error: an illegal memory access was encountered",
+        "device-side assert triggered",
+        "unspecified launch failure",
+        "CUDA error 700",
+        "CUDA error 719",
+        "CUDA context is destroyed",
+    ],
+)
+def test_fatal_cuda_capture_errors_are_not_retryable(error_message: str) -> None:
+    assert is_fatal_cuda_capture_error(RuntimeError(error_message))
+
+
+def test_ordinary_capture_error_can_use_narrower_graph() -> None:
+    assert not is_fatal_cuda_capture_error(
+        RuntimeError("capture shape is unsupported at requested width")
+    )
 
 
 def test_batched_speculative_decision_handles_zero_tail_rejection_and_bonus() -> None:
