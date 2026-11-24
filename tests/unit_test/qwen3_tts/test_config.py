@@ -45,7 +45,21 @@ def test_speculative_verify_width_is_wired_to_the_engine_stage(width: int) -> No
     )
 
     assert config.stage_factory_kwargs("tts_engine") == {
-        "code_predictor_spec_verify_size": width
+        "code_predictor_spec_verify_size": width,
+        "code_predictor_spec_backend": "cuda_graph",
+    }
+
+
+def test_speculative_eager_backend_is_explicitly_wired_to_engine_stage() -> None:
+    config = Qwen3TTSPipelineConfig(
+        model_path="model",
+        code_predictor_spec_verify_size=4,
+        code_predictor_spec_backend="eager",
+    )
+
+    assert config.stage_factory_kwargs("tts_engine") == {
+        "code_predictor_spec_verify_size": 4,
+        "code_predictor_spec_backend": "eager",
     }
 
 

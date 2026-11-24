@@ -6,6 +6,12 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang_omni.models.qwen3_tts.speculative_runtime import (
+    accept_speculative_candidates,
+    expand_compact_probability_rows,
+    sample_compact_probability_rows,
+    speculative_sampling_fallback_reason,
+)
 from sglang_omni.utils.predictor_speculation import (
     SpeculativeRowState,
     acceptance_probability,
@@ -487,6 +493,7 @@ def test_capability_resolution_reports_platform_sampling_capacity_fallbacks() ->
         "kv_heads": 8,
         "attention_tile_capacity": 16,
         "vocab_size": 2048,
+        "grouped_lm_head_supported": True,
         "graph_available": True,
         "sampling_supported": True,
         "has_explicit_seed": False,
@@ -505,6 +512,12 @@ def test_capability_resolution_reports_platform_sampling_capacity_fallbacks() ->
     assert sampling.effective_width == 0
     assert sampling.fallback_reason == "unsupported-sampling-configuration"
 
+    grouped_head = resolve_speculative_capability(
+        **{**base, "grouped_lm_head_supported": False}
+    )
+    assert grouped_head.effective_width == 0
+    assert grouped_head.fallback_reason == "grouped-lm-head-unavailable"
+
     capacity = resolve_speculative_capability(**{**base, "packed_row_capacity": 15})
     assert capacity.effective_width == 0
     assert capacity.fallback_reason == "packed-row-capacity-exceeded"
@@ -512,3 +525,88 @@ def test_capability_resolution_reports_platform_sampling_capacity_fallbacks() ->
     seeded = resolve_speculative_capability(**{**base, "has_explicit_seed": True})
     assert seeded.effective_width == 0
     assert seeded.fallback_reason == "seeded-request-requires-native-decoding"
+
+
+def test_batched_speculative_decision_handles_zero_tail_rejection_and_bonus() -> None:
+    draft_tokens = torch.tensor([[0, 0], [0, 0], [0, 1]], dtype=torch.long)
+    draft_probabilities = torch.zeros((3, 2, 4), dtype=torch.float32)
+    draft_probabilities[:, :, 0] = 1.0
+    draft_probabilities[2, 1].zero_()
+    draft_probabilities[2, 1, 1] = 1.0
+    target_probabilities = torch.zeros((3, 3, 4), dtype=torch.float32)
+    target_probabilities[0, 0, 2] = 1.0
+    target_probabilities[1, 0, 0] = 1.0
+    target_probabilities[1, 1, 3] = 1.0
+    target_probabilities[2, 0, 0] = 1.0
+    target_probabilities[2, 1, 2] = 1.0
+    target_probabilities[2, 2, 1] = 1.0
+
+    decision = accept_speculative_candidates(
+        draft_tokens,
+        draft_probabilities,
+        target_probabilities,
+        torch.tensor([0, 1, 2]),
+        torch.tensor([True, True, True]),
+        torch.tensor([[0.5, 0.5], [0.1, 0.5], [0.1, 0.5]]),
+        torch.zeros((3, 3)),
+        torch.zeros((3, 3)),
+    )
+
+    assert decision.committed_tokens.tolist() == [[2, 0, 0], [0, 3, 0], [0, 2, 0]]
+    assert decision.accepted_draft_counts.tolist() == [0, 1, 1]
+    assert decision.committed_token_counts.tolist() == [1, 2, 2]
+    assert decision.bonus_rows.tolist() == [True, True, False]
+    assert decision.rejected_rows.tolist() == [False, False, True]
+
+
+def test_compact_probability_expansion_and_request_eligibility() -> None:
+    probabilities = torch.tensor([[0.25, 0.75], [1.0, 0.0]])
+    token_ids = torch.tensor([[3, 1], [2, 0]])
+    dense = expand_compact_probability_rows(probabilities, token_ids, 5)
+    assert dense.tolist() == [[0.0, 0.75, 0.0, 0.25, 0.0], [0.0, 0.0, 1.0, 0.0, 0.0]]
+
+    ordinary_unseeded = speculative_sampling_fallback_reason(
+        ("request-a", "request-b"),
+        (False, False),
+        (True, True),
+        has_unbounded_top_k=False,
+        deterministic_mode=False,
+    )
+    assert ordinary_unseeded is None
+    explicit_seed = speculative_sampling_fallback_reason(
+        ("request-a",),
+        (True,),
+        (True,),
+        has_unbounded_top_k=False,
+        deterministic_mode=False,
+    )
+    assert explicit_seed == "explicit-seed-requires-native-decoding"
+    mixed_seed_batch = speculative_sampling_fallback_reason(
+        ("request-a", "request-b"),
+        (False, True),
+        (True, True),
+        has_unbounded_top_k=False,
+        deterministic_mode=False,
+    )
+    assert mixed_seed_batch == "explicit-seed-requires-native-decoding"
+    mixed_sampling = speculative_sampling_fallback_reason(
+        ("request-a", "request-b"),
+        (False, False),
+        (True, False),
+        has_unbounded_top_k=False,
+        deterministic_mode=False,
+    )
+    assert mixed_sampling == "greedy-or-mixed-sampling-requires-native-decoding"
+
+
+def test_compact_sampler_clamps_rounding_tail_to_last_positive_candidate() -> None:
+    probabilities = torch.tensor([[0.1, 0.2, 0.6999999, 0.0]])
+    token_ids = torch.tensor([[11, 13, 17, 19]], dtype=torch.long)
+    uniforms = torch.tensor([0.99999994], dtype=torch.float32)
+    active_rows = torch.tensor([True])
+
+    actual = sample_compact_probability_rows(
+        probabilities, token_ids, uniforms, active_rows
+    )
+
+    assert actual.tolist() == [17]
