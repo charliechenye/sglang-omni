@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 from sglang_omni.utils.json import JsonValue
 
+
 def request_headers(api_key: str) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
@@ -332,9 +333,7 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
         "standalone_correction_forward_count_delta": integer_stat(
             speculative_stats_after, "standalone_correction_forward_count"
         )
-        - integer_stat(
-            speculative_stats_before, "standalone_correction_forward_count"
-        ),
+        - integer_stat(speculative_stats_before, "standalone_correction_forward_count"),
         "committed_codes_delta": integer_stat(
             speculative_stats_after, "committed_codes"
         )

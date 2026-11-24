@@ -101,9 +101,9 @@ if triton is not None:
         has_rejection = False
 
         for draft_offset in tl.static_range(0, DRAFT_WIDTH):
-            draft_token = tl.load(
-                draft_tokens + row * DRAFT_WIDTH + draft_offset
-            ).to(tl.int32)
+            draft_token = tl.load(draft_tokens + row * DRAFT_WIDTH + draft_offset).to(
+                tl.int32
+            )
             draft_row = row * DRAFT_WIDTH + draft_offset
             target_row = row * VERIFY_WIDTH + draft_offset
             draft_ids = tl.load(
@@ -112,9 +112,7 @@ if triton is not None:
                 other=-1,
             ).to(tl.int32)
             draft_values = tl.load(
-                draft_probabilities
-                + draft_row * CANDIDATE_COUNT
-                + candidate_offsets,
+                draft_probabilities + draft_row * CANDIDATE_COUNT + candidate_offsets,
                 mask=candidate_mask,
                 other=0.0,
             ).to(tl.float32)
@@ -124,9 +122,7 @@ if triton is not None:
                 other=-1,
             ).to(tl.int32)
             target_values = tl.load(
-                target_probabilities
-                + target_row * CANDIDATE_COUNT
-                + candidate_offsets,
+                target_probabilities + target_row * CANDIDATE_COUNT + candidate_offsets,
                 mask=candidate_mask,
                 other=0.0,
             ).to(tl.float32)
@@ -157,9 +153,9 @@ if triton is not None:
             )
             has_rejection = has_rejection | rejected
 
-        accepted_count = tl.where(
-            has_rejection, first_rejection, proposal_count
-        ).to(tl.int32)
+        accepted_count = tl.where(has_rejection, first_rejection, proposal_count).to(
+            tl.int32
+        )
         accepted_count = tl.where(is_active, accepted_count, 0)
         correction_row = row * VERIFY_WIDTH + accepted_count
         target_ids = tl.load(
@@ -168,9 +164,7 @@ if triton is not None:
             other=2147483647,
         ).to(tl.int32)
         target_values = tl.load(
-            target_probabilities
-            + correction_row * CANDIDATE_COUNT
-            + candidate_offsets,
+            target_probabilities + correction_row * CANDIDATE_COUNT + candidate_offsets,
             mask=candidate_mask,
             other=0.0,
         ).to(tl.float32)
@@ -236,7 +230,9 @@ if triton is not None:
         output_offsets = tl.arange(0, BLOCK_WIDTH)
         draft_output_mask = output_offsets < DRAFT_WIDTH
         committed_drafts = tl.load(
-            draft_tokens + row * DRAFT_WIDTH + tl.minimum(output_offsets, DRAFT_WIDTH - 1),
+            draft_tokens
+            + row * DRAFT_WIDTH
+            + tl.minimum(output_offsets, DRAFT_WIDTH - 1),
             mask=draft_output_mask,
             other=0,
         ).to(tl.int64)
@@ -257,7 +253,6 @@ if triton is not None:
         )
         tl.store(rejected_rows + row, (has_rejection & is_active).to(tl.int64))
         tl.store(bonus_rows + row, ((~has_rejection) & is_active).to(tl.int64))
-
 
 else:
     sample_compact_probability_rows_kernel = None
@@ -303,7 +298,10 @@ def accept_speculative_candidates_compact(
         raise ValueError("draft tokens must use an integer dtype")
     elif draft_token_ids.shape != draft_probabilities.shape:
         raise ValueError("draft token IDs do not match compact probabilities")
-    elif target_probabilities.ndim != 2 or target_probabilities.shape[0] != batch_size * verify_width:
+    elif (
+        target_probabilities.ndim != 2
+        or target_probabilities.shape[0] != batch_size * verify_width
+    ):
         raise ValueError("compact target rows must include a trailing bonus row")
     elif target_token_ids.shape != target_probabilities.shape:
         raise ValueError("target token IDs do not match compact probabilities")
@@ -336,7 +334,10 @@ def accept_speculative_candidates_compact(
     )
     if any(tensor.device != draft_tokens.device for tensor in round_tensors):
         raise ValueError("speculative round tensors must share one device")
-    elif draft_probabilities.dtype is not torch.float32 or target_probabilities.dtype is not torch.float32:
+    elif (
+        draft_probabilities.dtype is not torch.float32
+        or target_probabilities.dtype is not torch.float32
+    ):
         raise ValueError("speculative compact probabilities must use float32")
     elif (
         acceptance_uniforms.dtype is not torch.float32
@@ -344,7 +345,10 @@ def accept_speculative_candidates_compact(
         or bonus_uniforms.dtype is not torch.float32
     ):
         raise ValueError("speculative uniforms must use float32")
-    elif draft_token_ids.dtype not in (torch.int32, torch.int64) or target_token_ids.dtype not in (torch.int32, torch.int64):
+    elif draft_token_ids.dtype not in (
+        torch.int32,
+        torch.int64,
+    ) or target_token_ids.dtype not in (torch.int32, torch.int64):
         raise ValueError("compact token IDs must use an integer dtype")
     elif not draft_tokens.is_contiguous():
         raise ValueError("draft token rows must be contiguous")
@@ -417,7 +421,9 @@ def sample_compact_probability_rows_fused(
 ) -> torch.Tensor:
     """Sample compact proposal rows with a single inverse-CDF launch."""
     if probabilities.ndim != 2 or token_ids.shape != probabilities.shape:
-        raise ValueError("compact probabilities and token IDs must have equal 2D shapes")
+        raise ValueError(
+            "compact probabilities and token IDs must have equal 2D shapes"
+        )
     elif uniforms.ndim != 2 or active_rows.shape != uniforms.shape:
         raise ValueError("proposal uniforms and active rows must have equal 2D shapes")
     else:
@@ -450,7 +456,9 @@ def sample_compact_probability_rows_fused(
     else:
         pass
     if row_count == 0:
-        return torch.empty((batch_size, proposal_width), device=probabilities.device, dtype=torch.long)
+        return torch.empty(
+            (batch_size, proposal_width), device=probabilities.device, dtype=torch.long
+        )
     else:
         pass
     sampled_tokens = torch.empty(

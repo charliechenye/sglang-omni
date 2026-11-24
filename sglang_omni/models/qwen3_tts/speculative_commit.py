@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - depends on runtime image
     tl = None
 
 if triton is not None:
+
     @triton.jit
     def commit_speculative_codes_kernel(
         committed_tokens,
@@ -38,7 +39,9 @@ if triton is not None:
         commit_count = tl.load(committed_token_counts + row).to(tl.int32)
         starting_depth = tl.load(committed_depths + row).to(tl.int32)
         accumulator = tl.load(
-            summed_embeddings + row * SUM_STRIDE_ROW + hidden_offsets * SUM_STRIDE_HIDDEN,
+            summed_embeddings
+            + row * SUM_STRIDE_ROW
+            + hidden_offsets * SUM_STRIDE_HIDDEN,
             mask=hidden_mask,
             other=0,
         )
@@ -79,7 +82,9 @@ if triton is not None:
                 mask=is_valid & token_is_valid & (tl.program_id(1) == 0),
             )
         tl.store(
-            summed_embeddings + row * SUM_STRIDE_ROW + hidden_offsets * SUM_STRIDE_HIDDEN,
+            summed_embeddings
+            + row * SUM_STRIDE_ROW
+            + hidden_offsets * SUM_STRIDE_HIDDEN,
             accumulator,
             mask=hidden_mask,
         )
@@ -126,13 +131,19 @@ def commit_speculative_codes(
         raise ValueError("committed depths must use an integer dtype")
     elif output_codes.dtype not in (torch.int32, torch.int64):
         raise ValueError("output codes must use an integer dtype")
-    elif codec_tables.dtype is not torch.bfloat16 or summed_embeddings.dtype is not torch.bfloat16:
+    elif (
+        codec_tables.dtype is not torch.bfloat16
+        or summed_embeddings.dtype is not torch.bfloat16
+    ):
         raise ValueError("codec commitment requires BF16 tables and sums")
     elif not codec_tables.is_contiguous():
         raise ValueError("codec tables must be contiguous")
     elif not committed_tokens.is_contiguous():
         raise ValueError("committed token rows must be contiguous")
-    elif not committed_token_counts.is_contiguous() or not committed_depths.is_contiguous():
+    elif (
+        not committed_token_counts.is_contiguous()
+        or not committed_depths.is_contiguous()
+    ):
         raise ValueError("commit metadata must be contiguous")
     elif any(
         tensor.device != committed_tokens.device
@@ -151,7 +162,9 @@ def commit_speculative_codes(
         pass
     hidden_size = summed_embeddings.shape[1]
     hidden_block = 256
-    commit_speculative_codes_kernel[(batch_size, triton.cdiv(hidden_size, hidden_block))](
+    commit_speculative_codes_kernel[
+        (batch_size, triton.cdiv(hidden_size, hidden_block))
+    ](
         committed_tokens,
         committed_token_counts,
         committed_depths,
