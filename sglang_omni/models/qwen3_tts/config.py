@@ -56,6 +56,9 @@ class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
     shares_engine_speech_tokenizer: bool
     code_predictor_spec_verify_size: int
     code_predictor_spec_backend: Literal["cuda_graph", "eager"]
+    code_predictor_spec_probability_backend: Literal["split_top_k", "radix_compact"]
+    code_predictor_spec_lm_head_backend: Literal["grouped_triton", "warp_gemv"]
+    code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"]
 
 
 class Qwen3TTSPipelineConfig(PipelineConfig):
@@ -97,6 +100,13 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
     enable_deterministic_inference: bool = False
     code_predictor_spec_verify_size: int = 0
     code_predictor_spec_backend: Literal["cuda_graph", "eager"] = "cuda_graph"
+    code_predictor_spec_probability_backend: Literal["split_top_k", "radix_compact"] = (
+        "split_top_k"
+    )
+    code_predictor_spec_lm_head_backend: Literal["grouped_triton", "warp_gemv"] = (
+        "grouped_triton"
+    )
+    code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"] = "per_round"
     stages: list[StageConfig] = [
         StageConfig(
             name="preprocessing",
@@ -141,6 +151,15 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
                 self.code_predictor_spec_verify_size
             )
             kwargs["code_predictor_spec_backend"] = self.code_predictor_spec_backend
+            kwargs["code_predictor_spec_probability_backend"] = (
+                self.code_predictor_spec_probability_backend
+            )
+            kwargs["code_predictor_spec_lm_head_backend"] = (
+                self.code_predictor_spec_lm_head_backend
+            )
+            kwargs["code_predictor_spec_rng_backend"] = (
+                self.code_predictor_spec_rng_backend
+            )
         else:
             pass
         # Note (Jiaxin Deng): outside the engine process the preprocessing stage

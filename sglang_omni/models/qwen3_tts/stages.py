@@ -413,6 +413,13 @@ def create_sglang_tts_engine_executor(
     prefill_coalesce_wait_ms: float = 60.0,
     code_predictor_spec_verify_size: int = 0,
     code_predictor_spec_backend: Literal["cuda_graph", "eager"] = "cuda_graph",
+    code_predictor_spec_probability_backend: Literal[
+        "split_top_k", "radix_compact"
+    ] = "split_top_k",
+    code_predictor_spec_lm_head_backend: Literal[
+        "grouped_triton", "warp_gemv"
+    ] = "grouped_triton",
+    code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"] = "per_round",
     server_args_overrides: Mapping[str, object] | None = None,
     reference_encoder_cuda_graph_bucket_frames: Sequence[int] = (
         DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES
@@ -427,6 +434,9 @@ def create_sglang_tts_engine_executor(
         prefill_coalesce_wait_ms=prefill_coalesce_wait_ms,
         code_predictor_spec_verify_size=code_predictor_spec_verify_size,
         code_predictor_spec_backend=code_predictor_spec_backend,
+        code_predictor_spec_probability_backend=code_predictor_spec_probability_backend,
+        code_predictor_spec_lm_head_backend=code_predictor_spec_lm_head_backend,
+        code_predictor_spec_rng_backend=code_predictor_spec_rng_backend,
         reference_encoder_cuda_graph_bucket_frames=(
             reference_encoder_cuda_graph_bucket_frames
         ),

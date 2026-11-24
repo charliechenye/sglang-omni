@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 
 GROUPED_HEAD_BLOCK_VOCAB = 64
 GROUPED_HEAD_BLOCK_HIDDEN = 32
+WARP_GEMV_BLOCK_VOCAB = 8
 
 try:
     import triton
@@ -82,13 +85,81 @@ if triton is not None:
             mask=vocab_offsets < vocab_size,
         )
 
+    @triton.jit
+    def grouped_lm_head_warp_gemv_kernel(
+        hidden_states,
+        packed_weights,
+        hidden_indices,
+        head_indices,
+        active_rows,
+        logits,
+        source_rows: tl.constexpr,
+        head_count: tl.constexpr,
+        vocab_size: tl.constexpr,
+        hidden_size: tl.constexpr,
+        block_vocab: tl.constexpr,
+        block_hidden: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        vocab_start = tl.program_id(1) * block_vocab
+        vocab_offsets = vocab_start + tl.arange(0, block_vocab)
+        hidden_offsets = tl.arange(0, block_hidden)
+        is_active = tl.load(active_rows + row)
+        hidden_index = tl.load(hidden_indices + row)
+        head_index = tl.load(head_indices + row)
+        is_valid = (
+            is_active
+            & (hidden_index >= 0)
+            & (hidden_index < source_rows)
+            & (head_index >= 0)
+            & (head_index < head_count)
+        )
+        safe_hidden_index = tl.minimum(tl.maximum(hidden_index, 0), source_rows - 1)
+        safe_head_index = tl.minimum(tl.maximum(head_index, 0), head_count - 1)
+        accumulator = tl.zeros((block_vocab,), dtype=tl.float32)
+        for hidden_start in range(0, hidden_size, block_hidden):
+            hidden_offsets_at_block = hidden_start + hidden_offsets
+            hidden_tile = tl.load(
+                hidden_states
+                + safe_hidden_index * hidden_size
+                + hidden_offsets_at_block,
+                mask=is_valid & (hidden_offsets_at_block < hidden_size),
+                other=0.0,
+            )
+            weight_tile = tl.load(
+                packed_weights
+                + safe_head_index * vocab_size * hidden_size
+                + vocab_offsets[:, None] * hidden_size
+                + hidden_offsets_at_block[None, :],
+                mask=is_valid
+                & (vocab_offsets[:, None] < vocab_size)
+                & (hidden_offsets_at_block[None, :] < hidden_size),
+                other=0.0,
+            )
+            accumulator += tl.sum(
+                weight_tile.to(tl.float32) * hidden_tile.to(tl.float32)[None, :],
+                axis=1,
+            )
+        output = accumulator.to(tl.bfloat16)
+        tl.store(
+            logits + row * vocab_size + vocab_offsets,
+            tl.where(is_valid, output, 0.0),
+            mask=vocab_offsets < vocab_size,
+        )
+
 else:
     grouped_lm_head_kernel = None
+    grouped_lm_head_warp_gemv_kernel = None
 
 
 def grouped_lm_head_cuda_available() -> bool:
     """Return whether the row-selected CUDA projection kernel is importable."""
     return triton is not None and grouped_lm_head_kernel is not None
+
+
+def grouped_lm_head_warp_gemv_available() -> bool:
+    """Return whether the eight-output CUDA GEMV candidate is importable."""
+    return triton is not None and grouped_lm_head_warp_gemv_kernel is not None
 
 
 def grouped_lm_head_linear(
@@ -97,6 +168,8 @@ def grouped_lm_head_linear(
     hidden_indices: torch.Tensor,
     head_indices: torch.Tensor,
     active_rows: torch.Tensor,
+    *,
+    backend: Literal["grouped_triton", "warp_gemv"] = "grouped_triton",
 ) -> torch.Tensor:
     """Project selected hidden rows through selected heads, returning model-dtype logits."""
     if hidden_states.ndim != 2 or packed_weights.ndim != 3:
@@ -115,6 +188,8 @@ def grouped_lm_head_linear(
         pass
     if hidden_states.shape[1] != packed_weights.shape[2]:
         raise ValueError("grouped LM-head hidden width does not match its weights")
+    elif backend not in ("grouped_triton", "warp_gemv"):
+        raise ValueError("unsupported grouped LM-head backend")
     else:
         pass
     if any(
@@ -136,8 +211,10 @@ def grouped_lm_head_linear(
     else:
         pass
     if hidden_states.is_cuda:
-        if not grouped_lm_head_cuda_available():
+        if backend == "grouped_triton" and not grouped_lm_head_cuda_available():
             raise RuntimeError("grouped CUDA LM-head kernel is unavailable")
+        elif backend == "warp_gemv" and not grouped_lm_head_warp_gemv_available():
+            raise RuntimeError("warp-oriented CUDA LM-head kernel is unavailable")
         else:
             pass
         if (
@@ -152,12 +229,17 @@ def grouped_lm_head_linear(
             raise RuntimeError("grouped CUDA LM-head inputs are unsupported")
         else:
             pass
-        grouped_lm_head_kernel[
-            (
-                rows,
-                triton.cdiv(packed_weights.shape[1], GROUPED_HEAD_BLOCK_VOCAB),
-            )
-        ](
+        kernel = (
+            grouped_lm_head_kernel
+            if backend == "grouped_triton"
+            else grouped_lm_head_warp_gemv_kernel
+        )
+        block_vocab = (
+            GROUPED_HEAD_BLOCK_VOCAB
+            if backend == "grouped_triton"
+            else WARP_GEMV_BLOCK_VOCAB
+        )
+        kernel[(rows, triton.cdiv(packed_weights.shape[1], block_vocab))](
             hidden_states,
             packed_weights,
             hidden_indices,
@@ -168,9 +250,9 @@ def grouped_lm_head_linear(
             packed_weights.shape[0],
             packed_weights.shape[1],
             packed_weights.shape[2],
-            GROUPED_HEAD_BLOCK_VOCAB,
+            block_vocab,
             GROUPED_HEAD_BLOCK_HIDDEN,
-            num_warps=4,
+            num_warps=4 if backend == "grouped_triton" else 8,
         )
     else:
         valid_rows = (

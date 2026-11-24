@@ -47,6 +47,9 @@ def test_speculative_verify_width_is_wired_to_the_engine_stage(width: int) -> No
     assert config.stage_factory_kwargs("tts_engine") == {
         "code_predictor_spec_verify_size": width,
         "code_predictor_spec_backend": "cuda_graph",
+        "code_predictor_spec_probability_backend": "split_top_k",
+        "code_predictor_spec_lm_head_backend": "grouped_triton",
+        "code_predictor_spec_rng_backend": "per_round",
     }
 
 
@@ -60,7 +63,38 @@ def test_speculative_eager_backend_is_explicitly_wired_to_engine_stage() -> None
     assert config.stage_factory_kwargs("tts_engine") == {
         "code_predictor_spec_verify_size": 4,
         "code_predictor_spec_backend": "eager",
+        "code_predictor_spec_probability_backend": "split_top_k",
+        "code_predictor_spec_lm_head_backend": "grouped_triton",
+        "code_predictor_spec_rng_backend": "per_round",
     }
+
+
+def test_speculative_radix_probability_backend_is_wired_to_engine_stage() -> None:
+    config = Qwen3TTSPipelineConfig(
+        model_path="model",
+        code_predictor_spec_verify_size=4,
+        code_predictor_spec_probability_backend="radix_compact",
+    )
+
+
+def test_speculative_kernel_ablation_backends_are_wired_to_engine_stage() -> None:
+    config = Qwen3TTSPipelineConfig(
+        model_path="model",
+        code_predictor_spec_verify_size=4,
+        code_predictor_spec_lm_head_backend="warp_gemv",
+        code_predictor_spec_rng_backend="frame_pool",
+    )
+
+    engine_kwargs = config.stage_factory_kwargs("tts_engine")
+    assert engine_kwargs["code_predictor_spec_lm_head_backend"] == "warp_gemv"
+    assert engine_kwargs["code_predictor_spec_rng_backend"] == "frame_pool"
+
+    assert (
+        config.stage_factory_kwargs("tts_engine")[
+            "code_predictor_spec_probability_backend"
+        ]
+        == "radix_compact"
+    )
 
 
 @pytest.mark.parametrize("width", [1, 9, -1])

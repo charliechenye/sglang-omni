@@ -24,17 +24,26 @@ from sglang_omni.models.qwen3_tts.speculative_acceptance import (
     SpeculativeAcceptanceBatch,
     sample_compact_probability_rows_fused,
 )
+from sglang_omni.models.qwen3_tts.speculative_commit import (
+    commit_speculative_codes,
+    commit_speculative_state,
+)
+from sglang_omni.models.qwen3_tts.speculative_prepare import (
+    SpeculativeVerifierInputs,
+    prepare_speculative_verification_inputs,
+)
 from sglang_omni.models.qwen3_tts.speculative_rng import (
     speculative_uniforms,
     speculative_uniforms_all_purposes,
+    speculative_uniforms_frame_pool,
 )
 from sglang_omni.models.qwen3_tts.speculative_runtime import (
     accept_speculative_candidates,
     accept_speculative_candidates_compact,
-    commit_speculative_codes,
     expand_compact_probability_rows,
     sample_compact_probability_rows,
 )
+from sglang_omni.utils.predictor_grouped_heads import grouped_lm_head_linear
 from sglang_omni.vendor.sglang.layers import RMSNorm
 from tests.unit_test.qwen3_tts.test_predictor_cuda_graph import (
     DTYPE,
@@ -367,7 +376,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
 
         native_grouped_head = sglang_model_module.grouped_lm_head_linear
         native_probability_builder = (
-            sglang_model_module.build_speculative_probability_candidates
+            sglang_model_module.build_speculative_probability_candidates_selected
         )
         native_acceptance = sglang_model_module.accept_speculative_candidates_compact
         native_packed_forward = talker.predictor_forward_packed_tokens
@@ -439,6 +448,8 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             hidden_indices: torch.Tensor,
             head_indices: torch.Tensor,
             active_rows: torch.Tensor,
+            *,
+            backend: str,
         ) -> torch.Tensor:
             logits = native_grouped_head(
                 hidden_states,
@@ -446,6 +457,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 hidden_indices,
                 head_indices,
                 active_rows,
+                backend=backend,
             )
             if hidden_states.shape[0] == target_row_count:
                 target_logits.append(logits.view(batch_size, verify_width, -1).clone())
@@ -463,6 +475,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             max_top_k: int,
             has_top_p: bool,
             has_unbounded_top_k: bool,
+            backend: str,
         ) -> tuple[torch.Tensor, torch.Tensor] | None:
             candidates = native_probability_builder(
                 logits,
@@ -473,6 +486,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 max_top_k=max_top_k,
                 has_top_p=has_top_p,
                 has_unbounded_top_k=has_unbounded_top_k,
+                backend=backend,
             )
             if logits.shape[0] == target_row_count and candidates is not None:
                 probabilities, token_ids = candidates
@@ -534,7 +548,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
         )
         monkeypatch.setattr(
             sglang_model_module,
-            "build_speculative_probability_candidates",
+            "build_speculative_probability_candidates_selected",
             record_probability_builder,
         )
         monkeypatch.setattr(
@@ -1016,11 +1030,169 @@ def test_compact_acceptance_matches_dense_reference_at_every_rejection_position(
     )
     assert torch.equal(compact_result.rejected_rows, dense_result.rejected_rows)
     assert torch.equal(compact_result.bonus_rows, dense_result.bonus_rows)
+    assert not bool(compact_result.invalid_rows.any())
     assert compact_result.accepted_draft_counts[:draft_width].tolist() == [0, 1, 2]
     assert compact_result.committed_tokens[3, -1].item() == 6
     assert compact_result.accepted_draft_counts[4:].tolist() == [1, 0]
     assert compact_result.committed_token_counts[4:].tolist() == [2, 0]
     assert compact_result.committed_tokens[4, 1].item() == 5
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compact_acceptance_w1_samples_target_and_flags_invalid_mass() -> None:
+    device = torch.device("cuda")
+    target_probabilities = torch.tensor(
+        [[0.4, 0.6, 0.0, 0.0], [0.2, 0.3, 0.0, 0.0]],
+        device=device,
+        dtype=torch.float32,
+    )
+    target_token_ids = torch.tensor(
+        [[5, 6, -1, -1], [5, 6, -1, -1]], device=device, dtype=torch.long
+    )
+    result = accept_speculative_candidates_compact(
+        torch.empty((2, 0), device=device, dtype=torch.long),
+        torch.empty((0, 4), device=device, dtype=torch.float32),
+        torch.empty((0, 4), device=device, dtype=torch.long),
+        target_probabilities,
+        target_token_ids,
+        torch.zeros((2,), device=device, dtype=torch.long),
+        torch.tensor([True, True], device=device),
+        torch.empty((2, 0), device=device, dtype=torch.float32),
+        torch.zeros((2, 1), device=device, dtype=torch.float32),
+        torch.tensor([[0.99999], [0.5]], device=device, dtype=torch.float32),
+    )
+
+    assert result.committed_tokens.shape == (2, 1)
+    assert result.committed_tokens[0, 0].item() == 6
+    assert result.committed_token_counts.tolist() == [1, 0]
+    assert result.invalid_rows.tolist() == [False, True]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compact_residual_normalizes_subnormal_probability_mass() -> None:
+    device = torch.device("cuda")
+    draft_probabilities = torch.tensor(
+        [[1.0, 0.0, 0.0, 0.0]], device=device, dtype=torch.float32
+    )
+    draft_token_ids = torch.tensor([[0, -1, -1, -1]], device=device, dtype=torch.long)
+    target_probabilities = torch.tensor(
+        [
+            [0.99999994, 0.5e-40, 1.5e-40, 0.0],
+            [0.25, 0.25, 0.25, 0.25],
+        ],
+        device=device,
+        dtype=torch.float32,
+    )
+    target_token_ids = torch.tensor([[0, 1, 2, -1], [3, 4, 5, 6]], device=device)
+    result = accept_speculative_candidates_compact(
+        torch.tensor([[0]], device=device, dtype=torch.long),
+        draft_probabilities,
+        draft_token_ids,
+        target_probabilities,
+        target_token_ids,
+        torch.ones((1,), device=device, dtype=torch.long),
+        torch.ones((1,), device=device, dtype=torch.bool),
+        torch.tensor([[0.99999994]], device=device, dtype=torch.float32),
+        torch.tensor([[0.1, 0.1]], device=device, dtype=torch.float32),
+        torch.tensor([[0.1, 0.1]], device=device, dtype=torch.float32),
+    )
+
+    assert result.committed_tokens[0, 0].item() == 1
+    assert result.rejected_rows.tolist() == [True]
+    assert not bool(result.invalid_rows.any())
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_compact_acceptance_top_k50_padding_and_unsorted_support_match_dense() -> None:
+    device = torch.device("cuda")
+    batch_size = 2
+    draft_width = 1
+    verify_width = 2
+    candidate_count = 64
+    draft_probabilities = torch.zeros(
+        (batch_size, candidate_count), device=device, dtype=torch.float32
+    )
+    draft_token_ids = torch.full(
+        (batch_size, candidate_count), 5, device=device, dtype=torch.long
+    )
+    draft_probabilities[0, 45] = 0.6
+    draft_token_ids[0, 45] = 5
+    draft_probabilities[0, 2] = 0.4
+    draft_token_ids[0, 2] = 6
+    draft_probabilities[1, 8] = 0.4
+    draft_token_ids[1, 8] = 6
+    draft_probabilities[1, 17] = 0.6
+    draft_token_ids[1, 17] = 5
+    target_probabilities = torch.zeros(
+        (batch_size * verify_width, candidate_count),
+        device=device,
+        dtype=torch.float32,
+    )
+    target_token_ids = torch.full(
+        (batch_size * verify_width, candidate_count),
+        5,
+        device=device,
+        dtype=torch.long,
+    )
+    target_probabilities[0, 40] = 0.3
+    target_probabilities[0, 1] = 0.2
+    target_token_ids[0, 1] = 7
+    target_probabilities[0, 25] = 0.5
+    target_token_ids[0, 25] = 8
+    target_probabilities[1, 3] = 0.25
+    target_token_ids[1, 3] = 1
+    target_probabilities[1, 55] = 0.75
+    target_token_ids[1, 55] = 14
+    target_probabilities[2, 30] = 0.9
+    target_token_ids[2, 30] = 6
+    target_probabilities[2, 20] = 0.1
+    target_probabilities[3, 44] = 0.7
+    target_token_ids[3, 44] = 12
+    target_probabilities[3, 4] = 0.3
+    target_token_ids[3, 4] = 13
+    draft_tokens = torch.tensor([[5], [6]], device=device, dtype=torch.long)
+    proposal_counts = torch.ones((batch_size,), device=device, dtype=torch.long)
+    active_rows = torch.ones((batch_size,), device=device, dtype=torch.bool)
+    acceptance_uniforms = torch.tensor([[0.4], [0.0]], device=device)
+    correction_uniforms = torch.tensor([[0.99, 0.0], [0.0, 0.0]], device=device)
+    bonus_uniforms = torch.tensor([[0.0, 0.0], [0.0, 0.8]], device=device)
+
+    compact_result = accept_speculative_candidates_compact(
+        draft_tokens,
+        draft_probabilities,
+        draft_token_ids,
+        target_probabilities,
+        target_token_ids,
+        proposal_counts,
+        active_rows,
+        acceptance_uniforms,
+        correction_uniforms,
+        bonus_uniforms,
+    )
+    dense_result = accept_speculative_candidates(
+        draft_tokens,
+        expand_compact_probability_rows(
+            draft_probabilities, draft_token_ids, vocab_size=16
+        ).view(batch_size, draft_width, 16),
+        expand_compact_probability_rows(
+            target_probabilities, target_token_ids, vocab_size=16
+        ).view(batch_size, verify_width, 16),
+        proposal_counts,
+        active_rows,
+        acceptance_uniforms,
+        correction_uniforms,
+        bonus_uniforms,
+    )
+
+    assert torch.equal(compact_result.committed_tokens, dense_result.committed_tokens)
+    assert torch.equal(
+        compact_result.accepted_draft_counts, dense_result.accepted_draft_counts
+    )
+    assert compact_result.accepted_draft_counts.tolist() == [1, 1]
+    assert not bool(compact_result.invalid_rows.any())
 
 
 @pytest.mark.accelerator
@@ -1155,6 +1327,81 @@ def test_radix_probability_selector_matches_production_split_top_k() -> None:
 
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("max_top_k", "row_count"),
+    [
+        (50, 1),
+        (50, 8),
+        (50, 16),
+        (64, 1),
+        (64, 8),
+        (64, 16),
+        (128, 1),
+        (128, 8),
+        (128, 16),
+    ],
+)
+def test_radix_probability_support_compaction_matches_split_for_small_batches(
+    max_top_k: int, row_count: int
+) -> None:
+    device = torch.device("cuda")
+    torch.manual_seed(1024 + max_top_k)
+    logits = torch.randn((row_count, 2048), device=device).to(torch.bfloat16)
+    temperatures = torch.full((row_count,), 0.9, device=device, dtype=torch.float32)
+    top_ks = torch.full((row_count,), max_top_k, device=device, dtype=torch.long)
+    top_ps = torch.ones((row_count,), device=device, dtype=torch.float32)
+    active_rows = torch.ones((row_count,), device=device, dtype=torch.bool)
+    split_candidates = build_speculative_probability_candidates(
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        active_rows,
+        max_top_k=max_top_k,
+        has_top_p=False,
+        has_unbounded_top_k=False,
+    )
+    radix_candidates = build_speculative_probability_candidates_radix(
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        active_rows,
+        max_top_k=max_top_k,
+        has_top_p=False,
+        has_unbounded_top_k=False,
+    )
+
+    assert split_candidates is not None
+    assert radix_candidates is not None
+    split_probabilities, split_token_ids = split_candidates
+    radix_probabilities, radix_token_ids = radix_candidates
+    torch.testing.assert_close(
+        radix_probabilities.sum(dim=1),
+        torch.ones((row_count,), device=device),
+        atol=1.0e-6,
+        rtol=0.0,
+    )
+    for row in range(row_count):
+        split_positive = split_probabilities[row] > 0.0
+        radix_positive = radix_probabilities[row] > 0.0
+        assert torch.equal(
+            radix_token_ids[row, radix_positive],
+            split_token_ids[row, split_positive],
+        )
+        torch.testing.assert_close(
+            radix_probabilities[row, radix_positive],
+            split_probabilities[row, split_positive],
+            atol=0.0,
+            rtol=0.0,
+        )
+        assert bool((radix_token_ids[row, radix_positive] >= 0).all())
+    else:
+        pass
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_fused_speculative_rng_matches_four_murmur_reference_domains() -> None:
     device = torch.device("cuda")
     seeds = torch.tensor([17, 2**40 + 29, 2**52 + 91], device=device, dtype=torch.long)
@@ -1186,6 +1433,85 @@ def test_fused_speculative_rng_matches_four_murmur_reference_domains() -> None:
         assert torch.equal(actual_uniforms, expected)
     else:
         pass
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_frame_rng_pool_matches_each_round_and_dynamic_width_prefix() -> None:
+    device = torch.device("cuda")
+    seeds = torch.tensor([17, 2**40 + 29], device=device, dtype=torch.long)
+    semantic_positions = torch.tensor([0, 19], device=device, dtype=torch.long)
+    num_code_groups = 16
+    max_rounds = num_code_groups - 2
+    max_verify_width = 4
+    pool_storage = torch.empty(
+        (2, 4, max_rounds, max_verify_width), device=device, dtype=torch.float32
+    )
+    actual_pool = speculative_uniforms_frame_pool(
+        seeds,
+        semantic_positions,
+        num_code_groups,
+        max_rounds,
+        max_verify_width,
+        pool_storage,
+    )
+
+    for round_index in range(max_rounds):
+        round_value = torch.tensor(round_index, device=device, dtype=torch.long)
+        expected = speculative_uniforms_all_purposes(
+            seeds,
+            semantic_positions,
+            round_value,
+            num_code_groups,
+            proposal_width=3,
+            verify_width=4,
+        )
+        actual = (
+            actual_pool[:, 0, round_index, :3],
+            actual_pool[:, 1, round_index, :3],
+            actual_pool[:, 2, round_index, :4],
+            actual_pool[:, 3, round_index, :4],
+        )
+        for actual_draws, expected_draws in zip(actual, expected, strict=True):
+            assert torch.equal(actual_draws, expected_draws)
+        else:
+            pass
+        assert torch.equal(actual_pool[:, 0, round_index, :1], expected[0][:, :1])
+    else:
+        pass
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
+    device = torch.device("cuda")
+    torch.manual_seed(1729)
+    hidden_states = torch.randn((8, 1024), device=device, dtype=torch.bfloat16)
+    packed_weights = torch.randn((3, 2048, 1024), device=device, dtype=torch.bfloat16)
+    hidden_indices = torch.tensor([0, 1, 2, 3, 4, 5, 6, 7], device=device)
+    head_indices = torch.tensor([0, 1, 2, 0, 1, 2, 0, 1], device=device)
+    active_rows = torch.tensor(
+        [True, True, True, True, True, False, True, False], device=device
+    )
+
+    baseline_logits = grouped_lm_head_linear(
+        hidden_states,
+        packed_weights,
+        hidden_indices,
+        head_indices,
+        active_rows,
+        backend="grouped_triton",
+    )
+    warp_logits = grouped_lm_head_linear(
+        hidden_states,
+        packed_weights,
+        hidden_indices,
+        head_indices,
+        active_rows,
+        backend="warp_gemv",
+    )
+
+    assert torch.equal(warp_logits, baseline_logits)
 
 
 @pytest.mark.accelerator
@@ -1227,3 +1553,145 @@ def test_fused_commit_preserves_bf16_order_and_writes_only_valid_codes() -> None
 
     assert torch.equal(output_codes, expected_codes)
     assert torch.equal(summed_embeddings, expected_embeddings)
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_state_transition_carries_hidden_and_advances_only_committed_prefix() -> (
+    None
+):
+    device = torch.device("cuda")
+    batch_size = 3
+    verify_width = 4
+    hidden_size = 32
+    committed_tokens = torch.tensor(
+        [[3, 8, 4, 0], [5, 11, 0, 0], [1, 2, 3, 4]],
+        device=device,
+        dtype=torch.long,
+    )
+    accepted_draft_counts = torch.tensor([2, 1, 0], device=device, dtype=torch.long)
+    committed_token_counts = torch.tensor([3, 2, 0], device=device, dtype=torch.long)
+    proposal_counts = torch.tensor([3, 1, 0], device=device, dtype=torch.long)
+    bonus_rows = torch.tensor([False, True, False], device=device)
+    rejected_rows = torch.tensor([True, False, False], device=device)
+    invalid_rows = torch.zeros((batch_size,), device=device, dtype=torch.bool)
+    valid_query_counts = torch.tensor([4, 2, 0], device=device, dtype=torch.long)
+    verified_hiddens = torch.randn(
+        (batch_size, verify_width, hidden_size), device=device, dtype=DTYPE
+    )
+    pending_tokens = torch.tensor([-1, -2, -3], device=device, dtype=torch.long)
+    preceding_hidden = torch.randn(
+        (batch_size, hidden_size), device=device, dtype=DTYPE
+    )
+    expected_preceding_hidden = preceding_hidden.clone()
+    expected_preceding_hidden[0].copy_(verified_hiddens[0, 2])
+    expected_preceding_hidden[1].copy_(verified_hiddens[1, 1])
+    committed_depths = torch.tensor([1, 5, 15], device=device, dtype=torch.long)
+    logical_kv_lengths = torch.tensor([2, 6, 16], device=device, dtype=torch.long)
+    active_rows = torch.tensor([True, True, False], device=device)
+    metadata = torch.empty((batch_size, 9), device=device, dtype=torch.long)
+
+    commit_speculative_state(
+        committed_tokens,
+        accepted_draft_counts,
+        committed_token_counts,
+        proposal_counts,
+        bonus_rows,
+        rejected_rows,
+        invalid_rows,
+        valid_query_counts,
+        verified_hiddens,
+        pending_tokens,
+        preceding_hidden,
+        committed_depths,
+        logical_kv_lengths,
+        active_rows,
+        metadata,
+        num_code_groups=16,
+    )
+
+    assert pending_tokens.tolist() == [4, 11, -3]
+    assert committed_depths.tolist() == [4, 7, 15]
+    assert logical_kv_lengths.tolist() == [5, 8, 16]
+    assert active_rows.tolist() == [True, True, False]
+    assert torch.equal(preceding_hidden, expected_preceding_hidden)
+    assert metadata.tolist() == [
+        [2, 1, 3, 3, 0, 1, 4, 4, 0],
+        [1, 1, 1, 2, 1, 0, 2, 7, 0],
+        [0, 0, 0, 0, 0, 0, 0, 15, 0],
+    ]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_fused_verifier_preparation_matches_projected_codec_lookup() -> None:
+    device = torch.device("cuda")
+    batch_size = 3
+    verify_width = 4
+    hidden_size = 16
+    projected_tables = torch.randn(
+        (14, 32, hidden_size), device=device, dtype=torch.bfloat16
+    )
+    pending_tokens = torch.tensor([4, 5, 6], device=device, dtype=torch.long)
+    draft_tokens = torch.tensor(
+        [[7, 8, 9], [10, 11, 12], [13, 14, 15]], device=device, dtype=torch.long
+    )
+    committed_depths = torch.tensor([1, 3, 13], device=device, dtype=torch.long)
+    logical_kv_lengths = torch.tensor([2, 7, 15], device=device, dtype=torch.long)
+    active_rows = torch.tensor([True, True, False], device=device)
+    proposal_counts = torch.tensor([3, 1, 0], device=device, dtype=torch.long)
+    outputs = SpeculativeVerifierInputs(
+        token_embeddings=torch.empty(
+            (batch_size, verify_width, hidden_size),
+            device=device,
+            dtype=torch.bfloat16,
+        ),
+        positions=torch.empty(
+            batch_size * verify_width, device=device, dtype=torch.long
+        ),
+        target_head_indices=torch.empty(
+            (batch_size, verify_width), device=device, dtype=torch.long
+        ),
+        valid_queries=torch.empty(
+            (batch_size, verify_width), device=device, dtype=torch.bool
+        ),
+    )
+
+    assert prepare_speculative_verification_inputs(
+        pending_tokens,
+        draft_tokens,
+        committed_depths,
+        logical_kv_lengths,
+        active_rows,
+        proposal_counts,
+        projected_tables,
+        outputs,
+    )
+    expected_valid = torch.tensor(
+        [[True, True, True, True], [True, True, False, False], [False] * 4],
+        device=device,
+    )
+    expected_positions = torch.tensor(
+        [[2, 3, 4, 5], [7, 8, -1, -1], [-1] * 4], device=device
+    )
+    expected_heads = torch.tensor([[1, 2, 3, 4], [3, 4, 0, 0], [0] * 4], device=device)
+    query_tokens = torch.cat((pending_tokens[:, None], draft_tokens), dim=1)
+    query_depths = (
+        committed_depths[:, None] + torch.arange(verify_width, device=device)[None, :]
+    )
+    expected_embeddings = projected_tables[
+        (query_depths - 1).clamp(min=0, max=projected_tables.shape[0] - 1),
+        query_tokens,
+    ]
+    expected_embeddings = torch.where(
+        expected_valid.unsqueeze(-1),
+        expected_embeddings,
+        torch.zeros_like(expected_embeddings),
+    )
+
+    assert torch.equal(
+        outputs.positions.view(batch_size, verify_width), expected_positions
+    )
+    assert torch.equal(outputs.target_head_indices, expected_heads)
+    assert torch.equal(outputs.valid_queries, expected_valid)
+    assert torch.equal(outputs.token_embeddings, expected_embeddings)

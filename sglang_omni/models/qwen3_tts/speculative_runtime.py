@@ -272,4 +272,5 @@ def accept_speculative_candidates(
         committed_token_counts=committed_token_counts,
         rejected_rows=has_rejection & active_rows,
         bonus_rows=~has_rejection & active_rows,
+        invalid_rows=torch.zeros_like(active_rows),
     )

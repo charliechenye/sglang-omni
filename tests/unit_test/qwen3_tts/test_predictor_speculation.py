@@ -20,6 +20,7 @@ from sglang_omni.utils.predictor_speculation import (
     probabilities_from_logits_cpu,
     residual_distribution_cpu,
     resolve_speculative_capability,
+    resolve_speculative_round_width,
     run_speculative_frame_reference,
     sample_categorical_cpu,
     speculative_acceptance_cpu,
@@ -508,6 +509,43 @@ def test_speculation_width_defaults_off_and_validates_range() -> None:
     for invalid_width in (1, 9, -1, 2.0, True):
         with pytest.raises(ValueError):
             speculative_resources_requested(invalid_width)
+
+
+def test_speculative_width_shrinks_from_staged_heterogeneous_depths() -> None:
+    committed_depths = torch.tensor([3, 4, 5, 6, 7], dtype=torch.long)
+    active_rows = torch.tensor([True, True, True, True, False])
+    selected_widths = [
+        resolve_speculative_round_width(
+            configured_width=4,
+            backend_capacity_width=4,
+            num_code_groups=8,
+            committed_depths=torch.tensor([depth], dtype=torch.long),
+            active_rows=torch.tensor([True]),
+        )
+        for depth in (3, 4, 5, 6)
+    ]
+
+    assert selected_widths == [4, 3, 2, 1]
+    assert (
+        resolve_speculative_round_width(
+            configured_width=4,
+            backend_capacity_width=3,
+            num_code_groups=8,
+            committed_depths=committed_depths,
+            active_rows=active_rows,
+        )
+        == 3
+    )
+    assert (
+        resolve_speculative_round_width(
+            configured_width=4,
+            backend_capacity_width=4,
+            num_code_groups=8,
+            committed_depths=committed_depths,
+            active_rows=torch.zeros_like(active_rows),
+        )
+        == 0
+    )
 
 
 def test_capability_resolution_reports_platform_sampling_capacity_fallbacks() -> None:

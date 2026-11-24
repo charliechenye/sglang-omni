@@ -34,6 +34,46 @@ class SpeculativeRowState:
         return len(self.committed_codes) - 1
 
 
+def resolve_speculative_round_width(
+    configured_width: int,
+    backend_capacity_width: int,
+    num_code_groups: int,
+    committed_depths: torch.Tensor,
+    active_rows: torch.Tensor,
+) -> int:
+    """Choose the largest safe width from the already-staged CPU round metadata."""
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (configured_width, backend_capacity_width, num_code_groups)
+    ):
+        raise ValueError("speculative round dimensions must be integers")
+    elif not 1 <= configured_width <= 8 or not 1 <= backend_capacity_width <= 8:
+        raise ValueError("speculative round widths must be in [1, 8]")
+    elif num_code_groups < 2:
+        raise ValueError("speculative decoding requires at least two code groups")
+    elif committed_depths.device.type != "cpu" or active_rows.device.type != "cpu":
+        raise ValueError("round-width selection requires staged CPU metadata")
+    elif committed_depths.ndim != 1 or active_rows.shape != committed_depths.shape:
+        raise ValueError("round-width metadata must contain aligned rows")
+    elif committed_depths.dtype not in (torch.int32, torch.int64):
+        raise ValueError("committed depths must use an integer dtype")
+    elif active_rows.dtype is not torch.bool:
+        raise ValueError("active-row metadata must use a boolean dtype")
+    else:
+        pass
+    if not bool(active_rows.any()):
+        return 0
+    else:
+        pass
+    active_depths = committed_depths[active_rows]
+    if bool(((active_depths < 0) | (active_depths >= num_code_groups - 1)).any()):
+        raise ValueError("active rows must have remaining code groups")
+    else:
+        pass
+    maximum_remaining = int((num_code_groups - 1 - active_depths).max())
+    return min(configured_width, backend_capacity_width, maximum_remaining)
+
+
 @dataclass(frozen=True)
 class SpeculativeRoundDecision:
     """Tokens committed by one row in one speculative round."""

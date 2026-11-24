@@ -747,10 +747,10 @@ def resolve_fused_predictor_width(
     if (
         isinstance(requested_width, bool)
         or not isinstance(requested_width, int)
-        or requested_width < 2
+        or requested_width < 1
         or requested_width > 8
     ):
-        raise ValueError("requested_width must be in [2, 8]")
+        raise ValueError("requested_width must be in [1, 8]")
     else:
         pass
     if any(
@@ -771,7 +771,7 @@ def resolve_fused_predictor_width(
     width_from_scratch = max_rows // graph_batch_size
     width_from_tile = ATTENTION_ROWS // (query_heads // kv_heads)
     effective_width = min(requested_width, width_from_scratch, width_from_tile)
-    if effective_width < 2:
+    if effective_width < 1:
         return 0
     else:
         pass
