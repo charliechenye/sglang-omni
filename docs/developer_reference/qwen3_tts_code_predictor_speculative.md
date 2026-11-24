@@ -22,7 +22,7 @@ The fixed-width policy reduces width to fit `min(batch_size * verify_width, MAX_
 
 ## Sampling, RNG, and precision
 
-The speculative probability builder reuses Omni's score packing, temperature scaling, top-k ordering, FP32 normalization, and top-p boundary rule. It returns candidate probabilities and IDs for proposal, target, and residual calculations. On SM90 it uses the existing split chunk/merge selection infrastructure. The NVIDIA-style radix selector is present as a parity candidate for larger top-k values; it is not the default sampler. The candidate is tested against the production split path on SM90.
+The speculative probability builder reuses Omni's score packing, temperature scaling, top-k ordering, FP32 normalization, and top-p boundary rule. It returns candidate probabilities and IDs for proposal, target, and residual calculations. On SM90 it uses the existing split chunk/merge selection infrastructure. The NVIDIA-style radix selector is present as a parity candidate for larger top-k values; it is not the default sampler. An accelerator parity test compares it with the production split path.
 
 For top-k values up to 32, the production probability kernel reconstructs the native PyTorch gather order and bitonic sort order. For larger top-k values, packed score keys order score ties by token ID, matching the split selector contract. The grouped Triton LM-head kernel accumulates BF16 products in FP32 and rounds logits to BF16. Its output may differ from the native GEMM at rounding boundaries, so exact target-distribution parity must be established by the H200 tests before claiming mathematical output equivalence.
 
@@ -36,10 +36,10 @@ Ordinary sampled requests are eligible even though the request builder generated
 
 ## H200 test commands
 
-Run CPU reference and RNG tests:
+Run CPU reference, acceptance-state, and eligibility tests:
 
 ```bash
-pytest -q tests/unit_test/qwen3_tts/test_predictor_speculation.py tests/unit_test/qwen3_tts/test_speculative_rng.py
+pytest -q tests/unit_test/qwen3_tts/test_predictor_speculation.py
 ```
 
 Run packed attention positions, C1/C8/C16 capacity, and tail-mask checks:
@@ -54,10 +54,10 @@ Run grouped LM-head and target-distribution parity:
 pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_grouped_heads.py
 ```
 
-Run native probability, SM90 split Top-K, radix-candidate, and tie-order tests:
+Run native probability, split Top-K, radix-candidate, and tie-order tests:
 
 ```bash
-pytest -q -m accelerator tests/unit_test/qwen3_tts/test_sampling_kernels.py -k speculative
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_sampling_kernels.py -k "speculative_probabilities or speculative_radix"
 ```
 
 Run a complete unseeded eager CUDA frame and verify all codebooks and accumulated codec embeddings:
@@ -66,16 +66,22 @@ Run a complete unseeded eager CUDA frame and verify all codebooks and accumulate
 pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k unseeded_eager
 ```
 
+Force each rejection position in a three-proposal window, then replay committed codes through the sequential native Predictor to compare target logits, probabilities, carried hidden states, and valid KV prefixes across heterogeneous tail depths:
+
+```bash
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k forced_code_replay
+```
+
 Run persistent verifier graph capture/replay correctness:
 
 ```bash
 pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k verifier_graph
 ```
 
-Run the checkpoint-shaped frozen-frame timing gate. It compares four fixed-input frames through the five-layer Predictor, asserts a positive speculative frame count, and fails if any frame falls back. The weights are synthetic; use the serving benchmark below for real-checkpoint timing.
+Run the synthetic fixed-frame smoke test. It checks that the speculative path completes frames without falling back; it is not a performance comparison.
 
 ```bash
-pytest -q -s -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k frozen_frame_benchmark
+pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py -k frozen_frame_smoke
 ```
 
 Run explicit-seed fallback followed by an unseeded speculative frame:
@@ -96,38 +102,43 @@ Run graph replay and ragged cache accesses under Compute Sanitizer:
 compute-sanitizer --tool memcheck --error-exitcode 1 python -m pytest -q -m accelerator tests/unit_test/qwen3_tts/test_predictor_speculative_cuda.py
 ```
 
-## H200 serving comparison
+## H200 single-GPU serving comparison
 
-Start a native server with speculation disabled:
+Use one H200 for both runs. Keep the request payload, model revision, concurrency, clocks, and process environment fixed. The native phase requires positive replays of the full Predictor CUDA Graph. The speculative phase requires positive verifier graph replays, positive speculative frame counts, and zero native fallbacks. The current speculative graph captures the packed verifier; proposal generation, acceptance, and commitment still run outside that graph.
+
+Start the native server with speculative decoding disabled:
 
 ```bash
 sgl-omni serve --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --config examples/configs/qwen3_tts_1_7b_customvoice.yaml --port 8000
 ```
 
-Start a second server with verifier width 4:
+In a second terminal, warm up and measure the fixed payload. This writes the native baseline and graph replay counters to `/tmp/qwen3-tts-native-baseline.json`.
 
 ```bash
-sgl-omni serve --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --config examples/configs/qwen3_tts_1_7b_customvoice_speculative.yaml --port 8001
+python scripts/benchmark_qwen3_tts_speculative_serving.py --phase native --base-url http://127.0.0.1:8000 --baseline-file /tmp/qwen3-tts-native-baseline.json --request-count 32 --warmup-requests 2 --concurrency 4
 ```
 
-Compare fixed, unseeded serving requests and require at least parity with native latency:
+Stop the native server before starting the speculative server on the same GPU and port:
 
 ```bash
-python scripts/benchmark_qwen3_tts_speculative_serving.py --native-url http://127.0.0.1:8000 --speculative-url http://127.0.0.1:8001 --request-count 32 --warmup-requests 2 --concurrency 4 --minimum-speedup 1.0
+sgl-omni serve --model-path Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice --config examples/configs/qwen3_tts_1_7b_customvoice_speculative.yaml --port 8000
 ```
 
-The benchmark omits the `seed` request field, reads speculative counters before and after the measured workload, and exits nonzero if the speculative frame delta or packed verifier count is zero, if any measured frame falls back, or if the configured speedup gate is missed. Run the two servers on matched hardware and with the same software, model revision, GPU clocks, and concurrency. End-to-end audio latency includes preprocessing and vocoding; the frozen-frame test isolates the Predictor path.
+Run the same workload against that process. The benchmark omits the `seed` request field so speculative decoding remains eligible, reads actual model counters around the measured requests, and exits nonzero if speculative frames or graph replays are missing, if any frame falls back, or if the configured serving speedup is missed.
+
+```bash
+python scripts/benchmark_qwen3_tts_speculative_serving.py --phase speculative --base-url http://127.0.0.1:8000 --baseline-file /tmp/qwen3-tts-native-baseline.json --request-count 32 --warmup-requests 2 --concurrency 4 --minimum-speedup 1.0
+```
+
+The output includes request latency, committed codes, accepted drafts, bonus tokens, effective widths, valid and padded query counts, head evaluations, generic forward counts, standalone correction forward counts, and graph replay counts. The API benchmark measures full speech-request latency; it does not substitute a verifier-only timing for full-frame serving latency. The current speculative CUDA Graph is verifier-only, so this benchmark does not yet meet a round-level graph comparison gate.
 
 ## Push commands for a personal fork
 
-After adding your fork as a Git remote, push the current branch without opening a PR:
+The configured `origin` remote is the personal fork. Push the current branch without opening a PR:
 
 ```bash
-git remote add fork git@github.com:<your-user>/sglang-omni.git
-git push fork HEAD:refs/heads/feat/qwen3-tts-codepredictor-specdec
+git push origin HEAD:refs/heads/feat/qwen3-tts-codepredictor-specdec
 ```
-
-If the `fork` remote already exists, omit the `git remote add` command.
 
 ## NVIDIA parity reference
 
