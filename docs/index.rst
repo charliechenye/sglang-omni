@@ -242,6 +242,7 @@ Community & Resources
    developer_reference/full_duplex_guide.md
    developer_reference/tts_bench.md
    developer_reference/tts_model_integration.md
+   developer_reference/qwen3_tts_code_predictor_speculative.md
    developer_reference/asr_bench.md
    developer_reference/omni_offline_bench.md
    developer_reference/rl_admin_control.md

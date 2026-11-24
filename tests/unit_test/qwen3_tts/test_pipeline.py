@@ -8828,6 +8828,7 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     assert isinstance(data.semantic_sampling_seed, int)
     assert 0 <= data.semantic_sampling_seed <= 0x7FFFFFFF
     assert data.req.sampling_params.sampling_seed is None
+    assert data.user_seed_provided is False
     assert data.req.sampling_params.repetition_penalty == 1.1
     assert isinstance(data.subtalker_sampling_seed, int)
     assert 0 <= data.subtalker_sampling_seed <= 0x7FFFFFFF
@@ -8876,6 +8877,7 @@ def test_qwen3_tts_request_data_uses_private_sampling_seeds(
     assert data.semantic_sampling_seed == 12345
     assert data.subtalker_sampling_seed == 67890
     assert data.req.sampling_params.sampling_seed is None
+    assert data.user_seed_provided is False
 
 
 def test_qwen3_tts_request_data_uses_public_seed_split(
@@ -8918,6 +8920,39 @@ def test_qwen3_tts_request_data_uses_public_seed_split(
     assert data.semantic_sampling_seed == expected_semantic_seed
     assert data.subtalker_sampling_seed == expected_subtalker_seed
     assert data.req.sampling_params.sampling_seed == expected_semantic_seed
+    assert data.user_seed_provided is True
+
+
+def test_qwen3_tts_speculative_draw_seed_is_namespaced_and_row_order_independent() -> (
+    None
+):
+    derive_seed = qwen3_request_builders.derive_qwen3_tts_speculative_draw_seed
+    coordinates = (67890, "request-a", 12, 4, 2, "proposal", 1)
+    expected = derive_seed(*coordinates)
+
+    assert derive_seed(*coordinates) == expected
+    assert (
+        len(
+            {
+                derive_seed(67890, "request-b", 12, 4, 2, "proposal", 1),
+                derive_seed(67890, "request-a", 13, 4, 2, "proposal", 1),
+                derive_seed(67890, "request-a", 12, 5, 2, "proposal", 1),
+                derive_seed(67890, "request-a", 12, 4, 3, "proposal", 1),
+                derive_seed(67890, "request-a", 12, 4, 2, "acceptance", 1),
+                derive_seed(67890, "request-a", 12, 4, 2, "proposal", 2),
+            }
+        )
+        == 6
+    )
+    batch_draws = {
+        request_id: derive_seed(67890, request_id, 12, 4, 2, "acceptance")
+        for request_id in ("request-a", "request-b")
+    }
+    reordered_draws = {
+        request_id: derive_seed(67890, request_id, 12, 4, 2, "acceptance")
+        for request_id in ("request-b", "request-a")
+    }
+    assert reordered_draws == batch_draws
 
 
 def stage_qwen3_tts_prepared(payload: StagePayload) -> None:
@@ -9802,6 +9837,7 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
                 subtalker_top_p=0.9,
                 subtalker_top_k=40,
                 subtalker_sampling_seed=7,
+                user_seed_provided=True,
             )
         ),
         SimpleNamespace(
@@ -9821,6 +9857,7 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     assert talker.sub_batch_size == 2
     assert talker.semantic_sampling_seed_tensor[:2].tolist() == [5, 9]
     assert talker.sub_sampling_seed_tensor[:2].tolist() == [7, 11]
+    assert talker.sub_user_seed_rows == (True, False)
     assert talker.sub_temperature_tensor[:2].tolist() == pytest.approx([0.8, 1.0])
     assert talker.sub_top_k_tensor[:2].tolist() == [40, 1]
     assert talker.sub_do_sample_tensor[:2].tolist() == [True, False]
@@ -10710,14 +10747,15 @@ def make_prep_talker(monkeypatch, device=None, max_batch=2):
 
 
 def prep_request(
-    request_id,
-    temperature,
+    request_id: str,
+    temperature: float,
     *,
-    top_k=40,
-    top_p=0.9,
-    do_sample=True,
-    seeds=(5, 7),
-):
+    top_k: int = 40,
+    top_p: float = 0.9,
+    do_sample: bool = True,
+    seeds: tuple[int, int] = (5, 7),
+    user_seed_provided: bool = False,
+) -> SimpleNamespace:
     return SimpleNamespace(
         request_id=request_id,
         data=Qwen3TTSSGLangRequestData(
@@ -10727,6 +10765,7 @@ def prep_request(
             subtalker_top_p=top_p,
             subtalker_top_k=top_k,
             subtalker_sampling_seed=seeds[1],
+            user_seed_provided=user_seed_provided,
         ),
     )
 
@@ -10754,8 +10793,11 @@ def test_qwen3_tts_prepare_decode_buffers_restages_on_request_id_reuse(
     assert talker.sub_temperature_tensor[:1].tolist() == pytest.approx([0.8])
 
     # Same request id, brand-new request data: must restage, not reuse.
-    talker_cls.prepare_decode_buffers(talker, [prep_request("req-a", 0.4)])
+    talker_cls.prepare_decode_buffers(
+        talker, [prep_request("req-a", 0.4, user_seed_provided=True)]
+    )
     assert talker.sub_temperature_tensor[:1].tolist() == pytest.approx([0.4])
+    assert talker.sub_user_seed_rows == (True,)
 
 
 def test_qwen3_tts_prepare_decode_buffers_pairs_each_column_with_its_buffer(
@@ -10764,7 +10806,7 @@ def test_qwen3_tts_prepare_decode_buffers_pairs_each_column_with_its_buffer(
     """Reordering the batch must move every column, not only the temperature."""
     talker_cls, talker = make_prep_talker(monkeypatch)
     batch = [
-        prep_request("a", 0.8),
+        prep_request("a", 0.8, user_seed_provided=True),
         prep_request("b", 0.6, top_k=20, top_p=0.5, seeds=(11, 12)),
     ]
 
@@ -10776,6 +10818,7 @@ def test_qwen3_tts_prepare_decode_buffers_pairs_each_column_with_its_buffer(
     assert talker.sub_top_k_tensor[:2].tolist() == [20, 40]
     assert talker.semantic_sampling_seed_tensor[:2].tolist() == [11, 5]
     assert talker.sub_sampling_seed_tensor[:2].tolist() == [12, 7]
+    assert talker.sub_user_seed_rows == (False, True)
 
 
 @pytest.mark.accelerator

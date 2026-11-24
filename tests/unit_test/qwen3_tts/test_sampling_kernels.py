@@ -906,7 +906,8 @@ def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile()
     runner.model = talker
     seeded_request = SimpleNamespace(
         data=SimpleNamespace(
-            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=7))
+            user_seed_provided=True,
+            req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=7)),
         )
     )
     torch.compiler.reset()

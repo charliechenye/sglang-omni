@@ -30,7 +30,14 @@ from sglang_omni.models.qwen3_tts.sglang_model import (
     predictor_gqa_attention,
 )
 from sglang_omni.platforms import current_platform
-from sglang_omni.utils.predictor_layers import HAS_TRITON, decode_attention
+from sglang_omni.utils.predictor_layers import (
+    ATTENTION_ROWS,
+    HAS_TRITON,
+    MAX_FUSED_ROWS,
+    decode_attention,
+    fused_predictor_scratch_rows,
+    resolve_fused_predictor_width,
+)
 
 if find_spec("cutlass") is not None:
     from sglang_omni.models.qwen3_tts.cutedsl.api import (
@@ -52,6 +59,69 @@ def rounded_rmsnorm(values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         values.float().square().mean(-1, keepdim=True) + 1e-6
     )
     return normalized.to(values.dtype) * weight
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 16])
+@pytest.mark.parametrize("verify_width", [2, 3, 4])
+def test_speculative_fused_capacity_for_c1_c8_c16(
+    batch_size: int, verify_width: int
+) -> None:
+    max_rows = fused_predictor_scratch_rows(16, verify_width)
+
+    assert max_rows == min(16 * verify_width, MAX_FUSED_ROWS)
+    assert (
+        resolve_fused_predictor_width(
+            verify_width,
+            batch_size,
+            max_rows,
+            query_heads=16,
+            kv_heads=8,
+        )
+        == verify_width
+    )
+
+
+@pytest.mark.parametrize(
+    ("graph_batch_size", "requested_width", "expected_width"),
+    [(8, 8, 8), (16, 8, 4), (16, 3, 3)],
+)
+def test_speculative_fused_capacity_reduces_only_unsupported_widths(
+    graph_batch_size: int, requested_width: int, expected_width: int
+) -> None:
+    max_rows = fused_predictor_scratch_rows(16, requested_width)
+
+    assert (
+        resolve_fused_predictor_width(
+            requested_width,
+            graph_batch_size,
+            max_rows,
+            query_heads=16,
+            kv_heads=8,
+        )
+        == expected_width
+    )
+
+
+def test_speculative_fused_capacity_respects_gqa_attention_tile() -> None:
+    max_rows = fused_predictor_scratch_rows(16, 8)
+
+    assert resolve_fused_predictor_width(
+        8,
+        graph_batch_size=8,
+        max_rows=max_rows,
+        query_heads=32,
+        kv_heads=4,
+    ) == min(8, ATTENTION_ROWS // 8)
+    assert (
+        resolve_fused_predictor_width(
+            8,
+            graph_batch_size=8,
+            max_rows=max_rows,
+            query_heads=64,
+            kv_heads=4,
+        )
+        == 0
+    )
 
 
 @pytest.mark.accelerator
@@ -129,13 +199,12 @@ def test_packed_predictor_attention_masks_per_row_absolute_positions(
                     @ keys[row, : position + 1, kv_head].float().T
                 ) / head_dim**0.5
                 weights = torch.softmax(scores, dim=-1)
-                rounded_weighted_values = weights.to(torch.bfloat16).float() @ values[
-                    row, : position + 1, kv_head
-                ].float()
+                rounded_weighted_values = (
+                    weights.to(torch.bfloat16).float()
+                    @ values[row, : position + 1, kv_head].float()
+                )
                 expected[row, token, head] = rounded_weighted_values / weights.sum()
-    torch.testing.assert_close(
-        actual.float(), expected, atol=0.04, rtol=0.02
-    )
+    torch.testing.assert_close(actual.float(), expected, atol=0.04, rtol=0.02)
 
 
 @pytest.mark.accelerator

@@ -77,7 +77,9 @@ from sglang_omni.scheduling.types import SchedulerRequest
 from sglang_omni.utils.predictor_layers import (
     ATTENTION_ROWS,
     decode_attention,
+    fused_predictor_scratch_rows,
     resolve_fused_predictor_layers,
+    resolve_fused_predictor_width,
 )
 from sglang_omni.utils.predictor_speculation import (
     resolve_speculative_capability,
@@ -251,6 +253,8 @@ class PredictorGraphStats(TypedDict):
 class PredictorSpeculativeStats(TypedDict):
     requested_width: int
     effective_width: int
+    fused_predictor_scratch_rows: int
+    effective_width_histogram: dict[str, int]
     fallback_reason: str | None
     frames: int
     rounds: int
@@ -261,6 +265,10 @@ class PredictorSpeculativeStats(TypedDict):
     rejections: int
     average_codes_per_round: float
     packed_transformer_forwards: int
+    draft_head_evaluations: int
+    target_head_evaluations: int
+    fused_predictor_forwards: int
+    generic_predictor_forwards: int
     standalone_correction_forward_count: int
     graph_replays: int
     graph_capture_failures: int
@@ -1133,6 +1141,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
 
         server_args = get_context().server_args
         max_batch_size = get_schedule().max_running_requests
+        self.predictor_max_batch_size = max_batch_size
         hidden_size = config.hidden_size
         predictor_len = config.num_code_groups + 1
         device = self.model.codec_embedding.weight.device
@@ -1244,6 +1253,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         )
         self.sub_has_sampled_rows = False
         self.sub_has_argmax_rows = False
+        self.sub_user_seed_rows: tuple[bool, ...] = ()
         self.sub_sampled_has_top_p = False
         self.sub_sampled_max_top_k = 0
         self.sub_sampled_has_unbounded_top_k = False
@@ -1322,6 +1332,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         sub_top_ps: list[float] = []
         sub_top_ks: list[int] = []
         sub_seeds: list[int] = []
+        user_seed_rows: list[bool] = []
         sub_do_samples: list[bool] = []
         sample_rows: list[int] = []
         for row_idx, sched_req in enumerate(requests):
@@ -1333,6 +1344,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 subtalker_top_p = float(data.subtalker_top_p)
                 subtalker_top_k = int(data.subtalker_top_k)
                 subtalker_seed = int(data.subtalker_sampling_seed)
+                user_seed_provided = data.user_seed_provided
             except AttributeError as exc:
                 raise TypeError(
                     "Qwen3-TTS decode buffers require request data with semantic "
@@ -1343,6 +1355,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     "Qwen3-TTS decode buffers require numeric semantic and "
                     "subtalker sampling fields"
                 ) from exc
+            if not isinstance(user_seed_provided, bool):
+                raise TypeError("user_seed_provided must be a boolean")
+            else:
+                pass
             semantic_seeds.append(semantic_seed)
             sub_do_samples.append(do_sample)
             # note(ratish): the sampler divides by the temperature, staged clamped
@@ -1355,6 +1371,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             # which would otherwise hit the full-sort branch.
             sub_top_ks.append(subtalker_top_k if do_sample else 1)
             sub_seeds.append(subtalker_seed)
+            user_seed_rows.append(user_seed_provided)
             if do_sample:
                 sample_rows.append(row_idx)
             else:
@@ -1369,6 +1386,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.sub_batch_size = batch_size
         self.sub_has_sampled_rows = bool(sample_rows)
         self.sub_has_argmax_rows = len(sample_rows) < batch_size
+        self.sub_user_seed_rows = tuple(user_seed_rows)
         self.sub_sampled_has_top_p = has_top_p
         self.sub_sampled_max_top_k = max_top_k
         self.sub_sampled_has_unbounded_top_k = has_unbounded_top_k
@@ -1491,7 +1509,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         }
 
     def configure_code_predictor_speculation(self, requested_width: int) -> None:
-        """Resolve startup support before allocating or mutating speculative state."""
+        """Allocate opt-in fused scratch before graph capture, then resolve support."""
         speculative_resources_requested(requested_width)
         self.code_predictor_spec_requested_width = requested_width
         self.code_predictor_spec_effective_width = 0
@@ -1501,13 +1519,47 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         else:
             pass
         attention = self.code_predictor.model.layers[0].self_attn
+        if self.predictor_fused_layers is not None:
+            graph_batch_size = max(self.predictor_graph_batch_sizes)
+            requested_capacity = fused_predictor_scratch_rows(
+                self.predictor_max_batch_size, requested_width
+            )
+            capacity_width = resolve_fused_predictor_width(
+                requested_width,
+                graph_batch_size,
+                requested_capacity,
+                int(attention.num_heads),
+                int(attention.num_kv_heads),
+            )
+            if capacity_width >= 2:
+                requested_scratch_rows = fused_predictor_scratch_rows(
+                    self.predictor_max_batch_size, capacity_width
+                )
+                width_to_resolve = capacity_width
+            else:
+                requested_scratch_rows = self.predictor_fused_layers.max_rows
+                width_to_resolve = requested_width
+            if requested_scratch_rows > self.predictor_fused_layers.max_rows:
+                self.predictor_fused_layers = resolve_fused_predictor_layers(
+                    self.code_predictor,
+                    self.config.num_code_groups + 1,
+                    self.predictor_max_batch_size,
+                    self.predictor_device,
+                    self.predictor_k_cache.dtype,
+                    max_tokens_per_row=capacity_width,
+                )
+            else:
+                pass
+        else:
+            graph_batch_size = max(self.predictor_graph_batch_sizes)
+            width_to_resolve = requested_width
         resolution = resolve_speculative_capability(
-            requested_width,
+            width_to_resolve,
             is_cuda=current_platform.is_cuda(),
             is_bfloat16=self.predictor_k_cache.dtype == torch.bfloat16,
             tensor_parallel_size=int(get_parallel().tp_size),
             fused_predictor_available=self.predictor_fused_layers is not None,
-            batch_size=1,
+            batch_size=graph_batch_size,
             packed_row_capacity=(
                 0
                 if self.predictor_fused_layers is None
@@ -1547,6 +1599,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         return {
             "requested_width": self.code_predictor_spec_requested_width,
             "effective_width": self.code_predictor_spec_effective_width,
+            "fused_predictor_scratch_rows": (
+                0
+                if self.predictor_fused_layers is None
+                else self.predictor_fused_layers.max_rows
+            ),
+            "effective_width_histogram": {},
             "fallback_reason": self.code_predictor_spec_fallback_reason,
             "frames": self.code_predictor_spec_frame_count,
             "rounds": self.code_predictor_spec_round_count,
@@ -1559,6 +1617,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             "packed_transformer_forwards": (
                 self.code_predictor_spec_packed_forward_count
             ),
+            "draft_head_evaluations": 0,
+            "target_head_evaluations": 0,
+            "fused_predictor_forwards": 0,
+            "generic_predictor_forwards": 0,
             "standalone_correction_forward_count": 0,
             "graph_replays": self.code_predictor_spec_graph_replay_count,
             "graph_capture_failures": (

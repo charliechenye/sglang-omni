@@ -422,18 +422,16 @@ if HAS_TRITON:
             other=0.0,
         )
         scores = tl.dot(q, tl.trans(k)) * scale
-        visible = (rs[None, :] <= query_positions[:, None]) & (
-            rs[None, :] < cache_size
-        )
+        visible = (rs[None, :] <= query_positions[:, None]) & (rs[None, :] < cache_size)
         visible = visible & position_valid[:, None]
         scores = tl.where(visible, scores, float("-inf"))
         max_scores = tl.max(scores, 1)
         max_scores = tl.where(position_valid, max_scores, 0.0)
         weights = tl.where(visible, libdevice.exp(scores - max_scores[:, None]), 0.0)
         weight_sums = tl.sum(weights, 1)
-        attended = tl.dot(weights.to(tl.bfloat16), v) / tl.maximum(
-            weight_sums, 1.0
-        )[:, None]
+        attended = (
+            tl.dot(weights.to(tl.bfloat16), v) / tl.maximum(weight_sums, 1.0)[:, None]
+        )
         tl.store(OUT + out_offsets, attended.to(tl.bfloat16), mask=is_query[:, None])
         # note (ratish): released after the store, so o_proj's waiting programs do not hold
         # the SM slots the attention's later waves need.
@@ -710,6 +708,69 @@ def split_count(output_tiles: int, k_blocks: int, sm_count: int) -> int:
     """The power-of-two K split whose program count lands nearest the SM count."""
     candidates = [split for split in (1, 2, 4, 8) if k_blocks % split == 0]
     return min(candidates, key=lambda split: abs(output_tiles * split - sm_count))
+
+
+def fused_predictor_scratch_rows(max_batch_size: int, max_tokens_per_row: int) -> int:
+    """Rows needed for an opt-in packed width, capped by the fused kernel limit."""
+    if (
+        isinstance(max_batch_size, bool)
+        or not isinstance(max_batch_size, int)
+        or max_batch_size <= 0
+    ):
+        raise ValueError("max_batch_size must be a positive integer")
+    else:
+        pass
+    if (
+        isinstance(max_tokens_per_row, bool)
+        or not isinstance(max_tokens_per_row, int)
+        or not 2 <= max_tokens_per_row <= 8
+    ):
+        raise ValueError("max_tokens_per_row must be an integer in [2, 8]")
+    else:
+        pass
+    return min(max_batch_size * max_tokens_per_row, MAX_FUSED_ROWS)
+
+
+def resolve_fused_predictor_width(
+    requested_width: int,
+    graph_batch_size: int,
+    max_rows: int,
+    query_heads: int,
+    kv_heads: int,
+) -> int:
+    """Reduce width for padded graph rows, scratch capacity, and attention tiles."""
+    if (
+        isinstance(requested_width, bool)
+        or not isinstance(requested_width, int)
+        or requested_width < 2
+        or requested_width > 8
+    ):
+        raise ValueError("requested_width must be in [2, 8]")
+    else:
+        pass
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (graph_batch_size, max_rows, query_heads, kv_heads)
+    ):
+        raise ValueError("packed capacity dimensions must be integers")
+    else:
+        pass
+    if graph_batch_size <= 0 or max_rows <= 0:
+        return 0
+    else:
+        pass
+    if query_heads <= 0 or kv_heads <= 0 or query_heads % kv_heads != 0:
+        return 0
+    else:
+        pass
+    width_from_scratch = max_rows // graph_batch_size
+    width_from_tile = ATTENTION_ROWS // (query_heads // kv_heads)
+    effective_width = min(requested_width, width_from_scratch, width_from_tile)
+    if effective_width < 2:
+        return 0
+    else:
+        pass
+    return effective_width
 
 
 def resolve_predictor_layer_shape(
@@ -1198,9 +1259,7 @@ class FusedPredictorLayers:
             )
         else:
             pass
-        if num_tokens * (
-            shape.num_q_heads // shape.num_kv_heads
-        ) > ATTENTION_ROWS:
+        if num_tokens * (shape.num_q_heads // shape.num_kv_heads) > ATTENTION_ROWS:
             raise ValueError(
                 "packed Predictor width exceeds the fused attention tile capacity"
             )
@@ -1284,15 +1343,15 @@ def resolve_fused_predictor_layers(
     max_batch_size: int,
     device: torch.device,
     dtype: torch.dtype,
+    *,
+    max_tokens_per_row: int = 2,
 ) -> FusedPredictorLayers | None:
-    """The fused layers for this predictor, or None where it keeps the plain path. The
-    opening pair runs as one pass of two rows per request; the layers cover passes of
-    up to MAX_FUSED_ROWS rows."""
+    """Return fused layers, defaulting to opening-pair capacity and allowing opt-in packed width."""
     shape = resolve_predictor_layer_shape(code_predictor, predictor_len, device)
     # note (ratish): deterministic inference promises the same bits at every batch size,
     # and a pass above MAX_FUSED_ROWS runs plain.
     if shape is None or get_exec().deterministic.enable_deterministic_inference:
         return None
     else:
-        max_rows = min(2 * max_batch_size, MAX_FUSED_ROWS)
+        max_rows = fused_predictor_scratch_rows(max_batch_size, max_tokens_per_row)
         return FusedPredictorLayers(shape, max_rows, device, dtype)

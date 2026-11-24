@@ -377,9 +377,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         # note(ratish): the tokenizer and the predictor graphs live for the whole
         # process, so they are attached before sglang reads free memory for the pool.
         model = model_worker.model_runner.model
-        model.configure_code_predictor_speculation(
-            self.code_predictor_spec_verify_size
-        )
+        model.configure_code_predictor_speculation(self.code_predictor_spec_verify_size)
         speech_tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
             checkpoint_dir,
             device=device,

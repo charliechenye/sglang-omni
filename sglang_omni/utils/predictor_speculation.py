@@ -9,8 +9,8 @@ path, so tests can exercise rejection and KV-prefix commitment without a GPU.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 
@@ -25,6 +25,13 @@ class SpeculativeRowState:
     valid_kv_length: int
     accumulated_embedding: torch.Tensor
     finished: bool = False
+    valid_proposal_count: int = 0
+    valid_query_count: int = 0
+
+    @property
+    def committed_predictor_code_count(self) -> int:
+        """Count committed codebooks after codebook 0's opening input."""
+        return len(self.committed_codes) - 1
 
 
 @dataclass(frozen=True)
@@ -36,6 +43,11 @@ class SpeculativeRoundDecision:
     proposal_count: int
     rejected: bool
     bonus_sampled: bool
+
+    @property
+    def valid_query_count(self) -> int:
+        """The pending input plus each proposal occupies one verifier row."""
+        return self.proposal_count + 1
 
 
 @dataclass(frozen=True)
@@ -152,23 +164,33 @@ def speculative_resources_requested(requested_width: int) -> bool:
     return requested_width > 0
 
 
-DraftProvider = Callable[
-    [list[SpeculativeRowState], torch.Tensor], tuple[torch.Tensor, torch.Tensor]
-]
-VerifyProvider = Callable[
-    [
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
-    ],
-    tuple[torch.Tensor, torch.Tensor],
-]
-UniformProvider = Callable[
-    [int, torch.Tensor], tuple[torch.Tensor, torch.Tensor]
-]
+class DraftProvider(Protocol):
+    def __call__(
+        self,
+        states: list[SpeculativeRowState],
+        proposal_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+class VerifyProvider(Protocol):
+    def __call__(
+        self,
+        pending_tokens: torch.Tensor,
+        padded_draft_tokens: torch.Tensor,
+        valid_proposal_counts: torch.Tensor,
+        valid_query_counts: torch.Tensor,
+        active_row_mask: torch.Tensor,
+        logical_kv_lengths: torch.Tensor,
+        preceding_hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
+
+
+class UniformProvider(Protocol):
+    def __call__(
+        self,
+        round_index: int,
+        proposal_counts: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
 def probabilities_from_logits_cpu(
@@ -177,12 +199,16 @@ def probabilities_from_logits_cpu(
     temperature: float,
     top_k: int,
     top_p: float,
+    ordered_token_ids: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Build the FP64 reference distribution for one Qwen3-TTS codebook row.
 
-    Top-k boundary ties use the lower token ID first. Top-p follows SGLang's
-    nucleus rule: remove a token only after the probability mass before it has
-    reached top_p. Values of top_p equal to zero or one disable nucleus filtering.
+    If ``ordered_token_ids`` is provided, it supplies the already-selected native
+    candidate order, including backend-specific tie handling. Without it, top-k
+    boundary ties use the lower token ID as a deterministic reference policy.
+    Top-p follows SGLang's nucleus rule: remove a token only after the probability
+    mass before it has reached top_p. Values of top_p equal to zero or one disable
+    nucleus filtering.
     """
     if logits.device.type != "cpu" or logits.ndim != 1:
         raise ValueError("CPU reference logits must be a one-dimensional CPU tensor")
@@ -205,16 +231,49 @@ def probabilities_from_logits_cpu(
         raise ValueError("logits may not contain NaN or positive infinity")
     else:
         pass
-    valid_ids = [
-        index
-        for index, value in enumerate(values.tolist())
-        if value != -float("inf")
-    ]
-    if not valid_ids:
+    if ordered_token_ids is None:
+        ordered_ids = [
+            index
+            for index, value in enumerate(values.tolist())
+            if value != -float("inf")
+        ]
+        ordered_ids.sort(key=lambda index: (-float(values[index]), index))
+    elif (
+        ordered_token_ids.device.type != "cpu"
+        or ordered_token_ids.ndim != 1
+        or ordered_token_ids.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError(
+            "ordered_token_ids must be a one-dimensional CPU integer tensor"
+        )
+    else:
+        ordered_ids = [int(token) for token in ordered_token_ids]
+        if (
+            not ordered_ids
+            or any(token < 0 or token >= values.numel() for token in ordered_ids)
+            or len(set(ordered_ids)) != len(ordered_ids)
+        ):
+            raise ValueError("ordered_token_ids contains invalid or repeated token IDs")
+        else:
+            pass
+    if not ordered_ids:
         raise ValueError("logits have no finite token")
     else:
         pass
-    ordered_ids = sorted(valid_ids, key=lambda index: (-float(values[index]), index))
+    if not any(float(values[token]) != -float("inf") for token in ordered_ids):
+        raise ValueError("logits have no finite token")
+    else:
+        pass
+    if ordered_token_ids is not None:
+        minimum_candidates = top_k if 0 < top_k < values.numel() else values.numel()
+        if len(ordered_ids) < minimum_candidates:
+            raise ValueError(
+                "ordered_token_ids does not cover the native candidate set"
+            )
+        else:
+            pass
+    else:
+        pass
     if 0 < top_k < len(ordered_ids):
         ordered_ids = ordered_ids[:top_k]
     else:
@@ -241,8 +300,7 @@ def probabilities_from_logits_cpu(
 
 
 def validate_probability_distribution(probabilities: torch.Tensor) -> torch.Tensor:
-    """Return a normalized FP64 view after checking a finite nonnegative distribution.
-    """
+    """Return a normalized FP64 view after checking a finite nonnegative distribution."""
     if probabilities.ndim != 1 or probabilities.device.type != "cpu":
         raise ValueError("probabilities must be a one-dimensional CPU tensor")
     else:
@@ -343,10 +401,7 @@ def speculative_acceptance_cpu(
     else:
         pass
     proposal_count = int(draft_tokens.numel())
-    if (
-        draft_probabilities.ndim != 2
-        or draft_probabilities.shape[0] != proposal_count
-    ):
+    if draft_probabilities.ndim != 2 or draft_probabilities.shape[0] != proposal_count:
         raise ValueError("draft probability count does not match draft tokens")
     else:
         pass
@@ -445,8 +500,8 @@ def run_speculative_frame_reference(
 
     The initial codes contain codebook 0 and the natively sampled codebook 1;
     ``initial_embedding_sum`` already includes both embeddings. ``verify_provider``
-    receives pending tokens, padded drafts, proposal counts, the active-row mask,
-    valid KV lengths, and the hidden state preceding each pending token.
+    receives pending tokens, padded drafts, proposal and query counts, the active-row
+    mask, valid KV lengths, and the hidden state preceding each pending token.
     Its target probabilities and verified hidden rows have packed shape
     ``[batch, verify_width, ...]``. The cache length advances by the consumed
     pending token plus accepted drafts; correction and bonus tokens stay pending.
@@ -477,10 +532,7 @@ def run_speculative_frame_reference(
         raise ValueError("initial hidden-state shape does not match the batch")
     else:
         pass
-    if (
-        initial_embedding_sum.ndim != 2
-        or initial_embedding_sum.shape[0] != batch_size
-    ):
+    if initial_embedding_sum.ndim != 2 or initial_embedding_sum.shape[0] != batch_size:
         raise ValueError("initial embedding-sum shape does not match the batch")
     else:
         pass
@@ -547,18 +599,34 @@ def run_speculative_frame_reference(
     while any(not state.finished for state in states):
         proposal_counts = torch.tensor(
             [
-                min(verify_width - 1, num_code_groups - len(state.committed_codes) - 1)
-                if not state.finished
-                else 0
+                (
+                    min(
+                        verify_width - 1,
+                        num_code_groups - len(state.committed_codes) - 1,
+                    )
+                    if not state.finished
+                    else 0
+                )
                 for state in states
             ],
             dtype=torch.long,
         )
+        active_rows = torch.tensor(
+            [not state.finished for state in states], dtype=torch.bool
+        )
+        valid_query_counts = torch.where(
+            active_rows, proposal_counts + 1, torch.zeros_like(proposal_counts)
+        )
+        for row, state in enumerate(states):
+            state.valid_proposal_count = int(proposal_counts[row])
+            state.valid_query_count = int(valid_query_counts[row])
+        else:
+            pass
         draft_probabilities, draft_tokens = draft_provider(states, proposal_counts)
         expected_draft_shape = (batch_size, verify_width - 1, vocab_size)
-        if (
-            draft_probabilities.shape != expected_draft_shape
-            or draft_tokens.shape != (batch_size, verify_width - 1)
+        if draft_probabilities.shape != expected_draft_shape or draft_tokens.shape != (
+            batch_size,
+            verify_width - 1,
         ):
             raise ValueError("draft provider returned an invalid packed shape")
         else:
@@ -574,9 +642,8 @@ def run_speculative_frame_reference(
             torch.tensor([state.pending_token for state in states], dtype=torch.long),
             draft_tokens,
             proposal_counts,
-            torch.tensor(
-                [not state.finished for state in states], dtype=torch.bool
-            ),
+            valid_query_counts,
+            active_rows,
             torch.tensor([state.valid_kv_length for state in states], dtype=torch.long),
             torch.stack([state.preceding_hidden for state in states]),
         )
@@ -603,10 +670,10 @@ def run_speculative_frame_reference(
         acceptance_uniforms, sampling_uniforms = uniform_provider(
             rounds, proposal_counts
         )
-        if (
-            acceptance_uniforms.shape != (batch_size, verify_width - 1)
-            or sampling_uniforms.shape != (batch_size, verify_width)
-        ):
+        if acceptance_uniforms.shape != (
+            batch_size,
+            verify_width - 1,
+        ) or sampling_uniforms.shape != (batch_size, verify_width):
             raise ValueError("uniform provider returned invalid packed shapes")
         else:
             pass
@@ -661,7 +728,7 @@ def run_speculative_frame_reference(
             state.preceding_hidden = verified_hidden[row, consumed_rows].clone()
             state.valid_kv_length += consumed_rows + 1
             state.finished = len(state.committed_codes) == num_code_groups
-            if state.valid_kv_length != len(state.committed_codes):
+            if state.valid_kv_length != state.committed_predictor_code_count + 1:
                 raise RuntimeError(
                     "logical KV prefix and committed-code count diverged"
                 )

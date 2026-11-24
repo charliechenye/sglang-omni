@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from sglang_omni.utils.predictor_speculation import (
+    SpeculativeRowState,
     acceptance_probability,
     probabilities_from_logits_cpu,
     residual_distribution_cpu,
@@ -15,7 +16,6 @@ from sglang_omni.utils.predictor_speculation import (
     sample_categorical_cpu,
     speculative_acceptance_cpu,
     speculative_resources_requested,
-    SpeculativeRowState,
 )
 
 
@@ -54,6 +54,30 @@ def test_cpu_reference_probability_filtering_handles_ties_and_signed_zero() -> N
     assert top_p_probabilities[0] == pytest.approx(1.0)
     assert top_p_probabilities[1:].sum() == 0.0
     assert top_p_probabilities.sum() == pytest.approx(1.0)
+
+
+def test_probability_reference_accepts_native_selected_tie_order() -> None:
+    logits = torch.tensor([2.0, 1.0, 1.0, 1.0], dtype=torch.float32)
+    native_candidate_order = torch.tensor([0, 3, 1, 2], dtype=torch.long)
+
+    stable_reference = probabilities_from_logits_cpu(
+        logits,
+        temperature=1.0,
+        top_k=4,
+        top_p=0.75,
+    )
+    selected_native_order = probabilities_from_logits_cpu(
+        logits,
+        temperature=1.0,
+        top_k=4,
+        top_p=0.75,
+        ordered_token_ids=native_candidate_order,
+    )
+
+    assert stable_reference[3] == 0.0
+    assert selected_native_order[3] > 0.0
+    assert selected_native_order[2] == 0.0
+    assert selected_native_order.sum() == pytest.approx(1.0)
 
 
 @pytest.mark.parametrize(
@@ -147,9 +171,7 @@ def test_rejects_each_proposal_position_and_accepts_full_window() -> None:
     accepted = speculative_acceptance_cpu(
         draft_tokens,
         draft_probabilities,
-        torch.stack(
-            [one_hot(token, vocab_size) for token in (0, 1, 2, 5)]
-        ),
+        torch.stack([one_hot(token, vocab_size) for token in (0, 1, 2, 5)]),
         torch.zeros(3, dtype=torch.float64),
         torch.zeros(4, dtype=torch.float64),
     )
@@ -200,6 +222,10 @@ def test_complete_frame_state_machine_commits_only_surviving_codes() -> None:
         states: list[SpeculativeRowState], proposal_counts: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert len(states) == batch_size
+        assert all(
+            state.valid_kv_length == state.committed_predictor_code_count + 1
+            for state in states
+        )
         distributions = torch.zeros(
             (batch_size, verify_width - 1, vocab_size), dtype=torch.float64
         )
@@ -213,6 +239,7 @@ def test_complete_frame_state_machine_commits_only_surviving_codes() -> None:
         pending: torch.Tensor,
         drafts: torch.Tensor,
         proposal_counts: torch.Tensor,
+        valid_query_counts: torch.Tensor,
         active_rows: torch.Tensor,
         kv_lengths: torch.Tensor,
         preceding_hidden: torch.Tensor,
@@ -222,6 +249,9 @@ def test_complete_frame_state_machine_commits_only_surviving_codes() -> None:
         assert tuple(int(length) for length in kv_lengths) == expected_kv_lengths
         assert tuple(int(count) for count in proposal_counts) == (
             (2, 2, 2) if verify_round == 0 else (1, 0, 0)
+        )
+        assert tuple(int(count) for count in valid_query_counts) == (
+            (3, 3, 3) if verify_round == 0 else (2, 0, 1)
         )
         assert tuple(bool(active) for active in active_rows) == (
             (True, True, True) if verify_round == 0 else (True, False, True)
@@ -298,6 +328,8 @@ def test_frame_with_one_remaining_code_uses_bonus_without_proposals() -> None:
     def provide_drafts(
         states: list[SpeculativeRowState], proposal_counts: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert states[0].valid_proposal_count == 0
+        assert states[0].valid_query_count == 1
         assert tuple(int(count) for count in proposal_counts) == (0,)
         return (
             torch.zeros((1, verify_width - 1, vocab_size), dtype=torch.float64),
@@ -308,11 +340,13 @@ def test_frame_with_one_remaining_code_uses_bonus_without_proposals() -> None:
         pending: torch.Tensor,
         drafts: torch.Tensor,
         proposal_counts: torch.Tensor,
+        valid_query_counts: torch.Tensor,
         active_rows: torch.Tensor,
         kv_lengths: torch.Tensor,
         preceding_hidden: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert tuple(int(token) for token in pending) == (1,)
+        assert tuple(int(count) for count in valid_query_counts) == (1,)
         assert tuple(bool(active) for active in active_rows) == (True,)
         assert tuple(int(length) for length in kv_lengths) == (2,)
         probabilities = torch.stack(
@@ -357,9 +391,7 @@ def test_current_model_frame_commits_exactly_16_codes() -> None:
     initial_codes = torch.zeros((batch_size, 2), dtype=torch.long)
     initial_hidden = torch.zeros((batch_size, 1), dtype=torch.float64)
     initial_sum = torch.zeros((batch_size, 1), dtype=torch.float64)
-    embedding_tables = torch.ones(
-        (num_groups - 1, vocab_size, 1), dtype=torch.float64
-    )
+    embedding_tables = torch.ones((num_groups - 1, vocab_size, 1), dtype=torch.float64)
 
     def provide_drafts(
         states: list[SpeculativeRowState], proposal_counts: torch.Tensor
@@ -375,6 +407,7 @@ def test_current_model_frame_commits_exactly_16_codes() -> None:
         pending: torch.Tensor,
         drafts: torch.Tensor,
         proposal_counts: torch.Tensor,
+        valid_query_counts: torch.Tensor,
         active_rows: torch.Tensor,
         kv_lengths: torch.Tensor,
         preceding_hidden: torch.Tensor,
@@ -468,20 +501,14 @@ def test_capability_resolution_reports_platform_sampling_capacity_fallbacks() ->
     assert cpu.effective_width == 0
     assert cpu.fallback_reason == "unsupported-device-backend"
 
-    sampling = resolve_speculative_capability(
-        **{**base, "sampling_supported": False}
-    )
+    sampling = resolve_speculative_capability(**{**base, "sampling_supported": False})
     assert sampling.effective_width == 0
     assert sampling.fallback_reason == "unsupported-sampling-configuration"
 
-    capacity = resolve_speculative_capability(
-        **{**base, "packed_row_capacity": 15}
-    )
+    capacity = resolve_speculative_capability(**{**base, "packed_row_capacity": 15})
     assert capacity.effective_width == 0
     assert capacity.fallback_reason == "packed-row-capacity-exceeded"
 
-    seeded = resolve_speculative_capability(
-        **{**base, "has_explicit_seed": True}
-    )
+    seeded = resolve_speculative_capability(**{**base, "has_explicit_seed": True})
     assert seeded.effective_width == 0
     assert seeded.fallback_reason == "seeded-request-requires-native-decoding"

@@ -219,9 +219,8 @@ class Qwen3TTSModelRunner(ModelRunner):
         """Install the staged semantic seeds when a request in the batch carries a
         seed, or deterministic inference has already seeded every row."""
         sampling_info = forward_batch.sampling_info
-        if sampling_info.sampling_seed is None and all(
-            scheduled_request.data.req.sampling_params.sampling_seed is None
-            for scheduled_request in requests
+        if sampling_info.sampling_seed is None and not any(
+            scheduled_request.data.user_seed_provided for scheduled_request in requests
         ):
             return
         else:
