@@ -8,7 +8,7 @@ import logging
 import time
 from collections.abc import Callable, Sequence
 from types import FunctionType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -238,6 +238,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         prefill_coalesce_requests: int = 0,
         prefill_coalesce_wait_ms: float = 60.0,
         code_predictor_spec_verify_size: int = 0,
+        code_predictor_spec_backend: Literal["cuda_graph", "eager"] = "cuda_graph",
         reference_encoder_cuda_graph_bucket_frames: Sequence[int] = (
             DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES
         ),
@@ -247,6 +248,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
     ) -> None:
         speculative_resources_requested(code_predictor_spec_verify_size)
         self.code_predictor_spec_verify_size = code_predictor_spec_verify_size
+        self.code_predictor_spec_backend = code_predictor_spec_backend
         self.attn_implementation = attn_implementation
         self.prefill_coalesce_requests = prefill_coalesce_requests
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
@@ -377,7 +379,10 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         # note(ratish): the tokenizer and the predictor graphs live for the whole
         # process, so they are attached before sglang reads free memory for the pool.
         model = model_worker.model_runner.model
-        model.configure_code_predictor_speculation(self.code_predictor_spec_verify_size)
+        model.configure_code_predictor_speculation(
+            self.code_predictor_spec_verify_size,
+            backend=self.code_predictor_spec_backend,
+        )
         speech_tokenizer = qwen3_stages.load_qwen3_tts_tokenizer(
             checkpoint_dir,
             device=device,

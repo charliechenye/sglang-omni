@@ -27,7 +27,10 @@ from sglang.kernels.spec import KernelBackend
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.layers.linear import RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedLinearMethod,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.sampler import multinomial_with_seed
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel, get_schedule
@@ -58,6 +61,8 @@ from sglang_omni.models.qwen3_tts.predictor_kernels import (
     short_cache_gqa_npu,
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
+    build_speculative_probability_candidates,
+    fused_raw_logit_block_k,
     sample_codes_and_gather_codec_embedding,
     sample_from_logits_with_seed_top_k_top_p,
     sample_from_logprobs_with_seed_npu,
@@ -67,13 +72,27 @@ from sglang_omni.models.qwen3_tts.sampling_kernels import (
 from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
     Qwen3TTSSpeakerEncoderCudaGraphRunner,
 )
+from sglang_omni.models.qwen3_tts.speculative_rng import (
+    derive_speculative_request_seed,
+    speculative_uniforms,
+)
+from sglang_omni.models.qwen3_tts.speculative_runtime import (
+    accept_speculative_candidates,
+    expand_compact_probability_rows,
+    sample_compact_probability_rows,
+    speculative_sampling_fallback_reason,
+)
 from sglang_omni.platforms import current_platform
-from sglang_omni.platforms.device_graph import ReplayableGraph
+from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGraph
 from sglang_omni.sampling.sampler_compile import (
     SamplerCompileForms,
     compile_sampler_functions,
 )
 from sglang_omni.scheduling.types import SchedulerRequest
+from sglang_omni.utils.predictor_grouped_heads import (
+    grouped_lm_head_cuda_available,
+    grouped_lm_head_linear,
+)
 from sglang_omni.utils.predictor_layers import (
     ATTENTION_ROWS,
     decode_attention,
@@ -261,10 +280,13 @@ class PredictorSpeculativeStats(TypedDict):
     proposed_draft_tokens: int
     accepted_draft_tokens: int
     committed_codes: int
+    round_committed_codes: int
     bonus_tokens: int
     rejections: int
     average_codes_per_round: float
     packed_transformer_forwards: int
+    packed_query_slots: int
+    padded_query_slots: int
     draft_head_evaluations: int
     target_head_evaluations: int
     fused_predictor_forwards: int
@@ -272,7 +294,13 @@ class PredictorSpeculativeStats(TypedDict):
     standalone_correction_forward_count: int
     graph_replays: int
     graph_capture_failures: int
+    graph_captures: int
+    graph_capture_memory_delta_bytes: int
+    graph_capture_time_ms: float
+    configuration_time_ms: float
     native_fallback_count: int
+    attempted_frames: int
+    native_fallback_fraction: float
 
 
 class PredictorDecodeGraph:
@@ -346,6 +374,65 @@ class PredictorDecodeGraph:
         assert self.result_codes is not None
         assert self.summed_embeddings is not None
         return self.result_codes[:live], self.summed_embeddings[:live]
+
+
+class PredictorSpeculativeVerifyGraph:
+    """Persistent graph for the compute-heavy packed Predictor verifier."""
+
+    def __init__(
+        self,
+        batch_size: int,
+        verify_width: int,
+        *,
+        device: torch.device,
+        hidden_size: int,
+        hidden_dtype: torch.dtype,
+    ) -> None:
+        self.batch_size = batch_size
+        self.verify_width = verify_width
+        self.device = device
+        self.device_module = torch.get_device_module(device)
+        self.token_embeds = torch.zeros(
+            batch_size,
+            verify_width,
+            hidden_size,
+            device=device,
+            dtype=hidden_dtype,
+        )
+        self.positions = torch.full(
+            (batch_size * verify_width,),
+            -1,
+            device=device,
+            dtype=torch.long,
+        )
+        self.graph: ReplayableGraph | None = None
+        self.hidden_states: torch.Tensor | None = None
+
+    @torch.no_grad()
+    def replay(
+        self, token_embeds: torch.Tensor, positions: torch.Tensor
+    ) -> torch.Tensor:
+        live = int(token_embeds.shape[0])
+        if live > self.batch_size or token_embeds.shape[1] != self.verify_width:
+            raise ValueError("packed Predictor graph shape does not match its bucket")
+        else:
+            pass
+        if positions.shape != (live * self.verify_width,):
+            raise ValueError("packed Predictor graph positions have an invalid shape")
+        else:
+            pass
+        with self.device_module.device(self.device):
+            self.token_embeds[:live].copy_(token_embeds)
+            self.positions[: live * self.verify_width].copy_(positions)
+            if live < self.batch_size:
+                self.token_embeds[live:].zero_()
+                self.positions[live * self.verify_width :].fill_(-1)
+            else:
+                pass
+            assert self.graph is not None
+            self.graph.replay()
+        assert self.hidden_states is not None
+        return self.hidden_states[:live]
 
 
 class Qwen3TTSTalkerDecoderLayer(nn.Module):
@@ -1245,6 +1332,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.sub_sampling_seed_tensor = torch.zeros(
             max_batch_size, device=device, dtype=torch.long
         )
+        self.sub_speculative_seed_tensor: torch.Tensor | None = None
         self.sub_do_sample_tensor = torch.zeros(
             max_batch_size, device=device, dtype=torch.bool
         )
@@ -1254,6 +1342,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.sub_has_sampled_rows = False
         self.sub_has_argmax_rows = False
         self.sub_user_seed_rows: tuple[bool, ...] = ()
+        self.sub_request_ids: tuple[str, ...] = ()
+        self.sub_sample_rows: tuple[bool, ...] = ()
         self.sub_sampled_has_top_p = False
         self.sub_sampled_max_top_k = 0
         self.sub_sampled_has_unbounded_top_k = False
@@ -1277,6 +1367,20 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.predictor_eager_count = 0
         self.predictor_graph_pool = None
         self.predictor_capture_stream: torch.Stream | None = None
+        self.code_predictor_spec_backend = "cuda_graph"
+        self.code_predictor_spec_graphs: dict[
+            tuple[int, int], PredictorSpeculativeVerifyGraph
+        ] = {}
+        self.code_predictor_spec_lm_head_weights: torch.Tensor | None = None
+        self.code_predictor_spec_metadata_device: torch.Tensor | None = None
+        self.code_predictor_spec_metadata_host: torch.Tensor | None = None
+        self.code_predictor_spec_effective_width_histogram: dict[int, int] = {}
+        self.code_predictor_spec_graph_memory_delta_bytes = 0
+        self.code_predictor_spec_graph_capture_time_ms = 0.0
+        self.code_predictor_spec_configuration_time_ms = 0.0
+        self.code_predictor_spec_fused_predictor_forward_count = 0
+        self.code_predictor_spec_draft_head_evaluation_count = 0
+        self.code_predictor_spec_target_head_evaluation_count = 0
         self.code_predictor_spec_requested_width = 0
         self.code_predictor_spec_effective_width = 0
         self.code_predictor_spec_fallback_reason: str | None = None
@@ -1289,6 +1393,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_bonus_count = 0
         self.code_predictor_spec_rejection_count = 0
         self.code_predictor_spec_packed_forward_count = 0
+        self.code_predictor_spec_packed_query_slots = 0
+        self.code_predictor_spec_padded_query_slots = 0
         self.code_predictor_spec_graph_replay_count = 0
         self.code_predictor_spec_graph_capture_failure_count = 0
         bind_default_weight_loaders(self)
@@ -1308,7 +1414,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         # (request_id, per-data epoch); test doubles without request_id restage.
         rids: list[tuple[str, int]] | None = []
         for sched_req in requests:
-            rid = getattr(sched_req, "request_id", None)
+            rid = sched_req.request_id
             if rid is None:
                 rids = None
                 break
@@ -1328,6 +1434,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.decode_prep_rids = None
 
         semantic_seeds: list[int] = []
+        speculative_seeds: list[int] = []
+        request_ids: list[str] = []
         sub_temperatures: list[float] = []
         sub_top_ps: list[float] = []
         sub_top_ks: list[int] = []
@@ -1360,6 +1468,15 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             else:
                 pass
             semantic_seeds.append(semantic_seed)
+            request_id = sched_req.request_id
+            if request_id:
+                request_ids.append(request_id)
+                speculative_seeds.append(
+                    derive_speculative_request_seed(subtalker_seed, request_id)
+                )
+            else:
+                request_ids.append("")
+                speculative_seeds.append(0)
             sub_do_samples.append(do_sample)
             # note(ratish): the sampler divides by the temperature, staged clamped
             # so the sub-steps read it without a kernel.
@@ -1387,6 +1504,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.sub_has_sampled_rows = bool(sample_rows)
         self.sub_has_argmax_rows = len(sample_rows) < batch_size
         self.sub_user_seed_rows = tuple(user_seed_rows)
+        self.sub_request_ids = tuple(request_ids)
+        self.sub_sample_rows = tuple(sub_do_samples)
         self.sub_sampled_has_top_p = has_top_p
         self.sub_sampled_max_top_k = max_top_k
         self.sub_sampled_has_unbounded_top_k = has_unbounded_top_k
@@ -1411,6 +1530,15 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 torch.tensor(values, dtype=buffer.dtype, pin_memory=pin_memory),
                 non_blocking=True,
             )
+        if self.sub_speculative_seed_tensor is not None:
+            self.sub_speculative_seed_tensor[:batch_size].copy_(
+                torch.tensor(
+                    speculative_seeds, dtype=torch.long, pin_memory=pin_memory
+                ),
+                non_blocking=True,
+            )
+        else:
+            pass
         self.decode_prep_rids = rids
 
     @torch.no_grad()
@@ -1472,11 +1600,23 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             talker_hidden = talker_hidden.unsqueeze(1)
         else:
             pass
-        if (
-            self.code_predictor_spec_requested_width > 0
-            and self.code_predictor_spec_effective_width == 0
-        ):
-            self.code_predictor_spec_native_fallback_count += 1
+        if self.code_predictor_spec_requested_width > 0:
+            speculative_result = self.code_predictor_forward_speculative(
+                layer0_codes,
+                talker_hidden,
+                semantic_positions,
+            )
+            if speculative_result is not None:
+                return speculative_result
+            else:
+                self.code_predictor_spec_native_fallback_count += int(
+                    layer0_codes.shape[0]
+                )
+                self.code_predictor_spec_fallback_reason = (
+                    self.code_predictor_speculative_fallback_reason(
+                        layer0_codes, talker_hidden
+                    )
+                )
         else:
             pass
         graph_result = self.predictor_forward_graphed(
@@ -1496,6 +1636,532 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         )
         return result_codes, summed_embeddings
 
+    def code_predictor_speculative_fallback_reason(
+        self, layer0_codes: torch.Tensor, talker_hidden: torch.Tensor
+    ) -> str:
+        """Return the explicit reason the current request batch used native decode."""
+        if self.code_predictor_spec_effective_width <= 0:
+            return (
+                self.code_predictor_spec_fallback_reason
+                or "speculative-capability-unavailable"
+            )
+        else:
+            pass
+        sampling_reason = speculative_sampling_fallback_reason(
+            self.sub_request_ids,
+            self.sub_user_seed_rows,
+            self.sub_sample_rows,
+            has_unbounded_top_k=self.sub_sampled_has_unbounded_top_k,
+            deterministic_mode=bool(
+                get_exec().deterministic.enable_deterministic_inference
+            ),
+        )
+        if sampling_reason is not None:
+            return sampling_reason
+        else:
+            pass
+        if fused_raw_logit_block_k(self.sub_sampled_max_top_k) is None:
+            return "unsupported-sampling-configuration"
+        else:
+            pass
+        if self.predictor_cutedsl_layers is not None:
+            return "unsupported-predictor-backend"
+        else:
+            pass
+        if (
+            layer0_codes.shape[1] != 1
+            or talker_hidden.shape[1] != 1
+            or layer0_codes.device.type != "cuda"
+            or talker_hidden.device != self.predictor_device
+        ):
+            return "unsupported-frame-input-shape"
+        else:
+            pass
+        if self.code_predictor_spec_backend == "cuda_graph":
+            return "speculative-verifier-graph-unavailable-for-batch"
+        else:
+            pass
+        return "fused-predictor-capacity-unavailable"
+
+    def resolve_code_predictor_speculative_frame_path(
+        self, batch_size: int
+    ) -> tuple[int, PredictorSpeculativeVerifyGraph | None] | None:
+        """Resolve an eager or captured verifier before touching frame state."""
+        sampling_fallback = speculative_sampling_fallback_reason(
+            self.sub_request_ids,
+            self.sub_user_seed_rows,
+            self.sub_sample_rows,
+            has_unbounded_top_k=self.sub_sampled_has_unbounded_top_k,
+            deterministic_mode=bool(
+                get_exec().deterministic.enable_deterministic_inference
+            ),
+        )
+        if (
+            self.code_predictor_spec_effective_width <= 0
+            or batch_size <= 0
+            or batch_size != self.sub_batch_size
+            or self.predictor_device.type != "cuda"
+            or self.predictor_k_cache.dtype is not torch.bfloat16
+            or self.predictor_fused_layers is None
+            or self.predictor_cutedsl_layers is not None
+            or self.code_predictor_spec_lm_head_weights is None
+            or sampling_fallback is not None
+            or self.sub_has_argmax_rows
+            or not self.sub_has_sampled_rows
+            or fused_raw_logit_block_k(self.sub_sampled_max_top_k) is None
+        ):
+            return None
+        else:
+            pass
+
+        attention = self.code_predictor.model.layers[0].self_attn
+        if self.code_predictor_spec_backend == "eager":
+            width = resolve_fused_predictor_width(
+                self.code_predictor_spec_requested_width,
+                batch_size,
+                self.predictor_fused_layers.max_rows,
+                int(attention.num_heads),
+                int(attention.num_kv_heads),
+            )
+            if width < 2:
+                return None
+            else:
+                pass
+            return width, None
+        else:
+            pass
+
+        for bucket_size in self.predictor_graph_batch_sizes:
+            if bucket_size < batch_size:
+                continue
+            else:
+                pass
+            maximum_width = resolve_fused_predictor_width(
+                self.code_predictor_spec_requested_width,
+                bucket_size,
+                self.predictor_fused_layers.max_rows,
+                int(attention.num_heads),
+                int(attention.num_kv_heads),
+            )
+            for width in range(maximum_width, 1, -1):
+                graph = self.code_predictor_spec_graphs.get((bucket_size, width))
+                if graph is not None:
+                    return width, graph
+                else:
+                    pass
+        return None
+
+    @torch.no_grad()
+    def code_predictor_forward_speculative(
+        self,
+        layer0_codes: torch.Tensor,
+        talker_hidden: torch.Tensor,
+        semantic_positions: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Execute one complete Predictor frame with packed speculative rounds."""
+        batch_size = int(layer0_codes.shape[0])
+        if (
+            layer0_codes.shape[1] != 1
+            or talker_hidden.shape[0] != batch_size
+            or talker_hidden.shape[1] != 1
+        ):
+            return None
+        else:
+            pass
+        frame_path = self.resolve_code_predictor_speculative_frame_path(batch_size)
+        if frame_path is None:
+            return None
+        else:
+            pass
+        verify_width, verify_graph = frame_path
+        proposal_width = verify_width - 1
+        num_groups = int(self.config.num_code_groups)
+        vocab_size = int(self.config.code_predictor_config.vocab_size)
+        predictor_dtype = self.predictor_k_cache.dtype
+        semantic_positions = self.normalize_semantic_positions(
+            semantic_positions,
+            batch_size=batch_size,
+            seq_len=1,
+            device=layer0_codes.device,
+        )[:, 0]
+
+        result_codes = self.output_codes[:batch_size].unsqueeze(-1)
+        code_outputs = result_codes[:, :, 0]
+        summed_embeddings = self.output_embeds[:batch_size].unsqueeze(1)
+        summed_embeddings.zero_()
+        layer0_embed = self.get_input_embeddings()(layer0_codes).to(
+            dtype=predictor_dtype
+        )
+        code_outputs[:, 0].copy_(layer0_codes[:, 0])
+        summed_embeddings[:, 0, :].add_(layer0_embed[:, 0, :])
+        pair_embeds = self.code_predictor.project_input(
+            torch.cat(
+                (
+                    talker_hidden.to(dtype=predictor_dtype),
+                    layer0_embed,
+                ),
+                dim=1,
+            )
+        )
+        pair_hidden = self.predictor_forward_tokens(
+            token_embeds=pair_embeds,
+            batch_size=batch_size,
+            cache_len=0,
+        )
+        self.code_predictor_spec_fused_predictor_forward_count += 1
+        code1_logits, _ = self.code_predictor.lm_head[0](pair_hidden[:, 1:, :])
+        sub_positions = self.sub_seed_positions(semantic_positions)[0]
+        codec_tables = self.code_predictor.model.codec_embedding.weight
+        projected_tables = self.predictor_projected_embeddings
+        projected_table = None if projected_tables is None else projected_tables[0]
+        self.sample_subtalker_embedding(
+            code1_logits[:, -1, :],
+            codec_tables[0],
+            summed_embeddings[:, 0, :],
+            code_outputs[:, 1],
+            projected_table,
+            self.predictor_embedding_buffer[:batch_size],
+            (
+                None
+                if self.predictor_projected_buffer is None
+                else self.predictor_projected_buffer[:batch_size]
+            ),
+            sub_positions,
+        )
+
+        committed_depths = torch.ones(
+            batch_size, device=self.predictor_device, dtype=torch.long
+        )
+        logical_kv_lengths = torch.full_like(committed_depths, 2)
+        pending_tokens = code_outputs[:, 1].clone()
+        preceding_hidden = pair_hidden[:, 1, :].contiguous()
+        active_rows = torch.ones(
+            batch_size, device=self.predictor_device, dtype=torch.bool
+        )
+        metadata_device = self.code_predictor_spec_metadata_device
+        metadata_host = self.code_predictor_spec_metadata_host
+        if metadata_device is None or metadata_host is None:
+            raise RuntimeError("speculative metadata buffers were not configured")
+        else:
+            pass
+
+        batch_rows = torch.arange(batch_size, device=self.predictor_device)
+        query_offsets = torch.arange(
+            verify_width, device=self.predictor_device, dtype=torch.long
+        )
+        proposal_offsets = torch.arange(
+            proposal_width, device=self.predictor_device, dtype=torch.long
+        )
+        proposal_head_rows = batch_rows.repeat_interleave(proposal_width)
+        target_hidden_rows = torch.arange(
+            batch_size * verify_width, device=self.predictor_device, dtype=torch.long
+        )
+        temperatures = self.sub_temperature_tensor[:batch_size]
+        top_ks = self.sub_top_k_tensor[:batch_size]
+        top_ps = self.sub_top_p_tensor[:batch_size]
+        speculative_seed_buffer = self.sub_speculative_seed_tensor
+        if speculative_seed_buffer is None:
+            raise RuntimeError("speculative request seeds were not configured")
+        else:
+            pass
+        speculative_seeds = speculative_seed_buffer[:batch_size]
+        max_top_k = int(self.sub_sampled_max_top_k)
+        has_top_p = bool(self.sub_sampled_has_top_p)
+        round_index = 0
+
+        while True:
+            remaining_proposals = (num_groups - 2 - committed_depths).clamp_min(0)
+            proposal_counts = torch.minimum(
+                remaining_proposals,
+                torch.full_like(remaining_proposals, proposal_width),
+            )
+            proposal_counts = torch.where(
+                active_rows, proposal_counts, torch.zeros_like(proposal_counts)
+            )
+            active_proposals = proposal_offsets.unsqueeze(
+                0
+            ) < proposal_counts.unsqueeze(1)
+            proposal_head_indices = (
+                committed_depths.unsqueeze(1) + proposal_offsets.unsqueeze(0)
+            ).reshape(-1)
+            proposal_logits = grouped_lm_head_linear(
+                preceding_hidden,
+                self.code_predictor_spec_lm_head_weights,
+                proposal_head_rows,
+                proposal_head_indices,
+                active_proposals.reshape(-1).contiguous(),
+            )
+            flat_proposal_temperatures = temperatures.repeat_interleave(proposal_width)
+            flat_proposal_top_ks = top_ks.repeat_interleave(proposal_width)
+            flat_proposal_top_ps = top_ps.repeat_interleave(proposal_width)
+            proposal_candidates = build_speculative_probability_candidates(
+                proposal_logits,
+                flat_proposal_temperatures.contiguous(),
+                flat_proposal_top_ks.contiguous(),
+                flat_proposal_top_ps.contiguous(),
+                active_proposals.reshape(-1).contiguous(),
+                max_top_k=max_top_k,
+                has_top_p=has_top_p,
+                has_unbounded_top_k=False,
+            )
+            if proposal_candidates is None:
+                raise RuntimeError(
+                    "speculative proposal probability kernel rejected a preflighted shape"
+                )
+            else:
+                pass
+            proposal_probabilities_compact, proposal_ids_compact = proposal_candidates
+            proposal_uniforms = speculative_uniforms(
+                speculative_seeds,
+                semantic_positions,
+                round_index,
+                num_groups,
+                proposal_width,
+                "proposal",
+            )
+            draft_tokens = sample_compact_probability_rows(
+                proposal_probabilities_compact,
+                proposal_ids_compact,
+                proposal_uniforms.reshape(-1),
+                active_proposals.reshape(-1),
+            ).view(batch_size, proposal_width)
+            draft_probabilities = expand_compact_probability_rows(
+                proposal_probabilities_compact,
+                proposal_ids_compact,
+                vocab_size,
+            ).view(batch_size, proposal_width, vocab_size)
+
+            valid_query_counts = torch.where(
+                active_rows,
+                proposal_counts + 1,
+                torch.zeros_like(proposal_counts),
+            )
+            valid_queries = query_offsets.unsqueeze(0) < valid_query_counts.unsqueeze(1)
+            query_depths = committed_depths.unsqueeze(1) + query_offsets.unsqueeze(0)
+            query_tokens = torch.cat((pending_tokens[:, None], draft_tokens), dim=1)
+            safe_query_depths = (query_depths - 1).clamp(
+                min=0, max=codec_tables.shape[0] - 1
+            )
+            safe_query_tokens = query_tokens.clamp(min=0, max=vocab_size - 1)
+            raw_query_embeddings = codec_tables[safe_query_depths, safe_query_tokens]
+            if projected_tables is None:
+                query_embeddings = self.code_predictor.project_input(
+                    raw_query_embeddings
+                )
+            else:
+                safe_projected_depths = (query_depths - 1).clamp(
+                    min=0, max=projected_tables.shape[0] - 1
+                )
+                query_embeddings = projected_tables[
+                    safe_projected_depths, safe_query_tokens
+                ]
+            query_embeddings = torch.where(
+                valid_queries.unsqueeze(-1),
+                query_embeddings,
+                torch.zeros_like(query_embeddings),
+            ).to(dtype=predictor_dtype)
+            packed_positions = logical_kv_lengths.unsqueeze(
+                1
+            ) + query_offsets.unsqueeze(0)
+            packed_positions = (
+                torch.where(
+                    valid_queries,
+                    packed_positions,
+                    torch.full_like(packed_positions, -1),
+                )
+                .reshape(-1)
+                .contiguous()
+            )
+            if verify_graph is None:
+                verified_hiddens = self.predictor_forward_packed_tokens(
+                    token_embeds=query_embeddings,
+                    positions=packed_positions,
+                    batch_size=batch_size,
+                )
+            else:
+                verified_hiddens = verify_graph.replay(
+                    query_embeddings,
+                    packed_positions,
+                )
+                self.code_predictor_spec_graph_replay_count += 1
+            target_head_indices = query_depths.reshape(-1)
+            target_logits = grouped_lm_head_linear(
+                verified_hiddens.reshape(-1, verified_hiddens.shape[-1]),
+                self.code_predictor_spec_lm_head_weights,
+                target_hidden_rows,
+                target_head_indices,
+                valid_queries.reshape(-1).contiguous(),
+            ).view(batch_size, verify_width, vocab_size)
+            flat_target_temperatures = temperatures.repeat_interleave(verify_width)
+            flat_target_top_ks = top_ks.repeat_interleave(verify_width)
+            flat_target_top_ps = top_ps.repeat_interleave(verify_width)
+            target_candidates = build_speculative_probability_candidates(
+                target_logits.reshape(-1, vocab_size).contiguous(),
+                flat_target_temperatures.contiguous(),
+                flat_target_top_ks.contiguous(),
+                flat_target_top_ps.contiguous(),
+                valid_queries.reshape(-1).contiguous(),
+                max_top_k=max_top_k,
+                has_top_p=has_top_p,
+                has_unbounded_top_k=False,
+            )
+            if target_candidates is None:
+                raise RuntimeError(
+                    "speculative target probability kernel rejected a preflighted shape"
+                )
+            else:
+                pass
+            target_probabilities_compact, target_ids_compact = target_candidates
+            target_probabilities = expand_compact_probability_rows(
+                target_probabilities_compact,
+                target_ids_compact,
+                vocab_size,
+            ).view(batch_size, verify_width, vocab_size)
+            acceptance_uniforms = speculative_uniforms(
+                speculative_seeds,
+                semantic_positions,
+                round_index,
+                num_groups,
+                proposal_width,
+                "acceptance",
+            )
+            correction_uniforms = speculative_uniforms(
+                speculative_seeds,
+                semantic_positions,
+                round_index,
+                num_groups,
+                verify_width,
+                "correction",
+            )
+            bonus_uniforms = speculative_uniforms(
+                speculative_seeds,
+                semantic_positions,
+                round_index,
+                num_groups,
+                verify_width,
+                "bonus",
+            )
+            decision = accept_speculative_candidates(
+                draft_tokens,
+                draft_probabilities,
+                target_probabilities,
+                proposal_counts,
+                active_rows,
+                acceptance_uniforms,
+                correction_uniforms,
+                bonus_uniforms,
+            )
+
+            commit_offsets = query_offsets
+            valid_commits = commit_offsets.unsqueeze(
+                0
+            ) < decision.committed_token_counts.unsqueeze(1)
+            valid_commits = valid_commits & active_rows.unsqueeze(1)
+            output_depths = (
+                committed_depths.unsqueeze(1) + 1 + commit_offsets.unsqueeze(0)
+            )
+            safe_output_depths = output_depths.clamp(max=num_groups - 1)
+            safe_table_depths = (safe_output_depths - 1).clamp(
+                min=0, max=codec_tables.shape[0] - 1
+            )
+            committed_tokens = decision.committed_tokens[:, :verify_width]
+            for commit_offset in range(verify_width):
+                token_at_offset = committed_tokens[:, commit_offset].clamp(
+                    min=0, max=vocab_size - 1
+                )
+                output_depth_at_offset = safe_output_depths[:, commit_offset]
+                previous_code = code_outputs[batch_rows, output_depth_at_offset]
+                code_outputs[batch_rows, output_depth_at_offset] = torch.where(
+                    valid_commits[:, commit_offset],
+                    token_at_offset,
+                    previous_code,
+                )
+                table_depth_at_offset = safe_table_depths[:, commit_offset]
+                committed_embedding = codec_tables[
+                    table_depth_at_offset, token_at_offset
+                ]
+                summed_embeddings[:, 0, :].add_(
+                    torch.where(
+                        valid_commits[:, commit_offset, None],
+                        committed_embedding,
+                        torch.zeros_like(committed_embedding),
+                    )
+                )
+
+            previous_depths = committed_depths
+            previous_kv_lengths = logical_kv_lengths
+            commit_counts = decision.committed_token_counts
+            accepted_counts = decision.accepted_draft_counts
+            safe_final_offsets = (commit_counts - 1).clamp(min=0, max=verify_width - 1)
+            final_tokens = decision.committed_tokens.gather(
+                1, safe_final_offsets.unsqueeze(1)
+            ).squeeze(1)
+            verified_preceding_hidden = verified_hiddens[
+                batch_rows, accepted_counts.clamp(max=verify_width - 1)
+            ]
+            has_commit = active_rows & (commit_counts > 0)
+            pending_tokens = torch.where(has_commit, final_tokens, pending_tokens)
+            preceding_hidden = torch.where(
+                has_commit.unsqueeze(1),
+                verified_preceding_hidden,
+                preceding_hidden,
+            )
+            committed_depths = previous_depths + commit_counts
+            logical_kv_lengths = previous_kv_lengths + commit_counts
+            active_rows = committed_depths < (num_groups - 1)
+
+            metadata_device[:batch_size, 0].copy_(accepted_counts)
+            metadata_device[:batch_size, 1].copy_(active_rows.to(torch.long))
+            metadata_device[:batch_size, 2].copy_(proposal_counts)
+            metadata_device[:batch_size, 3].copy_(commit_counts)
+            metadata_device[:batch_size, 4].copy_(decision.bonus_rows.to(torch.long))
+            metadata_device[:batch_size, 5].copy_(decision.rejected_rows.to(torch.long))
+            metadata_device[:batch_size, 6].copy_(valid_query_counts)
+            metadata_host[:batch_size].copy_(
+                metadata_device[:batch_size],
+                non_blocking=metadata_host.is_pinned(),
+            )
+            current_stream = self.predictor_device_module.current_stream(
+                self.predictor_device
+            )
+            current_stream.synchronize()
+            round_metadata = metadata_host[:batch_size]
+            active_count = int(round_metadata[:, 1].sum())
+            self.code_predictor_spec_round_count += 1
+            self.code_predictor_spec_proposed_count += int(round_metadata[:, 2].sum())
+            self.code_predictor_spec_accepted_count += int(round_metadata[:, 0].sum())
+            self.code_predictor_spec_committed_count += int(round_metadata[:, 3].sum())
+            self.code_predictor_spec_bonus_count += int(round_metadata[:, 4].sum())
+            self.code_predictor_spec_rejection_count += int(round_metadata[:, 5].sum())
+            self.code_predictor_spec_packed_forward_count += 1
+            self.code_predictor_spec_effective_width_histogram[verify_width] = (
+                self.code_predictor_spec_effective_width_histogram.get(verify_width, 0)
+                + 1
+            )
+            self.code_predictor_spec_fused_predictor_forward_count += 1
+            draft_evaluation_count = int(round_metadata[:, 2].sum())
+            valid_target_count = int(round_metadata[:, 6].sum())
+            self.code_predictor_spec_draft_head_evaluation_count += (
+                draft_evaluation_count
+            )
+            self.code_predictor_spec_target_head_evaluation_count += valid_target_count
+            graph_batch_size = (
+                batch_size if verify_graph is None else verify_graph.batch_size
+            )
+            packed_query_slots = graph_batch_size * verify_width
+            self.code_predictor_spec_packed_query_slots += packed_query_slots
+            self.code_predictor_spec_padded_query_slots += (
+                packed_query_slots - valid_target_count
+            )
+            round_index += 1
+            if active_count == 0:
+                break
+            else:
+                pass
+
+        self.code_predictor_spec_frame_count += batch_size
+        return result_codes, summed_embeddings
+
     def predictor_graph_stats(self) -> PredictorGraphStats:
         return {
             "enabled": self.predictor_graph_enabled,
@@ -1508,37 +2174,52 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             "capture_failures": self.predictor_graph_failure_count,
         }
 
-    def configure_code_predictor_speculation(self, requested_width: int) -> None:
-        """Allocate opt-in fused scratch before graph capture, then resolve support."""
+    def configure_code_predictor_speculation(
+        self,
+        requested_width: int,
+        *,
+        backend: Literal["cuda_graph", "eager"] = "cuda_graph",
+    ) -> None:
+        """Allocate opt-in scratch and resolve the selected speculative backend."""
+        configuration_started = time.perf_counter()
         speculative_resources_requested(requested_width)
+        if backend not in ("cuda_graph", "eager"):
+            raise ValueError(
+                "CodePredictor speculative backend must be cuda_graph or eager"
+            )
+        else:
+            pass
         self.code_predictor_spec_requested_width = requested_width
+        self.code_predictor_spec_backend = backend
         self.code_predictor_spec_effective_width = 0
         self.code_predictor_spec_fallback_reason = None
+        self.code_predictor_spec_graphs.clear()
         if requested_width == 0:
+            self.sub_speculative_seed_tensor = None
+            self.code_predictor_spec_lm_head_weights = None
+            self.code_predictor_spec_metadata_device = None
+            self.code_predictor_spec_metadata_host = None
+            self.code_predictor_spec_configuration_time_ms = (
+                time.perf_counter() - configuration_started
+            ) * 1000.0
             return
         else:
             pass
+
+        if self.sub_speculative_seed_tensor is None:
+            self.sub_speculative_seed_tensor = torch.zeros(
+                self.predictor_max_batch_size,
+                device=self.predictor_device,
+                dtype=torch.long,
+            )
+        else:
+            pass
+
         attention = self.code_predictor.model.layers[0].self_attn
         if self.predictor_fused_layers is not None:
-            graph_batch_size = max(self.predictor_graph_batch_sizes)
-            requested_capacity = fused_predictor_scratch_rows(
+            requested_scratch_rows = fused_predictor_scratch_rows(
                 self.predictor_max_batch_size, requested_width
             )
-            capacity_width = resolve_fused_predictor_width(
-                requested_width,
-                graph_batch_size,
-                requested_capacity,
-                int(attention.num_heads),
-                int(attention.num_kv_heads),
-            )
-            if capacity_width >= 2:
-                requested_scratch_rows = fused_predictor_scratch_rows(
-                    self.predictor_max_batch_size, capacity_width
-                )
-                width_to_resolve = capacity_width
-            else:
-                requested_scratch_rows = self.predictor_fused_layers.max_rows
-                width_to_resolve = requested_width
             if requested_scratch_rows > self.predictor_fused_layers.max_rows:
                 self.predictor_fused_layers = resolve_fused_predictor_layers(
                     self.code_predictor,
@@ -1546,31 +2227,116 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     self.predictor_max_batch_size,
                     self.predictor_device,
                     self.predictor_k_cache.dtype,
-                    max_tokens_per_row=capacity_width,
+                    max_tokens_per_row=requested_width,
                 )
             else:
                 pass
         else:
-            graph_batch_size = max(self.predictor_graph_batch_sizes)
-            width_to_resolve = requested_width
+            pass
+        head_count = int(self.config.num_code_groups) - 1
+        vocab_size = int(self.config.code_predictor_config.vocab_size)
+        lm_head_weights_supported = all(
+            isinstance(lm_head.quant_method, UnquantizedLinearMethod)
+            and lm_head.bias is None
+            and lm_head.weight.device == self.predictor_device
+            and lm_head.weight.dtype is torch.bfloat16
+            and lm_head.weight.is_contiguous()
+            and tuple(lm_head.weight.shape)
+            == (
+                vocab_size,
+                int(self.code_predictor.model.norm.weight.shape[0]),
+            )
+            for lm_head in self.code_predictor.lm_head
+        )
+        if (
+            current_platform.is_cuda()
+            and grouped_lm_head_cuda_available()
+            and self.predictor_fused_layers is not None
+            and self.predictor_k_cache.dtype is torch.bfloat16
+            and int(get_parallel().tp_size) == 1
+            and lm_head_weights_supported
+        ):
+            head_weight = self.code_predictor.lm_head[0].weight
+            hidden_size = int(head_weight.shape[1])
+            self.code_predictor_spec_lm_head_weights = torch.empty(
+                (head_count, vocab_size, hidden_size),
+                device=self.predictor_device,
+                dtype=self.predictor_k_cache.dtype,
+            )
+            self.copy_code_predictor_spec_lm_head_weights()
+            self.code_predictor_spec_metadata_device = torch.empty(
+                (self.predictor_max_batch_size, 7),
+                device=self.predictor_device,
+                dtype=torch.long,
+            )
+            pin_memory = is_pin_memory_available(self.predictor_device)
+            self.code_predictor_spec_metadata_host = torch.empty(
+                (self.predictor_max_batch_size, 7),
+                dtype=torch.long,
+                pin_memory=pin_memory,
+            )
+        else:
+            self.code_predictor_spec_lm_head_weights = None
+            self.code_predictor_spec_metadata_device = None
+            self.code_predictor_spec_metadata_host = None
+
+        if (
+            backend == "cuda_graph"
+            and self.code_predictor_spec_lm_head_weights is not None
+        ):
+            self.capture_code_predictor_speculative_graphs(requested_width)
+        else:
+            pass
+
+        graph_available = backend == "eager" or bool(self.code_predictor_spec_graphs)
+        capacity_rows = (
+            0
+            if self.predictor_fused_layers is None
+            else self.predictor_fused_layers.max_rows
+        )
+        largest_eligible_width = 0
+        if self.predictor_fused_layers is not None:
+            for batch_size in self.predictor_graph_batch_sizes:
+                resolved_width = resolve_fused_predictor_width(
+                    requested_width,
+                    batch_size,
+                    capacity_rows,
+                    int(attention.num_heads),
+                    int(attention.num_kv_heads),
+                )
+                largest_eligible_width = max(largest_eligible_width, resolved_width)
+        else:
+            pass
+        if backend == "cuda_graph":
+            largest_eligible_width = max(
+                (width for _, width in self.code_predictor_spec_graphs),
+                default=0,
+            )
+        else:
+            pass
+        width_to_resolve = largest_eligible_width or requested_width
         resolution = resolve_speculative_capability(
             width_to_resolve,
             is_cuda=current_platform.is_cuda(),
-            is_bfloat16=self.predictor_k_cache.dtype == torch.bfloat16,
+            is_bfloat16=(
+                self.predictor_k_cache.dtype is torch.bfloat16
+                and lm_head_weights_supported
+            ),
             tensor_parallel_size=int(get_parallel().tp_size),
             fused_predictor_available=self.predictor_fused_layers is not None,
-            batch_size=graph_batch_size,
-            packed_row_capacity=(
-                0
-                if self.predictor_fused_layers is None
-                else self.predictor_fused_layers.max_rows
-            ),
+            batch_size=1,
+            packed_row_capacity=capacity_rows,
             query_heads=int(attention.num_heads),
             kv_heads=int(attention.num_kv_heads),
             attention_tile_capacity=ATTENTION_ROWS,
             vocab_size=int(self.config.code_predictor_config.vocab_size),
-            graph_available=False,
-            sampling_supported=False,
+            grouped_lm_head_supported=(
+                grouped_lm_head_cuda_available() and lm_head_weights_supported
+            ),
+            graph_available=graph_available,
+            sampling_supported=(
+                self.predictor_device.type == "cuda" and lm_head_weights_supported
+            ),
             has_explicit_seed=False,
             has_greedy_rows=False,
             deterministic_mode=bool(
@@ -1579,6 +2345,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         )
         self.code_predictor_spec_effective_width = resolution.effective_width
         self.code_predictor_spec_fallback_reason = resolution.fallback_reason
+        self.code_predictor_spec_configuration_time_ms = (
+            time.perf_counter() - configuration_started
+        ) * 1000.0
         if resolution.fallback_reason is not None:
             logger.warning(
                 "Qwen3-TTS CodePredictor speculative decoding requested at width %d "
@@ -1588,6 +2357,141 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             )
         else:
             pass
+
+    def copy_code_predictor_spec_lm_head_weights(self) -> None:
+        """Refresh the persistent grouped-head layout after checkpoint loading."""
+        packed_weights = self.code_predictor_spec_lm_head_weights
+        if packed_weights is None:
+            return
+        else:
+            pass
+        for head_index, lm_head in enumerate(self.code_predictor.lm_head):
+            packed_weights[head_index].copy_(lm_head.weight)
+
+    def capture_code_predictor_speculative_graphs(self, requested_width: int) -> int:
+        """Capture verifier graphs for supported batch buckets before decoding."""
+        if self.predictor_fused_layers is None:
+            return 0
+        else:
+            pass
+        if bool(get_exec().graph.disable_cuda_graph):
+            return 0
+        else:
+            pass
+        backend = current_platform.get_device_graph_backend(self.predictor_device)
+        if backend is None:
+            return 0
+        else:
+            pass
+        attention = self.code_predictor.model.layers[0].self_attn
+        capture_count = 0
+        capture_started = time.perf_counter()
+        for bucket_size in reversed(self.predictor_graph_batch_sizes):
+            maximum_verify_width = resolve_fused_predictor_width(
+                requested_width,
+                bucket_size,
+                self.predictor_fused_layers.max_rows,
+                int(attention.num_heads),
+                int(attention.num_kv_heads),
+            )
+            if maximum_verify_width < 2:
+                continue
+            else:
+                pass
+            for verify_width in range(maximum_verify_width, 1, -1):
+                try:
+                    graph = self.capture_code_predictor_speculative_verify_graph(
+                        bucket_size, verify_width, backend
+                    )
+                except Exception:
+                    self.code_predictor_spec_graph_capture_failure_count += 1
+                    logger.warning(
+                        "Failed to capture CodePredictor verifier graph for batch=%d width=%d",
+                        bucket_size,
+                        verify_width,
+                        exc_info=True,
+                    )
+                else:
+                    self.code_predictor_spec_graphs[(bucket_size, verify_width)] = graph
+                    capture_count += 1
+                    break
+                if verify_width == 2:
+                    break
+                else:
+                    pass
+        self.code_predictor_spec_graph_capture_time_ms += (
+            time.perf_counter() - capture_started
+        ) * 1000.0
+        return capture_count
+
+    def capture_code_predictor_speculative_verify_graph(
+        self, batch_size: int, verify_width: int, backend: DeviceGraphBackend
+    ) -> PredictorSpeculativeVerifyGraph:
+        """Capture a packed verifier over stable graph-owned input buffers."""
+        graph = PredictorSpeculativeVerifyGraph(
+            batch_size,
+            verify_width,
+            device=self.predictor_device,
+            hidden_size=int(self.output_embeds.shape[-1]),
+            hidden_dtype=self.output_embeds.dtype,
+        )
+        graph.positions.view(batch_size, verify_width).copy_(
+            torch.arange(verify_width, device=self.predictor_device).expand(
+                batch_size, verify_width
+            )
+        )
+        module = self.predictor_device_module
+        if self.predictor_capture_stream is None:
+            self.predictor_capture_stream = module.Stream(device=self.predictor_device)
+        else:
+            pass
+        capture_stream = self.predictor_capture_stream
+        current_stream = module.current_stream(self.predictor_device)
+        capture_stream.wait_stream(current_stream)
+        memory_before = torch.cuda.memory_allocated(self.predictor_device)
+        captured = None
+        try:
+            with (
+                module.device(self.predictor_device),
+                current_platform.graph_capture_attention(),
+                module.stream(capture_stream),
+            ):
+                self.predictor_forward_packed_tokens(
+                    token_embeds=graph.token_embeds,
+                    positions=graph.positions,
+                    batch_size=batch_size,
+                )
+                with backend.capture(
+                    pool=self.predictor_graph_memory_pool(),
+                    stream=capture_stream,
+                    thread_local_errors=True,
+                ) as captured:
+                    graph.hidden_states = self.predictor_forward_packed_tokens(
+                        token_embeds=graph.token_embeds,
+                        positions=graph.positions,
+                        batch_size=batch_size,
+                    )
+        except Exception:
+            if captured is not None:
+                try:
+                    captured.reset()
+                except Exception:
+                    pass
+            else:
+                pass
+            raise
+        finally:
+            current_stream.wait_stream(capture_stream)
+        memory_after = torch.cuda.memory_allocated(self.predictor_device)
+        self.code_predictor_spec_graph_memory_delta_bytes += max(
+            memory_after - memory_before, 0
+        )
+        graph.graph = captured
+        if graph.hidden_states is None:
+            raise RuntimeError("CodePredictor verifier graph captured no outputs")
+        else:
+            pass
+        return graph
 
     def predictor_speculative_stats(self) -> PredictorSpeculativeStats:
         average_codes_per_round = (
@@ -1604,29 +2508,61 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 if self.predictor_fused_layers is None
                 else self.predictor_fused_layers.max_rows
             ),
-            "effective_width_histogram": {},
+            "effective_width_histogram": {
+                str(width): count
+                for width, count in self.code_predictor_spec_effective_width_histogram.items()
+            },
             "fallback_reason": self.code_predictor_spec_fallback_reason,
             "frames": self.code_predictor_spec_frame_count,
             "rounds": self.code_predictor_spec_round_count,
             "proposed_draft_tokens": self.code_predictor_spec_proposed_count,
             "accepted_draft_tokens": self.code_predictor_spec_accepted_count,
-            "committed_codes": self.code_predictor_spec_committed_count,
+            "committed_codes": (
+                self.code_predictor_spec_committed_count
+                + self.code_predictor_spec_frame_count
+            ),
+            "round_committed_codes": self.code_predictor_spec_committed_count,
             "bonus_tokens": self.code_predictor_spec_bonus_count,
             "rejections": self.code_predictor_spec_rejection_count,
             "average_codes_per_round": average_codes_per_round,
             "packed_transformer_forwards": (
                 self.code_predictor_spec_packed_forward_count
             ),
-            "draft_head_evaluations": 0,
-            "target_head_evaluations": 0,
-            "fused_predictor_forwards": 0,
+            "packed_query_slots": self.code_predictor_spec_packed_query_slots,
+            "padded_query_slots": self.code_predictor_spec_padded_query_slots,
+            "draft_head_evaluations": self.code_predictor_spec_draft_head_evaluation_count,
+            "target_head_evaluations": self.code_predictor_spec_target_head_evaluation_count,
+            "fused_predictor_forwards": self.code_predictor_spec_fused_predictor_forward_count,
             "generic_predictor_forwards": 0,
             "standalone_correction_forward_count": 0,
             "graph_replays": self.code_predictor_spec_graph_replay_count,
             "graph_capture_failures": (
                 self.code_predictor_spec_graph_capture_failure_count
             ),
+            "graph_captures": len(self.code_predictor_spec_graphs),
+            "graph_capture_memory_delta_bytes": (
+                self.code_predictor_spec_graph_memory_delta_bytes
+            ),
+            "graph_capture_time_ms": self.code_predictor_spec_graph_capture_time_ms,
+            "configuration_time_ms": self.code_predictor_spec_configuration_time_ms,
             "native_fallback_count": self.code_predictor_spec_native_fallback_count,
+            "attempted_frames": (
+                self.code_predictor_spec_frame_count
+                + self.code_predictor_spec_native_fallback_count
+            ),
+            "native_fallback_fraction": (
+                self.code_predictor_spec_native_fallback_count
+                / (
+                    self.code_predictor_spec_frame_count
+                    + self.code_predictor_spec_native_fallback_count
+                )
+                if (
+                    self.code_predictor_spec_frame_count
+                    + self.code_predictor_spec_native_fallback_count
+                )
+                > 0
+                else 0.0
+            ),
         }
 
     @staticmethod
@@ -2537,6 +3473,56 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         )
         return normed.reshape(batch_size, num_tokens, hidden_size)
 
+    def predictor_forward_packed_tokens(
+        self,
+        *,
+        token_embeds: torch.Tensor,
+        positions: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        """Run packed Predictor queries only through the production fused stack."""
+        if token_embeds.ndim != 3 or token_embeds.shape[0] != batch_size:
+            raise ValueError(
+                "packed Predictor embeddings must have shape [batch, width, hidden]"
+            )
+        else:
+            pass
+        if positions.shape != (batch_size * token_embeds.shape[1],):
+            raise ValueError("packed Predictor positions must align with query rows")
+        else:
+            pass
+        if (
+            token_embeds.device != self.predictor_device
+            or positions.device != self.predictor_device
+        ):
+            raise ValueError("packed Predictor tensors must use the Predictor device")
+        else:
+            pass
+        fused = self.predictor_fused_layers
+        packed_rows = batch_size * token_embeds.shape[1]
+        if fused is None or not fused.covers(packed_rows):
+            raise RuntimeError("packed Predictor fused scratch capacity is unavailable")
+        else:
+            pass
+        attention = self.code_predictor.model.layers[0].self_attn
+        if (
+            token_embeds.shape[1]
+            * (int(attention.num_heads) // int(attention.num_kv_heads))
+            > ATTENTION_ROWS
+        ):
+            raise RuntimeError("packed Predictor exceeds fused attention tile capacity")
+        else:
+            pass
+        return fused.forward(
+            layers=self.code_predictor.model.layers,
+            final_norm=self.code_predictor.model.norm,
+            token_embeds=token_embeds,
+            batch_size=batch_size,
+            positions=positions,
+            k_cache=self.predictor_k_cache,
+            v_cache=self.predictor_v_cache,
+        )
+
     @staticmethod
     def predictor_o_proj_add_residual(
         o_proj: RowParallelLinear,
@@ -2741,6 +3727,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
     def post_load_weights(self) -> None:
         """Rebuild the projected codec tables; the loaders call this after every
         weight load."""
+        self.copy_code_predictor_spec_lm_head_weights()
         if self.predictor_projected_embeddings is None:
             pass
         else:

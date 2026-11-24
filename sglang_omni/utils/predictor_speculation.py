@@ -85,6 +85,7 @@ def resolve_speculative_capability(
     kv_heads: int,
     attention_tile_capacity: int,
     vocab_size: int,
+    grouped_lm_head_supported: bool,
     graph_available: bool,
     sampling_supported: bool,
     has_explicit_seed: bool,
@@ -126,6 +127,8 @@ def resolve_speculative_capability(
         reason = "attention-tile-capacity-exceeded"
     elif vocab_size != 2048:
         reason = "unsupported-codebook-vocabulary"
+    elif not grouped_lm_head_supported:
+        reason = "grouped-lm-head-unavailable"
     elif not graph_available:
         reason = "speculative-graph-unavailable"
     elif not sampling_supported:

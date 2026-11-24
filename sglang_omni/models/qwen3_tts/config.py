@@ -7,7 +7,7 @@ import base64
 import json
 import re
 from pathlib import Path
-from typing import ClassVar, TypedDict
+from typing import ClassVar, Literal, TypedDict
 
 from pydantic import field_validator
 
@@ -55,6 +55,7 @@ class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
     codec_state_slots: int | None
     shares_engine_speech_tokenizer: bool
     code_predictor_spec_verify_size: int
+    code_predictor_spec_backend: Literal["cuda_graph", "eager"]
 
 
 class Qwen3TTSPipelineConfig(PipelineConfig):
@@ -95,6 +96,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
     # reducing throughput.
     enable_deterministic_inference: bool = False
     code_predictor_spec_verify_size: int = 0
+    code_predictor_spec_backend: Literal["cuda_graph", "eager"] = "cuda_graph"
     stages: list[StageConfig] = [
         StageConfig(
             name="preprocessing",
@@ -138,6 +140,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             kwargs["code_predictor_spec_verify_size"] = (
                 self.code_predictor_spec_verify_size
             )
+            kwargs["code_predictor_spec_backend"] = self.code_predictor_spec_backend
         else:
             pass
         # Note (Jiaxin Deng): outside the engine process the preprocessing stage

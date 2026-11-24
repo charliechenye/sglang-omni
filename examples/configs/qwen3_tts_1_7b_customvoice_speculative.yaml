@@ -1,0 +1,4 @@
+config_cls: Qwen3TTSPipelineConfig
+model_path: Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice
+code_predictor_spec_verify_size: 4
+code_predictor_spec_backend: cuda_graph
