@@ -43,6 +43,7 @@ class TurnDetectionFactoryArgs(FactoryArgs):
     threshold: float | None = Field(default=None, ge=0, le=1)
     prefix_padding_ms: int | None = Field(default=None, ge=0)
     silence_duration_ms: int | None = Field(default=800, ge=0)
+    server_vad_default_silence_duration_ms: int | None = Field(default=None, ge=0)
     background_margin_db: float | None = Field(default=6.0, ge=0)
     max_open_sessions: int | None = Field(default=None, ge=1)
     max_concurrency: int | None = Field(default=None, ge=1)

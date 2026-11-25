@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 import yaml
 
+from sglang_omni.config.manager import ConfigManager
+from sglang_omni.config.runtime import resolve_stage_factory_args
 from sglang_omni.models.streaming_cascade.base import (
     ChatMessage,
     control_chunk,
@@ -25,6 +27,7 @@ from sglang_omni.models.streaming_cascade.generators import (
     FunctionDelta,
     ToolCallDelta,
 )
+from sglang_omni.models.turn_detection.node import TURN_DETECTION_STAGE
 from sglang_omni.proto.session import TimedChunk
 from sglang_omni.proto.streams import (
     INTERRUPT,
@@ -918,6 +921,64 @@ def test_the_profile_speaks_only_through_the_tool():
     assert settings.node("tts").edges()["dialog"] == {TOOL_CALL}
     assert TEXT_DELTA in settings.node("aligner").edges()["tts"]
     assert "llm" not in settings.publish
+
+
+def test_profile_uses_fused_smart_turn_with_a_scoped_server_vad_fallback():
+    config = ConfigManager.from_file(str(SPEECH_PROFILE)).config
+    detection = config.session_nodes["turn_detection"]
+    assert detection.stages == [TURN_DETECTION_STAGE]
+    assert detection.inputs == ["input:pcm16", "input:session"]
+    assert "vad" not in config.session_nodes
+    assert [stage.name for stage in config.stages].count(TURN_DETECTION_STAGE) == 1
+    assert not any(stage.name == "vad" for stage in config.stages)
+
+    factory_args = resolve_stage_factory_args(
+        config.stage_named(TURN_DETECTION_STAGE), config
+    )
+    assert factory_args["eagerness"] == "high"
+    assert factory_args["silence_duration_ms"] == 160
+    assert factory_args["server_vad_default_silence_duration_ms"] == 800
+
+    asr = config.session_nodes["asr"]
+    assert asr.inputs == [
+        "turn_detection:pcm16",
+        "turn_detection:session",
+        "turn_detection:session_internal",
+    ]
+    dialog = config.session_nodes["dialog"]
+    assert "turn_detection:session" in dialog.inputs
+    assert "turn_detection:session_internal" in dialog.inputs
+    assert "input:session" not in dialog.inputs
+    assert {item.source for item in dialog.inputs if hasattr(item, "feedback")} == {
+        "llm:text_delta",
+        "llm:tool_call",
+        "llm:session",
+        "tts:session",
+    }
+    assert any(getattr(item, "event", None) == "interrupt" for item in dialog.inputs)
+    assert any(
+        getattr(item, "event", None) == "reply.progress" for item in dialog.inputs
+    )
+    assert all(
+        "input:session" in config.session_nodes[name].inputs
+        for name in ("llm", "tts", "aligner")
+    )
+    assert config.session_publish["turn_detection"] == ["session"]
+
+    graph = config.component_graph()
+    assert graph.node("dialog").component.speech_tool == "tts_start"
+    llm = graph.node("llm").component
+    assert llm.required_call_opening == OPENING
+    assert [tool.name for tool in llm.tools] == ["tts_start"]
+    tts = graph.node("tts").component
+    assert tts.model == "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    assert tts.reference_audio_path == "examples/streaming_cascade/voices/vivian.wav"
+    assert tts.reference_text == (
+        "Hi there, it is nice to meet you, and I am happy to help with whatever you need today."
+    )
+    assert tts.drop_quiet_start
+    assert tts.sentence_pause_ms == 200
+    assert tts.timeout_s == 10
 
 
 INTERRUPT_EDGE = {"kind": "control", "source": "dialog", "event": INTERRUPT}
