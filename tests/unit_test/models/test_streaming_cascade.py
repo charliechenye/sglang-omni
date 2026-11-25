@@ -2269,6 +2269,11 @@ def test_profiles_expand_components_into_independent_session_nodes(profile):
     assert config.session_ports() == replace(
         CASCADE_PORTS,
         skips_screen_blocks=profile == "qwen3-asr-qwen3.8-27b-vivian-screen",
+        turn_detection_types=(
+            ("server_vad", "semantic_vad")
+            if profile == "qwen3-asr-qwen3.8-27b-vivian-tts-tool"
+            else CASCADE_PORTS.turn_detection_types
+        ),
     )
     assert (
         StreamingCascadePipelineConfig.model_validate(
