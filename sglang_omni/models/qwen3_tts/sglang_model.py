@@ -73,6 +73,7 @@ from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
     Qwen3TTSSpeakerEncoderCudaGraphRunner,
 )
 from sglang_omni.models.qwen3_tts.speculative_acceptance import (
+    accept_speculative_candidates_compact,
     sample_compact_probability_rows_fused,
 )
 from sglang_omni.models.qwen3_tts.speculative_commit import (
@@ -89,7 +90,6 @@ from sglang_omni.models.qwen3_tts.speculative_rng import (
     speculative_uniforms_frame_pool,
 )
 from sglang_omni.models.qwen3_tts.speculative_runtime import (
-    accept_speculative_candidates_compact,
     speculative_sampling_fallback_reason,
 )
 from sglang_omni.platforms import current_platform
