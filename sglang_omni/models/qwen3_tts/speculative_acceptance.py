@@ -327,7 +327,14 @@ if triton is not None:
             tl.where(normalized_values > 0.0, candidate_offsets, 0), axis=0
         )
         selected_rank = tl.minimum(selected_rank, last_positive_rank)
-        final_token = tl.gather(selected_token_ids, selected_rank, axis=0)
+        final_token = tl.sum(
+            tl.where(
+                candidate_offsets == selected_rank,
+                selected_token_ids,
+                0,
+            ),
+            axis=0,
+        )
         final_token = tl.where(is_active, final_token, 0)
         row_is_invalid = invalid_distribution & is_active
         final_token = tl.where(row_is_invalid, 0, final_token)

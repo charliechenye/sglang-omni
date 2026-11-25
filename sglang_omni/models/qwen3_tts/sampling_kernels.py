@@ -735,11 +735,12 @@ if has_triton_runtime():
         max_top_k: tl.constexpr,
         block_k: tl.constexpr,
         has_top_p: tl.constexpr,
+        vocab_size: tl.constexpr,
     ):
         row = tl.program_id(0)
         ranks = tl.arange(0, block_k)
         if tl.load(active_rows + row):
-            vocab_offsets = tl.arange(0, FUSED_SAMPLER_VOCAB_SIZE)
+            vocab_offsets = tl.arange(0, vocab_size)
             scores, ordered_score_bits, packed = pack_scaled_scores(
                 logits, temperatures, row, logits_stride_b, vocab_offsets
             )
@@ -827,13 +828,14 @@ if has_triton_runtime():
         max_top_k: tl.constexpr,
         block_k: tl.constexpr,
         has_top_p: tl.constexpr,
+        vocab_size: tl.constexpr,
     ):
         row = tl.program_id(0)
         ranks = tl.arange(0, block_k)
         tl.store(compacted_keys + row * block_k + ranks, 0)
         tl.debug_barrier()
         if tl.load(active_rows + row):
-            vocab_offsets = tl.arange(0, FUSED_SAMPLER_VOCAB_SIZE)
+            vocab_offsets = tl.arange(0, vocab_size)
             _, _, packed = pack_scaled_scores(
                 logits, temperatures, row, logits_stride_b, vocab_offsets
             )
@@ -1699,6 +1701,7 @@ def build_speculative_probability_candidates(
         int(max_top_k),
         int(block_k),
         bool(has_top_p),
+        vocab_size=int(logits.shape[1]),
         num_warps=8,
     )
     return probabilities, token_ids
@@ -1779,6 +1782,7 @@ def build_speculative_probability_candidates_radix(
         int(max_top_k),
         int(block_k),
         bool(has_top_p),
+        vocab_size=int(logits.shape[1]),
         num_warps=8,
     )
     return probabilities, token_ids

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Literal
 
 import pytest
 import torch
@@ -93,7 +94,7 @@ def build_speculative_talker(
         num_code_groups=16,
         code_predictor_config=SimpleNamespace(vocab_size=CODEBOOK_VOCAB_SIZE),
     )
-    talker.predictor_device = device
+    talker.predictor_device = talker.predictor_k_cache.device
     talker.predictor_device_module = torch.get_device_module(device)
     talker.predictor_max_batch_size = batch_size
     talker.predictor_graph_batch_sizes = (batch_size,)
@@ -130,6 +131,7 @@ def build_speculative_talker(
     )
     talker.sub_speculative_round_index_tensor = None
     talker.sub_speculative_uniforms_tensor = None
+    talker.sub_speculative_rng_pool_tensor = None
     talker.sub_seed_offsets = torch.arange(1, 16, device=device, dtype=torch.long)
     talker.sub_do_sample_tensor = torch.ones(
         (batch_size,), device=device, dtype=torch.bool
@@ -147,6 +149,8 @@ def build_speculative_talker(
     talker.code_predictor_spec_requested_width = 0
     talker.code_predictor_spec_effective_width = 0
     talker.code_predictor_spec_backend = "cuda_graph"
+    talker.code_predictor_spec_rng_backend = "per_round"
+    talker.code_predictor_spec_lm_head_backend = "grouped_triton"
     talker.code_predictor_spec_probability_backend = "split_top_k"
     talker.code_predictor_spec_probability_backend_execution_counts = {
         "split_top_k": 0,
@@ -155,6 +159,7 @@ def build_speculative_talker(
     talker.code_predictor_spec_probability_backend_fallback_count = 0
     talker.code_predictor_spec_fallback_reason = None
     talker.code_predictor_spec_graphs = {}
+    talker.code_predictor_spec_input_buffers = {}
     talker.code_predictor_spec_effective_width_histogram = {}
     talker.code_predictor_spec_graph_replay_count = 0
     talker.code_predictor_spec_eager_round_count = 0
@@ -162,6 +167,7 @@ def build_speculative_talker(
     talker.code_predictor_spec_graph_memory_delta_bytes = 0
     talker.code_predictor_spec_graph_capture_time_ms = 0.0
     talker.code_predictor_spec_configuration_time_ms = 0.0
+    talker.code_predictor_output_frame_count = 0
     talker.code_predictor_spec_frame_count = 0
     talker.code_predictor_spec_round_count = 0
     talker.code_predictor_spec_proposed_count = 0
@@ -276,58 +282,62 @@ def verify_complete_frame(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
-def test_packed_predictor_matches_sequential_native_hidden_and_kv_prefixes() -> None:
-    device = torch.device("cuda")
-    torch.manual_seed(108)
-    talker = build_speculative_talker(device)
-    query_embeddings = torch.randn((1, 3, FUSED_HIDDEN), device=device, dtype=DTYPE)
-    packed_positions = torch.tensor([2, 3, -1], device=device, dtype=torch.long)
-    packed_hiddens = talker.predictor_forward_packed_tokens(
-        token_embeds=query_embeddings,
-        positions=packed_positions,
-        batch_size=1,
-    )
-    packed_key_prefix = talker.predictor_k_cache[:, :1, :4].clone()
-    packed_value_prefix = talker.predictor_v_cache[:, :1, :4].clone()
+def test_packed_predictor_matches_sequential_native_hidden_and_kv_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_runtime_context(monkeypatch)
+    with get_context().override_server_args(max_running_requests=1):
+        device = torch.device("cuda")
+        torch.manual_seed(108)
+        talker = build_speculative_talker(device)
+        query_embeddings = torch.randn((1, 3, FUSED_HIDDEN), device=device, dtype=DTYPE)
+        packed_positions = torch.tensor([2, 3, -1], device=device, dtype=torch.long)
+        packed_hiddens = talker.predictor_forward_packed_tokens(
+            token_embeds=query_embeddings,
+            positions=packed_positions,
+            batch_size=1,
+        )
+        packed_key_prefix = talker.predictor_k_cache[:, :1, :4].clone()
+        packed_value_prefix = talker.predictor_v_cache[:, :1, :4].clone()
 
-    talker.predictor_k_cache.zero_()
-    talker.predictor_v_cache.zero_()
-    native_hiddens = torch.cat(
-        [
-            talker.predictor_forward_tokens(
-                token_embeds=query_embeddings[:, offset : offset + 1],
-                batch_size=1,
-                cache_len=offset + 2,
-            )
-            for offset in range(2)
-        ],
-        dim=1,
-    )
+        talker.predictor_k_cache.zero_()
+        talker.predictor_v_cache.zero_()
+        native_hiddens = torch.cat(
+            [
+                talker.predictor_forward_tokens(
+                    token_embeds=query_embeddings[:, offset : offset + 1],
+                    batch_size=1,
+                    cache_len=offset + 2,
+                )
+                for offset in range(2)
+            ],
+            dim=1,
+        )
 
-    torch.testing.assert_close(
-        packed_hiddens[:, :2], native_hiddens, atol=2e-2, rtol=2e-2
-    )
-    for layer_index, lm_head in enumerate(talker.code_predictor.lm_head[:2]):
-        packed_logits, _ = lm_head(packed_hiddens[:, layer_index : layer_index + 1])
-        native_logits, _ = lm_head(native_hiddens[:, layer_index : layer_index + 1])
-        torch.testing.assert_close(packed_logits, native_logits, atol=2e-2, rtol=2e-2)
-    else:
-        pass
-    torch.testing.assert_close(
-        talker.predictor_k_cache[:, :1, :4],
-        packed_key_prefix,
-        atol=2e-2,
-        rtol=2e-2,
-    )
-    torch.testing.assert_close(
-        talker.predictor_v_cache[:, :1, :4],
-        packed_value_prefix,
-        atol=2e-2,
-        rtol=2e-2,
-    )
-    torch.testing.assert_close(
-        packed_hiddens[:, 1], native_hiddens[:, 1], atol=2e-2, rtol=2e-2
-    )
+        torch.testing.assert_close(
+            packed_hiddens[:, :2], native_hiddens, atol=2e-2, rtol=2e-2
+        )
+        for layer_index, lm_head in enumerate(talker.code_predictor.lm_head[:2]):
+            packed_logits, _ = lm_head(packed_hiddens[:, layer_index : layer_index + 1])
+            native_logits, _ = lm_head(native_hiddens[:, layer_index : layer_index + 1])
+            torch.testing.assert_close(packed_logits, native_logits, atol=2e-2, rtol=2e-2)
+        else:
+            pass
+        torch.testing.assert_close(
+            talker.predictor_k_cache[:, :1, :4],
+            packed_key_prefix,
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        torch.testing.assert_close(
+            talker.predictor_v_cache[:, :1, :4],
+            packed_value_prefix,
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        torch.testing.assert_close(
+            packed_hiddens[:, 1], native_hiddens[:, 1], atol=2e-2, rtol=2e-2
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -497,9 +507,6 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
 ) -> None:
     device = torch.device("cuda")
     batch_size = 2
-    verify_width = 4
-    proposal_width = verify_width - 1
-    target_row_count = batch_size * verify_width
     configure_runtime_context(monkeypatch)
     with get_context().override_server_args(max_running_requests=batch_size):
         talker = build_speculative_talker(device, batch_size)
@@ -508,7 +515,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
         else:
             pass
         configure_unseeded_request(talker, batch_size)
-        talker.configure_code_predictor_speculation(verify_width, backend="eager")
+        talker.configure_code_predictor_speculation(4, backend="eager")
 
         native_grouped_head = sglang_model_module.grouped_lm_head_linear
         native_probability_builder = (
@@ -516,12 +523,15 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
         )
         native_acceptance = sglang_model_module.accept_speculative_candidates_compact
         native_packed_forward = talker.predictor_forward_packed_tokens
+        round_verification_widths: list[int] = []
         packed_hiddens: list[torch.Tensor] = []
         packed_keys: list[torch.Tensor] = []
         packed_values: list[torch.Tensor] = []
+        proposal_head_hiddens: dict[int, torch.Tensor] = {}
         target_logits: list[torch.Tensor] = []
         target_probabilities: list[torch.Tensor] = []
         target_token_ids: list[torch.Tensor] = []
+        draft_tokens_by_round: list[torch.Tensor] = []
         acceptance_records: list[
             tuple[
                 torch.Tensor,
@@ -546,32 +556,35 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             assert output is not None
             assert seeds.shape == semantic_positions.shape == (batch_size,)
             assert num_code_groups == 16
-            assert current_proposal_width == proposal_width
-            assert current_verify_width == verify_width
+            assert current_verify_width == current_proposal_width + 1
             output[:batch_size].zero_()
             current_round = int(round_index.item())
-            if current_round == 0:
-                output[1, 1, forced_rejection_offset] = 1.0
-            elif current_round in (1, 2):
-                output[1, 1, 0] = 1.0
+            if current_round < 3:
+                rejection_offset = forced_rejection_offset if current_round == 0 else 0
+                assert rejection_offset < current_proposal_width
+                output[1, 1, rejection_offset] = 0.5
             else:
                 pass
             return (
-                output[:batch_size, 0, :proposal_width],
-                output[:batch_size, 1, :proposal_width],
-                output[:batch_size, 2, :verify_width],
-                output[:batch_size, 3, :verify_width],
+                output[:batch_size, 0, :current_proposal_width],
+                output[:batch_size, 1, :current_proposal_width],
+                output[:batch_size, 2, :current_verify_width],
+                output[:batch_size, 3, :current_verify_width],
             )
 
         def record_packed_forward(
             token_embeds: torch.Tensor,
             positions: torch.Tensor,
-            current_batch_size: int,
+            batch_size: int,
         ) -> torch.Tensor:
+            verification_width = int(token_embeds.shape[1])
+            assert token_embeds.shape[0] == batch_size
+            assert positions.shape == (batch_size * verification_width,)
+            round_verification_widths.append(verification_width)
             hidden_states = native_packed_forward(
                 token_embeds=token_embeds,
                 positions=positions,
-                batch_size=current_batch_size,
+                batch_size=batch_size,
             )
             packed_hiddens.append(hidden_states.clone())
             packed_keys.append(talker.predictor_k_cache.clone())
@@ -595,10 +608,17 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 active_rows,
                 backend=backend,
             )
-            if hidden_states.shape[0] == target_row_count:
-                target_logits.append(logits.view(batch_size, verify_width, -1).clone())
+            if len(round_verification_widths) > len(target_logits):
+                round_index = len(target_logits)
+                verification_width = round_verification_widths[round_index]
+                assert hidden_states.shape[0] == batch_size * verification_width
+                target_logits.append(
+                    logits.view(batch_size, verification_width, -1).clone()
+                )
             else:
-                pass
+                proposal_head_hiddens[len(round_verification_widths)] = (
+                    hidden_states.clone()
+                )
             return logits
 
         def record_probability_builder(
@@ -612,7 +632,14 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             has_top_p: bool,
             has_unbounded_top_k: bool,
             backend: str,
-        ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        ) -> (
+            tuple[
+                torch.Tensor,
+                torch.Tensor,
+                Literal["split_top_k", "radix_compact"],
+            ]
+            | None
+        ):
             candidates = native_probability_builder(
                 logits,
                 temperatures,
@@ -624,17 +651,31 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 has_unbounded_top_k=has_unbounded_top_k,
                 backend=backend,
             )
-            if logits.shape[0] == target_row_count and candidates is not None:
-                probabilities, token_ids = candidates
-                target_probabilities.append(
-                    probabilities.view(batch_size, verify_width, -1).clone()
-                )
-                target_token_ids.append(
-                    token_ids.view(batch_size, verify_width, -1).clone()
-                )
+            if candidates is None:
+                return None
             else:
                 pass
-            return candidates
+            probabilities, token_ids, actual_backend = candidates
+            if len(round_verification_widths) > len(target_probabilities):
+                round_index = len(target_probabilities)
+                verification_width = round_verification_widths[round_index]
+                assert logits.shape[0] == batch_size * verification_width
+                target_probabilities.append(
+                    probabilities.view(batch_size, verification_width, -1).clone()
+                )
+                target_token_ids.append(
+                    token_ids.view(batch_size, verification_width, -1).clone()
+                )
+                return candidates
+            else:
+                assert logits.shape[0] % batch_size == 0
+                assert logits.shape[0] > 0
+                controlled_probabilities = torch.zeros_like(probabilities)
+                controlled_probabilities[:, 0] = 1.0
+                controlled_probabilities = torch.where(
+                    active_rows[:, None], controlled_probabilities, probabilities
+                ).contiguous()
+                return controlled_probabilities, token_ids, actual_backend
 
         def record_acceptance(
             draft_tokens: torch.Tensor,
@@ -648,6 +689,51 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             correction_uniforms: torch.Tensor,
             bonus_uniforms: torch.Tensor,
         ) -> SpeculativeAcceptanceBatch:
+            round_index = len(acceptance_records)
+            verification_width = round_verification_widths[round_index]
+            current_proposal_width = verification_width - 1
+            assert draft_tokens.shape == (batch_size, current_proposal_width)
+            assert row_target_probabilities.shape[0] == batch_size * verification_width
+            assert all(
+                bool(((uniforms >= 0.0) & (uniforms < 1.0)).all())
+                for uniforms in (
+                    acceptance_uniforms,
+                    correction_uniforms,
+                    bonus_uniforms,
+                )
+            )
+            if round_index < 3:
+                rejection_offset = forced_rejection_offset if round_index == 0 else 0
+                assert bool(active_rows[1])
+                assert int(proposal_counts[1].item()) > rejection_offset
+                draft_row = current_proposal_width + rejection_offset
+                target_row = verification_width + rejection_offset
+                draft_token = draft_tokens[1, rejection_offset]
+                draft_token_probability = draft_probabilities[draft_row][
+                    draft_token_ids[draft_row] == draft_token
+                ].sum()
+                target_token_probability = row_target_probabilities[target_row][
+                    row_target_token_ids[target_row] == draft_token
+                ].sum()
+                assert not torch.equal(
+                    draft_probabilities[draft_row],
+                    row_target_probabilities[target_row],
+                )
+                assert float(draft_token_probability.item()) == 1.0
+                assert float(target_token_probability.item()) < float(
+                    draft_token_probability.item()
+                )
+                acceptance_ratio = min(
+                    1.0,
+                    float(target_token_probability.item())
+                    / float(draft_token_probability.item()),
+                )
+                rejection_uniform = float(
+                    acceptance_uniforms[1, rejection_offset].item()
+                )
+                assert acceptance_ratio < rejection_uniform < 1.0
+            else:
+                pass
             decision = native_acceptance(
                 draft_tokens,
                 draft_probabilities,
@@ -660,6 +746,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 correction_uniforms,
                 bonus_uniforms,
             )
+            draft_tokens_by_round.append(draft_tokens.clone())
             acceptance_records.append(
                 (
                     proposal_counts.clone(),
@@ -704,14 +791,32 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
         codes = codes.clone()
         verify_complete_frame(talker, codes, summed_embedding)
 
-        assert acceptance_records[0][2].tolist() == [
-            proposal_width,
-            forced_rejection_offset,
-        ]
-        assert acceptance_records[0][5].tolist() == [True, False]
-        assert acceptance_records[0][6].tolist() == [False, True]
-        assert acceptance_records[0][0].tolist() == [proposal_width, proposal_width]
-        assert acceptance_records[3][0].tolist() == [1, proposal_width]
+        assert len(round_verification_widths) == len(acceptance_records)
+        assert len(round_verification_widths) == len(packed_hiddens)
+        assert len(round_verification_widths) == len(target_logits)
+        assert len(round_verification_widths) == len(target_probabilities)
+        assert len(round_verification_widths) == len(target_token_ids)
+        assert len(round_verification_widths) == len(draft_tokens_by_round)
+        assert len(round_verification_widths) >= 3
+        first_proposal_width = round_verification_widths[0] - 1
+        assert forced_rejection_offset < first_proposal_width
+        for round_index in range(3):
+            (
+                proposal_counts,
+                _,
+                accepted_counts,
+                _,
+                _,
+                bonus_rows,
+                rejected_rows,
+            ) = acceptance_records[round_index]
+            forced_offset = forced_rejection_offset if round_index == 0 else 0
+            assert rejected_rows.tolist() == [False, True]
+            assert accepted_counts.tolist() == [
+                int(proposal_counts[0].item()),
+                forced_offset,
+            ]
+            assert bonus_rows.tolist() == [True, False]
 
         talker.predictor_k_cache.zero_()
         talker.predictor_v_cache.zero_()
@@ -724,9 +829,10 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 dim=1,
             )
         )
-        talker.predictor_forward_tokens(
+        initial_hidden_states = talker.predictor_forward_tokens(
             token_embeds=pair_embeddings, batch_size=batch_size, cache_len=0
         )
+        native_initial_hiddens = initial_hidden_states[:, 1].clone()
         native_hiddens: dict[int, torch.Tensor] = {}
         native_logits: dict[int, torch.Tensor] = {}
         native_keys: dict[int, torch.Tensor] = {
@@ -759,6 +865,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             pass
 
         committed_depths = [1, 1]
+        starting_depths_by_round: list[list[int]] = []
         for round_index, decision_record in enumerate(acceptance_records):
             (
                 proposal_counts,
@@ -769,15 +876,10 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 bonus_rows,
                 rejected_rows,
             ) = decision_record
-            assert bool((proposal_counts <= proposal_width).all())
-            if round_index < 3:
-                assert rejected_rows.tolist() == [False, True]
-            else:
-                pass
-            if round_index == 0:
-                assert bonus_rows.tolist() == [True, False]
-            else:
-                pass
+            verification_width = round_verification_widths[round_index]
+            current_proposal_width = verification_width - 1
+            assert bool((proposal_counts <= current_proposal_width).all())
+            starting_depths_by_round.append(list(committed_depths))
             for row in range(batch_size):
                 starting_depth = committed_depths[row]
                 accepted_count = int(accepted_counts[row].item())
@@ -805,28 +907,6 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                             atol=2e-2,
                             rtol=2e-2,
                         )
-                        expected_candidates = build_speculative_probability_candidates(
-                            native_logits[code_depth][row : row + 1].contiguous(),
-                            torch.full((1,), 0.9, device=device, dtype=torch.float32),
-                            torch.full((1,), 4, device=device, dtype=torch.long),
-                            torch.ones((1,), device=device, dtype=torch.float32),
-                            torch.ones((1,), device=device, dtype=torch.bool),
-                            max_top_k=4,
-                            has_top_p=False,
-                            has_unbounded_top_k=False,
-                        )
-                        assert expected_candidates is not None
-                        expected_probabilities, expected_token_ids = expected_candidates
-                        torch.testing.assert_close(
-                            target_probabilities[round_index][row, query_offset],
-                            expected_probabilities[0],
-                            atol=1e-6,
-                            rtol=1e-6,
-                        )
-                        assert torch.equal(
-                            target_token_ids[round_index][row, query_offset],
-                            expected_token_ids[0],
-                        )
                     else:
                         pass
                 else:
@@ -853,6 +933,174 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             pass
 
         assert committed_depths == [15, 15]
+        assert len(proposal_head_hiddens) == sum(
+            verification_width > 1 for verification_width in round_verification_widths
+        )
+        for round_index, decision_record in enumerate(acceptance_records):
+            (
+                proposal_counts,
+                active_rows,
+                _,
+                _,
+                _,
+                _,
+                _,
+            ) = decision_record
+            current_proposal_width = round_verification_widths[round_index] - 1
+            if current_proposal_width > 0:
+                proposal_hidden_states = proposal_head_hiddens[round_index]
+                if round_index == 0:
+                    expected_proposal_hiddens = native_initial_hiddens
+                else:
+                    starting_depths = starting_depths_by_round[round_index]
+                    expected_proposal_hiddens = torch.stack(
+                        [
+                            native_hiddens[starting_depths[row] - 1][row]
+                            for row in range(batch_size)
+                        ]
+                    )
+                    previous_accepted_counts = acceptance_records[round_index - 1][2]
+                for row in range(batch_size):
+                    if active_rows[row]:
+                        torch.testing.assert_close(
+                            proposal_hidden_states[row],
+                            expected_proposal_hiddens[row],
+                            atol=2e-2,
+                            rtol=2e-2,
+                        )
+                        if round_index > 0:
+                            torch.testing.assert_close(
+                                proposal_hidden_states[row],
+                                packed_hiddens[round_index - 1][
+                                    row, int(previous_accepted_counts[row].item())
+                                ],
+                                atol=2e-2,
+                                rtol=2e-2,
+                            )
+                        else:
+                            pass
+                    else:
+                        pass
+            else:
+                pass
+
+            verification_width = round_verification_widths[round_index]
+            assert target_logits[round_index].shape[1] == verification_width
+            assert target_probabilities[round_index].shape[1] == verification_width
+            start_depths = starting_depths_by_round[round_index]
+            for row in range(batch_size):
+                if active_rows[row]:
+                    starting_depth = start_depths[row]
+                    proposal_count = int(proposal_counts[row].item())
+                    talker.predictor_k_cache.zero_()
+                    talker.predictor_v_cache.zero_()
+                    row_pair_embeddings = talker.code_predictor.project_input(
+                        torch.cat(
+                            (
+                                talker_hidden[row : row + 1].to(
+                                    dtype=layer0_embeddings.dtype
+                                ),
+                                layer0_embeddings[row : row + 1],
+                            ),
+                            dim=1,
+                        )
+                    )
+                    talker.predictor_forward_tokens(
+                        token_embeds=row_pair_embeddings,
+                        batch_size=1,
+                        cache_len=0,
+                    )
+                    for code_depth in range(1, starting_depth):
+                        code_token = codes[row, code_depth, 0]
+                        projected_embeddings = talker.predictor_projected_embeddings[
+                            code_depth - 1, code_token
+                        ].view(1, 1, -1)
+                        talker.predictor_forward_tokens(
+                            token_embeds=projected_embeddings,
+                            batch_size=1,
+                            cache_len=code_depth + 1,
+                        )
+                    else:
+                        pass
+                    for query_offset in range(proposal_count + 1):
+                        code_depth = starting_depth + query_offset
+                        if query_offset == 0:
+                            query_token = codes[row, starting_depth, 0]
+                        else:
+                            query_token = draft_tokens_by_round[round_index][
+                                row, query_offset - 1
+                            ]
+                        projected_embeddings = talker.predictor_projected_embeddings[
+                            code_depth - 1, query_token
+                        ].view(1, 1, -1)
+                        sequential_hidden = talker.predictor_forward_tokens(
+                            token_embeds=projected_embeddings,
+                            batch_size=1,
+                            cache_len=code_depth + 1,
+                        )
+                        sequential_logits, _ = talker.code_predictor.lm_head[
+                            code_depth
+                        ](sequential_hidden)
+                        torch.testing.assert_close(
+                            packed_hiddens[round_index][row, query_offset],
+                            sequential_hidden[0, 0],
+                            atol=2e-2,
+                            rtol=2e-2,
+                        )
+                        torch.testing.assert_close(
+                            target_logits[round_index][row, query_offset],
+                            sequential_logits[0, 0],
+                            atol=2e-2,
+                            rtol=2e-2,
+                        )
+                        expected_candidates = build_speculative_probability_candidates(
+                            sequential_logits.reshape(1, -1).contiguous(),
+                            talker.sub_temperature_tensor[row : row + 1].contiguous(),
+                            talker.sub_top_k_tensor[row : row + 1].contiguous(),
+                            talker.sub_top_p_tensor[row : row + 1].contiguous(),
+                            torch.ones((1,), device=device, dtype=torch.bool),
+                            max_top_k=int(talker.sub_sampled_max_top_k),
+                            has_top_p=bool(talker.sub_sampled_has_top_p),
+                            has_unbounded_top_k=bool(
+                                talker.sub_sampled_has_unbounded_top_k
+                            ),
+                        )
+                        assert expected_candidates is not None
+                        expected_probabilities, expected_token_ids = expected_candidates
+                        torch.testing.assert_close(
+                            target_probabilities[round_index][row, query_offset],
+                            expected_probabilities[0],
+                            atol=1e-6,
+                            rtol=1e-6,
+                        )
+                        assert torch.equal(
+                            target_token_ids[round_index][row, query_offset],
+                            expected_token_ids[0],
+                        )
+                        valid_cache_length = code_depth + 2
+                        torch.testing.assert_close(
+                            packed_keys[round_index][
+                                :, row : row + 1, :valid_cache_length
+                            ],
+                            talker.predictor_k_cache[:, :1, :valid_cache_length],
+                            atol=2e-2,
+                            rtol=2e-2,
+                        )
+                        torch.testing.assert_close(
+                            packed_values[round_index][
+                                :, row : row + 1, :valid_cache_length
+                            ],
+                            talker.predictor_v_cache[:, :1, :valid_cache_length],
+                            atol=2e-2,
+                            rtol=2e-2,
+                        )
+                    else:
+                        pass
+                else:
+                    assert int(proposal_counts[row].item()) == 0
+            else:
+                pass
+
         stats = talker.predictor_speculative_stats()
         assert stats["frames"] == batch_size
         assert stats["rejections"] == 3
@@ -891,7 +1139,7 @@ def test_packed_predictor_masks_positive_positions_past_physical_cache(
         talker.predictor_forward_packed_tokens(
             token_embeds=query_embeddings,
             positions=query_positions,
-            batch_size=1,
+            batch_size=2,
         )
         assert torch.all(talker.predictor_k_cache[:, 1] == cache_sentinel)
         assert torch.all(talker.predictor_v_cache[:, 1] == cache_sentinel)
@@ -1391,12 +1639,117 @@ def test_compact_acceptance_top_k50_padding_and_unsorted_support_match_dense() -
         bonus_uniforms,
     )
 
-    assert torch.equal(compact_result.committed_tokens, dense_result.committed_tokens)
-    assert torch.equal(
-        compact_result.accepted_draft_counts, dense_result.accepted_draft_counts
+    # CDF order differs between compact and dense sampling.
+    # Equal distributions do not imply identical draws.
+    assert compact_result.committed_tokens.tolist() == [[5, 1], [6, 12]]
+    assert dense_result.committed_tokens.tolist() == [[5, 1], [6, 13]]
+
+    for result in (compact_result, dense_result):
+        assert result.accepted_draft_counts.tolist() == [1, 1]
+        assert result.committed_token_counts.tolist() == [2, 2]
+        assert result.rejected_rows.tolist() == [False, False]
+        assert result.bonus_rows.tolist() == [True, True]
+        assert not bool(result.invalid_rows.any())
+
+    # Deterministic quantile sweep:
+    # Row 0 rejects token 5, exercising duplicate padding.
+    # Residual support: token 7 = 2/7, token 8 = 5/7.
+    # Row 1 accepts and samples the unsorted bonus support.
+    draw_count = 70
+
+    draws = (
+        torch.arange(
+            draw_count,
+            device=device,
+            dtype=torch.float32,
+        )
+        + 0.5
+    ) / draw_count
+
+    grid_uniforms = (
+        draws.repeat_interleave(batch_size)
+        .unsqueeze(1)
+        .expand(-1, verify_width)
+        .contiguous()
     )
-    assert compact_result.accepted_draft_counts.tolist() == [1, 1]
-    assert not bool(compact_result.invalid_rows.any())
+
+    grid_acceptance = acceptance_uniforms.clone()
+    grid_acceptance[0, 0] = 0.75
+    grid_acceptance = grid_acceptance.repeat(draw_count, 1)
+
+    grid_draft_tokens = draft_tokens.repeat(draw_count, 1)
+    grid_draft_probs = draft_probabilities.repeat(draw_count, 1)
+    grid_draft_ids = draft_token_ids.repeat(draw_count, 1)
+    grid_target_probs = target_probabilities.repeat(draw_count, 1)
+    grid_target_ids = target_token_ids.repeat(draw_count, 1)
+    grid_proposal_counts = proposal_counts.repeat(draw_count)
+    grid_active_rows = active_rows.repeat(draw_count)
+
+    grid_batch_size = batch_size * draw_count
+
+    compact_grid = accept_speculative_candidates_compact(
+        grid_draft_tokens,
+        grid_draft_probs,
+        grid_draft_ids,
+        grid_target_probs,
+        grid_target_ids,
+        grid_proposal_counts,
+        grid_active_rows,
+        grid_acceptance,
+        grid_uniforms,
+        grid_uniforms,
+    )
+
+    dense_grid = accept_speculative_candidates(
+        grid_draft_tokens,
+        expand_compact_probability_rows(
+            grid_draft_probs,
+            grid_draft_ids,
+            vocab_size=16,
+        ).view(grid_batch_size, draft_width, 16),
+        expand_compact_probability_rows(
+            grid_target_probs,
+            grid_target_ids,
+            vocab_size=16,
+        ).view(grid_batch_size, verify_width, 16),
+        grid_proposal_counts,
+        grid_active_rows,
+        grid_acceptance,
+        grid_uniforms,
+        grid_uniforms,
+    )
+
+    expected_residual_counts = [0] * 16
+    expected_residual_counts[7] = 20
+    expected_residual_counts[8] = 50
+
+    expected_bonus_counts = [0] * 16
+    expected_bonus_counts[12] = 49
+    expected_bonus_counts[13] = 21
+
+    for result in (compact_grid, dense_grid):
+        assert not bool(result.invalid_rows.any())
+
+        assert result.accepted_draft_counts.tolist() == ([0, 1] * draw_count)
+        assert result.committed_token_counts.tolist() == ([1, 2] * draw_count)
+        assert result.rejected_rows.tolist() == ([True, False] * draw_count)
+        assert result.bonus_rows.tolist() == ([False, True] * draw_count)
+
+        codes = result.committed_tokens.view(draw_count, batch_size, verify_width)
+
+        residual_tokens = codes[:, 0, 0]
+        bonus_tokens = codes[:, 1, 1]
+
+        assert bool((codes[:, 1, 0] == 6).all())
+
+        residual_counts = torch.bincount(residual_tokens, minlength=16).tolist()
+
+        bonus_counts = torch.bincount(bonus_tokens, minlength=16).tolist()
+
+        assert residual_counts == expected_residual_counts
+        assert bonus_counts == expected_bonus_counts
+
+    print("UNSORTED_COMPACT_DISTRIBUTION_PARITY_PASS")
 
 
 @pytest.mark.accelerator
@@ -1487,6 +1840,72 @@ def test_speculative_probability_rows_match_native_seeded_sampler_distribution()
     )
 
 
+def assert_radix_distribution_parity(
+    radix_probabilities,
+    radix_token_ids,
+    split_probabilities,
+    split_token_ids,
+):
+    assert radix_probabilities.shape == split_probabilities.shape
+
+    for probabilities in (
+        radix_probabilities,
+        split_probabilities,
+    ):
+        assert bool(torch.isfinite(probabilities).all())
+        assert bool((probabilities >= 0).all())
+
+        torch.testing.assert_close(
+            probabilities.double().sum(dim=-1),
+            torch.ones(
+                probabilities.shape[0],
+                device=probabilities.device,
+                dtype=torch.float64,
+            ),
+            atol=1e-6,
+            rtol=0.0,
+        )
+
+    radix_positive = radix_probabilities > 0
+    split_positive = split_probabilities > 0
+
+    assert torch.equal(radix_positive, split_positive)
+
+    assert torch.equal(
+        radix_token_ids[radix_positive],
+        split_token_ids[split_positive],
+    )
+
+    for row in range(radix_probabilities.shape[0]):
+        ids = radix_token_ids[row, radix_positive[row]]
+        assert bool(((ids >= 0) & (ids < 2048)).all())
+        assert ids.unique().numel() == ids.numel()
+
+    # Allow FP32 reduction-order rounding only.
+    torch.testing.assert_close(
+        radix_probabilities,
+        split_probabilities,
+        atol=0.0,
+        rtol=1e-6,
+    )
+
+    diff = (radix_probabilities.double() - split_probabilities.double()).abs()
+
+    tv = 0.5 * diff.sum(dim=-1)
+
+    assert bool((tv <= 5e-7).all()), tv
+
+    print(
+        "RADIX_DISTRIBUTION_PARITY_PASS",
+        "rows=",
+        radix_probabilities.shape[0],
+        "max_abs=",
+        float(diff.max()),
+        "max_tv=",
+        float(tv.max()),
+    )
+
+
 @pytest.mark.accelerator
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_radix_probability_selector_matches_production_split_top_k() -> None:
@@ -1524,8 +1943,11 @@ def test_radix_probability_selector_matches_production_split_top_k() -> None:
     split_probabilities, split_token_ids = split_candidates
     radix_probabilities, radix_token_ids = radix_candidates
     assert torch.equal(radix_token_ids, split_token_ids)
-    torch.testing.assert_close(
-        radix_probabilities, split_probabilities, atol=0.0, rtol=0.0
+    assert_radix_distribution_parity(
+        radix_probabilities,
+        radix_token_ids,
+        split_probabilities,
+        split_token_ids,
     )
 
 
@@ -1580,28 +2002,12 @@ def test_radix_probability_support_compaction_matches_split_for_small_batches(
     assert radix_candidates is not None
     split_probabilities, split_token_ids = split_candidates
     radix_probabilities, radix_token_ids = radix_candidates
-    torch.testing.assert_close(
-        radix_probabilities.sum(dim=1),
-        torch.ones((row_count,), device=device),
-        atol=1.0e-6,
-        rtol=0.0,
+    assert_radix_distribution_parity(
+        radix_probabilities,
+        radix_token_ids,
+        split_probabilities,
+        split_token_ids,
     )
-    for row in range(row_count):
-        split_positive = split_probabilities[row] > 0.0
-        radix_positive = radix_probabilities[row] > 0.0
-        assert torch.equal(
-            radix_token_ids[row, radix_positive],
-            split_token_ids[row, split_positive],
-        )
-        torch.testing.assert_close(
-            radix_probabilities[row, radix_positive],
-            split_probabilities[row, split_positive],
-            atol=0.0,
-            rtol=0.0,
-        )
-        assert bool((radix_token_ids[row, radix_positive] >= 0).all())
-    else:
-        pass
 
 
 @pytest.mark.accelerator
@@ -1715,7 +2121,200 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
         backend="warp_gemv",
     )
 
-    assert torch.equal(warp_logits, baseline_logits)
+    # Independent high-precision oracle.
+    reference = torch.zeros_like(
+        baseline_logits, dtype=torch.float64
+    )
+    abs_product_sum = torch.zeros_like(reference)
+    native_logits = torch.zeros_like(baseline_logits)
+
+    for row in active_rows.nonzero(as_tuple=True)[0].tolist():
+        h = hidden_states[hidden_indices[row]]
+        w = packed_weights[head_indices[row]]
+
+        products = w.double() * h.double()
+        reference[row] = products.sum(dim=-1)
+        abs_product_sum[row] = products.abs().sum(dim=-1)
+
+        native_logits[row] = torch.nn.functional.linear(h, w)
+
+    rounded_reference = reference.to(torch.bfloat16)
+
+    # Both kernels reduce 32-element tiles, then accumulate
+    # 32 tile sums in FP32. Use a conservative rounding bound.
+    unit_roundoff = 2.0 ** -24
+    gamma = (
+        64 * unit_roundoff
+        / (1 - 64 * unit_roundoff)
+    )
+    fp32_error_bound = gamma * abs_product_sum
+
+    for name, logits in (
+        ("grouped_triton", baseline_logits),
+        ("warp_gemv", warp_logits),
+    ):
+        assert bool(torch.isfinite(logits).all())
+        assert bool((logits[~active_rows] == 0).all())
+
+        values = logits.double()
+
+        previous = torch.nextafter(
+            logits, torch.full_like(logits, -float("inf"))
+        ).double()
+
+        following = torch.nextafter(
+            logits, torch.full_like(logits, float("inf"))
+        ).double()
+
+        lower = (previous + values) * 0.5
+        upper = (following + values) * 0.5
+
+        outside_rounding_interval = torch.maximum(
+            lower - reference,
+            reference - upper,
+        ).clamp_min(0)
+
+        violations = (
+            outside_rounding_interval > fp32_error_bound
+        )
+
+        print(
+            "GROUPED_GEMV_ORACLE",
+            name,
+            "rounded_mismatch=",
+            int((logits != rounded_reference).sum()),
+            "max_abs_fp64_error=",
+            float((values - reference).abs().max()),
+            "rounding_bound_violations=",
+            int(violations.sum()),
+        )
+
+        assert not bool(violations.any()), name
+
+    pairwise_error = (
+        warp_logits.float() - baseline_logits.float()
+    ).abs()
+
+    print(
+        "GROUPED_GEMV_PAIRWISE",
+        "mismatched=", int((pairwise_error != 0).sum()),
+        "max_abs=", float(pairwise_error.max()),
+    )
+
+    # Logit closeness alone does not establish sampling parity.
+    # Exercise small top-k and the production default top-k.
+    row_count, vocab_size = baseline_logits.shape
+
+    for top_k in (4, 50):
+        for top_p in (1.0, 0.9):
+            temperatures = torch.full(
+                (row_count,), 0.9, device=device
+            )
+            top_ks = torch.full(
+                (row_count,),
+                top_k,
+                device=device,
+                dtype=torch.long,
+            )
+            top_ps = torch.full(
+                (row_count,), top_p, device=device
+            )
+
+            distributions = {}
+
+            for name, logits in (
+                ("native", native_logits),
+                ("grouped_triton", baseline_logits),
+                ("warp_gemv", warp_logits),
+            ):
+                candidates = build_speculative_probability_candidates(
+                    logits.contiguous(),
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    active_rows,
+                    max_top_k=top_k,
+                    has_top_p=top_p < 1.0,
+                    has_unbounded_top_k=False,
+                )
+
+                assert candidates is not None
+
+                probabilities, token_ids = candidates
+
+                positive = probabilities > 0
+
+                assert bool(torch.isfinite(probabilities).all())
+                assert bool((probabilities >= 0).all())
+
+                assert bool(
+                    (
+                        (token_ids[positive] >= 0)
+                        & (token_ids[positive] < vocab_size)
+                    ).all()
+                )
+
+                dense = torch.zeros(
+                    (row_count, vocab_size),
+                    device=device,
+                    dtype=torch.float32,
+                )
+
+                safe_ids = torch.where(
+                    positive,
+                    token_ids.long(),
+                    torch.zeros_like(token_ids.long()),
+                )
+
+                dense.scatter_add_(
+                    1, safe_ids, probabilities
+                )
+
+                torch.testing.assert_close(
+                    dense.sum(dim=-1),
+                    active_rows.float(),
+                    atol=1e-6,
+                    rtol=0.0,
+                )
+
+                distributions[name] = dense
+
+            for left, right in (
+                ("grouped_triton", "native"),
+                ("warp_gemv", "native"),
+                ("warp_gemv", "grouped_triton"),
+            ):
+                a = distributions[left]
+                b = distributions[right]
+
+                diff = (a.double() - b.double()).abs()
+                tv = 0.5 * diff.sum(dim=-1)
+
+                support_mismatch = int(
+                    ((a > 0) != (b > 0)).sum()
+                )
+
+                print(
+                    "GROUPED_GEMV_DISTRIBUTION",
+                    left, right,
+                    "top_k=", top_k,
+                    "top_p=", top_p,
+                    "support_mismatch=", support_mismatch,
+                    "max_abs=", float(diff.max()),
+                    "max_tv=", float(tv.max()),
+                )
+
+                assert support_mismatch == 0
+
+                torch.testing.assert_close(
+                    a, b,
+                    atol=3e-5,
+                    rtol=3e-4,
+                )
+
+                assert bool((tv <= 1e-4).all())
+
+    print("WARP_GEMV_NUMERICAL_PARITY_PASS")
 
 
 @pytest.mark.accelerator
