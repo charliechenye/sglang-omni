@@ -75,7 +75,9 @@ from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
 )
 from sglang_omni.models.qwen3_tts.speculative_acceptance import (
     accept_speculative_candidates_compact,
+    accept_speculative_candidates_dense_indexed,
     sample_compact_probability_rows_fused,
+    update_speculative_dense_probability_table,
 )
 from sglang_omni.models.qwen3_tts.speculative_commit import (
     commit_speculative_codes,
@@ -91,11 +93,11 @@ from sglang_omni.models.qwen3_tts.speculative_rng import (
     speculative_uniforms_all_purposes,
     speculative_uniforms_frame_pool,
 )
-from sglang_omni.models.qwen3_tts.speculative_workspace import (
-    PredictorSpeculativeWorkspace,
-)
 from sglang_omni.models.qwen3_tts.speculative_runtime import (
     speculative_sampling_fallback_reason,
+)
+from sglang_omni.models.qwen3_tts.speculative_workspace import (
+    PredictorSpeculativeWorkspace,
 )
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.device_graph import DeviceGraphBackend, ReplayableGraph
@@ -295,6 +297,8 @@ class PredictorSpeculativeStats(TypedDict):
     probability_backend: str
     probability_backend_execution_counts: dict[str, int]
     probability_backend_fallbacks: int
+    acceptance_backend: str
+    acceptance_backend_execution_counts: dict[str, int]
     lm_head_backend: str
     rng_backend: str
     fused_predictor_scratch_rows: int
@@ -328,6 +332,7 @@ class PredictorSpeculativeStats(TypedDict):
     workspace_bytes: int
     workspace_allocations: int
     configuration_time_ms: float
+    nvtx_enabled: bool
     native_fallback_count: int
     attempted_frames: int
     native_fallback_fraction: float
@@ -1428,12 +1433,16 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.predictor_graph_pool = None
         self.predictor_capture_stream: torch.Stream | None = None
         self.code_predictor_spec_backend = "cuda_graph"
+        self.code_predictor_spec_nvtx_enabled = (
+            os.environ.get("SGLANG_QWEN3_TTS_SPEC_NVTX", "0") == "1"
+        )
         self.code_predictor_spec_probability_backend: Literal[
-            "split_top_k", "radix_compact"
+            "split_top_k", "radix_compact", "radix_compact_4bit"
         ] = "split_top_k"
         self.code_predictor_spec_probability_backend_execution_counts = {
             "split_top_k": 0,
             "radix_compact": 0,
+            "radix_compact_4bit": 0,
         }
         self.code_predictor_spec_probability_backend_fallback_count = 0
         self.code_predictor_spec_lm_head_backend: Literal[
@@ -1442,6 +1451,20 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"] = (
             "per_round"
         )
+        self.code_predictor_spec_acceptance_backend: Literal[
+            "compact", "dense_indexed"
+        ] = "compact"
+        self.code_predictor_spec_acceptance_backend_execution_counts = {
+            "compact": 0,
+            "dense_indexed": 0,
+        }
+        self.code_predictor_spec_dense_draft_probabilities: torch.Tensor | None = None
+        self.code_predictor_spec_dense_target_probabilities: torch.Tensor | None = None
+        self.code_predictor_spec_dense_draft_previous_ids: torch.Tensor | None = None
+        self.code_predictor_spec_dense_target_previous_ids: torch.Tensor | None = None
+        self.code_predictor_spec_dense_current_ids: torch.Tensor | None = None
+        self.code_predictor_spec_dense_candidate_offsets: torch.Tensor | None = None
+        self.code_predictor_spec_dense_candidate_capacity = 0
         self.code_predictor_spec_graphs: dict[
             tuple[int, int], PredictorSpeculativeVerifyGraph
         ] = {}
@@ -1891,7 +1914,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         return requested_width, None
 
     def record_code_predictor_spec_probability_backend(
-        self, actual_backend: Literal["split_top_k", "radix_compact"]
+        self,
+        actual_backend: Literal["split_top_k", "radix_compact", "radix_compact_4bit"],
     ) -> None:
         """Count the implementation that built one compact distribution."""
         self.code_predictor_spec_probability_backend_execution_counts[
@@ -1899,11 +1923,22 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         ] += 1
         if (
             self.code_predictor_spec_probability_backend == "radix_compact"
-            and actual_backend == "split_top_k"
-        ):
+            or self.code_predictor_spec_probability_backend == "radix_compact_4bit"
+        ) and actual_backend == "split_top_k":
             self.code_predictor_spec_probability_backend_fallback_count += 1
         else:
             pass
+
+    @contextmanager
+    def code_predictor_spec_nvtx_range(self, label: str) -> Generator[None, None, None]:
+        """Mark a speculative stage when optional CUDA NVTX ranges are enabled."""
+        if not getattr(self, "code_predictor_spec_nvtx_enabled", False) or (
+            self.predictor_device.type != "cuda"
+        ):
+            yield
+        else:
+            with torch.cuda.nvtx.range(f"Qwen3-TTS CodePredictor: {label}"):
+                yield
 
     def ensure_code_predictor_speculative_workspace(
         self,
@@ -1918,9 +1953,44 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             raise RuntimeError("speculative workspace has an unsupported Top-K")
         else:
             pass
-        workspace = self.code_predictor_spec_workspaces.get(
-            self.sub_sampled_max_top_k
-        )
+        if (
+            self.code_predictor_spec_acceptance_backend == "dense_indexed"
+            and candidate_width > self.code_predictor_spec_dense_candidate_capacity
+        ):
+            dense_row_capacity = (
+                self.predictor_max_batch_size * self.code_predictor_spec_requested_width
+            )
+            vocab_size = int(self.config.code_predictor_config.vocab_size)
+            self.code_predictor_spec_dense_draft_probabilities = torch.zeros(
+                dense_row_capacity,
+                vocab_size,
+                device=self.predictor_device,
+                dtype=torch.float32,
+            )
+            self.code_predictor_spec_dense_target_probabilities = torch.zeros_like(
+                self.code_predictor_spec_dense_draft_probabilities
+            )
+            self.code_predictor_spec_dense_draft_previous_ids = torch.zeros(
+                dense_row_capacity,
+                candidate_width,
+                device=self.predictor_device,
+                dtype=torch.long,
+            )
+            self.code_predictor_spec_dense_target_previous_ids = torch.zeros_like(
+                self.code_predictor_spec_dense_draft_previous_ids
+            )
+            self.code_predictor_spec_dense_current_ids = torch.empty_like(
+                self.code_predictor_spec_dense_draft_previous_ids
+            )
+            self.code_predictor_spec_dense_candidate_offsets = torch.arange(
+                candidate_width,
+                device=self.predictor_device,
+                dtype=torch.long,
+            )
+            self.code_predictor_spec_dense_candidate_capacity = candidate_width
+        else:
+            pass
+        workspace = self.code_predictor_spec_workspaces.get(self.sub_sampled_max_top_k)
         if workspace is None:
             if (
                 self.sub_speculative_seed_tensor is None
@@ -2005,46 +2075,47 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         result_codes = self.output_codes[:batch_size].unsqueeze(-1)
         code_outputs = result_codes[:, :, 0]
         summed_embeddings = self.output_embeds[:batch_size].unsqueeze(1)
-        summed_embeddings.zero_()
-        layer0_embed = self.get_input_embeddings()(layer0_codes).to(
-            dtype=predictor_dtype
-        )
-        code_outputs[:, 0].copy_(layer0_codes[:, 0])
-        summed_embeddings[:, 0, :].add_(layer0_embed[:, 0, :])
-        pair_embeds = self.code_predictor.project_input(
-            torch.cat(
-                (
-                    talker_hidden.to(dtype=predictor_dtype),
-                    layer0_embed,
-                ),
-                dim=1,
+        with self.code_predictor_spec_nvtx_range("opening pair"):
+            summed_embeddings.zero_()
+            layer0_embed = self.get_input_embeddings()(layer0_codes).to(
+                dtype=predictor_dtype
             )
-        )
-        pair_hidden = self.predictor_forward_tokens(
-            token_embeds=pair_embeds,
-            batch_size=batch_size,
-            cache_len=0,
-        )
-        self.code_predictor_spec_fused_predictor_forward_count += 1
-        code1_logits, _ = self.code_predictor.lm_head[0](pair_hidden[:, 1:, :])
-        sub_positions = self.sub_seed_positions(semantic_positions)[0]
-        codec_tables = self.code_predictor.model.codec_embedding.weight
-        projected_tables = self.predictor_projected_embeddings
-        projected_table = None if projected_tables is None else projected_tables[0]
-        self.sample_subtalker_embedding(
-            code1_logits[:, -1, :],
-            codec_tables[0],
-            summed_embeddings[:, 0, :],
-            code_outputs[:, 1],
-            projected_table,
-            self.predictor_embedding_buffer[:batch_size],
-            (
-                None
-                if self.predictor_projected_buffer is None
-                else self.predictor_projected_buffer[:batch_size]
-            ),
-            sub_positions,
-        )
+            code_outputs[:, 0].copy_(layer0_codes[:, 0])
+            summed_embeddings[:, 0, :].add_(layer0_embed[:, 0, :])
+            pair_embeds = self.code_predictor.project_input(
+                torch.cat(
+                    (
+                        talker_hidden.to(dtype=predictor_dtype),
+                        layer0_embed,
+                    ),
+                    dim=1,
+                )
+            )
+            pair_hidden = self.predictor_forward_tokens(
+                token_embeds=pair_embeds,
+                batch_size=batch_size,
+                cache_len=0,
+            )
+            self.code_predictor_spec_fused_predictor_forward_count += 1
+            code1_logits, _ = self.code_predictor.lm_head[0](pair_hidden[:, 1:, :])
+            sub_positions = self.sub_seed_positions(semantic_positions)[0]
+            codec_tables = self.code_predictor.model.codec_embedding.weight
+            projected_tables = self.predictor_projected_embeddings
+            projected_table = None if projected_tables is None else projected_tables[0]
+            self.sample_subtalker_embedding(
+                code1_logits[:, -1, :],
+                codec_tables[0],
+                summed_embeddings[:, 0, :],
+                code_outputs[:, 1],
+                projected_table,
+                self.predictor_embedding_buffer[:batch_size],
+                (
+                    None
+                    if self.predictor_projected_buffer is None
+                    else self.predictor_projected_buffer[:batch_size]
+                ),
+                sub_positions,
+            )
 
         committed_depths = workspace.committed_depths[:batch_size]
         committed_depths.fill_(1)
@@ -2120,67 +2191,76 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             target_temperatures = round_workspace.target_temperatures[:target_rows]
             target_top_ks = round_workspace.target_top_ks[:target_rows]
             target_top_ps = round_workspace.target_top_ps[:target_rows]
-            round_metadata_prepared = prepare_speculative_round_metadata(
-                committed_depths,
-                active_rows,
-                temperatures,
-                top_ks,
-                top_ps,
-                round_workspace.proposal_head_offsets[:proposal_rows],
-                proposal_head_indices,
-                active_proposal_rows,
-                proposal_counts,
-                valid_query_counts,
-                proposal_temperatures,
-                proposal_top_ks,
-                proposal_top_ps,
-                target_temperatures,
-                target_top_ks,
-                target_top_ps,
-                verify_width,
-                num_groups,
-            )
+            with self.code_predictor_spec_nvtx_range("proposal preparation"):
+                round_metadata_prepared = prepare_speculative_round_metadata(
+                    committed_depths,
+                    active_rows,
+                    temperatures,
+                    top_ks,
+                    top_ps,
+                    round_workspace.proposal_head_offsets[:proposal_rows],
+                    proposal_head_indices,
+                    active_proposal_rows,
+                    proposal_counts,
+                    valid_query_counts,
+                    proposal_temperatures,
+                    proposal_top_ks,
+                    proposal_top_ps,
+                    target_temperatures,
+                    target_top_ks,
+                    target_top_ps,
+                    verify_width,
+                    num_groups,
+                )
             if not round_metadata_prepared:
                 raise RuntimeError("speculative round metadata kernel is unavailable")
             else:
                 pass
             if proposal_width > 0:
-                proposal_logits = grouped_lm_head_linear(
-                    preceding_hidden,
-                    self.code_predictor_spec_lm_head_weights,
-                    round_workspace.proposal_hidden_rows[:proposal_rows],
-                    proposal_head_indices,
-                    active_proposal_rows,
-                    backend=self.code_predictor_spec_lm_head_backend,
-                    output=round_workspace.proposal_logits[:proposal_rows],
-                )
-                proposal_candidates = build_speculative_probability_candidates_selected(
-                    proposal_logits,
-                    proposal_temperatures,
-                    proposal_top_ks,
-                    proposal_top_ps,
-                    active_proposal_rows,
-                    max_top_k=max_top_k,
-                    has_top_p=has_top_p,
-                    has_unbounded_top_k=False,
-                    backend=self.code_predictor_spec_probability_backend,
-                    probability_output=round_workspace.proposal_probabilities[
-                        :proposal_rows, :candidate_count
-                    ],
-                    token_id_output=round_workspace.proposal_token_ids[
-                        :proposal_rows, :candidate_count
-                    ],
-                    split_candidate_keys=(
-                        None
-                        if round_workspace.split_candidate_keys is None
-                        else round_workspace.split_candidate_keys[:proposal_rows]
-                    ),
-                    radix_candidate_keys=(
-                        None
-                        if round_workspace.radix_candidate_keys is None
-                        else round_workspace.radix_candidate_keys[:proposal_rows]
-                    ),
-                )
+                with self.code_predictor_spec_nvtx_range("draft GEMV"):
+                    proposal_logits = grouped_lm_head_linear(
+                        preceding_hidden,
+                        self.code_predictor_spec_lm_head_weights,
+                        round_workspace.proposal_hidden_rows[:proposal_rows],
+                        proposal_head_indices,
+                        active_proposal_rows,
+                        backend=self.code_predictor_spec_lm_head_backend,
+                        output=round_workspace.proposal_logits[:proposal_rows],
+                    )
+                with self.code_predictor_spec_nvtx_range("draft probabilities"):
+                    proposal_candidates = (
+                        build_speculative_probability_candidates_selected(
+                            proposal_logits,
+                            proposal_temperatures,
+                            proposal_top_ks,
+                            proposal_top_ps,
+                            active_proposal_rows,
+                            max_top_k=max_top_k,
+                            has_top_p=has_top_p,
+                            has_unbounded_top_k=False,
+                            backend=self.code_predictor_spec_probability_backend,
+                            probability_output=round_workspace.proposal_probabilities[
+                                :proposal_rows, :candidate_count
+                            ],
+                            token_id_output=round_workspace.proposal_token_ids[
+                                :proposal_rows, :candidate_count
+                            ],
+                            split_candidate_keys=(
+                                None
+                                if round_workspace.split_candidate_keys is None
+                                else round_workspace.split_candidate_keys[
+                                    :proposal_rows
+                                ]
+                            ),
+                            radix_candidate_keys=(
+                                None
+                                if round_workspace.radix_candidate_keys is None
+                                else round_workspace.radix_candidate_keys[
+                                    :proposal_rows
+                                ]
+                            ),
+                        )
+                    )
                 if proposal_candidates is None:
                     raise RuntimeError(
                         "speculative proposal probability kernel rejected a preflighted shape"
@@ -2208,6 +2288,31 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 proposal_ids_compact = round_workspace.proposal_token_ids[
                     :0, :candidate_count
                 ]
+            if self.code_predictor_spec_acceptance_backend == "dense_indexed":
+                dense_draft_probabilities = (
+                    self.code_predictor_spec_dense_draft_probabilities
+                )
+                dense_draft_previous_ids = (
+                    self.code_predictor_spec_dense_draft_previous_ids
+                )
+                dense_current_ids = self.code_predictor_spec_dense_current_ids
+                if (
+                    dense_draft_probabilities is None
+                    or dense_draft_previous_ids is None
+                    or dense_current_ids is None
+                ):
+                    raise RuntimeError("dense-indexed probability storage is missing")
+                else:
+                    pass
+                update_speculative_dense_probability_table(
+                    proposal_probabilities_compact,
+                    proposal_ids_compact,
+                    dense_draft_probabilities[:proposal_rows],
+                    dense_draft_previous_ids[:proposal_rows],
+                    dense_current_ids[:proposal_rows],
+                )
+            else:
+                pass
             if frame_rng_pool is None:
                 workspace.round_index.fill_(round_index)
                 assert workspace.uniforms is not None
@@ -2230,30 +2335,36 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 acceptance_uniforms = frame_rng_pool[:, 1, round_index, :proposal_width]
                 correction_uniforms = frame_rng_pool[:, 2, round_index, :verify_width]
                 bonus_uniforms = frame_rng_pool[:, 3, round_index, :verify_width]
-            if proposal_width > 0:
-                draft_tokens = sample_compact_probability_rows_fused(
-                    proposal_probabilities_compact,
-                    proposal_ids_compact,
-                    proposal_uniforms,
-                    active_proposal_rows.view(batch_size, proposal_width),
-                    output=round_workspace.proposal_tokens[:batch_size],
-                )
-            else:
-                draft_tokens = round_workspace.proposal_tokens[:batch_size]
+            with self.code_predictor_spec_nvtx_range("proposal sampling"):
+                if proposal_width > 0:
+                    draft_tokens = sample_compact_probability_rows_fused(
+                        proposal_probabilities_compact,
+                        proposal_ids_compact,
+                        proposal_uniforms,
+                        active_proposal_rows.view(batch_size, proposal_width),
+                        output=round_workspace.proposal_tokens[:batch_size],
+                    )
+                else:
+                    draft_tokens = round_workspace.proposal_tokens[:batch_size]
             input_buffer = round_workspace.verifier_inputs
-            source_tables = codec_tables if projected_tables is None else projected_tables
-            inputs_prepared = prepare_speculative_verification_inputs(
-                pending_tokens,
-                draft_tokens,
-                committed_depths,
-                logical_kv_lengths,
-                active_rows,
-                proposal_counts,
-                source_tables,
-                input_buffer,
+            source_tables = (
+                codec_tables if projected_tables is None else projected_tables
             )
+            with self.code_predictor_spec_nvtx_range("verification input preparation"):
+                inputs_prepared = prepare_speculative_verification_inputs(
+                    pending_tokens,
+                    draft_tokens,
+                    committed_depths,
+                    logical_kv_lengths,
+                    active_rows,
+                    proposal_counts,
+                    source_tables,
+                    input_buffer,
+                )
             if not inputs_prepared:
-                raise RuntimeError("speculative verifier preparation kernel is unavailable")
+                raise RuntimeError(
+                    "speculative verifier preparation kernel is unavailable"
+                )
             else:
                 pass
             query_embeddings = input_buffer.token_embeddings[:batch_size]
@@ -2262,28 +2373,33 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             valid_queries = input_buffer.valid_queries[:batch_size]
             target_hidden_rows = round_workspace.target_hidden_rows[:target_rows]
             if verify_graph is None:
-                verified_hiddens = self.predictor_forward_packed_tokens(
-                    token_embeds=query_embeddings,
-                    positions=packed_positions,
-                    batch_size=batch_size,
-                )
-                target_logits = grouped_lm_head_linear(
-                    verified_hiddens.reshape(-1, verified_hiddens.shape[-1]),
-                    packed_head_weights,
-                    target_hidden_rows,
-                    query_depths.reshape(-1),
-                    valid_queries.reshape(-1).contiguous(),
-                    backend=self.code_predictor_spec_lm_head_backend,
-                    output=round_workspace.target_logits[:target_rows],
-                )
+                with self.code_predictor_spec_nvtx_range("packed verifier"):
+                    verified_hiddens = self.predictor_forward_packed_tokens(
+                        token_embeds=query_embeddings,
+                        positions=packed_positions,
+                        batch_size=batch_size,
+                    )
+                with self.code_predictor_spec_nvtx_range("target GEMV"):
+                    target_logits = grouped_lm_head_linear(
+                        verified_hiddens.reshape(-1, verified_hiddens.shape[-1]),
+                        packed_head_weights,
+                        target_hidden_rows,
+                        query_depths.reshape(-1),
+                        valid_queries.reshape(-1).contiguous(),
+                        backend=self.code_predictor_spec_lm_head_backend,
+                        output=round_workspace.target_logits[:target_rows],
+                    )
                 self.code_predictor_spec_eager_round_count += 1
             else:
-                verified_hiddens = verify_graph.replay(
-                    query_embeddings,
-                    packed_positions,
-                    query_depths,
-                    valid_queries,
-                )
+                with self.code_predictor_spec_nvtx_range(
+                    "packed verifier and target GEMV graph replay"
+                ):
+                    verified_hiddens = verify_graph.replay(
+                        query_embeddings,
+                        packed_positions,
+                        query_depths,
+                        valid_queries,
+                    )
                 if verify_graph.target_logits is None:
                     raise RuntimeError("speculative graph has no target logits")
                 else:
@@ -2293,37 +2409,38 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 )
                 self.code_predictor_spec_graph_replay_count += 1
             target_logits = round_workspace.target_logits[:target_rows]
-            target_candidates = build_speculative_probability_candidates_selected(
-                target_logits,
-                target_temperatures,
-                target_top_ks,
-                target_top_ps,
-                valid_queries.reshape(-1).contiguous(),
-                max_top_k=max_top_k,
-                has_top_p=has_top_p,
-                has_unbounded_top_k=False,
-                backend=self.code_predictor_spec_probability_backend,
-                probability_output=round_workspace.target_probabilities[
-                    :target_rows, :candidate_count
-                ],
-                token_id_output=round_workspace.target_token_ids[
-                    :target_rows, :candidate_count
-                ],
-                split_candidate_keys=(
-                    None
-                    if round_workspace.split_candidate_keys is None
-                    else round_workspace.split_candidate_keys[
-                        proposal_rows : proposal_rows + target_rows
-                    ]
-                ),
-                radix_candidate_keys=(
-                    None
-                    if round_workspace.radix_candidate_keys is None
-                    else round_workspace.radix_candidate_keys[
-                        proposal_rows : proposal_rows + target_rows
-                    ]
-                ),
-            )
+            with self.code_predictor_spec_nvtx_range("target probabilities"):
+                target_candidates = build_speculative_probability_candidates_selected(
+                    target_logits,
+                    target_temperatures,
+                    target_top_ks,
+                    target_top_ps,
+                    valid_queries.reshape(-1).contiguous(),
+                    max_top_k=max_top_k,
+                    has_top_p=has_top_p,
+                    has_unbounded_top_k=False,
+                    backend=self.code_predictor_spec_probability_backend,
+                    probability_output=round_workspace.target_probabilities[
+                        :target_rows, :candidate_count
+                    ],
+                    token_id_output=round_workspace.target_token_ids[
+                        :target_rows, :candidate_count
+                    ],
+                    split_candidate_keys=(
+                        None
+                        if round_workspace.split_candidate_keys is None
+                        else round_workspace.split_candidate_keys[
+                            proposal_rows : proposal_rows + target_rows
+                        ]
+                    ),
+                    radix_candidate_keys=(
+                        None
+                        if round_workspace.radix_candidate_keys is None
+                        else round_workspace.radix_candidate_keys[
+                            proposal_rows : proposal_rows + target_rows
+                        ]
+                    ),
+                )
             if target_candidates is None:
                 raise RuntimeError(
                     "speculative target probability kernel rejected a preflighted shape"
@@ -2344,6 +2461,31 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             target_ids_compact = round_workspace.target_token_ids[
                 :target_rows, :candidate_count
             ]
+            if self.code_predictor_spec_acceptance_backend == "dense_indexed":
+                dense_target_probabilities = (
+                    self.code_predictor_spec_dense_target_probabilities
+                )
+                dense_target_previous_ids = (
+                    self.code_predictor_spec_dense_target_previous_ids
+                )
+                dense_current_ids = self.code_predictor_spec_dense_current_ids
+                if (
+                    dense_target_probabilities is None
+                    or dense_target_previous_ids is None
+                    or dense_current_ids is None
+                ):
+                    raise RuntimeError("dense-indexed probability storage is missing")
+                else:
+                    pass
+                update_speculative_dense_probability_table(
+                    target_probabilities_compact,
+                    target_ids_compact,
+                    dense_target_probabilities[:target_rows],
+                    dense_target_previous_ids[:target_rows],
+                    dense_current_ids[:target_rows],
+                )
+            else:
+                pass
             acceptance_outputs = round_workspace.acceptance_outputs
             live_acceptance_outputs = SpeculativeAcceptanceBatch(
                 committed_tokens=acceptance_outputs.committed_tokens[:batch_size],
@@ -2357,61 +2499,112 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 bonus_rows=acceptance_outputs.bonus_rows[:batch_size],
                 invalid_rows=acceptance_outputs.invalid_rows[:batch_size],
             )
-            decision = accept_speculative_candidates_compact(
-                draft_tokens,
-                proposal_probabilities_compact,
-                proposal_ids_compact,
-                target_probabilities_compact,
-                target_ids_compact,
-                proposal_counts,
-                active_rows,
-                acceptance_uniforms,
-                correction_uniforms,
-                bonus_uniforms,
-                outputs=live_acceptance_outputs,
-            )
+            with self.code_predictor_spec_nvtx_range("acceptance"):
+                if self.code_predictor_spec_acceptance_backend == "compact":
+                    decision = accept_speculative_candidates_compact(
+                        draft_tokens,
+                        proposal_probabilities_compact,
+                        proposal_ids_compact,
+                        target_probabilities_compact,
+                        target_ids_compact,
+                        proposal_counts,
+                        active_rows,
+                        acceptance_uniforms,
+                        correction_uniforms,
+                        bonus_uniforms,
+                        outputs=live_acceptance_outputs,
+                    )
+                    actual_acceptance_backend = "compact"
+                else:
+                    dense_draft_probabilities = (
+                        self.code_predictor_spec_dense_draft_probabilities
+                    )
+                    dense_target_probabilities = (
+                        self.code_predictor_spec_dense_target_probabilities
+                    )
+                    candidate_offsets = self.code_predictor_spec_dense_candidate_offsets
+                    if (
+                        dense_draft_probabilities is None
+                        or dense_target_probabilities is None
+                        or candidate_offsets is None
+                    ):
+                        raise RuntimeError(
+                            "dense-indexed probability storage is missing"
+                        )
+                    else:
+                        pass
+                    dense_vocab_size = dense_target_probabilities.shape[1]
+                    decision = accept_speculative_candidates_dense_indexed(
+                        draft_tokens,
+                        proposal_probabilities_compact,
+                        proposal_ids_compact,
+                        target_probabilities_compact,
+                        target_ids_compact,
+                        proposal_counts,
+                        active_rows,
+                        acceptance_uniforms,
+                        correction_uniforms,
+                        bonus_uniforms,
+                        dense_draft_probabilities[:proposal_rows].view(
+                            batch_size, proposal_width, dense_vocab_size
+                        ),
+                        dense_target_probabilities[:target_rows].view(
+                            batch_size, verify_width, dense_vocab_size
+                        ),
+                        candidate_offsets[:candidate_count],
+                        outputs=live_acceptance_outputs,
+                    )
+                    actual_acceptance_backend = "dense_indexed"
+                self.code_predictor_spec_acceptance_backend_execution_counts[
+                    actual_acceptance_backend
+                ] += 1
 
-            commit_speculative_codes(
-                decision.committed_tokens,
-                decision.committed_token_counts,
-                committed_depths,
-                codec_tables,
-                code_outputs,
-                summed_embeddings[:, 0, :],
-            )
-            commit_speculative_state(
-                decision.committed_tokens,
-                decision.accepted_draft_counts,
-                decision.committed_token_counts,
-                proposal_counts,
-                decision.bonus_rows,
-                decision.rejected_rows,
-                decision.invalid_rows,
-                valid_query_counts,
-                verified_hiddens,
-                pending_tokens,
-                preceding_hidden,
-                committed_depths,
-                logical_kv_lengths,
-                active_rows,
-                metadata_device[:batch_size],
-                num_groups,
-            )
-            metadata_host[:batch_size].copy_(
-                metadata_device[:batch_size],
-                non_blocking=metadata_host.is_pinned(),
-            )
+            with self.code_predictor_spec_nvtx_range("codec commit"):
+                commit_speculative_codes(
+                    decision.committed_tokens,
+                    decision.committed_token_counts,
+                    committed_depths,
+                    codec_tables,
+                    code_outputs,
+                    summed_embeddings[:, 0, :],
+                )
+            with self.code_predictor_spec_nvtx_range("state transition"):
+                commit_speculative_state(
+                    decision.committed_tokens,
+                    decision.accepted_draft_counts,
+                    decision.committed_token_counts,
+                    proposal_counts,
+                    decision.bonus_rows,
+                    decision.rejected_rows,
+                    decision.invalid_rows,
+                    valid_query_counts,
+                    verified_hiddens,
+                    pending_tokens,
+                    preceding_hidden,
+                    committed_depths,
+                    logical_kv_lengths,
+                    active_rows,
+                    metadata_device[:batch_size],
+                    num_groups,
+                )
+            with self.code_predictor_spec_nvtx_range("metadata D2H"):
+                metadata_host[:batch_size].copy_(
+                    metadata_device[:batch_size],
+                    non_blocking=metadata_host.is_pinned(),
+                )
             current_stream = self.predictor_device_module.current_stream(
                 self.predictor_device
             )
-            current_stream.synchronize()
-            round_metadata_rows = metadata_host[:batch_size].tolist()
-            if any(row[8] != 0 for row in round_metadata_rows):
-                raise RuntimeError(
-                    "compact speculative acceptance produced invalid probability mass"
-                )
-            else:
-                pass
+            with self.code_predictor_spec_nvtx_range("host synchronization"):
+                current_stream.synchronize()
+            with self.code_predictor_spec_nvtx_range("CPU orchestration"):
+                round_metadata_rows = metadata_host[:batch_size].tolist()
+                if any(row[8] != 0 for row in round_metadata_rows):
+                    raise RuntimeError(
+                        "compact speculative acceptance produced invalid probability mass"
+                    )
+                else:
+                    pass
             active_count = sum(row[1] for row in round_metadata_rows)
             self.code_predictor_spec_correction_forward_watch = any(
                 row[5] != 0 for row in round_metadata_rows
@@ -2486,11 +2679,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         requested_width: int,
         *,
         backend: Literal["cuda_graph", "eager"] = "cuda_graph",
-        probability_backend: Literal["split_top_k", "radix_compact"] = "split_top_k",
+        probability_backend: Literal[
+            "split_top_k", "radix_compact", "radix_compact_4bit"
+        ] = "split_top_k",
         lm_head_backend: Literal[
             "grouped_triton", "warp_gemv", "warp_accumulate"
         ] = "grouped_triton",
         rng_backend: Literal["per_round", "frame_pool"] = "per_round",
+        acceptance_backend: Literal["compact", "dense_indexed"] = "compact",
     ) -> None:
         """Allocate opt-in scratch and resolve the selected speculative backend."""
         configuration_started = time.perf_counter()
@@ -2501,7 +2697,11 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             )
         else:
             pass
-        if probability_backend not in ("split_top_k", "radix_compact"):
+        if probability_backend not in (
+            "split_top_k",
+            "radix_compact",
+            "radix_compact_4bit",
+        ):
             raise ValueError("unsupported CodePredictor probability backend")
         elif lm_head_backend not in (
             "grouped_triton",
@@ -2511,6 +2711,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             raise ValueError("unsupported CodePredictor grouped-head backend")
         elif rng_backend not in ("per_round", "frame_pool"):
             raise ValueError("unsupported CodePredictor RNG backend")
+        elif acceptance_backend not in ("compact", "dense_indexed"):
+            raise ValueError("unsupported CodePredictor acceptance backend")
         else:
             pass
         self.code_predictor_spec_requested_width = requested_width
@@ -2518,12 +2720,20 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_probability_backend = probability_backend
         self.code_predictor_spec_lm_head_backend = lm_head_backend
         self.code_predictor_spec_rng_backend = rng_backend
+        self.code_predictor_spec_acceptance_backend = acceptance_backend
         self.code_predictor_spec_effective_width = 0
         self.code_predictor_spec_fallback_reason = None
         self.code_predictor_spec_graphs.clear()
         self.code_predictor_spec_input_buffers.clear()
         self.code_predictor_spec_workspaces.clear()
         self.code_predictor_spec_active_workspace = None
+        self.code_predictor_spec_dense_draft_probabilities = None
+        self.code_predictor_spec_dense_target_probabilities = None
+        self.code_predictor_spec_dense_draft_previous_ids = None
+        self.code_predictor_spec_dense_target_previous_ids = None
+        self.code_predictor_spec_dense_current_ids = None
+        self.code_predictor_spec_dense_candidate_offsets = None
+        self.code_predictor_spec_dense_candidate_capacity = 0
         if requested_width == 0:
             self.sub_speculative_seed_tensor = None
             self.sub_speculative_round_index_tensor = None
@@ -2629,9 +2839,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         elif lm_head_backend == "warp_gemv":
             grouped_head_kernel_available = grouped_lm_head_warp_gemv_available()
         else:
-            grouped_head_kernel_available = (
-                grouped_lm_head_warp_accumulate_available()
-            )
+            grouped_head_kernel_available = grouped_lm_head_warp_accumulate_available()
         if (
             current_platform.is_cuda()
             and grouped_head_kernel_available
@@ -2962,6 +3170,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             self.sub_speculative_rng_pool_tensor,
             self.code_predictor_spec_metadata_device,
             self.code_predictor_spec_metadata_host,
+            self.code_predictor_spec_dense_draft_probabilities,
+            self.code_predictor_spec_dense_target_probabilities,
+            self.code_predictor_spec_dense_draft_previous_ids,
+            self.code_predictor_spec_dense_target_previous_ids,
+            self.code_predictor_spec_dense_current_ids,
+            self.code_predictor_spec_dense_candidate_offsets,
         ):
             if tensor is not None and tensor.numel() > 0:
                 workspace_tensors[tensor.data_ptr()] = tensor
@@ -2989,6 +3203,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             ),
             "probability_backend_fallbacks": (
                 self.code_predictor_spec_probability_backend_fallback_count
+            ),
+            "acceptance_backend": self.code_predictor_spec_acceptance_backend,
+            "acceptance_backend_execution_counts": dict(
+                self.code_predictor_spec_acceptance_backend_execution_counts
             ),
             "lm_head_backend": self.code_predictor_spec_lm_head_backend,
             "rng_backend": self.code_predictor_spec_rng_backend,
@@ -3043,6 +3261,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 self.code_predictor_spec_workspace_allocation_count
             ),
             "configuration_time_ms": self.code_predictor_spec_configuration_time_ms,
+            "nvtx_enabled": self.code_predictor_spec_nvtx_enabled,
             "native_fallback_count": self.code_predictor_spec_native_fallback_count,
             "attempted_frames": (
                 self.code_predictor_spec_frame_count

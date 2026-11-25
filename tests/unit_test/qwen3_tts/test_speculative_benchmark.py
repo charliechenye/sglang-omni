@@ -11,6 +11,7 @@ import pytest
 
 from sglang_omni.utils.qwen3_tts_speculative_benchmark import (
     SpeechResult,
+    acceptance_backend_execution_delta,
     classify_verifier_execution_coverage,
     parse_wav_audio,
     probability_backend_execution_delta,
@@ -129,16 +130,39 @@ def test_benchmark_reports_probability_backend_execution_deltas() -> None:
         "probability_backend_execution_counts": {
             "split_top_k": 2,
             "radix_compact": 1,
+            "radix_compact_4bit": 0,
         }
     }
     after = {
         "probability_backend_execution_counts": {
             "split_top_k": 4,
             "radix_compact": 5,
+            "radix_compact_4bit": 3,
         }
     }
 
     assert probability_backend_execution_delta(before, after) == {
         "split_top_k": 2,
         "radix_compact": 4,
+        "radix_compact_4bit": 3,
+    }
+
+
+def test_benchmark_reports_acceptance_backend_execution_deltas() -> None:
+    before = {
+        "acceptance_backend_execution_counts": {
+            "compact": 3,
+            "dense_indexed": 0,
+        }
+    }
+    after = {
+        "acceptance_backend_execution_counts": {
+            "compact": 3,
+            "dense_indexed": 7,
+        }
+    }
+
+    assert acceptance_backend_execution_delta(before, after) == {
+        "compact": 0,
+        "dense_indexed": 7,
     }

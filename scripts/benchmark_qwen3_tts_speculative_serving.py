@@ -51,7 +51,11 @@ def main() -> None:
     parser.add_argument("--expected-width", type=nonnegative_integer)
     parser.add_argument(
         "--expected-probability-backend",
-        choices=("split_top_k", "radix_compact"),
+        choices=("split_top_k", "radix_compact", "radix_compact_4bit"),
+    )
+    parser.add_argument(
+        "--expected-acceptance-backend",
+        choices=("compact", "dense_indexed"),
     )
     parser.add_argument("--require-all-verifier-graph", action="store_true")
     parser.add_argument("--result-file")

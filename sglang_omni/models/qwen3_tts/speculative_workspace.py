@@ -10,9 +10,7 @@ import torch
 from sglang_omni.models.qwen3_tts.speculative_acceptance import (
     SpeculativeAcceptanceBatch,
 )
-from sglang_omni.models.qwen3_tts.speculative_prepare import (
-    SpeculativeVerifierInputs,
-)
+from sglang_omni.models.qwen3_tts.speculative_prepare import SpeculativeVerifierInputs
 
 
 @dataclass(kw_only=True)
@@ -98,9 +96,7 @@ class PredictorSpeculativeWorkspace:
         self.preceding_hidden = torch.empty(
             max_batch_size, hidden_size, device=device, dtype=hidden_dtype
         )
-        self.active_rows = torch.empty(
-            max_batch_size, device=device, dtype=torch.bool
-        )
+        self.active_rows = torch.empty(max_batch_size, device=device, dtype=torch.bool)
         self.rounds: dict[int, PredictorSpeculativeRoundWorkspace] = {}
         for verify_width in range(1, max_verify_width + 1):
             proposal_width = verify_width - 1
@@ -192,9 +188,7 @@ class PredictorSpeculativeWorkspace:
             )
             accepted_draft_counts = torch.empty_like(proposal_counts)
             committed_token_counts = torch.empty_like(proposal_counts)
-            rejected_rows = torch.empty(
-                max_batch_size, device=device, dtype=torch.bool
-            )
+            rejected_rows = torch.empty(max_batch_size, device=device, dtype=torch.bool)
             bonus_rows = torch.empty_like(rejected_rows)
             invalid_rows = torch.empty_like(rejected_rows)
             split_candidate_keys = None
@@ -324,6 +318,5 @@ class PredictorSpeculativeWorkspace:
     def memory_bytes(self) -> int:
         unique_storage = {tensor.data_ptr(): tensor for tensor in self.tensor_storage}
         return sum(
-            tensor.numel() * tensor.element_size()
-            for tensor in unique_storage.values()
+            tensor.numel() * tensor.element_size() for tensor in unique_storage.values()
         )

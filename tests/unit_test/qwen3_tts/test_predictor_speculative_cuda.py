@@ -149,14 +149,28 @@ def build_speculative_talker(
     talker.code_predictor_spec_requested_width = 0
     talker.code_predictor_spec_effective_width = 0
     talker.code_predictor_spec_backend = "cuda_graph"
+    talker.code_predictor_spec_nvtx_enabled = False
     talker.code_predictor_spec_rng_backend = "per_round"
     talker.code_predictor_spec_lm_head_backend = "grouped_triton"
     talker.code_predictor_spec_probability_backend = "split_top_k"
     talker.code_predictor_spec_probability_backend_execution_counts = {
         "split_top_k": 0,
         "radix_compact": 0,
+        "radix_compact_4bit": 0,
     }
     talker.code_predictor_spec_probability_backend_fallback_count = 0
+    talker.code_predictor_spec_acceptance_backend = "compact"
+    talker.code_predictor_spec_acceptance_backend_execution_counts = {
+        "compact": 0,
+        "dense_indexed": 0,
+    }
+    talker.code_predictor_spec_dense_draft_probabilities = None
+    talker.code_predictor_spec_dense_target_probabilities = None
+    talker.code_predictor_spec_dense_draft_previous_ids = None
+    talker.code_predictor_spec_dense_target_previous_ids = None
+    talker.code_predictor_spec_dense_current_ids = None
+    talker.code_predictor_spec_dense_candidate_offsets = None
+    talker.code_predictor_spec_dense_candidate_capacity = 0
     talker.code_predictor_spec_fallback_reason = None
     talker.code_predictor_spec_graphs = {}
     talker.code_predictor_spec_input_buffers = {}
@@ -320,7 +334,9 @@ def test_packed_predictor_matches_sequential_native_hidden_and_kv_prefixes(
         for layer_index, lm_head in enumerate(talker.code_predictor.lm_head[:2]):
             packed_logits, _ = lm_head(packed_hiddens[:, layer_index : layer_index + 1])
             native_logits, _ = lm_head(native_hiddens[:, layer_index : layer_index + 1])
-            torch.testing.assert_close(packed_logits, native_logits, atol=2e-2, rtol=2e-2)
+            torch.testing.assert_close(
+                packed_logits, native_logits, atol=2e-2, rtol=2e-2
+            )
         else:
             pass
         torch.testing.assert_close(
@@ -374,10 +390,14 @@ def test_unseeded_eager_speculation_runs_a_complete_predictor_frame(
 
 @pytest.mark.parametrize("execution_backend", ["eager", "cuda_graph"])
 @pytest.mark.parametrize("top_k", [4, 50, 128])
+@pytest.mark.parametrize("acceptance_backend", ["compact", "dense_indexed"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
 def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
-    monkeypatch: pytest.MonkeyPatch, execution_backend: str, top_k: int
+    monkeypatch: pytest.MonkeyPatch,
+    execution_backend: str,
+    top_k: int,
+    acceptance_backend: str,
 ) -> None:
     device = torch.device("cuda")
     torch.manual_seed(318)
@@ -392,6 +412,7 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
             4,
             backend=execution_backend,
             probability_backend=probability_backend,
+            acceptance_backend=acceptance_backend,
         )
 
         probability_call_count = 0
@@ -456,7 +477,8 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
             probabilities[~active_rows] = 0.0
             actual_backend = (
                 "split_top_k"
-                if backend == "radix_compact" and max_top_k <= 32
+                if backend in ("radix_compact", "radix_compact_4bit")
+                and max_top_k <= 32
                 else backend
             )
             return probabilities, token_ids, actual_backend
@@ -506,6 +528,7 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
         verify_complete_frame(talker, codes, summed_embedding)
 
     stats = talker.predictor_speculative_stats()
+    assert stats["nvtx_enabled"] is False
     assert probability_call_count == 9
     assert stats["frames"] == 1
     assert stats["native_fallback_count"] == 0
@@ -513,8 +536,14 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
     assert stats["probability_backend_execution_counts"] == {
         "split_top_k": 9,
         "radix_compact": 0,
+        "radix_compact_4bit": 0,
     }
     assert stats["probability_backend_fallbacks"] == (9 if top_k == 4 else 0)
+    assert stats["acceptance_backend"] == acceptance_backend
+    assert stats["acceptance_backend_execution_counts"] == {
+        "compact": 5 if acceptance_backend == "compact" else 0,
+        "dense_indexed": 5 if acceptance_backend == "dense_indexed" else 0,
+    }
     if execution_backend == "eager":
         assert stats["eager_verifier_rounds"] == 5
         assert stats["verifier_graph_replays"] == 0
@@ -666,7 +695,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             tuple[
                 torch.Tensor,
                 torch.Tensor,
-                Literal["split_top_k", "radix_compact"],
+                Literal["split_top_k", "radix_compact", "radix_compact_4bit"],
             ]
             | None
         ):
@@ -1993,14 +2022,33 @@ def test_radix_probability_selector_matches_production_split_top_k() -> None:
         has_top_p=True,
         has_unbounded_top_k=False,
     )
+    radix_4bit_candidates = build_speculative_probability_candidates_radix(
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        active_rows,
+        max_top_k=64,
+        has_top_p=True,
+        has_unbounded_top_k=False,
+        radix_bits=4,
+    )
     assert split_candidates is not None
     assert radix_candidates is not None
+    assert radix_4bit_candidates is not None
     split_probabilities, split_token_ids = split_candidates
     radix_probabilities, radix_token_ids = radix_candidates
     assert torch.equal(radix_token_ids, split_token_ids)
     assert_radix_distribution_parity(
         radix_probabilities,
         radix_token_ids,
+        split_probabilities,
+        split_token_ids,
+    )
+    assert torch.equal(radix_4bit_candidates[1], split_token_ids)
+    assert_radix_distribution_parity(
+        radix_4bit_candidates[0],
+        radix_4bit_candidates[1],
         split_probabilities,
         split_token_ids,
     )
@@ -2022,8 +2070,9 @@ def test_radix_probability_selector_matches_production_split_top_k() -> None:
         (128, 16),
     ],
 )
+@pytest.mark.parametrize("radix_bits", [8, 4])
 def test_radix_probability_support_compaction_matches_split_for_small_batches(
-    max_top_k: int, row_count: int
+    max_top_k: int, row_count: int, radix_bits: int
 ) -> None:
     device = torch.device("cuda")
     torch.manual_seed(1024 + max_top_k)
@@ -2041,6 +2090,7 @@ def test_radix_probability_support_compaction_matches_split_for_small_batches(
         max_top_k=max_top_k,
         has_top_p=False,
         has_unbounded_top_k=False,
+        radix_bits=radix_bits,
     )
     radix_candidates = build_speculative_probability_candidates_radix(
         logits,
@@ -2185,9 +2235,7 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
     )
 
     # Independent high-precision oracle.
-    reference = torch.zeros_like(
-        baseline_logits, dtype=torch.float64
-    )
+    reference = torch.zeros_like(baseline_logits, dtype=torch.float64)
     abs_product_sum = torch.zeros_like(reference)
     native_logits = torch.zeros_like(baseline_logits)
 
@@ -2204,11 +2252,8 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
     rounded_reference = reference.to(torch.bfloat16)
 
     # Use a conservative rounding bound for both tiled and warp-local accumulators.
-    unit_roundoff = 2.0 ** -24
-    gamma = (
-        64 * unit_roundoff
-        / (1 - 64 * unit_roundoff)
-    )
+    unit_roundoff = 2.0**-24
+    gamma = 64 * unit_roundoff / (1 - 64 * unit_roundoff)
     fp32_error_bound = gamma * abs_product_sum
 
     for name, logits in (
@@ -2237,9 +2282,7 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
             reference - upper,
         ).clamp_min(0)
 
-        violations = (
-            outside_rounding_interval > fp32_error_bound
-        )
+        violations = outside_rounding_interval > fp32_error_bound
 
         print(
             "GROUPED_GEMV_ORACLE",
@@ -2254,14 +2297,14 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
 
         assert not bool(violations.any()), name
 
-    pairwise_error = (
-        warp_logits.float() - baseline_logits.float()
-    ).abs()
+    pairwise_error = (warp_logits.float() - baseline_logits.float()).abs()
 
     print(
         "GROUPED_GEMV_PAIRWISE",
-        "mismatched=", int((pairwise_error != 0).sum()),
-        "max_abs=", float(pairwise_error.max()),
+        "mismatched=",
+        int((pairwise_error != 0).sum()),
+        "max_abs=",
+        float(pairwise_error.max()),
     )
 
     # Logit closeness alone does not establish sampling parity.
@@ -2277,9 +2320,7 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
                 device=device,
                 dtype=torch.long,
             )
-            top_ps = torch.full(
-                (row_count,), top_p, device=device
-            )
+            top_ps = torch.full((row_count,), top_p, device=device)
 
             distributions = {}
 
@@ -2311,8 +2352,7 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
 
                 assert bool(
                     (
-                        (token_ids[positive] >= 0)
-                        & (token_ids[positive] < vocab_size)
+                        (token_ids[positive] >= 0) & (token_ids[positive] < vocab_size)
                     ).all()
                 )
 
@@ -2328,9 +2368,7 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
                     torch.zeros_like(token_ids.long()),
                 )
 
-                dense.scatter_add_(
-                    1, safe_ids, probabilities
-                )
+                dense.scatter_add_(1, safe_ids, probabilities)
 
                 torch.testing.assert_close(
                     dense.sum(dim=-1),
@@ -2354,24 +2392,29 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
                 diff = (a.double() - b.double()).abs()
                 tv = 0.5 * diff.sum(dim=-1)
 
-                support_mismatch = int(
-                    ((a > 0) != (b > 0)).sum()
-                )
+                support_mismatch = int(((a > 0) != (b > 0)).sum())
 
                 print(
                     "GROUPED_GEMV_DISTRIBUTION",
-                    left, right,
-                    "top_k=", top_k,
-                    "top_p=", top_p,
-                    "support_mismatch=", support_mismatch,
-                    "max_abs=", float(diff.max()),
-                    "max_tv=", float(tv.max()),
+                    left,
+                    right,
+                    "top_k=",
+                    top_k,
+                    "top_p=",
+                    top_p,
+                    "support_mismatch=",
+                    support_mismatch,
+                    "max_abs=",
+                    float(diff.max()),
+                    "max_tv=",
+                    float(tv.max()),
                 )
 
                 assert support_mismatch == 0
 
                 torch.testing.assert_close(
-                    a, b,
+                    a,
+                    b,
                     atol=3e-5,
                     rtol=3e-4,
                 )

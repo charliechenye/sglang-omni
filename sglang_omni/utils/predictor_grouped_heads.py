@@ -181,9 +181,7 @@ if triton is not None:
         )
         safe_hidden_index = tl.minimum(tl.maximum(hidden_index, 0), source_rows - 1)
         safe_head_index = tl.minimum(tl.maximum(head_index, 0), head_count - 1)
-        lane_accumulators = tl.zeros(
-            (outputs_per_cta, block_hidden), dtype=tl.float32
-        )
+        lane_accumulators = tl.zeros((outputs_per_cta, block_hidden), dtype=tl.float32)
         for hidden_start in range(0, hidden_size, block_hidden):
             hidden_offsets_at_block = hidden_start + hidden_offsets
             hidden_tile = tl.load(
@@ -300,7 +298,10 @@ def grouped_lm_head_linear(
             raise RuntimeError("grouped CUDA LM-head kernel is unavailable")
         elif backend == "warp_gemv" and not grouped_lm_head_warp_gemv_available():
             raise RuntimeError("warp-oriented CUDA LM-head kernel is unavailable")
-        elif backend == "warp_accumulate" and not grouped_lm_head_warp_accumulate_available():
+        elif (
+            backend == "warp_accumulate"
+            and not grouped_lm_head_warp_accumulate_available()
+        ):
             raise RuntimeError("warp-accumulate CUDA LM-head kernel is unavailable")
         else:
             pass

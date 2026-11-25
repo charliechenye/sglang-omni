@@ -463,7 +463,11 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
         pass
     graph_captures = integer_stat(speculative_stats_after, "graph_captures")
     probability_backend = speculative_stats_after.get("probability_backend")
-    if probability_backend not in ("split_top_k", "radix_compact"):
+    if probability_backend not in (
+        "split_top_k",
+        "radix_compact",
+        "radix_compact_4bit",
+    ):
         raise RuntimeError("speculative server has an invalid probability backend")
     elif (
         arguments.expected_probability_backend is not None
@@ -475,6 +479,21 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
     else:
         pass
     probability_backend_execution_counts = probability_backend_execution_delta(
+        speculative_stats_before, speculative_stats_after
+    )
+    acceptance_backend = speculative_stats_after.get("acceptance_backend")
+    if acceptance_backend not in ("compact", "dense_indexed"):
+        raise RuntimeError("speculative server has an invalid acceptance backend")
+    elif (
+        arguments.expected_acceptance_backend is not None
+        and acceptance_backend != arguments.expected_acceptance_backend
+    ):
+        raise RuntimeError(
+            "speculative acceptance backend does not match the requested ablation"
+        )
+    else:
+        pass
+    acceptance_backend_execution_counts = acceptance_backend_execution_delta(
         speculative_stats_before, speculative_stats_after
     )
     probability_backend_fallbacks = integer_stat(
@@ -504,12 +523,16 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
         raise RuntimeError(
             "performance gate failed: verifier execution mixed eager and graph rounds"
         )
-    elif probability_backend == "radix_compact" and (
-        probability_backend_execution_counts["radix_compact"] <= 0
+    elif probability_backend in ("radix_compact", "radix_compact_4bit") and (
+        probability_backend_execution_counts[probability_backend] <= 0
         or probability_backend_fallbacks > 0
     ):
         raise RuntimeError(
             "performance gate failed: radix ablation used split Top-K fallback"
+        )
+    elif sum(acceptance_backend_execution_counts.values()) != total_verifier_rounds:
+        raise RuntimeError(
+            "performance gate failed: acceptance counters do not cover all rounds"
         )
     elif (
         integer_stat(speculative_stats_after, "standalone_correction_forward_count")
@@ -601,6 +624,8 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
         "probability_backend": probability_backend,
         "probability_backend_execution_counts": probability_backend_execution_counts,
         "probability_backend_fallbacks": probability_backend_fallbacks,
+        "acceptance_backend": acceptance_backend,
+        "acceptance_backend_execution_counts": acceptance_backend_execution_counts,
         "speculative_graph_capture_memory_bytes": integer_stat(
             speculative_stats_after, "graph_capture_memory_delta_bytes"
         ),
@@ -707,7 +732,7 @@ def probability_backend_execution_delta(
     else:
         pass
     execution_delta: dict[str, int] = {}
-    for backend in ("split_top_k", "radix_compact"):
+    for backend in ("split_top_k", "radix_compact", "radix_compact_4bit"):
         before_count = before_counts.get(backend)
         after_count = after_counts.get(backend)
         if (
@@ -720,6 +745,37 @@ def probability_backend_execution_delta(
         ):
             raise RuntimeError(
                 f"model_info has invalid probability backend count for {backend}"
+            )
+        else:
+            pass
+        execution_delta[backend] = after_count - before_count
+    return execution_delta
+
+
+def acceptance_backend_execution_delta(
+    before: dict[str, JsonValue], after: dict[str, JsonValue]
+) -> dict[str, int]:
+    """Return acceptance executions by the implementation that ran."""
+    before_counts = before.get("acceptance_backend_execution_counts")
+    after_counts = after.get("acceptance_backend_execution_counts")
+    if not isinstance(before_counts, dict) or not isinstance(after_counts, dict):
+        raise RuntimeError("model_info is missing acceptance backend execution counts")
+    else:
+        pass
+    execution_delta: dict[str, int] = {}
+    for backend in ("compact", "dense_indexed"):
+        before_count = before_counts.get(backend)
+        after_count = after_counts.get(backend)
+        if (
+            isinstance(before_count, bool)
+            or not isinstance(before_count, int)
+            or isinstance(after_count, bool)
+            or not isinstance(after_count, int)
+            or before_count < 0
+            or after_count < before_count
+        ):
+            raise RuntimeError(
+                f"model_info has invalid acceptance backend count for {backend}"
             )
         else:
             pass

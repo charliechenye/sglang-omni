@@ -50,6 +50,7 @@ def test_speculative_verify_width_is_wired_to_the_engine_stage(width: int) -> No
         "code_predictor_spec_probability_backend": "split_top_k",
         "code_predictor_spec_lm_head_backend": "grouped_triton",
         "code_predictor_spec_rng_backend": "per_round",
+        "code_predictor_spec_acceptance_backend": "compact",
     }
 
 
@@ -66,6 +67,7 @@ def test_speculative_eager_backend_is_explicitly_wired_to_engine_stage() -> None
         "code_predictor_spec_probability_backend": "split_top_k",
         "code_predictor_spec_lm_head_backend": "grouped_triton",
         "code_predictor_spec_rng_backend": "per_round",
+        "code_predictor_spec_acceptance_backend": "compact",
     }
 
 
@@ -74,6 +76,21 @@ def test_speculative_radix_probability_backend_is_wired_to_engine_stage() -> Non
         model_path="model",
         code_predictor_spec_verify_size=4,
         code_predictor_spec_probability_backend="radix_compact",
+    )
+
+
+def test_speculative_four_bit_radix_backend_is_wired_to_engine_stage() -> None:
+    config = Qwen3TTSPipelineConfig(
+        model_path="model",
+        code_predictor_spec_verify_size=4,
+        code_predictor_spec_probability_backend="radix_compact_4bit",
+    )
+
+    assert (
+        config.stage_factory_kwargs("tts_engine")[
+            "code_predictor_spec_probability_backend"
+        ]
+        == "radix_compact_4bit"
     )
 
 
@@ -105,10 +122,23 @@ def test_warp_accumulate_lm_head_backend_is_wired_to_engine_stage() -> None:
     )
 
     assert (
-        config.stage_factory_kwargs("tts_engine")[
-            "code_predictor_spec_lm_head_backend"
-        ]
+        config.stage_factory_kwargs("tts_engine")["code_predictor_spec_lm_head_backend"]
         == "warp_accumulate"
+    )
+
+
+def test_dense_indexed_acceptance_backend_is_wired_to_engine_stage() -> None:
+    config = Qwen3TTSPipelineConfig(
+        model_path="model",
+        code_predictor_spec_verify_size=4,
+        code_predictor_spec_acceptance_backend="dense_indexed",
+    )
+
+    assert (
+        config.stage_factory_kwargs("tts_engine")[
+            "code_predictor_spec_acceptance_backend"
+        ]
+        == "dense_indexed"
     )
 
 

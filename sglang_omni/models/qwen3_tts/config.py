@@ -56,11 +56,14 @@ class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
     shares_engine_speech_tokenizer: bool
     code_predictor_spec_verify_size: int
     code_predictor_spec_backend: Literal["cuda_graph", "eager"]
-    code_predictor_spec_probability_backend: Literal["split_top_k", "radix_compact"]
+    code_predictor_spec_probability_backend: Literal[
+        "split_top_k", "radix_compact", "radix_compact_4bit"
+    ]
     code_predictor_spec_lm_head_backend: Literal[
         "grouped_triton", "warp_gemv", "warp_accumulate"
     ]
     code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"]
+    code_predictor_spec_acceptance_backend: Literal["compact", "dense_indexed"]
 
 
 class Qwen3TTSPipelineConfig(PipelineConfig):
@@ -102,13 +105,16 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
     enable_deterministic_inference: bool = False
     code_predictor_spec_verify_size: int = 0
     code_predictor_spec_backend: Literal["cuda_graph", "eager"] = "cuda_graph"
-    code_predictor_spec_probability_backend: Literal["split_top_k", "radix_compact"] = (
-        "split_top_k"
-    )
+    code_predictor_spec_probability_backend: Literal[
+        "split_top_k", "radix_compact", "radix_compact_4bit"
+    ] = "split_top_k"
     code_predictor_spec_lm_head_backend: Literal[
         "grouped_triton", "warp_gemv", "warp_accumulate"
     ] = "grouped_triton"
     code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"] = "per_round"
+    code_predictor_spec_acceptance_backend: Literal["compact", "dense_indexed"] = (
+        "compact"
+    )
     stages: list[StageConfig] = [
         StageConfig(
             name="preprocessing",
@@ -161,6 +167,9 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             )
             kwargs["code_predictor_spec_rng_backend"] = (
                 self.code_predictor_spec_rng_backend
+            )
+            kwargs["code_predictor_spec_acceptance_backend"] = (
+                self.code_predictor_spec_acceptance_backend
             )
         else:
             pass

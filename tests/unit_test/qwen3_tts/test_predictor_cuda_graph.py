@@ -302,7 +302,7 @@ def make_request(
             subtalker_top_p=top_p,
             subtalker_top_k=top_k,
             subtalker_sampling_seed=sub_seed,
-        )
+        ),
     )
 
 

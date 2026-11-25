@@ -217,7 +217,13 @@ def prepare_speculative_round_metadata(
         raise ValueError("speculative round state must contain aligned batch rows")
     elif any(
         tensor.shape != (batch_size,)
-        for tensor in (temperatures, top_ks, top_ps, proposal_counts, valid_query_counts)
+        for tensor in (
+            temperatures,
+            top_ks,
+            top_ps,
+            proposal_counts,
+            valid_query_counts,
+        )
     ):
         raise ValueError("speculative round parameters must contain aligned rows")
     elif proposal_head_offsets.shape != (batch_size * draft_width,):
@@ -225,12 +231,16 @@ def prepare_speculative_round_metadata(
     elif proposal_head_indices.shape != (batch_size * draft_width,):
         raise ValueError("proposal head output does not match the verification width")
     elif proposal_active_rows.shape != (batch_size * draft_width,):
-        raise ValueError("proposal activity output does not match the verification width")
+        raise ValueError(
+            "proposal activity output does not match the verification width"
+        )
     elif any(
         tensor.shape != (batch_size * draft_width,)
         for tensor in (proposal_temperatures, proposal_top_ks, proposal_top_ps)
     ):
-        raise ValueError("proposal sampling outputs do not match the verification width")
+        raise ValueError(
+            "proposal sampling outputs do not match the verification width"
+        )
     elif any(
         tensor.shape != (batch_size * verify_width,)
         for tensor in (target_temperatures, target_top_ks, target_top_ps)
@@ -258,7 +268,10 @@ def prepare_speculative_round_metadata(
     )
     if any(tensor.device != committed_depths.device for tensor in tensors):
         raise ValueError("speculative round metadata must share one device")
-    elif not committed_depths.is_cuda or prepare_speculative_round_metadata_kernel is None:
+    elif (
+        not committed_depths.is_cuda
+        or prepare_speculative_round_metadata_kernel is None
+    ):
         return False
     elif any(not tensor.is_contiguous() for tensor in tensors):
         raise ValueError("speculative round metadata must be contiguous")
@@ -266,7 +279,10 @@ def prepare_speculative_round_metadata(
         raise ValueError("speculative temperatures and top-p values must use FP32")
     elif top_ks.dtype is not torch.long or committed_depths.dtype is not torch.long:
         raise ValueError("speculative selectors must use int64")
-    elif active_rows.dtype is not torch.bool or proposal_active_rows.dtype is not torch.bool:
+    elif (
+        active_rows.dtype is not torch.bool
+        or proposal_active_rows.dtype is not torch.bool
+    ):
         raise ValueError("speculative activity selectors must use booleans")
     else:
         pass
