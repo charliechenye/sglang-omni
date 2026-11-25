@@ -55,7 +55,7 @@ class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
     codec_state_slots: int | None
     shares_engine_speech_tokenizer: bool
     code_predictor_spec_verify_size: int
-    code_predictor_spec_backend: Literal["cuda_graph", "eager"]
+    code_predictor_spec_backend: Literal["cuda_graph", "eager", "full_round_graph"]
     code_predictor_spec_probability_backend: Literal[
         "split_top_k", "radix_compact", "radix_compact_4bit"
     ]
@@ -64,6 +64,7 @@ class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
     ]
     code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"]
     code_predictor_spec_acceptance_backend: Literal["compact", "dense_indexed"]
+    code_predictor_spec_opening_pair_graph: bool
 
 
 class Qwen3TTSPipelineConfig(PipelineConfig):
@@ -104,7 +105,9 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
     # reducing throughput.
     enable_deterministic_inference: bool = False
     code_predictor_spec_verify_size: int = 0
-    code_predictor_spec_backend: Literal["cuda_graph", "eager"] = "cuda_graph"
+    code_predictor_spec_backend: Literal["cuda_graph", "eager", "full_round_graph"] = (
+        "cuda_graph"
+    )
     code_predictor_spec_probability_backend: Literal[
         "split_top_k", "radix_compact", "radix_compact_4bit"
     ] = "split_top_k"
@@ -115,6 +118,7 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
     code_predictor_spec_acceptance_backend: Literal["compact", "dense_indexed"] = (
         "compact"
     )
+    code_predictor_spec_opening_pair_graph: bool = False
     stages: list[StageConfig] = [
         StageConfig(
             name="preprocessing",
@@ -170,6 +174,9 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             )
             kwargs["code_predictor_spec_acceptance_backend"] = (
                 self.code_predictor_spec_acceptance_backend
+            )
+            kwargs["code_predictor_spec_opening_pair_graph"] = (
+                self.code_predictor_spec_opening_pair_graph
             )
         else:
             pass

@@ -39,13 +39,17 @@ if triton is not None:
         hidden_size: tl.constexpr,
         block_vocab: tl.constexpr,
         block_hidden: tl.constexpr,
+        implicit_hidden_indices: tl.constexpr,
     ):
         row = tl.program_id(0)
         vocab_start = tl.program_id(1) * block_vocab
         vocab_offsets = vocab_start + tl.arange(0, block_vocab)
         hidden_offsets = tl.arange(0, block_hidden)
         is_active = tl.load(active_rows + row)
-        hidden_index = tl.load(hidden_indices + row)
+        if implicit_hidden_indices:
+            hidden_index = row
+        else:
+            hidden_index = tl.load(hidden_indices + row)
         head_index = tl.load(head_indices + row)
         is_valid = (
             is_active
@@ -101,13 +105,17 @@ if triton is not None:
         hidden_size: tl.constexpr,
         block_vocab: tl.constexpr,
         block_hidden: tl.constexpr,
+        implicit_hidden_indices: tl.constexpr,
     ):
         row = tl.program_id(0)
         vocab_start = tl.program_id(1) * block_vocab
         vocab_offsets = vocab_start + tl.arange(0, block_vocab)
         hidden_offsets = tl.arange(0, block_hidden)
         is_active = tl.load(active_rows + row)
-        hidden_index = tl.load(hidden_indices + row)
+        if implicit_hidden_indices:
+            hidden_index = row
+        else:
+            hidden_index = tl.load(hidden_indices + row)
         head_index = tl.load(head_indices + row)
         is_valid = (
             is_active
@@ -163,6 +171,7 @@ if triton is not None:
         hidden_size: tl.constexpr,
         outputs_per_cta: tl.constexpr,
         block_hidden: tl.constexpr,
+        implicit_hidden_indices: tl.constexpr,
     ):
         row = tl.program_id(0)
         output_offsets = tl.program_id(1) * outputs_per_cta + tl.arange(
@@ -170,7 +179,10 @@ if triton is not None:
         )
         hidden_offsets = tl.arange(0, block_hidden)
         is_active = tl.load(active_rows + row)
-        hidden_index = tl.load(hidden_indices + row)
+        if implicit_hidden_indices:
+            hidden_index = row
+        else:
+            hidden_index = tl.load(hidden_indices + row)
         head_index = tl.load(head_indices + row)
         is_valid = (
             is_active
@@ -235,7 +247,7 @@ def grouped_lm_head_warp_accumulate_available() -> bool:
 def grouped_lm_head_linear(
     hidden_states: torch.Tensor,
     packed_weights: torch.Tensor,
-    hidden_indices: torch.Tensor,
+    hidden_indices: torch.Tensor | None,
     head_indices: torch.Tensor,
     active_rows: torch.Tensor,
     *,
@@ -249,13 +261,15 @@ def grouped_lm_head_linear(
         raise ValueError("grouped LM-head inputs have invalid rank")
     else:
         pass
-    if hidden_indices.ndim != 1 or head_indices.shape != hidden_indices.shape:
+    if head_indices.ndim != 1 or (
+        hidden_indices is not None and hidden_indices.shape != head_indices.shape
+    ):
         raise ValueError(
             "grouped LM-head selectors must be one-dimensional and aligned"
         )
     else:
         pass
-    if active_rows.shape != hidden_indices.shape or active_rows.dtype is not torch.bool:
+    if active_rows.shape != head_indices.shape or active_rows.dtype is not torch.bool:
         raise ValueError("grouped LM-head active mask must align with its selectors")
     else:
         pass
@@ -263,17 +277,21 @@ def grouped_lm_head_linear(
         raise ValueError("grouped LM-head hidden width does not match its weights")
     elif backend not in ("grouped_triton", "warp_gemv", "warp_accumulate"):
         raise ValueError("unsupported grouped LM-head backend")
+    elif hidden_indices is None and head_indices.shape[0] > hidden_states.shape[0]:
+        raise ValueError("implicit hidden rows exceed the hidden-state buffer")
     else:
         pass
     if any(
         tensor.device != hidden_states.device
-        for tensor in (packed_weights, hidden_indices, head_indices, active_rows)
+        for tensor in (packed_weights, head_indices, active_rows)
     ):
+        raise ValueError("grouped LM-head tensors must share one device")
+    elif hidden_indices is not None and hidden_indices.device != hidden_states.device:
         raise ValueError("grouped LM-head tensors must share one device")
     else:
         pass
 
-    rows = hidden_indices.shape[0]
+    rows = head_indices.shape[0]
     if output is None:
         logits = torch.empty(
             (rows, packed_weights.shape[1]),
@@ -310,7 +328,7 @@ def grouped_lm_head_linear(
             or packed_weights.dtype is not torch.bfloat16
             or not hidden_states.is_contiguous()
             or not packed_weights.is_contiguous()
-            or not hidden_indices.is_contiguous()
+            or (hidden_indices is not None and not hidden_indices.is_contiguous())
             or not head_indices.is_contiguous()
             or not active_rows.is_contiguous()
         ):
@@ -335,7 +353,7 @@ def grouped_lm_head_linear(
         kernel[(rows, triton.cdiv(packed_weights.shape[1], block_vocab))](
             hidden_states,
             packed_weights,
-            hidden_indices,
+            head_indices if hidden_indices is None else hidden_indices,
             head_indices,
             active_rows,
             logits,
@@ -345,22 +363,34 @@ def grouped_lm_head_linear(
             packed_weights.shape[2],
             block_vocab,
             block_hidden,
+            hidden_indices is None,
             num_warps=num_warps,
         )
     else:
+        if hidden_indices is None:
+            hidden_selector_valid = (
+                torch.arange(rows, device=hidden_states.device) < hidden_states.shape[0]
+            )
+            safe_hidden_indices = None
+        else:
+            hidden_selector_valid = (hidden_indices >= 0) & (
+                hidden_indices < hidden_states.shape[0]
+            )
+            safe_hidden_indices = hidden_indices.clamp(0, hidden_states.shape[0] - 1)
         valid_rows = (
             active_rows
-            & (hidden_indices >= 0)
-            & (hidden_indices < hidden_states.shape[0])
+            & hidden_selector_valid
             & (head_indices >= 0)
             & (head_indices < packed_weights.shape[0])
         )
-        safe_hidden_indices = hidden_indices.clamp(0, hidden_states.shape[0] - 1)
         safe_head_indices = head_indices.clamp(0, packed_weights.shape[0] - 1)
         for row in range(rows):
+            hidden_index = (
+                row if safe_hidden_indices is None else safe_hidden_indices[row]
+            )
             logits[row].copy_(
                 torch.nn.functional.linear(
-                    hidden_states[safe_hidden_indices[row]],
+                    hidden_states[hidden_index],
                     packed_weights[safe_head_indices[row]],
                 )
             )

@@ -51,6 +51,7 @@ def test_speculative_verify_width_is_wired_to_the_engine_stage(width: int) -> No
         "code_predictor_spec_lm_head_backend": "grouped_triton",
         "code_predictor_spec_rng_backend": "per_round",
         "code_predictor_spec_acceptance_backend": "compact",
+        "code_predictor_spec_opening_pair_graph": False,
     }
 
 
@@ -68,7 +69,21 @@ def test_speculative_eager_backend_is_explicitly_wired_to_engine_stage() -> None
         "code_predictor_spec_lm_head_backend": "grouped_triton",
         "code_predictor_spec_rng_backend": "per_round",
         "code_predictor_spec_acceptance_backend": "compact",
+        "code_predictor_spec_opening_pair_graph": False,
     }
+
+
+def test_full_round_and_opening_pair_graph_options_are_wired_to_engine_stage() -> None:
+    config = Qwen3TTSPipelineConfig(
+        model_path="model",
+        code_predictor_spec_verify_size=4,
+        code_predictor_spec_backend="full_round_graph",
+        code_predictor_spec_opening_pair_graph=True,
+    )
+
+    engine_kwargs = config.stage_factory_kwargs("tts_engine")
+    assert engine_kwargs["code_predictor_spec_backend"] == "full_round_graph"
+    assert engine_kwargs["code_predictor_spec_opening_pair_graph"] is True
 
 
 def test_speculative_radix_probability_backend_is_wired_to_engine_stage() -> None:

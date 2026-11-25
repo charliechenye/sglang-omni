@@ -622,12 +622,34 @@ def update_speculative_dense_probability_table(
     active_previous_ids = previous_token_ids[:row_count]
     active_current_ids = current_token_ids[:row_count, :candidate_count]
     active_dense_probabilities = dense_probabilities[:row_count]
-    active_current_ids.copy_(token_ids)
-    active_current_ids.clamp_(min=0, max=dense_probabilities.shape[1] - 1)
+    token_ids_long = token_ids.to(torch.long)
+    in_vocabulary = (token_ids_long >= 0) & (
+        token_ids_long < dense_probabilities.shape[1]
+    )
+    # Keep invalid source IDs in the compact rows for acceptance validation. The
+    # dense scatter needs safe indices, so invalid IDs map to a zero-mass scratch
+    # slot and are rejected by accept_speculative_candidates_dense_indexed.
+    active_current_ids.copy_(torch.where(in_vocabulary, token_ids_long, 0))
     active_dense_probabilities.scatter_(1, active_previous_ids, 0.0)
     active_dense_probabilities.scatter_add_(1, active_current_ids, probabilities)
     active_previous_ids.zero_()
     active_previous_ids[:, :candidate_count].copy_(active_current_ids)
+
+
+def invalid_compact_distribution_rows(
+    probabilities: torch.Tensor,
+    token_ids: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Mark malformed compact probability rows without synchronizing the device."""
+    return (
+        ~torch.isfinite(probabilities).all(dim=-1)
+        | (probabilities < 0.0).any(dim=-1)
+        | ((probabilities.sum(dim=-1) - 1.0).abs() > 1.0e-4)
+        | ((probabilities > 0.0) & ((token_ids < 0) | (token_ids >= vocab_size))).any(
+            dim=-1
+        )
+    )
 
 
 def accept_speculative_candidates_dense_indexed(
@@ -664,9 +686,14 @@ def accept_speculative_candidates_dense_indexed(
         raise ValueError("dense-indexed target rows must include a bonus row")
     elif target_token_ids.shape != target_probabilities.shape:
         raise ValueError("dense-indexed target IDs do not match probabilities")
-    elif dense_draft_probabilities.shape[:2] != (batch_size, draft_width):
+    elif dense_draft_probabilities.ndim != 3 or dense_draft_probabilities.shape[:2] != (
+        batch_size,
+        draft_width,
+    ):
         raise ValueError("dense draft tables do not match the proposal window")
-    elif dense_target_probabilities.shape[:2] != (batch_size, verify_width):
+    elif dense_target_probabilities.ndim != 3 or dense_target_probabilities.shape[
+        :2
+    ] != (batch_size, verify_width):
         raise ValueError("dense target tables do not match the verification window")
     elif dense_draft_probabilities.shape[2] != dense_target_probabilities.shape[2]:
         raise ValueError("dense draft and target tables must share a vocabulary")
@@ -699,6 +726,10 @@ def accept_speculative_candidates_dense_indexed(
     )
     if any(tensor.device != draft_tokens.device for tensor in round_tensors):
         raise ValueError("dense-indexed speculative tensors must share one device")
+    elif draft_token_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("dense-indexed draft token IDs must use integers")
+    elif target_token_ids.dtype not in (torch.int32, torch.int64):
+        raise ValueError("dense-indexed target token IDs must use integers")
     elif draft_probabilities.dtype is not torch.float32:
         raise ValueError("dense-indexed compact probabilities must use float32")
     elif target_probabilities.dtype is not torch.float32:
@@ -766,18 +797,60 @@ def accept_speculative_candidates_dense_indexed(
     compact_target_probabilities = target_probabilities.view(
         batch_size, verify_width, candidate_count
     )
-    compact_target_ids = (
-        target_token_ids.view(batch_size, verify_width, candidate_count)
-        .to(torch.long)
-        .clamp_(min=0, max=dense_target_probabilities.shape[-1] - 1)
+    compact_draft_probabilities = draft_probabilities.view(
+        batch_size, draft_width, candidate_count
+    )
+    compact_draft_ids = draft_token_ids.view(batch_size, draft_width, candidate_count)
+    compact_target_ids = target_token_ids.view(
+        batch_size, verify_width, candidate_count
+    ).to(torch.long)
+    dense_vocab_size = dense_target_probabilities.shape[-1]
+    invalid_draft_rows = invalid_compact_distribution_rows(
+        compact_draft_probabilities, compact_draft_ids, dense_vocab_size
+    )
+    invalid_target_rows = invalid_compact_distribution_rows(
+        compact_target_probabilities, compact_target_ids, dense_vocab_size
+    )
+    invalid_dense_draft_rows = (
+        ~torch.isfinite(dense_draft_rows).all(dim=-1)
+        | (dense_draft_rows < 0.0).any(dim=-1)
+        | ((dense_draft_rows.sum(dim=-1) - 1.0).abs() > 1.0e-4)
+    )
+    invalid_dense_target_rows = (
+        ~torch.isfinite(dense_target_rows).all(dim=-1)
+        | (dense_target_rows < 0.0).any(dim=-1)
+        | ((dense_target_rows.sum(dim=-1) - 1.0).abs() > 1.0e-4)
     )
     active_draft_tokens = draft_tokens.to(torch.long)
+    draft_tokens_in_vocabulary = (active_draft_tokens >= 0) & (
+        active_draft_tokens < dense_vocab_size
+    )
+    safe_draft_tokens = torch.where(draft_tokens_in_vocabulary, active_draft_tokens, 0)
+    invalid_proposal_counts = (proposal_counts < 0) | (proposal_counts > draft_width)
+    safe_proposal_counts = proposal_counts.clamp(min=0, max=draft_width)
+    proposal_positions = candidate_offsets[:draft_width]
+    valid_drafts = (proposal_positions[None, :] < safe_proposal_counts[:, None]) & (
+        active_rows[:, None]
+    )
+    invalid_active_proposals = (
+        (
+            invalid_draft_rows
+            | invalid_target_rows[:, :draft_width]
+            | invalid_dense_draft_rows
+            | invalid_dense_target_rows[:, :draft_width]
+        )
+        & valid_drafts
+    ).any(dim=1)
+    invalid_active_proposals |= ((~draft_tokens_in_vocabulary) & valid_drafts).any(
+        dim=1
+    )
+    invalid_active_proposals |= invalid_proposal_counts & active_rows
     q_values = torch.empty(
         (batch_size, draft_width), device=draft_tokens.device, dtype=torch.float64
     )
     p_values = torch.empty_like(q_values)
     for draft_index in range(draft_width):
-        token_index = active_draft_tokens[:, draft_index : draft_index + 1]
+        token_index = safe_draft_tokens[:, draft_index : draft_index + 1]
         q_values[:, draft_index] = (
             dense_draft_rows[:, draft_index, :]
             .gather(1, token_index)[:, 0]
@@ -791,15 +864,26 @@ def accept_speculative_candidates_dense_indexed(
     else:
         pass
 
-    safe_q_values = torch.where(q_values > 0.0, q_values, 1.0)
+    invalid_active_proposals |= (
+        (valid_drafts & (q_values <= 0.0))
+        | (valid_drafts & ~torch.isfinite(q_values))
+        | (valid_drafts & (q_values < 0.0))
+        | (valid_drafts & (q_values > 1.0))
+        | (valid_drafts & ~torch.isfinite(p_values))
+        | (valid_drafts & (p_values < 0.0))
+        | (valid_drafts & (p_values > 1.0))
+    ).any(dim=1)
+    safe_q_values = torch.where(
+        (q_values > 0.0) & torch.isfinite(q_values), q_values, 1.0
+    )
     acceptance_ratios = torch.where(
         q_values > 0.0,
         p_values / safe_q_values,
         0.0,
     ).clamp_(0.0, 1.0)
-    proposal_positions = candidate_offsets[:draft_width]
-    valid_drafts = proposal_positions[None, :] < proposal_counts[:, None]
-    valid_drafts &= active_rows[:, None]
+    acceptance_ratios = torch.where(
+        torch.isfinite(acceptance_ratios), acceptance_ratios, 0.0
+    )
     rejected_drafts = valid_drafts & (
         acceptance_uniforms.to(torch.float64) >= acceptance_ratios
     )
@@ -818,10 +902,26 @@ def accept_speculative_candidates_dense_indexed(
         1, selected_target_indices
     )[:, 0, :].to(torch.float64)
     selected_target_ids = compact_target_ids.gather(1, selected_target_indices)[:, 0, :]
+    selected_target_ids_in_vocabulary = (selected_target_ids >= 0) & (
+        selected_target_ids < dense_vocab_size
+    )
+    safe_selected_target_ids = torch.where(
+        selected_target_ids_in_vocabulary, selected_target_ids, 0
+    )
+    selected_target_invalid = invalid_target_rows.gather(
+        1, selected_target_rows[:, None]
+    )[:, 0]
+    selected_target_invalid |= invalid_dense_target_rows.gather(
+        1, selected_target_rows[:, None]
+    )[:, 0]
+    selected_target_invalid |= (
+        (selected_target_probabilities > 0.0) & ~selected_target_ids_in_vocabulary
+    ).any(dim=1)
+    invalid_rows = active_rows & (invalid_active_proposals | selected_target_invalid)
     selected_draft_probabilities = torch.zeros_like(selected_target_probabilities)
     if draft_width > 0:
         for draft_index in range(draft_width):
-            selected_ids = selected_target_ids
+            selected_ids = safe_selected_target_ids
             proposal_row = dense_draft_rows[:, draft_index, :]
             selected_q = proposal_row.gather(1, selected_ids)
             selected_draft_probabilities = torch.where(
@@ -838,12 +938,29 @@ def accept_speculative_candidates_dense_indexed(
         (selected_target_probabilities - selected_draft_probabilities).clamp_min(0.0),
         selected_target_probabilities,
     )
-    residual_scales = residual_values.max(dim=1).values
-    invalid_rows = rejected_rows & (residual_scales <= 0.0)
-    safe_residual_scales = torch.where(residual_scales > 0.0, residual_scales, 1.0)
-    scaled_residuals = residual_values / safe_residual_scales[:, None]
+    finite_residual_values = torch.isfinite(residual_values)
+    invalid_residual = ~finite_residual_values.all(dim=1) | (
+        (residual_values < 0.0).any(dim=1)
+    )
+    safe_residual_values = torch.where(
+        finite_residual_values & (residual_values > 0.0), residual_values, 0.0
+    )
+    residual_scales = safe_residual_values.max(dim=1).values
+    safe_residual_scales = torch.where(
+        torch.isfinite(residual_scales) & (residual_scales > 0.0), residual_scales, 1.0
+    )
+    scaled_residuals = safe_residual_values / safe_residual_scales[:, None]
     residual_masses = scaled_residuals.sum(dim=1)
-    safe_residual_masses = torch.where(residual_masses > 0.0, residual_masses, 1.0)
+    invalid_rows |= rejected_rows & (
+        invalid_residual
+        | ~torch.isfinite(residual_masses)
+        | (residual_masses <= 0.0)
+        | ~torch.isfinite(residual_scales)
+        | (residual_scales <= 0.0)
+    )
+    safe_residual_masses = torch.where(
+        torch.isfinite(residual_masses) & (residual_masses > 0.0), residual_masses, 1.0
+    )
     normalized_residuals = scaled_residuals / safe_residual_masses[:, None]
     selected_uniforms = torch.where(
         rejected_rows,
@@ -862,7 +979,7 @@ def accept_speculative_candidates_dense_indexed(
         .values
     )
     selected_ranks = torch.minimum(selected_ranks, last_positive_ranks)
-    final_tokens = selected_target_ids.gather(1, selected_ranks[:, None])[:, 0]
+    final_tokens = safe_selected_target_ids.gather(1, selected_ranks[:, None])[:, 0]
     final_tokens = torch.where(active_rows & ~invalid_rows, final_tokens, 0)
     accepted_counts = torch.where(invalid_rows, 0, accepted_counts)
     outputs.committed_tokens.zero_()

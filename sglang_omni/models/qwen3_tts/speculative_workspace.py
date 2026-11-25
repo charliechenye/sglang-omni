@@ -13,6 +13,36 @@ from sglang_omni.models.qwen3_tts.speculative_acceptance import (
 from sglang_omni.models.qwen3_tts.speculative_prepare import SpeculativeVerifierInputs
 
 
+def compact_candidate_view(
+    storage: torch.Tensor, row_count: int, candidate_count: int
+) -> torch.Tensor:
+    """View a reserved candidate arena as tightly packed rows for one Top-K shape."""
+    if storage.ndim != 2 or row_count < 0 or candidate_count <= 0:
+        raise ValueError("candidate storage and requested view dimensions are invalid")
+    elif candidate_count > storage.shape[1] or row_count > storage.shape[0]:
+        raise ValueError("candidate view exceeds its reserved capacity")
+    else:
+        pass
+    return storage.view(-1)[: row_count * candidate_count].view(
+        row_count, candidate_count
+    )
+
+
+def compact_scratch_view(
+    storage: torch.Tensor, row_count: int, columns_per_row: int
+) -> torch.Tensor:
+    """View wider persistent scratch as contiguous rows with a smaller signature."""
+    if storage.ndim != 2 or row_count < 0 or columns_per_row <= 0:
+        raise ValueError("scratch storage and requested view dimensions are invalid")
+    elif row_count > storage.shape[0] or columns_per_row > storage.shape[1]:
+        raise ValueError("scratch view exceeds its reserved capacity")
+    else:
+        pass
+    return storage.view(-1)[: row_count * columns_per_row].view(
+        row_count, columns_per_row
+    )
+
+
 @dataclass(kw_only=True)
 class PredictorSpeculativeRoundWorkspace:
     verify_width: int
@@ -26,7 +56,6 @@ class PredictorSpeculativeRoundWorkspace:
     proposal_temperatures: torch.Tensor
     proposal_top_ks: torch.Tensor
     proposal_top_ps: torch.Tensor
-    target_hidden_rows: torch.Tensor
     target_temperatures: torch.Tensor
     target_top_ks: torch.Tensor
     target_top_ps: torch.Tensor
@@ -84,7 +113,15 @@ class PredictorSpeculativeWorkspace:
         self.candidate_width = candidate_width
         self.seed_rows = seed_rows
         self.round_index = round_index
-        self.uniforms = uniforms
+        self.uniforms = (
+            torch.empty(
+                (max_batch_size, 4, max_verify_width),
+                device=device,
+                dtype=torch.float32,
+            )
+            if uniforms is None
+            else uniforms
+        )
         self.rng_pool = rng_pool
         self.metadata_device = metadata_device
         self.metadata_host = metadata_host
@@ -93,6 +130,7 @@ class PredictorSpeculativeWorkspace:
         )
         self.logical_kv_lengths = torch.empty_like(self.committed_depths)
         self.pending_tokens = torch.empty_like(self.committed_depths)
+        self.semantic_positions = torch.empty_like(self.committed_depths)
         self.preceding_hidden = torch.empty(
             max_batch_size, hidden_size, device=device, dtype=hidden_dtype
         )
@@ -114,9 +152,6 @@ class PredictorSpeculativeWorkspace:
                 proposal_head_offsets = torch.empty(
                     (0,), device=device, dtype=torch.long
                 )
-            target_hidden_rows = torch.arange(
-                target_row_count, device=device, dtype=torch.long
-            )
             proposal_active_rows = torch.empty(
                 proposal_row_count, device=device, dtype=torch.bool
             )
@@ -220,7 +255,6 @@ class PredictorSpeculativeWorkspace:
                 proposal_temperatures=proposal_temperatures,
                 proposal_top_ks=proposal_top_ks,
                 proposal_top_ps=proposal_top_ps,
-                target_hidden_rows=target_hidden_rows,
                 target_temperatures=target_temperatures,
                 target_top_ks=target_top_ks,
                 target_top_ps=target_top_ps,
@@ -253,6 +287,7 @@ class PredictorSpeculativeWorkspace:
             self.committed_depths,
             self.logical_kv_lengths,
             self.pending_tokens,
+            self.semantic_positions,
             self.preceding_hidden,
             self.active_rows,
             self.metadata_device,
@@ -277,7 +312,6 @@ class PredictorSpeculativeWorkspace:
                     round_workspace.proposal_temperatures,
                     round_workspace.proposal_top_ks,
                     round_workspace.proposal_top_ps,
-                    round_workspace.target_hidden_rows,
                     round_workspace.target_temperatures,
                     round_workspace.target_top_ks,
                     round_workspace.target_top_ps,

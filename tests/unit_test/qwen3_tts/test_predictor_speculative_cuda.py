@@ -149,6 +149,7 @@ def build_speculative_talker(
     talker.code_predictor_spec_requested_width = 0
     talker.code_predictor_spec_effective_width = 0
     talker.code_predictor_spec_backend = "cuda_graph"
+    talker.code_predictor_spec_opening_pair_graph_enabled = False
     talker.code_predictor_spec_nvtx_enabled = False
     talker.code_predictor_spec_rng_backend = "per_round"
     talker.code_predictor_spec_lm_head_backend = "grouped_triton"
@@ -173,11 +174,23 @@ def build_speculative_talker(
     talker.code_predictor_spec_dense_candidate_capacity = 0
     talker.code_predictor_spec_fallback_reason = None
     talker.code_predictor_spec_graphs = {}
+    talker.code_predictor_spec_opening_graphs = {}
+    talker.code_predictor_spec_opening_graph_disabled = set()
+    talker.code_predictor_spec_round_graphs = {}
+    talker.code_predictor_spec_round_graph_disabled = set()
     talker.code_predictor_spec_input_buffers = {}
     talker.code_predictor_spec_effective_width_histogram = {}
     talker.code_predictor_spec_graph_replay_count = 0
     talker.code_predictor_spec_eager_round_count = 0
     talker.code_predictor_spec_graph_capture_failure_count = 0
+    talker.code_predictor_spec_full_round_graph_replay_count = 0
+    talker.code_predictor_spec_opening_graph_replay_count = 0
+    talker.code_predictor_spec_full_round_graph_capture_count = 0
+    talker.code_predictor_spec_full_round_graph_capture_failure_count = 0
+    talker.code_predictor_spec_opening_graph_capture_count = 0
+    talker.code_predictor_spec_opening_graph_capture_failure_count = 0
+    talker.code_predictor_spec_full_round_graph_capture_time_ms = 0.0
+    talker.code_predictor_spec_opening_graph_capture_time_ms = 0.0
     talker.code_predictor_spec_graph_memory_delta_bytes = 0
     talker.code_predictor_spec_graph_capture_time_ms = 0.0
     talker.code_predictor_spec_configuration_time_ms = 0.0
@@ -388,7 +401,9 @@ def test_unseeded_eager_speculation_runs_a_complete_predictor_frame(
     assert stats["round_committed_codes"] == 14
 
 
-@pytest.mark.parametrize("execution_backend", ["eager", "cuda_graph"])
+@pytest.mark.parametrize(
+    "execution_backend", ["eager", "cuda_graph", "full_round_graph"]
+)
 @pytest.mark.parametrize("top_k", [4, 50, 128])
 @pytest.mark.parametrize("acceptance_backend", ["compact", "dense_indexed"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -399,6 +414,8 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
     top_k: int,
     acceptance_backend: str,
 ) -> None:
+    if execution_backend == "full_round_graph" and acceptance_backend != "compact":
+        pytest.skip("full-round graph initially supports compact acceptance only")
     device = torch.device("cuda")
     torch.manual_seed(318)
     configure_runtime_context(monkeypatch)
@@ -413,6 +430,7 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
             backend=execution_backend,
             probability_backend=probability_backend,
             acceptance_backend=acceptance_backend,
+            opening_pair_graph=execution_backend == "full_round_graph",
         )
 
         probability_call_count = 0
@@ -469,7 +487,7 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
                 token_ids = token_id_output
                 token_ids.fill_(-1)
             token_ids[:, 0] = 0
-            if probability_call_count == 8:
+            if logits.shape[0] == 2:
                 token_ids[:, 1] = 1
                 probabilities[:, :2] = 0.5
             else:
@@ -529,7 +547,10 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
 
     stats = talker.predictor_speculative_stats()
     assert stats["nvtx_enabled"] is False
-    assert probability_call_count == 9
+    if execution_backend == "full_round_graph":
+        assert probability_call_count > 0
+    else:
+        assert probability_call_count == 9
     assert stats["frames"] == 1
     assert stats["native_fallback_count"] == 0
     assert stats["effective_width_histogram"] == {"1": 1, "2": 1, "4": 3}
@@ -547,26 +568,60 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
     if execution_backend == "eager":
         assert stats["eager_verifier_rounds"] == 5
         assert stats["verifier_graph_replays"] == 0
-    else:
+        assert stats["verifier_graph_replay_coverage"] == 0.0
+    elif execution_backend == "cuda_graph":
         assert stats["eager_verifier_rounds"] == 0
         assert stats["verifier_graph_replays"] == 5
+        assert stats["verifier_graph_replay_coverage"] == 1.0
+    else:
+        assert stats["eager_verifier_rounds"] == 0
+        assert stats["verifier_graph_replays"] == 0
+        assert stats["full_round_graph_replays"] == 5
+        assert stats["full_round_graph_replay_coverage"] == 1.0
+        assert stats["full_round_graph_captures"] > 0
+        assert stats["full_round_graph_capture_failures"] == 0
+        assert stats["opening_pair_graph_replays"] == 1
+        assert stats["opening_pair_graph_replay_coverage"] == 1.0
+        assert stats["opening_pair_graph_captures"] == 1
+        assert stats["opening_pair_graph_capture_failures"] == 0
 
 
 @pytest.mark.parametrize("forced_rejection_offset", [0, 1, 2])
+@pytest.mark.parametrize("lm_head_mode", ["zero", "nonzero_depth_distinct"])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
 def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
-    monkeypatch: pytest.MonkeyPatch, forced_rejection_offset: int
+    monkeypatch: pytest.MonkeyPatch,
+    forced_rejection_offset: int,
+    lm_head_mode: str,
 ) -> None:
     device = torch.device("cuda")
     batch_size = 2
     configure_runtime_context(monkeypatch)
     with get_context().override_server_args(max_running_requests=batch_size):
         talker = build_speculative_talker(device, batch_size)
-        for lm_head in talker.code_predictor.lm_head:
-            lm_head.weight.zero_()
+        if lm_head_mode == "zero":
+            for lm_head in talker.code_predictor.lm_head:
+                lm_head.weight.zero_()
+            else:
+                pass
         else:
-            pass
+            torch.manual_seed(90210)
+            for head_index, lm_head in enumerate(talker.code_predictor.lm_head):
+                lm_head.weight.normal_(mean=0.0, std=1e-3 * (head_index + 1))
+            else:
+                pass
+            assert all(
+                bool((head.weight != 0).any()) for head in talker.code_predictor.lm_head
+            )
+            assert all(
+                not torch.equal(left.weight, right.weight)
+                for left, right in zip(
+                    talker.code_predictor.lm_head,
+                    talker.code_predictor.lm_head[1:],
+                    strict=False,
+                )
+            )
         configure_unseeded_request(talker, batch_size)
         talker.configure_code_predictor_speculation(4, backend="eager")
 
@@ -647,7 +702,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
         def record_grouped_head(
             hidden_states: torch.Tensor,
             packed_weights: torch.Tensor,
-            hidden_indices: torch.Tensor,
+            hidden_indices: torch.Tensor | None,
             head_indices: torch.Tensor,
             active_rows: torch.Tensor,
             *,
@@ -733,10 +788,10 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             else:
                 assert logits.shape[0] % batch_size == 0
                 assert logits.shape[0] > 0
-                controlled_probabilities = probabilities
-                controlled_probabilities.zero_()
-                controlled_probabilities[:, 0] = 1.0
-                controlled_probabilities[~active_rows] = probabilities[~active_rows]
+                controlled_probabilities = probabilities.clone()
+                controlled_probabilities[active_rows] = 0.0
+                controlled_probabilities[active_rows, 0] = 1.0
+                assert not bool((controlled_probabilities[~active_rows] != 0.0).any())
                 return controlled_probabilities, token_ids, actual_backend
 
         def record_acceptance(
@@ -1276,6 +1331,51 @@ def test_speculative_verifier_graph_replays_the_full_frame(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
+def test_verifier_graph_stats_report_mixed_eager_and_graph_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    torch.manual_seed(619)
+    configure_runtime_context(monkeypatch)
+    with get_context().override_server_args(max_running_requests=1):
+        talker = build_speculative_talker(device)
+        configure_unseeded_request(talker)
+        talker.configure_code_predictor_speculation(4, backend="cuda_graph")
+        native_resolver = talker.resolve_code_predictor_speculative_round_path
+        eager_rounds_remaining = 1
+
+        def resolve_one_round_eagerly(
+            batch_size: int, requested_width: int
+        ) -> tuple[int, object | None]:
+            nonlocal eager_rounds_remaining
+            if eager_rounds_remaining > 0:
+                eager_rounds_remaining -= 1
+                return requested_width, None
+            return native_resolver(batch_size, requested_width)
+
+        monkeypatch.setitem(
+            talker.__dict__,
+            "resolve_code_predictor_speculative_round_path",
+            resolve_one_round_eagerly,
+        )
+        layer0_codes = torch.tensor([[14]], device=device, dtype=torch.long)
+        talker_hidden = torch.randn(
+            (1, 1, TALKER_HIDDEN_SIZE), device=device, dtype=DTYPE
+        )
+        semantic_positions = torch.tensor([12], device=device, dtype=torch.long)
+        codes, summed_embedding = talker.code_predictor_forward(
+            layer0_codes, talker_hidden, semantic_positions
+        )
+        verify_complete_frame(talker, codes, summed_embedding)
+
+    stats = talker.predictor_speculative_stats()
+    assert stats["eager_verifier_rounds"] >= 1
+    assert stats["verifier_graph_replays"] >= 1
+    assert 0.0 < stats["verifier_graph_replay_coverage"] < 1.0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
 def test_explicit_seed_fallback_does_not_block_later_unseeded_speculation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1535,6 +1635,49 @@ def test_compact_acceptance_w1_samples_target_and_flags_invalid_mass() -> None:
     assert result.committed_tokens[0, 0].item() == 6
     assert result.committed_token_counts.tolist() == [1, 0]
     assert result.invalid_rows.tolist() == [False, True]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    ("target_probabilities", "dense_target_values"),
+    [
+        ([0.25, 0.25], [0.5, 0.5]),
+        ([0.5, 0.5], [0.0, 0.0]),
+    ],
+)
+def test_dense_indexed_w1_invalid_target_commits_nothing(
+    target_probabilities: list[float], dense_target_values: list[float]
+) -> None:
+    device = torch.device("cuda")
+    candidate_count = 2
+    target_probs = torch.tensor(
+        [target_probabilities], device=device, dtype=torch.float32
+    )
+    target_ids = torch.tensor([[0, 1]], device=device, dtype=torch.long)
+    dense_target = torch.zeros((1, 1, 8), device=device, dtype=torch.float32)
+    dense_target[0, 0, :2] = torch.tensor(
+        dense_target_values, device=device, dtype=torch.float32
+    )
+    result = accept_speculative_candidates_dense_indexed(
+        torch.empty((1, 0), device=device, dtype=torch.long),
+        torch.empty((0, candidate_count), device=device, dtype=torch.float32),
+        torch.empty((0, candidate_count), device=device, dtype=torch.long),
+        target_probs,
+        target_ids,
+        torch.zeros((1,), device=device, dtype=torch.long),
+        torch.ones((1,), device=device, dtype=torch.bool),
+        torch.empty((1, 0), device=device, dtype=torch.float32),
+        torch.zeros((1, 1), device=device, dtype=torch.float32),
+        torch.full((1, 1), 0.5, device=device, dtype=torch.float32),
+        torch.empty((1, 0, 8), device=device, dtype=torch.float32),
+        dense_target,
+        torch.arange(candidate_count, device=device, dtype=torch.long),
+    )
+
+    assert result.invalid_rows.tolist() == [True]
+    assert result.committed_token_counts.tolist() == [0]
+    assert result.committed_tokens.tolist() == [[0]]
 
 
 @pytest.mark.accelerator
@@ -2090,7 +2233,6 @@ def test_radix_probability_support_compaction_matches_split_for_small_batches(
         max_top_k=max_top_k,
         has_top_p=False,
         has_unbounded_top_k=False,
-        radix_bits=radix_bits,
     )
     radix_candidates = build_speculative_probability_candidates_radix(
         logits,
@@ -2101,6 +2243,7 @@ def test_radix_probability_support_compaction_matches_split_for_small_batches(
         max_top_k=max_top_k,
         has_top_p=False,
         has_unbounded_top_k=False,
+        radix_bits=radix_bits,
     )
 
     assert split_candidates is not None
