@@ -763,8 +763,10 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
         monkeypatch.setattr(
             sglang_model_module, "speculative_uniforms_all_purposes", fixed_uniforms
         )
-        monkeypatch.setattr(
-            talker, "predictor_forward_packed_tokens", record_packed_forward
+        monkeypatch.setitem(
+            talker.__dict__,
+            "predictor_forward_packed_tokens",
+            record_packed_forward,
         )
         monkeypatch.setattr(
             sglang_model_module, "grouped_lm_head_linear", record_grouped_head
@@ -916,13 +918,13 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 expected_cache_depth = new_depth - 1
                 torch.testing.assert_close(
                     packed_keys[round_index][:, row : row + 1, :valid_cache_length],
-                    native_keys[expected_cache_depth][row : row + 1],
+                    native_keys[expected_cache_depth][:, row : row + 1],
                     atol=2e-2,
                     rtol=2e-2,
                 )
                 torch.testing.assert_close(
                     packed_values[round_index][:, row : row + 1, :valid_cache_length],
-                    native_values[expected_cache_depth][row : row + 1],
+                    native_values[expected_cache_depth][:, row : row + 1],
                     atol=2e-2,
                     rtol=2e-2,
                 )

@@ -125,10 +125,32 @@ class IdentityRotary(nn.Module):
         return q, k
 
 
+def initialize_native_speculation_state(
+    talker: Qwen3TTSTalker,
+) -> None:
+    """Initialize disabled SpecDec state for constructor-free fixtures."""
+    talker.code_predictor_spec_requested_width = 0
+    talker.code_predictor_spec_lm_head_weights = None
+    talker.code_predictor_output_frame_count = 0
+    talker.code_predictor_generic_forward_count = 0
+    talker.code_predictor_spec_correction_forward_watch = False
+    talker.code_predictor_spec_standalone_correction_forward_count = 0
+
+    talker.sub_speculative_seed_tensor = None
+    talker.sub_speculative_round_index_tensor = None
+    talker.sub_speculative_uniforms_tensor = None
+    talker.sub_speculative_rng_pool_tensor = None
+
+    talker.sub_user_seed_rows = ()
+    talker.sub_request_ids = ()
+    talker.sub_sample_rows = ()
+
+
 def build_talker(device: torch.device) -> Qwen3TTSTalker:
     torch.manual_seed(7)
     predictor_len = NUM_CODE_GROUPS + 1
     talker = object.__new__(Qwen3TTSTalker)
+    initialize_native_speculation_state(talker)
     talker.training = False
     # The lightweight fixture bypasses Talker.__init__, but the graph gate reads
     # the production device property through model.codec_embedding.
@@ -267,7 +289,10 @@ def make_request(
     semantic_seed: int = 99,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        request_id=None,
         data=SimpleNamespace(
+            decode_prep_epoch=None,
+            user_seed_provided=False,
             semantic_sampling_seed=semantic_seed,
             subtalker_dosample=dosample,
             subtalker_temperature=temperature,
@@ -1131,6 +1156,21 @@ def test_a_declared_disable_also_drops_the_reference_encoder_buckets(
     class FakeTalker:
         device = torch.device("cpu")
         tts_model_type = "base"
+
+        def configure_code_predictor_speculation(
+            self,
+            requested_width: int,
+            *,
+            backend: str,
+            probability_backend: str,
+            lm_head_backend: str,
+            rng_backend: str,
+        ) -> None:
+            assert requested_width == 0
+            assert backend == "cuda_graph"
+            assert probability_backend == "split_top_k"
+            assert lm_head_backend == "grouped_triton"
+            assert rng_backend == "per_round"
 
         def load_speech_tokenizer(self, tokenizer) -> None:
             del tokenizer
@@ -2268,6 +2308,7 @@ def real_shape_talker(
 ) -> Qwen3TTSTalker:
     """A predictor at the checkpoint's shapes; fused runs the Triton layer launches."""
     talker = object.__new__(Qwen3TTSTalker)
+    initialize_native_speculation_state(talker)
     talker.training = False
     talker.predictor_cutedsl_layers = None
     positions = torch.arange(FUSED_PREDICTOR_LEN, device=device, dtype=torch.long)
