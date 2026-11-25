@@ -1602,6 +1602,9 @@ def build_speculative_probability_candidates(
     max_top_k: int,
     has_top_p: bool,
     has_unbounded_top_k: bool,
+    probability_output: torch.Tensor | None = None,
+    token_id_output: torch.Tensor | None = None,
+    split_candidate_keys: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Build native-ordered compact probabilities for bounded CUDA sampler rows."""
     block_k = fused_raw_logit_block_k(max_top_k)
@@ -1640,12 +1643,29 @@ def build_speculative_probability_candidates(
         return None
     else:
         pass
-    probabilities = torch.empty(
-        (row_count, block_k), device=logits.device, dtype=torch.float32
-    )
-    token_ids = torch.empty(
-        (row_count, block_k), device=logits.device, dtype=torch.int32
-    )
+    if (probability_output is None) != (token_id_output is None):
+        raise ValueError("probability and token-ID outputs must be supplied together")
+    elif probability_output is None:
+        probabilities = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.float32
+        )
+        token_ids = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.int32
+        )
+    elif (
+        probability_output.shape != (row_count, block_k)
+        or token_id_output.shape != (row_count, block_k)
+        or probability_output.device != logits.device
+        or token_id_output.device != logits.device
+        or probability_output.dtype is not torch.float32
+        or token_id_output.dtype is not torch.int32
+        or not probability_output.is_contiguous()
+        or not token_id_output.is_contiguous()
+    ):
+        raise ValueError("persistent probability outputs do not match the builder")
+    else:
+        probabilities = probability_output
+        token_ids = token_id_output
     if row_count == 0:
         return probabilities, token_ids
     else:
@@ -1659,9 +1679,19 @@ def build_speculative_probability_candidates(
         else:
             pass
         num_candidates = TOP_K_CHUNKS * block_k
-        chunk_keys = torch.empty(
-            (row_count, num_candidates), device=logits.device, dtype=torch.int64
-        )
+        if split_candidate_keys is None:
+            chunk_keys = torch.empty(
+                (row_count, num_candidates), device=logits.device, dtype=torch.int64
+            )
+        elif (
+            split_candidate_keys.shape != (row_count, num_candidates)
+            or split_candidate_keys.device != logits.device
+            or split_candidate_keys.dtype is not torch.int64
+            or not split_candidate_keys.is_contiguous()
+        ):
+            raise ValueError("persistent split Top-K scratch does not match the builder")
+        else:
+            chunk_keys = split_candidate_keys
         seeded_top_k_chunk_kernel[(row_count, TOP_K_CHUNKS)](
             logits,
             temperatures,
@@ -1717,6 +1747,9 @@ def build_speculative_probability_candidates_radix(
     max_top_k: int,
     has_top_p: bool,
     has_unbounded_top_k: bool,
+    probability_output: torch.Tensor | None = None,
+    token_id_output: torch.Tensor | None = None,
+    radix_candidate_keys: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Build a radix-selected candidate distribution for parity experiments."""
     block_k = fused_raw_logit_block_k(max_top_k)
@@ -1756,15 +1789,42 @@ def build_speculative_probability_candidates_radix(
         return None
     else:
         pass
-    probabilities = torch.empty(
-        (row_count, block_k), device=logits.device, dtype=torch.float32
-    )
-    token_ids = torch.empty(
-        (row_count, block_k), device=logits.device, dtype=torch.int32
-    )
-    compacted_keys = torch.empty(
-        (row_count, block_k), device=logits.device, dtype=torch.int64
-    )
+    if (probability_output is None) != (token_id_output is None):
+        raise ValueError("probability and token-ID outputs must be supplied together")
+    elif probability_output is None:
+        probabilities = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.float32
+        )
+        token_ids = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.int32
+        )
+    elif (
+        probability_output.shape != (row_count, block_k)
+        or token_id_output.shape != (row_count, block_k)
+        or probability_output.device != logits.device
+        or token_id_output.device != logits.device
+        or probability_output.dtype is not torch.float32
+        or token_id_output.dtype is not torch.int32
+        or not probability_output.is_contiguous()
+        or not token_id_output.is_contiguous()
+    ):
+        raise ValueError("persistent probability outputs do not match the builder")
+    else:
+        probabilities = probability_output
+        token_ids = token_id_output
+    if radix_candidate_keys is None:
+        compacted_keys = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.int64
+        )
+    elif (
+        radix_candidate_keys.shape != (row_count, block_k)
+        or radix_candidate_keys.device != logits.device
+        or radix_candidate_keys.dtype is not torch.int64
+        or not radix_candidate_keys.is_contiguous()
+    ):
+        raise ValueError("persistent radix scratch does not match the builder")
+    else:
+        compacted_keys = radix_candidate_keys
     if row_count == 0:
         return probabilities, token_ids
     else:
@@ -1799,6 +1859,10 @@ def build_speculative_probability_candidates_selected(
     has_top_p: bool,
     has_unbounded_top_k: bool,
     backend: Literal["split_top_k", "radix_compact"],
+    probability_output: torch.Tensor | None = None,
+    token_id_output: torch.Tensor | None = None,
+    split_candidate_keys: torch.Tensor | None = None,
+    radix_candidate_keys: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Literal["split_top_k", "radix_compact"]] | None:
     """Build compact probabilities and report the implementation that ran."""
     if backend == "radix_compact":
@@ -1811,6 +1875,9 @@ def build_speculative_probability_candidates_selected(
             max_top_k=max_top_k,
             has_top_p=has_top_p,
             has_unbounded_top_k=has_unbounded_top_k,
+            probability_output=probability_output,
+            token_id_output=token_id_output,
+            radix_candidate_keys=radix_candidate_keys,
         )
         if candidates is not None:
             return candidates[0], candidates[1], "radix_compact"
@@ -1829,6 +1896,9 @@ def build_speculative_probability_candidates_selected(
         max_top_k=max_top_k,
         has_top_p=has_top_p,
         has_unbounded_top_k=has_unbounded_top_k,
+        probability_output=probability_output,
+        token_id_output=token_id_output,
+        split_candidate_keys=split_candidate_keys,
     )
     if candidates is None:
         return None

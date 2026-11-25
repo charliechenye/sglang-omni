@@ -170,6 +170,7 @@ def grouped_lm_head_linear(
     active_rows: torch.Tensor,
     *,
     backend: Literal["grouped_triton", "warp_gemv"] = "grouped_triton",
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Project selected hidden rows through selected heads, returning model-dtype logits."""
     if hidden_states.ndim != 2 or packed_weights.ndim != 3:
@@ -201,11 +202,21 @@ def grouped_lm_head_linear(
         pass
 
     rows = hidden_indices.shape[0]
-    logits = torch.empty(
-        (rows, packed_weights.shape[1]),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
+    if output is None:
+        logits = torch.empty(
+            (rows, packed_weights.shape[1]),
+            device=hidden_states.device,
+            dtype=hidden_states.dtype,
+        )
+    elif (
+        output.shape != (rows, packed_weights.shape[1])
+        or output.device != hidden_states.device
+        or output.dtype != hidden_states.dtype
+        or not output.is_contiguous()
+    ):
+        raise ValueError("grouped LM-head output does not match its rows")
+    else:
+        logits = output
     if rows == 0:
         return logits
     else:

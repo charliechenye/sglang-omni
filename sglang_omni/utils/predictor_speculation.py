@@ -38,8 +38,8 @@ def resolve_speculative_round_width(
     configured_width: int,
     backend_capacity_width: int,
     num_code_groups: int,
-    committed_depths: torch.Tensor,
-    active_rows: torch.Tensor,
+    committed_depths: torch.Tensor | list[int],
+    active_rows: torch.Tensor | list[bool],
 ) -> int:
     """Choose the largest safe width from the already-staged CPU round metadata."""
     if any(
@@ -51,26 +51,51 @@ def resolve_speculative_round_width(
         raise ValueError("speculative round widths must be in [1, 8]")
     elif num_code_groups < 2:
         raise ValueError("speculative decoding requires at least two code groups")
-    elif committed_depths.device.type != "cpu" or active_rows.device.type != "cpu":
-        raise ValueError("round-width selection requires staged CPU metadata")
-    elif committed_depths.ndim != 1 or active_rows.shape != committed_depths.shape:
-        raise ValueError("round-width metadata must contain aligned rows")
-    elif committed_depths.dtype not in (torch.int32, torch.int64):
-        raise ValueError("committed depths must use an integer dtype")
-    elif active_rows.dtype is not torch.bool:
-        raise ValueError("active-row metadata must use a boolean dtype")
+    elif isinstance(committed_depths, torch.Tensor) and isinstance(
+        active_rows, torch.Tensor
+    ):
+        if committed_depths.device.type != "cpu" or active_rows.device.type != "cpu":
+            raise ValueError("round-width selection requires staged CPU metadata")
+        elif committed_depths.ndim != 1 or active_rows.shape != committed_depths.shape:
+            raise ValueError("round-width metadata must contain aligned rows")
+        elif committed_depths.dtype not in (torch.int32, torch.int64):
+            raise ValueError("committed depths must use an integer dtype")
+        elif active_rows.dtype is not torch.bool:
+            raise ValueError("active-row metadata must use a boolean dtype")
+        else:
+            pass
+        committed_depth_values = [int(depth) for depth in committed_depths.tolist()]
+        active_row_values = [bool(is_active) for is_active in active_rows.tolist()]
+    elif isinstance(committed_depths, list) and isinstance(active_rows, list):
+        if len(committed_depths) != len(active_rows):
+            raise ValueError("round-width metadata must contain aligned rows")
+        elif any(
+            isinstance(depth, bool) or not isinstance(depth, int)
+            for depth in committed_depths
+        ):
+            raise ValueError("committed depths must be integers")
+        elif any(not isinstance(is_active, bool) for is_active in active_rows):
+            raise ValueError("active-row metadata must contain booleans")
+        else:
+            pass
+        committed_depth_values = committed_depths
+        active_row_values = active_rows
     else:
-        pass
-    if not bool(active_rows.any()):
+        raise ValueError("round-width selection requires CPU tensors or host rows")
+    if not any(active_row_values):
         return 0
     else:
         pass
-    active_depths = committed_depths[active_rows]
-    if bool(((active_depths < 0) | (active_depths >= num_code_groups - 1)).any()):
+    active_depths = [
+        depth
+        for depth, is_active in zip(committed_depth_values, active_row_values)
+        if is_active
+    ]
+    if any(depth < 0 or depth >= num_code_groups - 1 for depth in active_depths):
         raise ValueError("active rows must have remaining code groups")
     else:
         pass
-    maximum_remaining = int((num_code_groups - 1 - active_depths).max())
+    maximum_remaining = max(num_code_groups - 1 - depth for depth in active_depths)
     return min(configured_width, backend_capacity_width, maximum_remaining)
 
 

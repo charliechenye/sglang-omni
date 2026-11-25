@@ -135,6 +135,9 @@ def initialize_native_speculation_state(
     talker.code_predictor_generic_forward_count = 0
     talker.code_predictor_spec_correction_forward_watch = False
     talker.code_predictor_spec_standalone_correction_forward_count = 0
+    talker.code_predictor_spec_workspaces = {}
+    talker.code_predictor_spec_active_workspace = None
+    talker.code_predictor_spec_workspace_allocation_count = 0
 
     talker.sub_speculative_seed_tensor = None
     talker.sub_speculative_round_index_tensor = None

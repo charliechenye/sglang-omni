@@ -26,6 +26,91 @@ class SpeculativeVerifierInputs:
 if triton is not None:
 
     @triton.jit
+    def prepare_speculative_round_metadata_kernel(
+        committed_depths,
+        active_rows,
+        temperatures,
+        top_ks,
+        top_ps,
+        proposal_head_offsets,
+        proposal_head_indices,
+        proposal_active_rows,
+        proposal_counts,
+        valid_query_counts,
+        proposal_temperatures,
+        proposal_top_ks,
+        proposal_top_ps,
+        target_temperatures,
+        target_top_ks,
+        target_top_ps,
+        DRAFT_WIDTH: tl.constexpr,
+        VERIFY_WIDTH: tl.constexpr,
+        NUM_CODE_GROUPS: tl.constexpr,
+        DRAFT_BLOCK: tl.constexpr,
+        VERIFY_BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        committed_depth = tl.load(committed_depths + row).to(tl.int32)
+        row_is_active = tl.load(active_rows + row).to(tl.int1)
+        remaining_count = tl.maximum(NUM_CODE_GROUPS - 2 - committed_depth, 0)
+        proposal_count = tl.minimum(remaining_count, DRAFT_WIDTH)
+        proposal_count = tl.where(row_is_active, proposal_count, 0)
+        tl.store(proposal_counts + row, proposal_count)
+        tl.store(
+            valid_query_counts + row,
+            tl.where(row_is_active, proposal_count + 1, 0),
+        )
+        if DRAFT_WIDTH > 0:
+            proposal_offsets = tl.arange(0, DRAFT_BLOCK)
+            proposal_mask = proposal_offsets < DRAFT_WIDTH
+            proposal_offset = tl.load(
+                proposal_head_offsets + row * DRAFT_WIDTH + proposal_offsets,
+                mask=proposal_mask,
+                other=0,
+            ).to(tl.int32)
+            proposal_row_is_active = row_is_active & (proposal_offsets < proposal_count)
+            proposal_flat_row = row * DRAFT_WIDTH + proposal_offsets
+            tl.store(
+                proposal_head_indices + proposal_flat_row,
+                committed_depth + proposal_offset,
+                mask=proposal_mask,
+            )
+            tl.store(
+                proposal_active_rows + proposal_flat_row,
+                proposal_row_is_active,
+                mask=proposal_mask,
+            )
+            temperature = tl.load(temperatures + row)
+            top_k = tl.load(top_ks + row)
+            top_p = tl.load(top_ps + row)
+            tl.store(
+                proposal_temperatures + proposal_flat_row,
+                temperature,
+                mask=proposal_mask,
+            )
+            tl.store(
+                proposal_top_ks + proposal_flat_row,
+                top_k,
+                mask=proposal_mask,
+            )
+            tl.store(
+                proposal_top_ps + proposal_flat_row,
+                top_p,
+                mask=proposal_mask,
+            )
+        else:
+            pass
+        query_offsets = tl.arange(0, VERIFY_BLOCK)
+        query_mask = query_offsets < VERIFY_WIDTH
+        target_flat_row = row * VERIFY_WIDTH + query_offsets
+        temperature = tl.load(temperatures + row)
+        top_k = tl.load(top_ks + row)
+        top_p = tl.load(top_ps + row)
+        tl.store(target_temperatures + target_flat_row, temperature, mask=query_mask)
+        tl.store(target_top_ks + target_flat_row, top_k, mask=query_mask)
+        tl.store(target_top_ps + target_flat_row, top_p, mask=query_mask)
+
+    @triton.jit
     def prepare_speculative_verification_inputs_kernel(
         pending_tokens,
         draft_tokens,
@@ -101,7 +186,115 @@ if triton is not None:
             pass
 
 else:
+    prepare_speculative_round_metadata_kernel = None
     prepare_speculative_verification_inputs_kernel = None
+
+
+def prepare_speculative_round_metadata(
+    committed_depths: torch.Tensor,
+    active_rows: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    proposal_head_offsets: torch.Tensor,
+    proposal_head_indices: torch.Tensor,
+    proposal_active_rows: torch.Tensor,
+    proposal_counts: torch.Tensor,
+    valid_query_counts: torch.Tensor,
+    proposal_temperatures: torch.Tensor,
+    proposal_top_ks: torch.Tensor,
+    proposal_top_ps: torch.Tensor,
+    target_temperatures: torch.Tensor,
+    target_top_ks: torch.Tensor,
+    target_top_ps: torch.Tensor,
+    verify_width: int,
+    num_code_groups: int,
+) -> bool:
+    """Prepare dynamic selectors and per-query sampling parameters on device."""
+    batch_size = int(committed_depths.shape[0])
+    draft_width = verify_width - 1
+    if committed_depths.ndim != 1 or active_rows.shape != (batch_size,):
+        raise ValueError("speculative round state must contain aligned batch rows")
+    elif any(
+        tensor.shape != (batch_size,)
+        for tensor in (temperatures, top_ks, top_ps, proposal_counts, valid_query_counts)
+    ):
+        raise ValueError("speculative round parameters must contain aligned rows")
+    elif proposal_head_offsets.shape != (batch_size * draft_width,):
+        raise ValueError("static proposal offsets do not match the verification width")
+    elif proposal_head_indices.shape != (batch_size * draft_width,):
+        raise ValueError("proposal head output does not match the verification width")
+    elif proposal_active_rows.shape != (batch_size * draft_width,):
+        raise ValueError("proposal activity output does not match the verification width")
+    elif any(
+        tensor.shape != (batch_size * draft_width,)
+        for tensor in (proposal_temperatures, proposal_top_ks, proposal_top_ps)
+    ):
+        raise ValueError("proposal sampling outputs do not match the verification width")
+    elif any(
+        tensor.shape != (batch_size * verify_width,)
+        for tensor in (target_temperatures, target_top_ks, target_top_ps)
+    ):
+        raise ValueError("target sampling outputs do not match the verification width")
+    else:
+        pass
+    tensors = (
+        committed_depths,
+        active_rows,
+        temperatures,
+        top_ks,
+        top_ps,
+        proposal_head_offsets,
+        proposal_head_indices,
+        proposal_active_rows,
+        proposal_counts,
+        valid_query_counts,
+        proposal_temperatures,
+        proposal_top_ks,
+        proposal_top_ps,
+        target_temperatures,
+        target_top_ks,
+        target_top_ps,
+    )
+    if any(tensor.device != committed_depths.device for tensor in tensors):
+        raise ValueError("speculative round metadata must share one device")
+    elif not committed_depths.is_cuda or prepare_speculative_round_metadata_kernel is None:
+        return False
+    elif any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("speculative round metadata must be contiguous")
+    elif temperatures.dtype is not torch.float32 or top_ps.dtype is not torch.float32:
+        raise ValueError("speculative temperatures and top-p values must use FP32")
+    elif top_ks.dtype is not torch.long or committed_depths.dtype is not torch.long:
+        raise ValueError("speculative selectors must use int64")
+    elif active_rows.dtype is not torch.bool or proposal_active_rows.dtype is not torch.bool:
+        raise ValueError("speculative activity selectors must use booleans")
+    else:
+        pass
+    prepare_speculative_round_metadata_kernel[(batch_size,)](
+        committed_depths,
+        active_rows,
+        temperatures,
+        top_ks,
+        top_ps,
+        proposal_head_offsets,
+        proposal_head_indices,
+        proposal_active_rows,
+        proposal_counts,
+        valid_query_counts,
+        proposal_temperatures,
+        proposal_top_ks,
+        proposal_top_ps,
+        target_temperatures,
+        target_top_ks,
+        target_top_ps,
+        DRAFT_WIDTH=draft_width,
+        VERIFY_WIDTH=verify_width,
+        NUM_CODE_GROUPS=num_code_groups,
+        DRAFT_BLOCK=triton.next_power_of_2(max(draft_width, 1)),
+        VERIFY_BLOCK=triton.next_power_of_2(verify_width),
+        num_warps=4,
+    )
+    return True
 
 
 def prepare_speculative_verification_inputs(

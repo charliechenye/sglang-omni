@@ -373,7 +373,7 @@ def test_unseeded_eager_speculation_runs_a_complete_predictor_frame(
 
 
 @pytest.mark.parametrize("execution_backend", ["eager", "cuda_graph"])
-@pytest.mark.parametrize("top_k", [4, 50])
+@pytest.mark.parametrize("top_k", [4, 50, 128])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @torch.inference_mode()
 def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
@@ -407,6 +407,10 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
             has_top_p: bool,
             has_unbounded_top_k: bool,
             backend: str,
+            probability_output: torch.Tensor | None = None,
+            token_id_output: torch.Tensor | None = None,
+            split_candidate_keys: torch.Tensor | None = None,
+            radix_candidate_keys: torch.Tensor | None = None,
         ) -> tuple[torch.Tensor, torch.Tensor, str]:
             nonlocal probability_call_count
             assert temperatures.shape == top_ks.shape == top_ps.shape
@@ -416,17 +420,33 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
             probability_call_count += 1
             candidate_count = fused_raw_logit_block_k(max_top_k)
             assert candidate_count is not None
-            probabilities = torch.zeros(
-                (logits.shape[0], candidate_count),
-                device=device,
-                dtype=torch.float32,
-            )
-            token_ids = torch.full(
-                (logits.shape[0], candidate_count),
-                -1,
-                device=device,
-                dtype=torch.int32,
-            )
+            if split_candidate_keys is not None:
+                assert split_candidate_keys.shape[0] == logits.shape[0]
+            else:
+                pass
+            if radix_candidate_keys is not None:
+                assert radix_candidate_keys.shape[0] == logits.shape[0]
+            else:
+                pass
+            if probability_output is None:
+                probabilities = torch.zeros(
+                    (logits.shape[0], candidate_count),
+                    device=device,
+                    dtype=torch.float32,
+                )
+            else:
+                probabilities = probability_output
+                probabilities.fill_(0.0)
+            if token_id_output is None:
+                token_ids = torch.full(
+                    (logits.shape[0], candidate_count),
+                    -1,
+                    device=device,
+                    dtype=torch.int32,
+                )
+            else:
+                token_ids = token_id_output
+                token_ids.fill_(-1)
             token_ids[:, 0] = 0
             if probability_call_count == 8:
                 token_ids[:, 1] = 1
@@ -434,7 +454,11 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
             else:
                 probabilities[:, 0] = 1.0
             probabilities[~active_rows] = 0.0
-            actual_backend = "split_top_k" if backend == "radix_compact" else backend
+            actual_backend = (
+                "split_top_k"
+                if backend == "radix_compact" and max_top_k <= 32
+                else backend
+            )
             return probabilities, token_ids, actual_backend
 
         def fixed_uniforms(
@@ -599,6 +623,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             active_rows: torch.Tensor,
             *,
             backend: str,
+            output: torch.Tensor | None = None,
         ) -> torch.Tensor:
             logits = native_grouped_head(
                 hidden_states,
@@ -607,6 +632,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 head_indices,
                 active_rows,
                 backend=backend,
+                output=output,
             )
             if len(round_verification_widths) > len(target_logits):
                 round_index = len(target_logits)
@@ -632,6 +658,10 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             has_top_p: bool,
             has_unbounded_top_k: bool,
             backend: str,
+            probability_output: torch.Tensor | None = None,
+            token_id_output: torch.Tensor | None = None,
+            split_candidate_keys: torch.Tensor | None = None,
+            radix_candidate_keys: torch.Tensor | None = None,
         ) -> (
             tuple[
                 torch.Tensor,
@@ -650,6 +680,10 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 has_top_p=has_top_p,
                 has_unbounded_top_k=has_unbounded_top_k,
                 backend=backend,
+                probability_output=probability_output,
+                token_id_output=token_id_output,
+                split_candidate_keys=split_candidate_keys,
+                radix_candidate_keys=radix_candidate_keys,
             )
             if candidates is None:
                 return None
@@ -670,11 +704,10 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             else:
                 assert logits.shape[0] % batch_size == 0
                 assert logits.shape[0] > 0
-                controlled_probabilities = torch.zeros_like(probabilities)
+                controlled_probabilities = probabilities
+                controlled_probabilities.zero_()
                 controlled_probabilities[:, 0] = 1.0
-                controlled_probabilities = torch.where(
-                    active_rows[:, None], controlled_probabilities, probabilities
-                ).contiguous()
+                controlled_probabilities[~active_rows] = probabilities[~active_rows]
                 return controlled_probabilities, token_ids, actual_backend
 
         def record_acceptance(
@@ -688,6 +721,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             acceptance_uniforms: torch.Tensor,
             correction_uniforms: torch.Tensor,
             bonus_uniforms: torch.Tensor,
+            outputs: SpeculativeAcceptanceBatch | None = None,
         ) -> SpeculativeAcceptanceBatch:
             round_index = len(acceptance_records)
             verification_width = round_verification_widths[round_index]
@@ -745,6 +779,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 acceptance_uniforms,
                 correction_uniforms,
                 bonus_uniforms,
+                outputs=outputs,
             )
             draft_tokens_by_round.append(draft_tokens.clone())
             acceptance_records.append(
@@ -1302,10 +1337,26 @@ def test_speculative_frozen_frame_smoke_executes_frames(
         )
         semantic_positions = torch.tensor([19], device=device, dtype=torch.long)
         talker.configure_code_predictor_speculation(4, backend="eager")
+        workspace_pointers: tuple[int, ...] | None = None
         for _ in range(4):
             talker.code_predictor_forward(
                 layer0_codes, talker_hidden, semantic_positions
             )
+            workspace = talker.code_predictor_spec_active_workspace
+            assert workspace is not None
+            round_workspace = workspace.rounds[4]
+            current_workspace_pointers = (
+                round_workspace.proposal_logits.data_ptr(),
+                round_workspace.target_logits.data_ptr(),
+                round_workspace.proposal_probabilities.data_ptr(),
+                round_workspace.target_probabilities.data_ptr(),
+                round_workspace.proposal_tokens.data_ptr(),
+                round_workspace.acceptance_outputs.committed_tokens.data_ptr(),
+            )
+            if workspace_pointers is None:
+                workspace_pointers = current_workspace_pointers
+            else:
+                assert current_workspace_pointers == workspace_pointers
         else:
             pass
         speculative_stats = talker.predictor_speculative_stats()
@@ -1318,6 +1369,8 @@ def test_speculative_frozen_frame_smoke_executes_frames(
         else:
             pass
         assert speculative_stats["frames"] == 4
+        assert speculative_stats["workspace_allocations"] == 1
+        assert speculative_stats["workspace_bytes"] > 0
 
 
 @pytest.mark.accelerator

@@ -12,6 +12,12 @@ from sglang_omni.models.qwen3_tts.speculative_runtime import (
     sample_compact_probability_rows,
     speculative_sampling_fallback_reason,
 )
+from sglang_omni.models.qwen3_tts.speculative_prepare import (
+    SpeculativeVerifierInputs,
+)
+from sglang_omni.models.qwen3_tts.speculative_workspace import (
+    PredictorSpeculativeWorkspace,
+)
 from sglang_omni.utils.predictor_grouped_heads import grouped_lm_head_linear
 from sglang_omni.utils.predictor_speculation import (
     SpeculativeRowState,
@@ -55,6 +61,103 @@ def test_cpu_grouped_lm_head_selects_rows_and_masks_padding() -> None:
     )
 
     torch.testing.assert_close(actual, expected)
+
+
+def test_cpu_grouped_lm_head_writes_to_persistent_output() -> None:
+    hidden_states = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    head_weights = torch.arange(40, dtype=torch.float32).reshape(2, 5, 4)
+    hidden_indices = torch.tensor([2, 0])
+    head_indices = torch.tensor([1, 0])
+    active_rows = torch.tensor([True, True])
+    output = torch.empty((2, 5), dtype=torch.float32)
+
+    actual = grouped_lm_head_linear(
+        hidden_states,
+        head_weights,
+        hidden_indices,
+        head_indices,
+        active_rows,
+        output=output,
+    )
+
+    assert actual.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(
+        actual,
+        torch.stack(
+            [
+                torch.nn.functional.linear(hidden_states[2], head_weights[1]),
+                torch.nn.functional.linear(hidden_states[0], head_weights[0]),
+            ]
+        ),
+    )
+
+
+def test_cpu_speculative_workspace_keeps_round_pointers_for_mixed_widths() -> None:
+    max_batch_size = 3
+    max_verify_width = 4
+    hidden_size = 8
+    verifier_inputs = {
+        verify_width: SpeculativeVerifierInputs(
+            token_embeddings=torch.empty(
+                max_batch_size, verify_width, hidden_size, dtype=torch.bfloat16
+            ),
+            positions=torch.empty(max_batch_size * verify_width, dtype=torch.long),
+            target_head_indices=torch.empty(
+                max_batch_size, verify_width, dtype=torch.long
+            ),
+            valid_queries=torch.empty(
+                max_batch_size, verify_width, dtype=torch.bool
+            ),
+        )
+        for verify_width in range(1, max_verify_width + 1)
+    }
+    workspace = PredictorSpeculativeWorkspace(
+        max_batch_size=max_batch_size,
+        max_verify_width=max_verify_width,
+        vocab_size=16,
+        hidden_size=hidden_size,
+        hidden_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        max_top_k=50,
+        candidate_width=64,
+        split_top_k_chunks=8,
+        seed_rows=torch.zeros(max_batch_size, dtype=torch.long),
+        round_index=torch.zeros((), dtype=torch.long),
+        uniforms=torch.empty(max_batch_size, 4, max_verify_width),
+        rng_pool=None,
+        metadata_device=torch.empty(max_batch_size, 9, dtype=torch.long),
+        metadata_host=torch.empty(max_batch_size, 9, dtype=torch.long),
+        verifier_input_buffers=verifier_inputs,
+    )
+    round_workspace = workspace.rounds[3]
+    stable_pointers = (
+        round_workspace.proposal_logits.data_ptr(),
+        round_workspace.target_logits.data_ptr(),
+        round_workspace.proposal_probabilities.data_ptr(),
+        round_workspace.target_probabilities.data_ptr(),
+        round_workspace.proposal_tokens.data_ptr(),
+        round_workspace.acceptance_outputs.committed_tokens.data_ptr(),
+        round_workspace.verifier_inputs.token_embeddings.data_ptr(),
+    )
+    live_batch_size = 2
+    live_proposal_rows = live_batch_size * round_workspace.proposal_width
+    live_target_rows = live_batch_size * round_workspace.verify_width
+
+    assert workspace.rounds[1].proposal_tokens.shape == (max_batch_size, 0)
+    assert round_workspace.proposal_logits[:live_proposal_rows].is_contiguous()
+    assert round_workspace.target_logits[:live_target_rows].is_contiguous()
+    assert round_workspace.split_candidate_keys is not None
+    assert workspace.candidate_width == 64
+    assert workspace.memory_bytes > 0
+    assert stable_pointers == (
+        round_workspace.proposal_logits.data_ptr(),
+        round_workspace.target_logits.data_ptr(),
+        round_workspace.proposal_probabilities.data_ptr(),
+        round_workspace.target_probabilities.data_ptr(),
+        round_workspace.proposal_tokens.data_ptr(),
+        round_workspace.acceptance_outputs.committed_tokens.data_ptr(),
+        round_workspace.verifier_inputs.token_embeddings.data_ptr(),
+    )
 
 
 def test_cpu_reference_probability_filtering_handles_ties_and_signed_zero() -> None:
@@ -545,6 +648,19 @@ def test_speculative_width_shrinks_from_staged_heterogeneous_depths() -> None:
             active_rows=torch.zeros_like(active_rows),
         )
         == 0
+    )
+
+
+def test_speculative_width_uses_host_rows_after_metadata_transfer() -> None:
+    assert (
+        resolve_speculative_round_width(
+            configured_width=4,
+            backend_capacity_width=4,
+            num_code_groups=8,
+            committed_depths=[4, 5, 6],
+            active_rows=[True, True, False],
+        )
+        == 3
     )
 
 

@@ -400,6 +400,7 @@ def accept_speculative_candidates_compact(
     acceptance_uniforms: torch.Tensor,
     correction_uniforms: torch.Tensor,
     bonus_uniforms: torch.Tensor,
+    outputs: SpeculativeAcceptanceBatch | None = None,
 ) -> SpeculativeAcceptanceBatch:
     """Run compact first-rejection and residual sampling in one Triton launch."""
     if draft_tokens.ndim != 2 or draft_probabilities.ndim != 2:
@@ -486,20 +487,54 @@ def accept_speculative_candidates_compact(
     else:
         pass
 
-    committed_tokens = torch.empty(
-        (batch_size, verify_width), device=draft_tokens.device, dtype=torch.long
-    )
-    accepted_draft_counts = torch.empty_like(proposal_counts)
-    committed_token_counts = torch.empty_like(proposal_counts)
-    rejected_rows = torch.empty(
-        (batch_size,), device=draft_tokens.device, dtype=torch.bool
-    )
-    bonus_rows = torch.empty(
-        (batch_size,), device=draft_tokens.device, dtype=torch.bool
-    )
-    invalid_rows = torch.empty(
-        (batch_size,), device=draft_tokens.device, dtype=torch.bool
-    )
+    if outputs is None:
+        outputs = SpeculativeAcceptanceBatch(
+            committed_tokens=torch.empty(
+                (batch_size, verify_width),
+                device=draft_tokens.device,
+                dtype=torch.long,
+            ),
+            accepted_draft_counts=torch.empty_like(proposal_counts),
+            committed_token_counts=torch.empty_like(proposal_counts),
+            rejected_rows=torch.empty(
+                (batch_size,), device=draft_tokens.device, dtype=torch.bool
+            ),
+            bonus_rows=torch.empty(
+                (batch_size,), device=draft_tokens.device, dtype=torch.bool
+            ),
+            invalid_rows=torch.empty(
+                (batch_size,), device=draft_tokens.device, dtype=torch.bool
+            ),
+        )
+    elif (
+        outputs.committed_tokens.shape != (batch_size, verify_width)
+        or outputs.accepted_draft_counts.shape != (batch_size,)
+        or outputs.committed_token_counts.shape != (batch_size,)
+        or outputs.rejected_rows.shape != (batch_size,)
+        or outputs.bonus_rows.shape != (batch_size,)
+        or outputs.invalid_rows.shape != (batch_size,)
+        or outputs.committed_tokens.device != draft_tokens.device
+        or outputs.accepted_draft_counts.device != draft_tokens.device
+        or outputs.committed_token_counts.device != draft_tokens.device
+        or outputs.rejected_rows.device != draft_tokens.device
+        or outputs.bonus_rows.device != draft_tokens.device
+        or outputs.invalid_rows.device != draft_tokens.device
+        or outputs.committed_tokens.dtype is not torch.long
+        or outputs.accepted_draft_counts.dtype is not proposal_counts.dtype
+        or outputs.committed_token_counts.dtype is not proposal_counts.dtype
+        or outputs.rejected_rows.dtype is not torch.bool
+        or outputs.bonus_rows.dtype is not torch.bool
+        or outputs.invalid_rows.dtype is not torch.bool
+        or not outputs.committed_tokens.is_contiguous()
+        or not outputs.accepted_draft_counts.is_contiguous()
+        or not outputs.committed_token_counts.is_contiguous()
+        or not outputs.rejected_rows.is_contiguous()
+        or not outputs.bonus_rows.is_contiguous()
+        or not outputs.invalid_rows.is_contiguous()
+    ):
+        raise ValueError("persistent acceptance outputs do not match the round")
+    else:
+        pass
     compact_speculative_acceptance_kernel[(batch_size,)](
         draft_tokens,
         draft_probabilities,
@@ -511,12 +546,12 @@ def accept_speculative_candidates_compact(
         acceptance_uniforms,
         correction_uniforms,
         bonus_uniforms,
-        committed_tokens,
-        accepted_draft_counts,
-        committed_token_counts,
-        rejected_rows,
-        bonus_rows,
-        invalid_rows,
+        outputs.committed_tokens,
+        outputs.accepted_draft_counts,
+        outputs.committed_token_counts,
+        outputs.rejected_rows,
+        outputs.bonus_rows,
+        outputs.invalid_rows,
         DRAFT_WIDTH=draft_width,
         VERIFY_WIDTH=verify_width,
         CANDIDATE_COUNT=candidate_count,
@@ -531,14 +566,7 @@ def accept_speculative_candidates_compact(
         BONUS_UNIFORM_STRIDE_COLUMN=bonus_uniforms.stride(1),
         num_warps=4,
     )
-    return SpeculativeAcceptanceBatch(
-        committed_tokens=committed_tokens,
-        accepted_draft_counts=accepted_draft_counts,
-        committed_token_counts=committed_token_counts,
-        rejected_rows=rejected_rows,
-        bonus_rows=bonus_rows,
-        invalid_rows=invalid_rows,
-    )
+    return outputs
 
 
 def sample_compact_probability_rows_fused(
@@ -546,6 +574,7 @@ def sample_compact_probability_rows_fused(
     token_ids: torch.Tensor,
     uniforms: torch.Tensor,
     active_rows: torch.Tensor,
+    output: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample compact proposal rows with a single inverse-CDF launch."""
     if probabilities.ndim != 2 or token_ids.shape != probabilities.shape:
@@ -583,21 +612,32 @@ def sample_compact_probability_rows_fused(
         raise ValueError("compact proposal active rows must be contiguous")
     else:
         pass
-    if row_count == 0:
-        return torch.empty(
-            (batch_size, proposal_width), device=probabilities.device, dtype=torch.long
+    if output is None:
+        sampled_tokens = torch.empty(
+            (batch_size, proposal_width),
+            device=probabilities.device,
+            dtype=torch.long,
         )
+    elif (
+        output.shape != (batch_size, proposal_width)
+        or output.device != probabilities.device
+        or output.dtype is not torch.long
+        or not output.is_contiguous()
+    ):
+        raise ValueError("persistent proposal output does not match the rows")
+    else:
+        sampled_tokens = output
+    if row_count == 0:
+        return sampled_tokens
     else:
         pass
-    sampled_tokens = torch.empty(
-        (row_count,), device=probabilities.device, dtype=torch.long
-    )
+    flat_sampled_tokens = sampled_tokens.view(row_count)
     sample_compact_probability_rows_kernel[(row_count,)](
         probabilities,
         token_ids,
         uniforms,
         active_rows.view(-1),
-        sampled_tokens,
+        flat_sampled_tokens,
         PROPOSAL_WIDTH=proposal_width,
         CANDIDATE_COUNT=candidate_count,
         UNIFORM_STRIDE_ROW=uniforms.stride(0),
@@ -605,4 +645,4 @@ def sample_compact_probability_rows_fused(
         BLOCK_CANDIDATES=triton.next_power_of_2(candidate_count),
         num_warps=4,
     )
-    return sampled_tokens.view(batch_size, proposal_width)
+    return sampled_tokens

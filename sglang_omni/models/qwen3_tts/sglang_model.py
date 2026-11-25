@@ -61,6 +61,7 @@ from sglang_omni.models.qwen3_tts.predictor_kernels import (
     short_cache_gqa_npu,
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
+    TOP_K_CHUNKS,
     build_speculative_probability_candidates_selected,
     fused_raw_logit_block_k,
     sample_codes_and_gather_codec_embedding,
@@ -82,12 +83,16 @@ from sglang_omni.models.qwen3_tts.speculative_commit import (
 )
 from sglang_omni.models.qwen3_tts.speculative_prepare import (
     SpeculativeVerifierInputs,
+    prepare_speculative_round_metadata,
     prepare_speculative_verification_inputs,
 )
 from sglang_omni.models.qwen3_tts.speculative_rng import (
     derive_speculative_request_seed,
     speculative_uniforms_all_purposes,
     speculative_uniforms_frame_pool,
+)
+from sglang_omni.models.qwen3_tts.speculative_workspace import (
+    PredictorSpeculativeWorkspace,
 )
 from sglang_omni.models.qwen3_tts.speculative_runtime import (
     speculative_sampling_fallback_reason,
@@ -319,6 +324,8 @@ class PredictorSpeculativeStats(TypedDict):
     graph_captures: int
     graph_capture_memory_delta_bytes: int
     graph_capture_time_ms: float
+    workspace_bytes: int
+    workspace_allocations: int
     configuration_time_ms: float
     native_fallback_count: int
     attempted_frames: int
@@ -1441,6 +1448,13 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_input_buffers: dict[int, SpeculativeVerifierInputs] = (
             {}
         )
+        self.code_predictor_spec_workspaces: dict[
+            int, PredictorSpeculativeWorkspace
+        ] = {}
+        self.code_predictor_spec_active_workspace: (
+            PredictorSpeculativeWorkspace | None
+        ) = None
+        self.code_predictor_spec_workspace_allocation_count = 0
         self.code_predictor_spec_metadata_device: torch.Tensor | None = None
         self.code_predictor_spec_metadata_host: torch.Tensor | None = None
         self.code_predictor_spec_effective_width_histogram: dict[int, int] = {}
@@ -1623,6 +1637,24 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         else:
             pass
         self.decode_prep_rids = rids
+        sampling_fallback = speculative_sampling_fallback_reason(
+            self.sub_request_ids,
+            self.sub_user_seed_rows,
+            self.sub_sample_rows,
+            has_unbounded_top_k=self.sub_sampled_has_unbounded_top_k,
+            deterministic_mode=bool(
+                get_exec().deterministic.enable_deterministic_inference
+            ),
+        )
+        if (
+            self.code_predictor_spec_requested_width > 0
+            and self.code_predictor_spec_effective_width > 0
+            and sampling_fallback is None
+            and fused_raw_logit_block_k(self.sub_sampled_max_top_k) is not None
+        ):
+            self.ensure_code_predictor_speculative_workspace()
+        else:
+            pass
 
     @torch.no_grad()
     def forward(
@@ -1872,6 +1904,64 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         else:
             pass
 
+    def ensure_code_predictor_speculative_workspace(
+        self,
+    ) -> PredictorSpeculativeWorkspace:
+        """Reuse the workspace for this bounded sampling signature or allocate it once."""
+        if self.code_predictor_spec_requested_width <= 0:
+            raise RuntimeError("speculative workspace is disabled at width zero")
+        else:
+            pass
+        candidate_width = fused_raw_logit_block_k(self.sub_sampled_max_top_k)
+        if candidate_width is None:
+            raise RuntimeError("speculative workspace has an unsupported Top-K")
+        else:
+            pass
+        workspace = self.code_predictor_spec_workspaces.get(
+            self.sub_sampled_max_top_k
+        )
+        if workspace is None:
+            if (
+                self.sub_speculative_seed_tensor is None
+                or self.sub_speculative_round_index_tensor is None
+                or self.code_predictor_spec_metadata_device is None
+                or self.code_predictor_spec_metadata_host is None
+                or self.predictor_fused_layers is None
+            ):
+                raise RuntimeError("speculative workspace buffers were not configured")
+            else:
+                pass
+            workspace = PredictorSpeculativeWorkspace(
+                max_batch_size=self.predictor_max_batch_size,
+                max_verify_width=self.code_predictor_spec_requested_width,
+                vocab_size=int(self.config.code_predictor_config.vocab_size),
+                hidden_size=int(self.predictor_fused_layers.shape.hidden_size),
+                hidden_dtype=self.predictor_k_cache.dtype,
+                device=self.predictor_device,
+                max_top_k=self.sub_sampled_max_top_k,
+                candidate_width=candidate_width,
+                split_top_k_chunks=TOP_K_CHUNKS,
+                seed_rows=self.sub_speculative_seed_tensor,
+                round_index=self.sub_speculative_round_index_tensor,
+                uniforms=self.sub_speculative_uniforms_tensor,
+                rng_pool=self.sub_speculative_rng_pool_tensor,
+                metadata_device=self.code_predictor_spec_metadata_device,
+                metadata_host=self.code_predictor_spec_metadata_host,
+                verifier_input_buffers=self.code_predictor_spec_input_buffers,
+            )
+            self.code_predictor_spec_workspaces[self.sub_sampled_max_top_k] = workspace
+            self.code_predictor_spec_workspace_allocation_count += 1
+        elif (
+            workspace.max_batch_size < self.predictor_max_batch_size
+            or workspace.max_verify_width < self.code_predictor_spec_requested_width
+            or workspace.candidate_width < candidate_width
+        ):
+            raise RuntimeError("cached speculative workspace has insufficient capacity")
+        else:
+            pass
+        self.code_predictor_spec_active_workspace = workspace
+        return workspace
+
     @torch.no_grad()
     def code_predictor_forward_speculative(
         self,
@@ -1895,6 +1985,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         else:
             pass
         maximum_frame_width, _ = frame_path
+        workspace = self.ensure_code_predictor_speculative_workspace()
         packed_head_weights = self.code_predictor_spec_lm_head_weights
         if packed_head_weights is None:
             raise RuntimeError("grouped Predictor head weights are unavailable")
@@ -1954,55 +2045,42 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             sub_positions,
         )
 
-        committed_depths = torch.ones(
-            batch_size, device=self.predictor_device, dtype=torch.long
-        )
-        logical_kv_lengths = torch.full_like(committed_depths, 2)
-        pending_tokens = code_outputs[:, 1].clone()
-        preceding_hidden = pair_hidden[:, 1, :].contiguous()
-        active_rows = torch.ones(
-            batch_size, device=self.predictor_device, dtype=torch.bool
-        )
-        metadata_device = self.code_predictor_spec_metadata_device
-        metadata_host = self.code_predictor_spec_metadata_host
-        if metadata_device is None or metadata_host is None:
-            raise RuntimeError("speculative metadata buffers were not configured")
-        else:
-            pass
-
-        batch_rows = torch.arange(batch_size, device=self.predictor_device)
+        committed_depths = workspace.committed_depths[:batch_size]
+        committed_depths.fill_(1)
+        logical_kv_lengths = workspace.logical_kv_lengths[:batch_size]
+        logical_kv_lengths.fill_(2)
+        pending_tokens = workspace.pending_tokens[:batch_size]
+        pending_tokens.copy_(code_outputs[:, 1])
+        preceding_hidden = workspace.preceding_hidden[:batch_size]
+        preceding_hidden.copy_(pair_hidden[:, 1, :])
+        active_rows = workspace.active_rows[:batch_size]
+        active_rows.fill_(True)
+        metadata_device = workspace.metadata_device
+        metadata_host = workspace.metadata_host
         temperatures = self.sub_temperature_tensor[:batch_size]
         top_ks = self.sub_top_k_tensor[:batch_size]
         top_ps = self.sub_top_p_tensor[:batch_size]
-        speculative_seed_buffer = self.sub_speculative_seed_tensor
-        round_index_buffer = self.sub_speculative_round_index_tensor
-        uniform_buffer = self.sub_speculative_uniforms_tensor
-        rng_pool_buffer = self.sub_speculative_rng_pool_tensor
         if (
-            speculative_seed_buffer is None
-            or round_index_buffer is None
-            or (
-                self.code_predictor_spec_rng_backend == "per_round"
-                and uniform_buffer is None
-            )
-            or (
-                self.code_predictor_spec_rng_backend == "frame_pool"
-                and rng_pool_buffer is None
-            )
+            self.code_predictor_spec_rng_backend == "per_round"
+            and workspace.uniforms is None
+        ) or (
+            self.code_predictor_spec_rng_backend == "frame_pool"
+            and workspace.rng_pool is None
         ):
             raise RuntimeError("speculative request seeds were not configured")
         else:
             pass
-        speculative_seeds = speculative_seed_buffer[:batch_size]
+        speculative_seeds = workspace.seed_rows[:batch_size]
         frame_rng_pool = None
         if self.code_predictor_spec_rng_backend == "frame_pool":
+            assert workspace.rng_pool is not None
             frame_rng_pool = speculative_uniforms_frame_pool(
                 speculative_seeds,
                 semantic_positions,
                 num_groups,
                 num_groups - 2,
-                int(rng_pool_buffer.shape[3]),
-                rng_pool_buffer[:batch_size],
+                int(workspace.rng_pool.shape[3]),
+                workspace.rng_pool[:batch_size],
             )
         else:
             pass
@@ -2024,47 +2102,83 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 )
             )
             proposal_width = verify_width - 1
-            proposal_offsets = torch.arange(
-                proposal_width, device=self.predictor_device, dtype=torch.long
+            round_workspace = workspace.rounds[verify_width]
+            proposal_rows = batch_size * proposal_width
+            target_rows = batch_size * verify_width
+            proposal_counts = round_workspace.proposal_counts[:batch_size]
+            valid_query_counts = round_workspace.valid_query_counts[:batch_size]
+            proposal_head_indices = round_workspace.proposal_head_indices[
+                :proposal_rows
+            ]
+            active_proposal_rows = round_workspace.proposal_active_rows[:proposal_rows]
+            proposal_temperatures = round_workspace.proposal_temperatures[
+                :proposal_rows
+            ]
+            proposal_top_ks = round_workspace.proposal_top_ks[:proposal_rows]
+            proposal_top_ps = round_workspace.proposal_top_ps[:proposal_rows]
+            target_temperatures = round_workspace.target_temperatures[:target_rows]
+            target_top_ks = round_workspace.target_top_ks[:target_rows]
+            target_top_ps = round_workspace.target_top_ps[:target_rows]
+            round_metadata_prepared = prepare_speculative_round_metadata(
+                committed_depths,
+                active_rows,
+                temperatures,
+                top_ks,
+                top_ps,
+                round_workspace.proposal_head_offsets[:proposal_rows],
+                proposal_head_indices,
+                active_proposal_rows,
+                proposal_counts,
+                valid_query_counts,
+                proposal_temperatures,
+                proposal_top_ks,
+                proposal_top_ps,
+                target_temperatures,
+                target_top_ks,
+                target_top_ps,
+                verify_width,
+                num_groups,
             )
-            proposal_counts = torch.minimum(
-                (num_groups - 2 - committed_depths).clamp_min(0),
-                torch.full_like(committed_depths, proposal_width),
-            )
-            proposal_counts = torch.where(
-                active_rows, proposal_counts, torch.zeros_like(proposal_counts)
-            )
-            active_proposals = proposal_offsets.unsqueeze(
-                0
-            ) < proposal_counts.unsqueeze(1)
+            if not round_metadata_prepared:
+                raise RuntimeError("speculative round metadata kernel is unavailable")
+            else:
+                pass
             if proposal_width > 0:
-                proposal_head_rows = batch_rows.repeat_interleave(proposal_width)
-                proposal_head_indices = (
-                    committed_depths.unsqueeze(1) + proposal_offsets.unsqueeze(0)
-                ).reshape(-1)
                 proposal_logits = grouped_lm_head_linear(
                     preceding_hidden,
                     self.code_predictor_spec_lm_head_weights,
-                    proposal_head_rows,
+                    round_workspace.proposal_hidden_rows[:proposal_rows],
                     proposal_head_indices,
-                    active_proposals.reshape(-1).contiguous(),
+                    active_proposal_rows,
                     backend=self.code_predictor_spec_lm_head_backend,
+                    output=round_workspace.proposal_logits[:proposal_rows],
                 )
-                flat_proposal_temperatures = temperatures.repeat_interleave(
-                    proposal_width
-                )
-                flat_proposal_top_ks = top_ks.repeat_interleave(proposal_width)
-                flat_proposal_top_ps = top_ps.repeat_interleave(proposal_width)
                 proposal_candidates = build_speculative_probability_candidates_selected(
                     proposal_logits,
-                    flat_proposal_temperatures.contiguous(),
-                    flat_proposal_top_ks.contiguous(),
-                    flat_proposal_top_ps.contiguous(),
-                    active_proposals.reshape(-1).contiguous(),
+                    proposal_temperatures,
+                    proposal_top_ks,
+                    proposal_top_ps,
+                    active_proposal_rows,
                     max_top_k=max_top_k,
                     has_top_p=has_top_p,
                     has_unbounded_top_k=False,
                     backend=self.code_predictor_spec_probability_backend,
+                    probability_output=round_workspace.proposal_probabilities[
+                        :proposal_rows, :candidate_count
+                    ],
+                    token_id_output=round_workspace.proposal_token_ids[
+                        :proposal_rows, :candidate_count
+                    ],
+                    split_candidate_keys=(
+                        None
+                        if round_workspace.split_candidate_keys is None
+                        else round_workspace.split_candidate_keys[:proposal_rows]
+                    ),
+                    radix_candidate_keys=(
+                        None
+                        if round_workspace.radix_candidate_keys is None
+                        else round_workspace.radix_candidate_keys[:proposal_rows]
+                    ),
                 )
                 if proposal_candidates is None:
                     raise RuntimeError(
@@ -2080,19 +2194,22 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 self.record_code_predictor_spec_probability_backend(
                     proposal_probability_backend
                 )
+                proposal_probabilities_compact = round_workspace.proposal_probabilities[
+                    :proposal_rows, :candidate_count
+                ]
+                proposal_ids_compact = round_workspace.proposal_token_ids[
+                    :proposal_rows, :candidate_count
+                ]
             else:
-                proposal_probabilities_compact = torch.empty(
-                    (0, candidate_count),
-                    device=self.predictor_device,
-                    dtype=torch.float32,
-                )
-                proposal_ids_compact = torch.empty(
-                    (0, candidate_count),
-                    device=self.predictor_device,
-                    dtype=torch.int32,
-                )
+                proposal_probabilities_compact = round_workspace.proposal_probabilities[
+                    :0, :candidate_count
+                ]
+                proposal_ids_compact = round_workspace.proposal_token_ids[
+                    :0, :candidate_count
+                ]
             if frame_rng_pool is None:
-                round_index_buffer.fill_(round_index)
+                workspace.round_index.fill_(round_index)
+                assert workspace.uniforms is not None
                 (
                     proposal_uniforms,
                     acceptance_uniforms,
@@ -2101,11 +2218,11 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 ) = speculative_uniforms_all_purposes(
                     speculative_seeds,
                     semantic_positions,
-                    round_index_buffer,
+                    workspace.round_index,
                     num_groups,
                     proposal_width,
                     verify_width,
-                    uniform_buffer[:batch_size],
+                    workspace.uniforms[:batch_size],
                 )
             else:
                 proposal_uniforms = frame_rng_pool[:, 0, round_index, :proposal_width]
@@ -2117,99 +2234,32 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     proposal_probabilities_compact,
                     proposal_ids_compact,
                     proposal_uniforms,
-                    active_proposals,
+                    active_proposal_rows.view(batch_size, proposal_width),
+                    output=round_workspace.proposal_tokens[:batch_size],
                 )
             else:
-                draft_tokens = torch.empty(
-                    (batch_size, 0), device=self.predictor_device, dtype=torch.long
-                )
-            valid_query_counts = torch.where(
+                draft_tokens = round_workspace.proposal_tokens[:batch_size]
+            input_buffer = round_workspace.verifier_inputs
+            source_tables = codec_tables if projected_tables is None else projected_tables
+            inputs_prepared = prepare_speculative_verification_inputs(
+                pending_tokens,
+                draft_tokens,
+                committed_depths,
+                logical_kv_lengths,
                 active_rows,
-                proposal_counts + 1,
-                torch.zeros_like(proposal_counts),
+                proposal_counts,
+                source_tables,
+                input_buffer,
             )
-            input_buffer = self.code_predictor_spec_input_buffers.get(verify_width)
-            can_use_projected_table = (
-                projected_tables is not None
-                or self.code_predictor.small_to_mtp_projection is None
-            )
-            if input_buffer is not None and can_use_projected_table:
-                source_tables = (
-                    codec_tables if projected_tables is None else projected_tables
-                )
-                inputs_prepared = prepare_speculative_verification_inputs(
-                    pending_tokens,
-                    draft_tokens,
-                    committed_depths,
-                    logical_kv_lengths,
-                    active_rows,
-                    proposal_counts,
-                    source_tables,
-                    input_buffer,
-                )
+            if not inputs_prepared:
+                raise RuntimeError("speculative verifier preparation kernel is unavailable")
             else:
-                inputs_prepared = False
-            if inputs_prepared:
-                query_embeddings = input_buffer.token_embeddings[:batch_size]
-                packed_positions = input_buffer.positions[: batch_size * verify_width]
-                query_depths = input_buffer.target_head_indices[:batch_size]
-                valid_queries = input_buffer.valid_queries[:batch_size]
-            else:
-                query_offsets = torch.arange(
-                    verify_width, device=self.predictor_device, dtype=torch.long
-                )
-                valid_queries = query_offsets.unsqueeze(
-                    0
-                ) < valid_query_counts.unsqueeze(1)
-                query_depths = committed_depths.unsqueeze(1) + query_offsets.unsqueeze(
-                    0
-                )
-                if proposal_width > 0:
-                    query_tokens = torch.cat(
-                        (pending_tokens[:, None], draft_tokens), dim=1
-                    )
-                else:
-                    query_tokens = pending_tokens[:, None]
-                safe_query_depths = (query_depths - 1).clamp(
-                    min=0, max=codec_tables.shape[0] - 1
-                )
-                safe_query_tokens = query_tokens.clamp(min=0, max=vocab_size - 1)
-                if projected_tables is None:
-                    raw_query_embeddings = codec_tables[
-                        safe_query_depths, safe_query_tokens
-                    ]
-                    query_embeddings = self.code_predictor.project_input(
-                        raw_query_embeddings
-                    )
-                else:
-                    safe_projected_depths = (query_depths - 1).clamp(
-                        min=0, max=projected_tables.shape[0] - 1
-                    )
-                    query_embeddings = projected_tables[
-                        safe_projected_depths, safe_query_tokens
-                    ]
-                query_embeddings = torch.where(
-                    valid_queries.unsqueeze(-1),
-                    query_embeddings,
-                    torch.zeros_like(query_embeddings),
-                ).to(dtype=predictor_dtype)
-                packed_positions = logical_kv_lengths.unsqueeze(
-                    1
-                ) + query_offsets.unsqueeze(0)
-                packed_positions = (
-                    torch.where(
-                        valid_queries,
-                        packed_positions,
-                        torch.full_like(packed_positions, -1),
-                    )
-                    .reshape(-1)
-                    .contiguous()
-                )
-            target_hidden_rows = torch.arange(
-                batch_size * verify_width,
-                device=self.predictor_device,
-                dtype=torch.long,
-            )
+                pass
+            query_embeddings = input_buffer.token_embeddings[:batch_size]
+            packed_positions = input_buffer.positions[: batch_size * verify_width]
+            query_depths = input_buffer.target_head_indices[:batch_size]
+            valid_queries = input_buffer.valid_queries[:batch_size]
+            target_hidden_rows = round_workspace.target_hidden_rows[:target_rows]
             if verify_graph is None:
                 verified_hiddens = self.predictor_forward_packed_tokens(
                     token_embeds=query_embeddings,
@@ -2223,6 +2273,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     query_depths.reshape(-1),
                     valid_queries.reshape(-1).contiguous(),
                     backend=self.code_predictor_spec_lm_head_backend,
+                    output=round_workspace.target_logits[:target_rows],
                 )
                 self.code_predictor_spec_eager_round_count += 1
             else:
@@ -2236,22 +2287,41 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     raise RuntimeError("speculative graph has no target logits")
                 else:
                     pass
-                target_logits = verify_graph.target_logits[: batch_size * verify_width]
+                round_workspace.target_logits[:target_rows].copy_(
+                    verify_graph.target_logits[:target_rows]
+                )
                 self.code_predictor_spec_graph_replay_count += 1
-            target_logits = target_logits.view(batch_size, verify_width, vocab_size)
-            flat_target_temperatures = temperatures.repeat_interleave(verify_width)
-            flat_target_top_ks = top_ks.repeat_interleave(verify_width)
-            flat_target_top_ps = top_ps.repeat_interleave(verify_width)
+            target_logits = round_workspace.target_logits[:target_rows]
             target_candidates = build_speculative_probability_candidates_selected(
-                target_logits.reshape(-1, vocab_size).contiguous(),
-                flat_target_temperatures.contiguous(),
-                flat_target_top_ks.contiguous(),
-                flat_target_top_ps.contiguous(),
+                target_logits,
+                target_temperatures,
+                target_top_ks,
+                target_top_ps,
                 valid_queries.reshape(-1).contiguous(),
                 max_top_k=max_top_k,
                 has_top_p=has_top_p,
                 has_unbounded_top_k=False,
                 backend=self.code_predictor_spec_probability_backend,
+                probability_output=round_workspace.target_probabilities[
+                    :target_rows, :candidate_count
+                ],
+                token_id_output=round_workspace.target_token_ids[
+                    :target_rows, :candidate_count
+                ],
+                split_candidate_keys=(
+                    None
+                    if round_workspace.split_candidate_keys is None
+                    else round_workspace.split_candidate_keys[
+                        proposal_rows : proposal_rows + target_rows
+                    ]
+                ),
+                radix_candidate_keys=(
+                    None
+                    if round_workspace.radix_candidate_keys is None
+                    else round_workspace.radix_candidate_keys[
+                        proposal_rows : proposal_rows + target_rows
+                    ]
+                ),
             )
             if target_candidates is None:
                 raise RuntimeError(
@@ -2267,6 +2337,25 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             self.record_code_predictor_spec_probability_backend(
                 target_probability_backend
             )
+            target_probabilities_compact = round_workspace.target_probabilities[
+                :target_rows, :candidate_count
+            ]
+            target_ids_compact = round_workspace.target_token_ids[
+                :target_rows, :candidate_count
+            ]
+            acceptance_outputs = round_workspace.acceptance_outputs
+            live_acceptance_outputs = SpeculativeAcceptanceBatch(
+                committed_tokens=acceptance_outputs.committed_tokens[:batch_size],
+                accepted_draft_counts=acceptance_outputs.accepted_draft_counts[
+                    :batch_size
+                ],
+                committed_token_counts=acceptance_outputs.committed_token_counts[
+                    :batch_size
+                ],
+                rejected_rows=acceptance_outputs.rejected_rows[:batch_size],
+                bonus_rows=acceptance_outputs.bonus_rows[:batch_size],
+                invalid_rows=acceptance_outputs.invalid_rows[:batch_size],
+            )
             decision = accept_speculative_candidates_compact(
                 draft_tokens,
                 proposal_probabilities_compact,
@@ -2278,6 +2367,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 acceptance_uniforms,
                 correction_uniforms,
                 bonus_uniforms,
+                outputs=live_acceptance_outputs,
             )
 
             commit_speculative_codes(
@@ -2314,31 +2404,41 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 self.predictor_device
             )
             current_stream.synchronize()
-            round_metadata = metadata_host[:batch_size]
-            if bool(round_metadata[:, 8].any()):
+            round_metadata_rows = metadata_host[:batch_size].tolist()
+            if any(row[8] != 0 for row in round_metadata_rows):
                 raise RuntimeError(
                     "compact speculative acceptance produced invalid probability mass"
                 )
             else:
                 pass
-            active_count = int(round_metadata[:, 1].sum())
-            self.code_predictor_spec_correction_forward_watch = bool(
-                round_metadata[:, 5].sum()
+            active_count = sum(row[1] for row in round_metadata_rows)
+            self.code_predictor_spec_correction_forward_watch = any(
+                row[5] != 0 for row in round_metadata_rows
             )
             self.code_predictor_spec_round_count += 1
-            self.code_predictor_spec_proposed_count += int(round_metadata[:, 2].sum())
-            self.code_predictor_spec_accepted_count += int(round_metadata[:, 0].sum())
-            self.code_predictor_spec_committed_count += int(round_metadata[:, 3].sum())
-            self.code_predictor_spec_bonus_count += int(round_metadata[:, 4].sum())
-            self.code_predictor_spec_rejection_count += int(round_metadata[:, 5].sum())
+            self.code_predictor_spec_proposed_count += sum(
+                row[2] for row in round_metadata_rows
+            )
+            self.code_predictor_spec_accepted_count += sum(
+                row[0] for row in round_metadata_rows
+            )
+            self.code_predictor_spec_committed_count += sum(
+                row[3] for row in round_metadata_rows
+            )
+            self.code_predictor_spec_bonus_count += sum(
+                row[4] for row in round_metadata_rows
+            )
+            self.code_predictor_spec_rejection_count += sum(
+                row[5] for row in round_metadata_rows
+            )
             self.code_predictor_spec_packed_forward_count += 1
             self.code_predictor_spec_effective_width_histogram[verify_width] = (
                 self.code_predictor_spec_effective_width_histogram.get(verify_width, 0)
                 + 1
             )
             self.code_predictor_spec_fused_predictor_forward_count += 1
-            draft_evaluation_count = int(round_metadata[:, 2].sum())
-            valid_target_count = int(round_metadata[:, 6].sum())
+            draft_evaluation_count = sum(row[2] for row in round_metadata_rows)
+            valid_target_count = sum(row[6] for row in round_metadata_rows)
             self.code_predictor_spec_draft_head_evaluation_count += (
                 draft_evaluation_count
             )
@@ -2360,8 +2460,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 maximum_frame_width,
                 maximum_frame_width,
                 num_groups,
-                round_metadata[:, 7],
-                round_metadata[:, 1].to(torch.bool),
+                [row[7] for row in round_metadata_rows],
+                [bool(row[1]) for row in round_metadata_rows],
             )
 
         self.code_predictor_spec_correction_forward_watch = False
@@ -2415,6 +2515,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_fallback_reason = None
         self.code_predictor_spec_graphs.clear()
         self.code_predictor_spec_input_buffers.clear()
+        self.code_predictor_spec_workspaces.clear()
+        self.code_predictor_spec_active_workspace = None
         if requested_width == 0:
             self.sub_speculative_seed_tensor = None
             self.sub_speculative_round_index_tensor = None
@@ -2825,6 +2927,40 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             if self.code_predictor_spec_round_count > 0
             else 0.0
         )
+        workspace_tensors: dict[int, torch.Tensor] = {}
+        for workspace in self.code_predictor_spec_workspaces.values():
+            for tensor in workspace.tensor_storage:
+                if tensor.numel() > 0:
+                    workspace_tensors[tensor.data_ptr()] = tensor
+                else:
+                    pass
+        for verifier_inputs in self.code_predictor_spec_input_buffers.values():
+            for tensor in (
+                verifier_inputs.token_embeddings,
+                verifier_inputs.positions,
+                verifier_inputs.target_head_indices,
+                verifier_inputs.valid_queries,
+            ):
+                if tensor.numel() > 0:
+                    workspace_tensors[tensor.data_ptr()] = tensor
+                else:
+                    pass
+        for tensor in (
+            self.sub_speculative_seed_tensor,
+            self.sub_speculative_round_index_tensor,
+            self.sub_speculative_uniforms_tensor,
+            self.sub_speculative_rng_pool_tensor,
+            self.code_predictor_spec_metadata_device,
+            self.code_predictor_spec_metadata_host,
+        ):
+            if tensor is not None and tensor.numel() > 0:
+                workspace_tensors[tensor.data_ptr()] = tensor
+            else:
+                pass
+        workspace_bytes = sum(
+            tensor.numel() * tensor.element_size()
+            for tensor in workspace_tensors.values()
+        )
         return {
             "requested_width": self.code_predictor_spec_requested_width,
             "effective_width": self.code_predictor_spec_effective_width,
@@ -2892,6 +3028,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 self.code_predictor_spec_graph_memory_delta_bytes
             ),
             "graph_capture_time_ms": self.code_predictor_spec_graph_capture_time_ms,
+            "workspace_bytes": workspace_bytes,
+            "workspace_allocations": (
+                self.code_predictor_spec_workspace_allocation_count
+            ),
             "configuration_time_ms": self.code_predictor_spec_configuration_time_ms,
             "native_fallback_count": self.code_predictor_spec_native_fallback_count,
             "attempted_frames": (
