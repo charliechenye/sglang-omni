@@ -6,14 +6,16 @@ from __future__ import annotations
 import pytest
 import torch
 
+from sglang_omni.models.qwen3_tts.speculative_acceptance import (
+    accept_speculative_candidates_dense_indexed,
+    update_speculative_dense_probability_table,
+)
+from sglang_omni.models.qwen3_tts.speculative_prepare import SpeculativeVerifierInputs
 from sglang_omni.models.qwen3_tts.speculative_runtime import (
     accept_speculative_candidates,
     expand_compact_probability_rows,
     sample_compact_probability_rows,
     speculative_sampling_fallback_reason,
-)
-from sglang_omni.models.qwen3_tts.speculative_prepare import (
-    SpeculativeVerifierInputs,
 )
 from sglang_omni.models.qwen3_tts.speculative_workspace import (
     PredictorSpeculativeWorkspace,
@@ -105,9 +107,7 @@ def test_cpu_speculative_workspace_keeps_round_pointers_for_mixed_widths() -> No
             target_head_indices=torch.empty(
                 max_batch_size, verify_width, dtype=torch.long
             ),
-            valid_queries=torch.empty(
-                max_batch_size, verify_width, dtype=torch.bool
-            ),
+            valid_queries=torch.empty(max_batch_size, verify_width, dtype=torch.bool),
         )
         for verify_width in range(1, max_verify_width + 1)
     }
@@ -252,6 +252,193 @@ def test_acceptance_residual_and_bonus_edge_cases() -> None:
     )
     assert equal_distribution_decision.accepted_draft_count == 1
     assert not equal_distribution_decision.rejected
+
+
+def test_dense_indexed_acceptance_handles_rejection_tail_bonus_and_w1() -> None:
+    batch_size = 3
+    draft_width = 2
+    verify_width = draft_width + 1
+    candidate_count = 3
+    vocab_size = 3
+    candidate_ids = torch.tensor([0, 1, 2], dtype=torch.int32)
+    proposal_probabilities = torch.tensor(
+        [
+            [0.5, 0.5, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    target_probabilities = torch.tensor(
+        [
+            [0.25, 0.75, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.1, 0.9, 0.0],
+            [0.4, 0.6, 0.0],
+            [0.5, 0.5, 0.0],
+            [0.2, 0.8, 0.0],
+            [0.1, 0.9, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    proposal_ids = candidate_ids.expand(batch_size * draft_width, -1).contiguous()
+    target_ids = candidate_ids.expand(batch_size * verify_width, -1).contiguous()
+    dense_proposals = torch.zeros(
+        (batch_size * draft_width, vocab_size), dtype=torch.float32
+    )
+    dense_targets = torch.zeros(
+        (batch_size * verify_width, vocab_size), dtype=torch.float32
+    )
+    proposal_previous_ids = torch.zeros_like(proposal_ids, dtype=torch.long)
+    target_previous_ids = torch.zeros_like(target_ids, dtype=torch.long)
+    current_ids = torch.empty_like(target_ids, dtype=torch.long)
+    update_speculative_dense_probability_table(
+        proposal_probabilities,
+        proposal_ids,
+        dense_proposals,
+        proposal_previous_ids,
+        current_ids,
+    )
+    update_speculative_dense_probability_table(
+        target_probabilities,
+        target_ids,
+        dense_targets,
+        target_previous_ids,
+        current_ids,
+    )
+    result = accept_speculative_candidates_dense_indexed(
+        draft_tokens=torch.zeros((batch_size, draft_width), dtype=torch.long),
+        draft_probabilities=proposal_probabilities,
+        draft_token_ids=proposal_ids,
+        target_probabilities=target_probabilities,
+        target_token_ids=target_ids,
+        proposal_counts=torch.tensor([2, 2, 1], dtype=torch.long),
+        active_rows=torch.ones((batch_size,), dtype=torch.bool),
+        acceptance_uniforms=torch.tensor([[0.75, 0.25], [0.25, 0.8], [0.25, 0.25]]),
+        correction_uniforms=torch.zeros((batch_size, verify_width)),
+        bonus_uniforms=torch.tensor(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.6, 0.0]]
+        ),
+        dense_draft_probabilities=dense_proposals.view(
+            batch_size, draft_width, vocab_size
+        ),
+        dense_target_probabilities=dense_targets.view(
+            batch_size, verify_width, vocab_size
+        ),
+        candidate_offsets=torch.arange(candidate_count, dtype=torch.long),
+    )
+
+    assert result.committed_tokens.tolist() == [[1, 0, 0], [0, 1, 0], [0, 1, 0]]
+    assert result.accepted_draft_counts.tolist() == [0, 1, 1]
+    assert result.committed_token_counts.tolist() == [1, 2, 2]
+    assert result.rejected_rows.tolist() == [True, True, False]
+    assert result.bonus_rows.tolist() == [False, False, True]
+    assert not bool(result.invalid_rows.any())
+
+    w1_target_probabilities = torch.tensor([[0.25, 0.75]], dtype=torch.float32)
+    w1_target_ids = torch.tensor([[0, 1]], dtype=torch.int32)
+    w1_dense_target = torch.zeros((1, vocab_size), dtype=torch.float32)
+    w1_previous_ids = torch.zeros((1, 2), dtype=torch.long)
+    w1_current_ids = torch.empty_like(w1_previous_ids)
+    update_speculative_dense_probability_table(
+        w1_target_probabilities,
+        w1_target_ids,
+        w1_dense_target,
+        w1_previous_ids,
+        w1_current_ids,
+    )
+    w1_result = accept_speculative_candidates_dense_indexed(
+        draft_tokens=torch.empty((1, 0), dtype=torch.long),
+        draft_probabilities=torch.empty((0, 2), dtype=torch.float32),
+        draft_token_ids=torch.empty((0, 2), dtype=torch.int32),
+        target_probabilities=w1_target_probabilities,
+        target_token_ids=w1_target_ids,
+        proposal_counts=torch.tensor([0], dtype=torch.long),
+        active_rows=torch.tensor([True]),
+        acceptance_uniforms=torch.empty((1, 0), dtype=torch.float32),
+        correction_uniforms=torch.zeros((1, 1), dtype=torch.float32),
+        bonus_uniforms=torch.tensor([[0.8]], dtype=torch.float32),
+        dense_draft_probabilities=torch.empty((1, 0, vocab_size)),
+        dense_target_probabilities=w1_dense_target.view(1, 1, vocab_size),
+        candidate_offsets=torch.tensor([0, 1], dtype=torch.long),
+    )
+    assert w1_result.committed_tokens.tolist() == [[1]]
+    assert w1_result.bonus_rows.tolist() == [True]
+
+
+def test_dense_indexed_acceptance_preserves_subnormal_residual_mass() -> None:
+    draft_probabilities = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
+    draft_token_ids = torch.tensor([[0, -1, -1, -1]], dtype=torch.int32)
+    target_probabilities = torch.tensor(
+        [[0.99999994, 0.5e-40, 1.5e-40, 0.0], [0.25, 0.25, 0.25, 0.25]]
+    )
+    target_token_ids = torch.tensor([[0, 1, 2, -1], [3, 4, 5, 6]], dtype=torch.int32)
+    dense_draft = torch.zeros((1, 7), dtype=torch.float32)
+    dense_target = torch.zeros((2, 7), dtype=torch.float32)
+    draft_previous_ids = torch.zeros((1, 4), dtype=torch.long)
+    target_previous_ids = torch.zeros((2, 4), dtype=torch.long)
+    current_ids = torch.empty((2, 4), dtype=torch.long)
+    update_speculative_dense_probability_table(
+        draft_probabilities,
+        draft_token_ids,
+        dense_draft,
+        draft_previous_ids,
+        current_ids,
+    )
+    update_speculative_dense_probability_table(
+        target_probabilities,
+        target_token_ids,
+        dense_target,
+        target_previous_ids,
+        current_ids,
+    )
+
+    result = accept_speculative_candidates_dense_indexed(
+        torch.tensor([[0]], dtype=torch.long),
+        draft_probabilities,
+        draft_token_ids,
+        target_probabilities,
+        target_token_ids,
+        torch.ones((1,), dtype=torch.long),
+        torch.ones((1,), dtype=torch.bool),
+        torch.tensor([[0.99999994]], dtype=torch.float32),
+        torch.tensor([[0.1, 0.1]], dtype=torch.float32),
+        torch.tensor([[0.1, 0.1]], dtype=torch.float32),
+        dense_draft.view(1, 1, 7),
+        dense_target.view(1, 2, 7),
+        torch.arange(4, dtype=torch.long),
+    )
+
+    assert result.committed_tokens[0, 0].item() == 1
+    assert result.rejected_rows.tolist() == [True]
+    assert not bool(result.invalid_rows.any())
+
+
+def test_dense_probability_table_replaces_a_wider_previous_support() -> None:
+    dense_probabilities = torch.zeros((1, 5), dtype=torch.float32)
+    previous_ids = torch.zeros((1, 4), dtype=torch.long)
+    current_ids = torch.empty_like(previous_ids)
+    update_speculative_dense_probability_table(
+        torch.tensor([[0.1, 0.2, 0.3, 0.4]], dtype=torch.float32),
+        torch.tensor([[0, 1, 2, 3]], dtype=torch.int32),
+        dense_probabilities,
+        previous_ids,
+        current_ids,
+    )
+    update_speculative_dense_probability_table(
+        torch.tensor([[0.25, 0.75]], dtype=torch.float32),
+        torch.tensor([[4, 2]], dtype=torch.int32),
+        dense_probabilities,
+        previous_ids,
+        current_ids,
+    )
+
+    assert dense_probabilities.tolist() == [[0.0, 0.0, 0.75, 0.0, 0.25]]
     assert torch.equal(
         residual_distribution_cpu(one_hot(1, 4), one_hot(0, 4)), one_hot(1, 4)
     )
