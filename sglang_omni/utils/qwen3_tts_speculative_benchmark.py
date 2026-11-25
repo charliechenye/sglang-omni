@@ -13,6 +13,7 @@ import time
 import wave
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal
 from urllib.request import Request, urlopen
 
 import numpy as np
@@ -442,12 +443,47 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
     verifier_graph_replays = integer_stat(
         speculative_stats_after, "verifier_graph_replays"
     ) - integer_stat(speculative_stats_before, "verifier_graph_replays")
+    eager_verifier_rounds = integer_stat(
+        speculative_stats_after, "eager_verifier_rounds"
+    ) - integer_stat(speculative_stats_before, "eager_verifier_rounds")
+    total_verifier_rounds = integer_stat(
+        speculative_stats_after, "rounds"
+    ) - integer_stat(speculative_stats_before, "rounds")
+    verifier_execution_coverage = classify_verifier_execution_coverage(
+        total_verifier_rounds,
+        eager_verifier_rounds,
+        verifier_graph_replays,
+    )
     graph_mode = speculative_stats_after.get("graph_mode")
     if not isinstance(graph_mode, str):
         raise RuntimeError("speculative server has no graph execution mode metric")
+    elif graph_mode not in ("verifier_only", "eager"):
+        raise RuntimeError("speculative server has an unsupported graph execution mode")
     else:
         pass
     graph_captures = integer_stat(speculative_stats_after, "graph_captures")
+    probability_backend = speculative_stats_after.get("probability_backend")
+    if probability_backend not in ("split_top_k", "radix_compact"):
+        raise RuntimeError("speculative server has an invalid probability backend")
+    elif (
+        arguments.expected_probability_backend is not None
+        and probability_backend != arguments.expected_probability_backend
+    ):
+        raise RuntimeError(
+            "speculative probability backend does not match the requested ablation"
+        )
+    else:
+        pass
+    probability_backend_execution_counts = probability_backend_execution_delta(
+        speculative_stats_before, speculative_stats_after
+    )
+    probability_backend_fallbacks = integer_stat(
+        speculative_stats_after, "probability_backend_fallbacks"
+    ) - integer_stat(speculative_stats_before, "probability_backend_fallbacks")
+    if probability_backend_fallbacks < 0:
+        raise RuntimeError("probability backend fallback counter moved backwards")
+    else:
+        pass
     if speculative_frames <= 0:
         raise RuntimeError("performance gate failed: speculative frame count is zero")
     elif output_code_frames != speculative_frames:
@@ -457,8 +493,24 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
         )
     elif native_fallbacks != 0:
         raise RuntimeError("performance gate failed: speculative workload fell back")
-    elif packed_forwards <= 0 or verifier_graph_replays <= 0 or graph_captures <= 0:
-        raise RuntimeError("performance gate failed: verifier graph did not replay")
+    elif packed_forwards <= 0:
+        raise RuntimeError("performance gate failed: no packed verifier round ran")
+    elif graph_mode == "verifier_only" and graph_captures <= 0:
+        raise RuntimeError("performance gate failed: verifier graph was not captured")
+    elif (
+        arguments.require_all_verifier_graph
+        and verifier_execution_coverage != "all_graph"
+    ):
+        raise RuntimeError(
+            "performance gate failed: verifier execution mixed eager and graph rounds"
+        )
+    elif probability_backend == "radix_compact" and (
+        probability_backend_execution_counts["radix_compact"] <= 0
+        or probability_backend_fallbacks > 0
+    ):
+        raise RuntimeError(
+            "performance gate failed: radix ablation used split Top-K fallback"
+        )
     elif (
         integer_stat(speculative_stats_after, "standalone_correction_forward_count")
         - integer_stat(speculative_stats_before, "standalone_correction_forward_count")
@@ -541,8 +593,14 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
             fused_stack_traversals / speculative_frames
         ),
         "verifier_graph_replays": verifier_graph_replays,
+        "eager_verifier_rounds": eager_verifier_rounds,
+        "total_verifier_rounds": total_verifier_rounds,
+        "verifier_execution_coverage": verifier_execution_coverage,
         "speculative_graph_mode": graph_mode,
         "speculative_graph_captures": graph_captures,
+        "probability_backend": probability_backend,
+        "probability_backend_execution_counts": probability_backend_execution_counts,
+        "probability_backend_fallbacks": probability_backend_fallbacks,
         "speculative_graph_capture_memory_bytes": integer_stat(
             speculative_stats_after, "graph_capture_memory_delta_bytes"
         ),
@@ -616,6 +674,57 @@ def integer_stat(stats: dict[str, JsonValue], name: str) -> int:
     else:
         pass
     return value
+
+
+def classify_verifier_execution_coverage(
+    total_verifier_rounds: int,
+    eager_verifier_rounds: int,
+    verifier_graph_replays: int,
+) -> Literal["all_graph", "mixed_graph_eager", "eager_only"]:
+    """Classify actual verifier rounds from graph and eager execution counters."""
+    if min(total_verifier_rounds, eager_verifier_rounds, verifier_graph_replays) < 0:
+        raise ValueError("verifier execution counters cannot be negative")
+    elif total_verifier_rounds == 0:
+        raise ValueError("verifier execution coverage requires at least one round")
+    elif eager_verifier_rounds + verifier_graph_replays != total_verifier_rounds:
+        raise ValueError("verifier execution counters do not cover every round")
+    elif eager_verifier_rounds == 0:
+        return "all_graph"
+    elif verifier_graph_replays == 0:
+        return "eager_only"
+    else:
+        return "mixed_graph_eager"
+
+
+def probability_backend_execution_delta(
+    before: dict[str, JsonValue], after: dict[str, JsonValue]
+) -> dict[str, int]:
+    """Return actual candidate-builder calls by implementation."""
+    before_counts = before.get("probability_backend_execution_counts")
+    after_counts = after.get("probability_backend_execution_counts")
+    if not isinstance(before_counts, dict) or not isinstance(after_counts, dict):
+        raise RuntimeError("model_info is missing probability backend execution counts")
+    else:
+        pass
+    execution_delta: dict[str, int] = {}
+    for backend in ("split_top_k", "radix_compact"):
+        before_count = before_counts.get(backend)
+        after_count = after_counts.get(backend)
+        if (
+            isinstance(before_count, bool)
+            or not isinstance(before_count, int)
+            or isinstance(after_count, bool)
+            or not isinstance(after_count, int)
+            or before_count < 0
+            or after_count < before_count
+        ):
+            raise RuntimeError(
+                f"model_info has invalid probability backend count for {backend}"
+            )
+        else:
+            pass
+        execution_delta[backend] = after_count - before_count
+    return execution_delta
 
 
 def numeric_stat(stats: dict[str, JsonValue], name: str) -> float:

@@ -1795,8 +1795,8 @@ def build_speculative_probability_candidates_selected(
     has_top_p: bool,
     has_unbounded_top_k: bool,
     backend: Literal["split_top_k", "radix_compact"],
-) -> tuple[torch.Tensor, torch.Tensor] | None:
-    """Select a compact speculative probability builder with split fallback."""
+) -> tuple[torch.Tensor, torch.Tensor, Literal["split_top_k", "radix_compact"]] | None:
+    """Build compact probabilities and report the implementation that ran."""
     if backend == "radix_compact":
         candidates = build_speculative_probability_candidates_radix(
             logits,
@@ -1809,14 +1809,14 @@ def build_speculative_probability_candidates_selected(
             has_unbounded_top_k=has_unbounded_top_k,
         )
         if candidates is not None:
-            return candidates
+            return candidates[0], candidates[1], "radix_compact"
         else:
             pass
     elif backend == "split_top_k":
         pass
     else:
         raise ValueError("unsupported speculative probability backend")
-    return build_speculative_probability_candidates(
+    candidates = build_speculative_probability_candidates(
         logits,
         temperatures,
         top_ks,
@@ -1826,3 +1826,7 @@ def build_speculative_probability_candidates_selected(
         has_top_p=has_top_p,
         has_unbounded_top_k=has_unbounded_top_k,
     )
+    if candidates is None:
+        return None
+    else:
+        return candidates[0], candidates[1], "split_top_k"

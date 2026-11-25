@@ -11,7 +11,9 @@ import pytest
 
 from sglang_omni.utils.qwen3_tts_speculative_benchmark import (
     SpeechResult,
+    classify_verifier_execution_coverage,
     parse_wav_audio,
+    probability_backend_execution_delta,
     summarize_speech_results,
     write_json_new,
 )
@@ -100,3 +102,43 @@ def test_benchmark_artifacts_do_not_overwrite_existing_files(tmp_path) -> None:
 
     with pytest.raises(FileExistsError):
         write_json_new(output_path, {"status": "replacement"})
+
+
+@pytest.mark.parametrize(
+    ("total_rounds", "eager_rounds", "graph_replays", "expected"),
+    [
+        (5, 0, 5, "all_graph"),
+        (5, 2, 3, "mixed_graph_eager"),
+        (5, 5, 0, "eager_only"),
+    ],
+)
+def test_benchmark_classifies_verifier_graph_coverage(
+    total_rounds: int,
+    eager_rounds: int,
+    graph_replays: int,
+    expected: str,
+) -> None:
+    assert (
+        classify_verifier_execution_coverage(total_rounds, eager_rounds, graph_replays)
+        == expected
+    )
+
+
+def test_benchmark_reports_probability_backend_execution_deltas() -> None:
+    before = {
+        "probability_backend_execution_counts": {
+            "split_top_k": 2,
+            "radix_compact": 1,
+        }
+    }
+    after = {
+        "probability_backend_execution_counts": {
+            "split_top_k": 4,
+            "radix_compact": 5,
+        }
+    }
+
+    assert probability_backend_execution_delta(before, after) == {
+        "split_top_k": 2,
+        "radix_compact": 4,
+    }

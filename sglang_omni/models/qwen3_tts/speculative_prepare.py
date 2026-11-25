@@ -125,14 +125,22 @@ def prepare_speculative_verification_inputs(
         raise ValueError("pending tokens must align with draft batch rows")
     elif any(
         tensor.shape != (batch_size,)
-        for tensor in (committed_depths, logical_kv_lengths, active_rows, proposal_counts)
+        for tensor in (
+            committed_depths,
+            logical_kv_lengths,
+            active_rows,
+            proposal_counts,
+        )
     ):
         raise ValueError("verifier preparation metadata must contain aligned rows")
     elif projected_tables.ndim != 3:
         raise ValueError("projected codec tables must have three dimensions")
     elif outputs.token_embeddings.shape[0] < batch_size:
         raise ValueError("persistent verifier inputs do not cover the batch")
-    elif outputs.token_embeddings.shape[1:] != (verify_width, projected_tables.shape[2]):
+    elif outputs.token_embeddings.shape[1:] != (
+        verify_width,
+        projected_tables.shape[2],
+    ):
         raise ValueError("persistent verifier embedding shape does not match the round")
     elif outputs.positions.numel() < batch_size * verify_width:
         raise ValueError("persistent verifier positions do not cover the batch")
@@ -161,7 +169,10 @@ def prepare_speculative_verification_inputs(
     )
     if any(tensor.device != pending_tokens.device for tensor in input_tensors):
         raise ValueError("verifier preparation tensors must share one device")
-    elif not pending_tokens.is_cuda or prepare_speculative_verification_inputs_kernel is None:
+    elif (
+        not pending_tokens.is_cuda
+        or prepare_speculative_verification_inputs_kernel is None
+    ):
         return False
     elif projected_tables.dtype is not torch.bfloat16:
         raise ValueError("projected codec tables must use BF16")

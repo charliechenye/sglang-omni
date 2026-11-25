@@ -11,9 +11,11 @@ from sglang.srt.runtime_context import get_context
 from torch import nn
 
 import sglang_omni.models.qwen3_tts.sglang_model as sglang_model_module
+from sglang_omni.models.qwen3_tts import sampling_kernels as sampling_kernels_module
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     build_speculative_probability_candidates,
     build_speculative_probability_candidates_radix,
+    fused_raw_logit_block_k,
     sample_from_logits_with_seed_top_k_top_p,
 )
 from sglang_omni.models.qwen3_tts.sglang_model import (
@@ -145,10 +147,17 @@ def build_speculative_talker(
     talker.code_predictor_spec_requested_width = 0
     talker.code_predictor_spec_effective_width = 0
     talker.code_predictor_spec_backend = "cuda_graph"
+    talker.code_predictor_spec_probability_backend = "split_top_k"
+    talker.code_predictor_spec_probability_backend_execution_counts = {
+        "split_top_k": 0,
+        "radix_compact": 0,
+    }
+    talker.code_predictor_spec_probability_backend_fallback_count = 0
     talker.code_predictor_spec_fallback_reason = None
     talker.code_predictor_spec_graphs = {}
     talker.code_predictor_spec_effective_width_histogram = {}
     talker.code_predictor_spec_graph_replay_count = 0
+    talker.code_predictor_spec_eager_round_count = 0
     talker.code_predictor_spec_graph_capture_failure_count = 0
     talker.code_predictor_spec_graph_memory_delta_bytes = 0
     talker.code_predictor_spec_graph_capture_time_ms = 0.0
@@ -351,6 +360,133 @@ def test_unseeded_eager_speculation_runs_a_complete_predictor_frame(
     assert stats["generic_predictor_forwards"] == 0
     assert stats["committed_codes"] == 15
     assert stats["round_committed_codes"] == 14
+
+
+@pytest.mark.parametrize("execution_backend", ["eager", "cuda_graph"])
+@pytest.mark.parametrize("top_k", [4, 50])
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
+    monkeypatch: pytest.MonkeyPatch, execution_backend: str, top_k: int
+) -> None:
+    device = torch.device("cuda")
+    torch.manual_seed(318)
+    configure_runtime_context(monkeypatch)
+    with get_context().override_server_args(max_running_requests=1):
+        talker = build_speculative_talker(device)
+        configure_unseeded_request(talker)
+        talker.sub_top_k_tensor.fill_(top_k)
+        talker.sub_sampled_max_top_k = top_k
+        probability_backend = "radix_compact" if top_k == 4 else "split_top_k"
+        talker.configure_code_predictor_speculation(
+            4,
+            backend=execution_backend,
+            probability_backend=probability_backend,
+        )
+
+        probability_call_count = 0
+
+        def controlled_probability_builder(
+            logits: torch.Tensor,
+            temperatures: torch.Tensor,
+            top_ks: torch.Tensor,
+            top_ps: torch.Tensor,
+            active_rows: torch.Tensor,
+            *,
+            max_top_k: int,
+            has_top_p: bool,
+            has_unbounded_top_k: bool,
+            backend: str,
+        ) -> tuple[torch.Tensor, torch.Tensor, str]:
+            nonlocal probability_call_count
+            assert temperatures.shape == top_ks.shape == top_ps.shape
+            assert temperatures.shape == active_rows.shape
+            assert has_top_p is False
+            assert has_unbounded_top_k is False
+            probability_call_count += 1
+            candidate_count = fused_raw_logit_block_k(max_top_k)
+            assert candidate_count is not None
+            probabilities = torch.zeros(
+                (logits.shape[0], candidate_count),
+                device=device,
+                dtype=torch.float32,
+            )
+            token_ids = torch.full(
+                (logits.shape[0], candidate_count),
+                -1,
+                device=device,
+                dtype=torch.int32,
+            )
+            token_ids[:, 0] = 0
+            if probability_call_count == 8:
+                token_ids[:, 1] = 1
+                probabilities[:, :2] = 0.5
+            else:
+                probabilities[:, 0] = 1.0
+            probabilities[~active_rows] = 0.0
+            actual_backend = "split_top_k" if backend == "radix_compact" else backend
+            return probabilities, token_ids, actual_backend
+
+        def fixed_uniforms(
+            seeds: torch.Tensor,
+            semantic_positions: torch.Tensor,
+            round_index: torch.Tensor,
+            num_code_groups: int,
+            proposal_width: int,
+            verify_width: int,
+            output: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+            assert output is not None
+            assert seeds.shape == semantic_positions.shape == (1,)
+            assert round_index.ndim == 0
+            assert num_code_groups == 16
+            output.zero_()
+            output[:, 0, :proposal_width] = 0.1
+            output[:, 1, :proposal_width] = 0.9
+            output[:, 2, :verify_width] = 0.1
+            output[:, 3, :verify_width] = 0.1
+            return (
+                output[:, 0, :proposal_width],
+                output[:, 1, :proposal_width],
+                output[:, 2, :verify_width],
+                output[:, 3, :verify_width],
+            )
+
+        monkeypatch.setattr(
+            sglang_model_module,
+            "build_speculative_probability_candidates_selected",
+            controlled_probability_builder,
+        )
+        monkeypatch.setattr(
+            sglang_model_module, "speculative_uniforms_all_purposes", fixed_uniforms
+        )
+        layer0_codes = torch.tensor([[9]], device=device, dtype=torch.long)
+        talker_hidden = torch.randn(
+            (1, 1, TALKER_HIDDEN_SIZE), device=device, dtype=DTYPE
+        )
+        semantic_positions = torch.tensor([7], device=device, dtype=torch.long)
+
+        codes, summed_embedding = talker.code_predictor_forward(
+            layer0_codes, talker_hidden, semantic_positions
+        )
+        verify_complete_frame(talker, codes, summed_embedding)
+
+    stats = talker.predictor_speculative_stats()
+    assert probability_call_count == 9
+    assert stats["frames"] == 1
+    assert stats["native_fallback_count"] == 0
+    assert stats["effective_width_histogram"] == {"1": 1, "2": 1, "4": 3}
+    assert stats["probability_backend_execution_counts"] == {
+        "split_top_k": 9,
+        "radix_compact": 0,
+    }
+    assert stats["probability_backend_fallbacks"] == (9 if top_k == 4 else 0)
+    if execution_backend == "eager":
+        assert stats["eager_verifier_rounds"] == 5
+        assert stats["verifier_graph_replays"] == 0
+    else:
+        assert stats["eager_verifier_rounds"] == 0
+        assert stats["verifier_graph_replays"] == 5
 
 
 @pytest.mark.parametrize("forced_rejection_offset", [0, 1, 2])
@@ -1067,6 +1203,74 @@ def test_compact_acceptance_w1_samples_target_and_flags_invalid_mass() -> None:
     assert result.committed_tokens[0, 0].item() == 6
     assert result.committed_token_counts.tolist() == [1, 0]
     assert result.invalid_rows.tolist() == [False, True]
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_radix_probability_selection_reports_split_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    logits = torch.zeros((1, CODEBOOK_VOCAB_SIZE), device=device, dtype=DTYPE)
+    temperatures = torch.ones((1,), device=device, dtype=torch.float32)
+    top_ks = torch.full((1,), 4, device=device, dtype=torch.long)
+    top_ps = torch.ones((1,), device=device, dtype=torch.float32)
+    active_rows = torch.ones((1,), device=device, dtype=torch.bool)
+    candidate_count = fused_raw_logit_block_k(4)
+    assert candidate_count == 32
+    split_probabilities = torch.zeros(
+        (1, candidate_count), device=device, dtype=torch.float32
+    )
+    split_probabilities[:, 0] = 1.0
+    split_token_ids = torch.full(
+        (1, candidate_count), -1, device=device, dtype=torch.int32
+    )
+    split_token_ids[:, 0] = 0
+
+    def split_builder(
+        candidate_logits: torch.Tensor,
+        candidate_temperatures: torch.Tensor,
+        candidate_top_ks: torch.Tensor,
+        candidate_top_ps: torch.Tensor,
+        candidate_active_rows: torch.Tensor,
+        *,
+        max_top_k: int,
+        has_top_p: bool,
+        has_unbounded_top_k: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert candidate_logits is logits
+        assert candidate_temperatures is temperatures
+        assert candidate_top_ks is top_ks
+        assert candidate_top_ps is top_ps
+        assert candidate_active_rows is active_rows
+        assert max_top_k == 4
+        assert has_top_p is False
+        assert has_unbounded_top_k is False
+        return split_probabilities, split_token_ids
+
+    monkeypatch.setattr(
+        sampling_kernels_module,
+        "build_speculative_probability_candidates",
+        split_builder,
+    )
+    candidates = (
+        sampling_kernels_module.build_speculative_probability_candidates_selected(
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            active_rows,
+            max_top_k=4,
+            has_top_p=False,
+            has_unbounded_top_k=False,
+            backend="radix_compact",
+        )
+    )
+
+    assert candidates is not None
+    assert candidates[0] is split_probabilities
+    assert candidates[1] is split_token_ids
+    assert candidates[2] == "split_top_k"
 
 
 @pytest.mark.accelerator

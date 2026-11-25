@@ -287,6 +287,8 @@ class PredictorSpeculativeStats(TypedDict):
     effective_width: int
     graph_mode: str
     probability_backend: str
+    probability_backend_execution_counts: dict[str, int]
+    probability_backend_fallbacks: int
     lm_head_backend: str
     rng_backend: str
     fused_predictor_scratch_rows: int
@@ -312,6 +314,7 @@ class PredictorSpeculativeStats(TypedDict):
     standalone_correction_forward_count: int
     graph_replays: int
     verifier_graph_replays: int
+    eager_verifier_rounds: int
     graph_capture_failures: int
     graph_captures: int
     graph_capture_memory_delta_bytes: int
@@ -1420,6 +1423,11 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_probability_backend: Literal[
             "split_top_k", "radix_compact"
         ] = "split_top_k"
+        self.code_predictor_spec_probability_backend_execution_counts = {
+            "split_top_k": 0,
+            "radix_compact": 0,
+        }
+        self.code_predictor_spec_probability_backend_fallback_count = 0
         self.code_predictor_spec_lm_head_backend: Literal[
             "grouped_triton", "warp_gemv"
         ] = "grouped_triton"
@@ -1461,6 +1469,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_packed_query_slots = 0
         self.code_predictor_spec_padded_query_slots = 0
         self.code_predictor_spec_graph_replay_count = 0
+        self.code_predictor_spec_eager_round_count = 0
         self.code_predictor_spec_graph_capture_failure_count = 0
         bind_default_weight_loaders(self)
         self.cached_params_dict = dict(self.named_parameters())
@@ -1848,6 +1857,21 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 pass
         return requested_width, None
 
+    def record_code_predictor_spec_probability_backend(
+        self, actual_backend: Literal["split_top_k", "radix_compact"]
+    ) -> None:
+        """Count the implementation that built one compact distribution."""
+        self.code_predictor_spec_probability_backend_execution_counts[
+            actual_backend
+        ] += 1
+        if (
+            self.code_predictor_spec_probability_backend == "radix_compact"
+            and actual_backend == "split_top_k"
+        ):
+            self.code_predictor_spec_probability_backend_fallback_count += 1
+        else:
+            pass
+
     @torch.no_grad()
     def code_predictor_forward_speculative(
         self,
@@ -1983,6 +2007,11 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         else:
             pass
         max_top_k = int(self.sub_sampled_max_top_k)
+        candidate_count = fused_raw_logit_block_k(max_top_k)
+        if candidate_count is None:
+            raise RuntimeError("speculative Top-K candidate width is unavailable")
+        else:
+            pass
         has_top_p = bool(self.sub_sampled_has_top_p)
         round_index = 0
 
@@ -2043,21 +2072,25 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     )
                 else:
                     pass
-                proposal_probabilities_compact, proposal_ids_compact = (
-                    proposal_candidates
+                (
+                    proposal_probabilities_compact,
+                    proposal_ids_compact,
+                    proposal_probability_backend,
+                ) = proposal_candidates
+                self.record_code_predictor_spec_probability_backend(
+                    proposal_probability_backend
                 )
             else:
                 proposal_probabilities_compact = torch.empty(
-                    (0, max_top_k), device=self.predictor_device, dtype=torch.float32
+                    (0, candidate_count),
+                    device=self.predictor_device,
+                    dtype=torch.float32,
                 )
                 proposal_ids_compact = torch.empty(
-                    (0, max_top_k), device=self.predictor_device, dtype=torch.int32
+                    (0, candidate_count),
+                    device=self.predictor_device,
+                    dtype=torch.int32,
                 )
-            target_hidden_rows = torch.arange(
-                batch_size * verify_width,
-                device=self.predictor_device,
-                dtype=torch.long,
-            )
             if frame_rng_pool is None:
                 round_index_buffer.fill_(round_index)
                 (
@@ -2191,6 +2224,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     valid_queries.reshape(-1).contiguous(),
                     backend=self.code_predictor_spec_lm_head_backend,
                 )
+                self.code_predictor_spec_eager_round_count += 1
             else:
                 verified_hiddens = verify_graph.replay(
                     query_embeddings,
@@ -2225,7 +2259,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 )
             else:
                 pass
-            target_probabilities_compact, target_ids_compact = target_candidates
+            (
+                target_probabilities_compact,
+                target_ids_compact,
+                target_probability_backend,
+            ) = target_candidates
+            self.record_code_predictor_spec_probability_backend(
+                target_probability_backend
+            )
             decision = accept_speculative_candidates_compact(
                 draft_tokens,
                 proposal_probabilities_compact,
@@ -2797,6 +2838,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 )
             ),
             "probability_backend": self.code_predictor_spec_probability_backend,
+            "probability_backend_execution_counts": dict(
+                self.code_predictor_spec_probability_backend_execution_counts
+            ),
+            "probability_backend_fallbacks": (
+                self.code_predictor_spec_probability_backend_fallback_count
+            ),
             "lm_head_backend": self.code_predictor_spec_lm_head_backend,
             "rng_backend": self.code_predictor_spec_rng_backend,
             "fused_predictor_scratch_rows": (
@@ -2836,6 +2883,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             ),
             "graph_replays": self.code_predictor_spec_graph_replay_count,
             "verifier_graph_replays": self.code_predictor_spec_graph_replay_count,
+            "eager_verifier_rounds": self.code_predictor_spec_eager_round_count,
             "graph_capture_failures": (
                 self.code_predictor_spec_graph_capture_failure_count
             ),

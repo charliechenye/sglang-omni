@@ -49,6 +49,11 @@ def main() -> None:
     parser.add_argument("--warmup-requests", type=nonnegative_integer, default=2)
     parser.add_argument("--concurrency", type=positive_integer, default=4)
     parser.add_argument("--expected-width", type=nonnegative_integer)
+    parser.add_argument(
+        "--expected-probability-backend",
+        choices=("split_top_k", "radix_compact"),
+    )
+    parser.add_argument("--require-all-verifier-graph", action="store_true")
     parser.add_argument("--result-file")
     parser.add_argument("--minimum-speedup", type=float, default=1.0)
     arguments = parser.parse_args()
