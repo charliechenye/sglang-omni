@@ -81,7 +81,9 @@ SAMPLE_RATE_HZ = 16000
 PROFILE_PATH = (
     "examples/streaming_cascade/profiles/qwen3-asr-qwen3-tts-base-clone/launch.yaml"
 )
-SERVER_PROFILE_PATH = "examples/streaming_cascade/profiles/qwen3-asr-qwen3.8-27b-vivian-tts-tool/launch.yaml"
+SERVER_PROFILE_PATH = (
+    "examples/streaming_cascade/profiles/qwen3-asr-qwen3-tts-vivian/launch.yaml"
+)
 
 
 def fake_silero_module() -> types.ModuleType:
@@ -160,6 +162,7 @@ class Node:
         settings: dict[str, object] | None = None,
         mode: str | None = None,
         vad_config: VADConfig | None = None,
+        server_vad_default_silence_duration_ms: int | None = None,
         hooks: TurnDetectionHooks | None = None,
         identity: SessionIdentity | None = None,
     ) -> None:
@@ -178,6 +181,9 @@ class Node:
                     background_margin_db=None,
                 ),
                 SileroSpeechDetector,
+                server_vad_default_silence_duration_ms=(
+                    server_vad_default_silence_duration_ms
+                ),
             )
         else:
             self.model = hooks.eou_model
@@ -483,6 +489,22 @@ def test_candidate_scoring_slices_audio_before_the_reported_turn_start() -> None
     assert node.model.scored_pcm == [expected_pcm]
 
 
+def test_smart_turn_high_scores_a_160_ms_candidate_before_its_deadline() -> None:
+    node = Node([0.85], eagerness="high")
+    node.frames(0, [True] * 3)
+    node.frames(96, [False] * 5)
+
+    assert node.session.mode == SEMANTIC_VAD
+    assert node.session.policy == SemanticVADConfig.from_eagerness("high")
+    assert node.session.detector_session.detector.config.silence_duration_ms == 160
+    assert node.session.pause_start_ms == 96
+    assert node.session.required_silence_ms == 320
+    assert node.boundaries() == [(SPEECH_STARTED, 0)]
+
+    node.frames(256, [False] * 5)
+    assert node.boundaries() == [(SPEECH_STARTED, 0), (SPEECH_STOPPED, 96)]
+
+
 @pytest.mark.parametrize(
     ("factory_overrides", "expected_margin_db", "expected_silence_ms"),
     [
@@ -523,6 +545,53 @@ def test_factory_resolution_preserves_omitted_and_null_defaults(
     scheduler = create_turn_scheduler(**arguments)
     assert scheduler.session_hooks.vad_config.background_margin_db == expected_margin_db
     assert scheduler.session_hooks.vad_config.silence_duration_ms == expected_silence_ms
+
+
+@pytest.mark.parametrize(
+    ("turn_detection", "silence_frames", "expected_silence_ms"),
+    [
+        ({"type": SERVER_VAD}, 25, 800),
+        ({"type": SERVER_VAD, "silence_duration_ms": 500}, 16, 500),
+        ({"type": SERVER_VAD, "silence_duration_ms": 0}, 1, 0),
+    ],
+)
+def test_server_vad_uses_the_profile_fallback_unless_the_client_overrides_it(
+    turn_detection: dict[str, str | int],
+    silence_frames: int,
+    expected_silence_ms: int,
+) -> None:
+    node = Node(
+        settings={"turn_detection": turn_detection},
+        vad_config=VADConfig(
+            prefix_padding_ms=0,
+            silence_duration_ms=160,
+            background_margin_db=None,
+        ),
+        server_vad_default_silence_duration_ms=800,
+    )
+    assert node.session.detector_session.detector.config.silence_duration_ms == (
+        expected_silence_ms
+    )
+
+    node.frames(0, [True] * 3)
+    node.frames(96, [False] * (silence_frames - 1))
+    assert node.boundaries() == [(SPEECH_STARTED, 0)]
+    node.frames(96 + (silence_frames - 1) * 32, [False])
+    assert node.boundaries() == [(SPEECH_STARTED, 0), (SPEECH_STOPPED, 96)]
+
+
+def test_fused_server_vad_without_a_profile_fallback_keeps_its_configured_default() -> (
+    None
+):
+    node = Node(
+        settings={"turn_detection": {"type": SERVER_VAD}},
+        vad_config=VADConfig(
+            prefix_padding_ms=0,
+            silence_duration_ms=160,
+            background_margin_db=None,
+        ),
+    )
+    assert node.session.detector_session.detector.config.silence_duration_ms == 160
 
 
 def test_server_vad_matches_standalone_vad_across_append_partitions() -> None:
@@ -646,8 +715,38 @@ def test_client_vad_overrides_apply_without_changing_semantic_candidate_silence(
     assert node.model.scored_seconds == []
 
 
+@pytest.mark.parametrize(
+    ("server_settings", "expected_silence_ms", "frames_to_deadline"),
+    [
+        ({"type": SERVER_VAD}, 800, 17),
+        ({"type": SERVER_VAD, "silence_duration_ms": 500}, 500, 8),
+    ],
+)
+def test_switching_a_held_semantic_pause_to_server_vad_uses_resolved_silence(
+    server_settings: dict[str, str | int],
+    expected_silence_ms: int,
+    frames_to_deadline: int,
+) -> None:
+    node = Node([0.85], eagerness="high", server_vad_default_silence_duration_ms=800)
+    node.frames(0, [True] * 29)
+    node.frames(928, [False] * 8)
+    node.control(CONFIGURE, turn_detection=server_settings)
+    assert node.boundaries() == [(SPEECH_STARTED, 0)]
+    assert node.session.is_open
+    assert node.session.required_silence_ms == expected_silence_ms
+
+    node.frames(1184, [False] * (frames_to_deadline - 1))
+    assert node.boundaries() == [(SPEECH_STARTED, 0)]
+    assert node.session.is_open
+    next_start_ms = 1184 + (frames_to_deadline - 1) * 32
+    node.frames(next_start_ms, [False])
+    assert node.boundaries() == [(SPEECH_STARTED, 0), (SPEECH_STOPPED, 928)]
+    assert not node.session.is_open
+    assert len(node.model.scored_seconds) == 1
+
+
 @pytest.mark.parametrize("resume_before_deadline", [False, True])
-def test_switching_a_held_semantic_pause_to_server_vad_waits_for_server_silence(
+def test_switching_a_held_semantic_pause_to_server_vad_preserves_resumption(
     resume_before_deadline: bool,
 ) -> None:
     node = Node([0.85], eagerness="high")
@@ -657,8 +756,6 @@ def test_switching_a_held_semantic_pause_to_server_vad_waits_for_server_silence(
         CONFIGURE,
         turn_detection={"type": SERVER_VAD, "silence_duration_ms": 800},
     )
-    assert node.boundaries() == [(SPEECH_STARTED, 0)]
-    assert node.session.is_open
 
     if resume_before_deadline:
         node.frames(1184, [False, False, True])
@@ -956,6 +1053,7 @@ def test_profiles_keep_their_fused_and_standalone_vad_defaults() -> None:
     assert semantic.session_ports().output is not None
     assert semantic.session_ports().output.format != PCM16
     assert semantic.stage_named("turn_detection").factory.silence_duration_ms == 160
+    assert semantic.stage_named("turn_detection").factory.eagerness == "medium"
     assert semantic.stage_named("turn_detection").factory.background_margin_db == 6.0
 
     server = ConfigManager.from_file(SERVER_PROFILE_PATH).config

@@ -114,11 +114,15 @@ class TurnDetectionHooks(SessionHooks):
         eagerness: str,
         vad_config: VADConfig | None = None,
         new_detector: DetectorFactory | None = None,
+        server_vad_default_silence_duration_ms: int | None = None,
     ) -> None:
         self.eou_model = eou_model
         self.eagerness = eagerness
         self.vad_config = vad_config or VADConfig()
         self.new_detector = new_detector or SileroSpeechDetector
+        self.server_vad_default_silence_duration_ms = (
+            server_vad_default_silence_duration_ms
+        )
         self.sessions: dict[SessionIdentity, TurnSession] = {}
 
     def open(self, session_identity: SessionIdentity, request: OmniRequest) -> None:
@@ -128,7 +132,7 @@ class TurnDetectionHooks(SessionHooks):
             self.eagerness,
             request.params,
         )
-        detector_config = turn_detection_config(self.vad_config, request.params)
+        detector_config = self.detector_config(self.vad_config, request.params, mode)
         self.sessions[session_identity] = TurnSession(
             detector_session=DetectorSession(
                 detector=self.new_detector(detector_config),
@@ -137,6 +141,27 @@ class TurnDetectionHooks(SessionHooks):
             mode=mode,
             policy=policy,
         )
+
+    def detector_config(
+        self,
+        config: VADConfig,
+        settings: Mapping[str, object],
+        mode: TurnDetectionMode,
+    ) -> VADConfig:
+        detector_config = turn_detection_config(config, settings)
+        turn_detection = settings.get("turn_detection")
+        if (
+            mode == SERVER_VAD
+            and self.server_vad_default_silence_duration_ms is not None
+            and isinstance(turn_detection, Mapping)
+            and turn_detection.get("silence_duration_ms") is None
+        ):
+            return replace(
+                detector_config,
+                silence_duration_ms=self.server_vad_default_silence_duration_ms,
+            )
+        else:
+            return detector_config
 
     def close(self, session_identity: SessionIdentity) -> None:
         del self.sessions[session_identity]
@@ -459,12 +484,13 @@ class TurnDetectionHooks(SessionHooks):
             self.eagerness,
             settings,
         )
-        detector_config = turn_detection_config(
+        detector_config = self.detector_config(
             replace(
                 session.detector_session.detector.config,
                 silence_duration_ms=self.vad_config.silence_duration_ms,
             ),
             settings,
+            mode,
         )
         session.detector_session.is_enabled = mode is not None
         if mode is None:
@@ -515,6 +541,7 @@ def create_scheduler(
     threshold: float = VADConfig.threshold,
     prefix_padding_ms: int = VADConfig.prefix_padding_ms,
     silence_duration_ms: int = VADConfig.silence_duration_ms,
+    server_vad_default_silence_duration_ms: int | None = None,
     background_margin_db: float | None = VADConfig.background_margin_db,
     max_open_sessions: int = NODE_STAGE_MAX_OPEN_SESSIONS,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
@@ -526,7 +553,14 @@ def create_scheduler(
         background_margin_db=background_margin_db,
     )
     return SessionScheduler(
-        TurnDetectionHooks(SmartTurnEOU.load(model_path), eagerness, vad_config),
+        TurnDetectionHooks(
+            SmartTurnEOU.load(model_path),
+            eagerness,
+            vad_config,
+            server_vad_default_silence_duration_ms=(
+                server_vad_default_silence_duration_ms
+            ),
+        ),
         max_open_sessions=max_open_sessions,
         max_concurrency=max_concurrency,
     )

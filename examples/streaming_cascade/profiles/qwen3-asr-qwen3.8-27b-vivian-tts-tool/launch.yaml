@@ -1,6 +1,13 @@
-# Qwen3-ASR transcribes each utterance through its transcription endpoint, Qwen3.8-27B speaks by calling tts_start, with thinking off, and Qwen3-TTS Base reads each call in the voice of one Vivian recording, cloned with its transcript, each a service of its own, with the VAD node beside the cascade.
+# Qwen3-ASR transcribes each utterance through its transcription endpoint, Qwen3.8-27B speaks by calling tts_start, with thinking off, and Qwen3-TTS Base reads each call in the voice of one Vivian recording, cloned with its transcript, each a service of its own, with fused Smart Turn.
 config_cls: StreamingCascadePipelineConfig
 model_path: examples/streaming_cascade/profiles/qwen3-asr-qwen3.8-27b-vivian-tts-tool
+
+stages:
+  turn_detection:
+    factory:
+      eagerness: high
+      silence_duration_ms: 160
+      server_vad_default_silence_duration_ms: 800
 
 services:
   - name: chat
@@ -18,12 +25,15 @@ services:
     env: {CUDA_VISIBLE_DEVICES: "1"}
 
 session_nodes:
-  vad:
-    stages: [vad]
-    inputs: [input]
+  turn_detection:
+    stages: [turn_detection]
+    inputs: ["input:pcm16", "input:session"]
   asr:
     kind: openai_transcription
-    inputs: [input, "vad:session"]
+    inputs:
+      - "turn_detection:pcm16"
+      - "turn_detection:session"
+      - "turn_detection:session_internal"
     base_url: "http://127.0.0.1:8002/v1"
     model: Qwen/Qwen3-ASR-1.7B
   dialog:
@@ -34,8 +44,8 @@ session_nodes:
       - {source: "llm:tool_call", feedback: true, overflow: drop_oldest, capacity: 1024}
       - {source: "llm:session", feedback: true, overflow: drop_oldest, capacity: 1024}
       - {source: "tts:session", feedback: true, overflow: drop_oldest, capacity: 1024}
-      - "vad:session"
-      - "input:session"
+      - "turn_detection:session"
+      - "turn_detection:session_internal"
       - {kind: control, source: input, event: interrupt}
       - {kind: control, source: aligner, event: reply.progress}
     speech_tool: tts_start
@@ -89,7 +99,7 @@ session_nodes:
     inputs: ["tts:text_delta", "tts:pcm_f32le", "tts:session", "dialog:session", "input:session"]
 
 session_publish:
-  vad: [session]
+  turn_detection: [session]
   asr: [transcript]
   dialog: [session]
   tts: [text_delta, pcm_f32le, session]

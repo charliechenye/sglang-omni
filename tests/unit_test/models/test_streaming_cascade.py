@@ -20,6 +20,7 @@ import yaml
 
 from sglang_omni.admission import QueueFullError
 from sglang_omni.audio.segmentation import UtteranceSegmenter
+from sglang_omni.audio.smart_turn import SmartTurnEOU
 from sglang_omni.config.manager import ConfigManager
 from sglang_omni.config.runtime import resolve_stage_factory_args
 from sglang_omni.models.streaming_cascade.alignment import AlignmentConfig
@@ -2268,6 +2269,11 @@ def test_profiles_expand_components_into_independent_session_nodes(profile):
     assert config.session_ports() == replace(
         CASCADE_PORTS,
         skips_screen_blocks=profile == "qwen3-asr-qwen3.8-27b-vivian-screen",
+        turn_detection_types=(
+            ("server_vad", "semantic_vad")
+            if profile == "qwen3-asr-qwen3.8-27b-vivian-tts-tool"
+            else CASCADE_PORTS.turn_detection_types
+        ),
     )
     assert (
         StreamingCascadePipelineConfig.model_validate(
@@ -3362,16 +3368,23 @@ def test_profiles_cloning_vivian_send_its_transcript_and_drop_the_quiet_start(pr
 @pytest.mark.parametrize(
     ("flags", "admitted"), [([], 16), (["--max_sessions", "24"], 24)]
 )
-def test_node_stages_admit_max_sessions_and_refuse_the_next(flags, admitted):
+def test_node_stages_admit_max_sessions_and_refuse_the_next(
+    flags, admitted, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        SmartTurnEOU,
+        "load",
+        classmethod(lambda cls, model_path: object()),
+    )
     manager = ConfigManager(profile_config("qwen3-asr-qwen3.8-27b-vivian-tts-tool"))
     config = manager.merge_config(manager.parse_extra_args(flags))
     stages = {}
-    for name in ("vad", "dialog"):
+    for name in ("turn_detection", "dialog"):
         stage = config.stage_named(name)
         stages[name] = import_string(stage.factory_path)(
             **resolve_stage_factory_args(stage, config)
         )
-    assert stages["vad"].max_open_sessions == admitted
+    assert stages["turn_detection"].max_open_sessions == admitted
     dialog = stages["dialog"]
     sessions = [SessionIdentity(f"session-{index}") for index in range(admitted)]
     try:
