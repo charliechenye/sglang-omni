@@ -417,7 +417,7 @@ def create_sglang_tts_engine_executor(
         "split_top_k", "radix_compact"
     ] = "split_top_k",
     code_predictor_spec_lm_head_backend: Literal[
-        "grouped_triton", "warp_gemv"
+        "grouped_triton", "warp_gemv", "warp_accumulate"
     ] = "grouped_triton",
     code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"] = "per_round",
     server_args_overrides: Mapping[str, object] | None = None,

@@ -2175,6 +2175,14 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
         active_rows,
         backend="warp_gemv",
     )
+    warp_accumulate_logits = grouped_lm_head_linear(
+        hidden_states,
+        packed_weights,
+        hidden_indices,
+        head_indices,
+        active_rows,
+        backend="warp_accumulate",
+    )
 
     # Independent high-precision oracle.
     reference = torch.zeros_like(
@@ -2195,8 +2203,7 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
 
     rounded_reference = reference.to(torch.bfloat16)
 
-    # Both kernels reduce 32-element tiles, then accumulate
-    # 32 tile sums in FP32. Use a conservative rounding bound.
+    # Use a conservative rounding bound for both tiled and warp-local accumulators.
     unit_roundoff = 2.0 ** -24
     gamma = (
         64 * unit_roundoff
@@ -2207,6 +2214,7 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
     for name, logits in (
         ("grouped_triton", baseline_logits),
         ("warp_gemv", warp_logits),
+        ("warp_accumulate", warp_accumulate_logits),
     ):
         assert bool(torch.isfinite(logits).all())
         assert bool((logits[~active_rows] == 0).all())
@@ -2260,11 +2268,9 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
     # Exercise small top-k and the production default top-k.
     row_count, vocab_size = baseline_logits.shape
 
-    for top_k in (4, 50):
+    for top_k in (4, 50, 128):
         for top_p in (1.0, 0.9):
-            temperatures = torch.full(
-                (row_count,), 0.9, device=device
-            )
+            temperatures = torch.linspace(0.6, 1.4, row_count, device=device)
             top_ks = torch.full(
                 (row_count,),
                 top_k,
@@ -2281,6 +2287,7 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
                 ("native", native_logits),
                 ("grouped_triton", baseline_logits),
                 ("warp_gemv", warp_logits),
+                ("warp_accumulate", warp_accumulate_logits),
             ):
                 candidates = build_speculative_probability_candidates(
                     logits.contiguous(),
@@ -2337,7 +2344,9 @@ def test_warp_gemv_grouped_head_matches_existing_bf16_projection() -> None:
             for left, right in (
                 ("grouped_triton", "native"),
                 ("warp_gemv", "native"),
+                ("warp_accumulate", "native"),
                 ("warp_gemv", "grouped_triton"),
+                ("warp_accumulate", "grouped_triton"),
             ):
                 a = distributions[left]
                 b = distributions[right]

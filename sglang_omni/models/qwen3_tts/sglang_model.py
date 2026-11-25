@@ -107,6 +107,7 @@ from sglang_omni.scheduling.types import SchedulerRequest
 from sglang_omni.utils.predictor_grouped_heads import (
     grouped_lm_head_cuda_available,
     grouped_lm_head_linear,
+    grouped_lm_head_warp_accumulate_available,
     grouped_lm_head_warp_gemv_available,
 )
 from sglang_omni.utils.predictor_layers import (
@@ -1436,7 +1437,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         }
         self.code_predictor_spec_probability_backend_fallback_count = 0
         self.code_predictor_spec_lm_head_backend: Literal[
-            "grouped_triton", "warp_gemv"
+            "grouped_triton", "warp_gemv", "warp_accumulate"
         ] = "grouped_triton"
         self.code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"] = (
             "per_round"
@@ -2486,7 +2487,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         *,
         backend: Literal["cuda_graph", "eager"] = "cuda_graph",
         probability_backend: Literal["split_top_k", "radix_compact"] = "split_top_k",
-        lm_head_backend: Literal["grouped_triton", "warp_gemv"] = "grouped_triton",
+        lm_head_backend: Literal[
+            "grouped_triton", "warp_gemv", "warp_accumulate"
+        ] = "grouped_triton",
         rng_backend: Literal["per_round", "frame_pool"] = "per_round",
     ) -> None:
         """Allocate opt-in scratch and resolve the selected speculative backend."""
@@ -2500,7 +2503,11 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             pass
         if probability_backend not in ("split_top_k", "radix_compact"):
             raise ValueError("unsupported CodePredictor probability backend")
-        elif lm_head_backend not in ("grouped_triton", "warp_gemv"):
+        elif lm_head_backend not in (
+            "grouped_triton",
+            "warp_gemv",
+            "warp_accumulate",
+        ):
             raise ValueError("unsupported CodePredictor grouped-head backend")
         elif rng_backend not in ("per_round", "frame_pool"):
             raise ValueError("unsupported CodePredictor RNG backend")
@@ -2617,11 +2624,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             )
             for lm_head in self.code_predictor.lm_head
         )
-        grouped_head_kernel_available = (
-            grouped_lm_head_cuda_available()
-            if lm_head_backend == "grouped_triton"
-            else grouped_lm_head_warp_gemv_available()
-        )
+        if lm_head_backend == "grouped_triton":
+            grouped_head_kernel_available = grouped_lm_head_cuda_available()
+        elif lm_head_backend == "warp_gemv":
+            grouped_head_kernel_available = grouped_lm_head_warp_gemv_available()
+        else:
+            grouped_head_kernel_available = (
+                grouped_lm_head_warp_accumulate_available()
+            )
         if (
             current_platform.is_cuda()
             and grouped_head_kernel_available
