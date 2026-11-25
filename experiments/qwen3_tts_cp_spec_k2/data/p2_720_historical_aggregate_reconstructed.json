@@ -1,0 +1,137 @@
+{
+  "schema": "qwen3tts-cpspec-p2-conversation-reconstructed-aggregate-v1",
+  "status": "P2_RECONSTRUCTED_HISTORICAL_AGGREGATE_NOT_ORIGINAL_TRACE_OR_PARITY_EVIDENCE",
+  "source_sha": "398297b1d4d2a44d10d1056da5607a7d4ac08e41",
+  "frames": 720,
+  "total_proposals": 6974,
+  "total_accepted": 3420,
+  "total_rejected": 3554,
+  "total_bonus": 3106,
+  "depths": [
+    {
+      "residual_depth": 2,
+      "proposals": 720,
+      "accepted": 56,
+      "rejected": 664,
+      "bonus_skipped_proposals": 0,
+      "accept_fraction_conditional_on_proposal": 0.07777777777777778
+    },
+    {
+      "residual_depth": 3,
+      "proposals": 664,
+      "accepted": 160,
+      "rejected": 504,
+      "bonus_skipped_proposals": 56,
+      "accept_fraction_conditional_on_proposal": 0.24096385542168675
+    },
+    {
+      "residual_depth": 4,
+      "proposals": 560,
+      "accepted": 202,
+      "rejected": 358,
+      "bonus_skipped_proposals": 160,
+      "accept_fraction_conditional_on_proposal": 0.3607142857142857
+    },
+    {
+      "residual_depth": 5,
+      "proposals": 518,
+      "accepted": 234,
+      "rejected": 284,
+      "bonus_skipped_proposals": 202,
+      "accept_fraction_conditional_on_proposal": 0.4517374517374517
+    },
+    {
+      "residual_depth": 6,
+      "proposals": 486,
+      "accepted": 244,
+      "rejected": 242,
+      "bonus_skipped_proposals": 234,
+      "accept_fraction_conditional_on_proposal": 0.5020576131687243
+    },
+    {
+      "residual_depth": 7,
+      "proposals": 476,
+      "accepted": 270,
+      "rejected": 206,
+      "bonus_skipped_proposals": 244,
+      "accept_fraction_conditional_on_proposal": 0.5672268907563025
+    },
+    {
+      "residual_depth": 8,
+      "proposals": 450,
+      "accepted": 272,
+      "rejected": 178,
+      "bonus_skipped_proposals": 270,
+      "accept_fraction_conditional_on_proposal": 0.6044444444444445
+    },
+    {
+      "residual_depth": 9,
+      "proposals": 448,
+      "accepted": 260,
+      "rejected": 188,
+      "bonus_skipped_proposals": 272,
+      "accept_fraction_conditional_on_proposal": 0.5803571428571429
+    },
+    {
+      "residual_depth": 10,
+      "proposals": 460,
+      "accepted": 268,
+      "rejected": 192,
+      "bonus_skipped_proposals": 260,
+      "accept_fraction_conditional_on_proposal": 0.5826086956521739
+    },
+    {
+      "residual_depth": 11,
+      "proposals": 452,
+      "accepted": 294,
+      "rejected": 158,
+      "bonus_skipped_proposals": 268,
+      "accept_fraction_conditional_on_proposal": 0.6504424778761062
+    },
+    {
+      "residual_depth": 12,
+      "proposals": 426,
+      "accepted": 266,
+      "rejected": 160,
+      "bonus_skipped_proposals": 294,
+      "accept_fraction_conditional_on_proposal": 0.6244131455399061
+    },
+    {
+      "residual_depth": 13,
+      "proposals": 454,
+      "accepted": 314,
+      "rejected": 140,
+      "bonus_skipped_proposals": 266,
+      "accept_fraction_conditional_on_proposal": 0.6916299559471366
+    },
+    {
+      "residual_depth": 14,
+      "proposals": 406,
+      "accepted": 266,
+      "rejected": 140,
+      "bonus_skipped_proposals": 314,
+      "accept_fraction_conditional_on_proposal": 0.6551724137931034
+    },
+    {
+      "residual_depth": 15,
+      "proposals": 454,
+      "accepted": 314,
+      "rejected": 140,
+      "bonus_skipped_proposals": 266,
+      "accept_fraction_conditional_on_proposal": 0.6916299559471366
+    }
+  ],
+  "provenance": {
+    "kind": "reconstructed_from_user_shared_prior_p2_720_frame_aggregate_in_chat",
+    "is_original_report": false,
+    "is_raw_trace": false,
+    "allows_reverification_of_P1_P2": false,
+    "purpose": "historical_rounds_per_frame_and_per_depth_accounting_only_for_P9_cost_screen",
+    "description": "The old P2 -004 report directory was unavailable on the H200 machine; figures are recovered from P2 summary previously shared in the project conversation. The original per-frame JSON traces are NOT reconstructed.",
+    "limitations": [
+      "No original P2 frame JSON, full parity-check records, per-frame RNG, logits, waveforms, or timestamps are included.",
+      "Historical prior experiment SHA is different from P9 source SHA; future on-policy rates may differ.",
+      "720 traced frames may include deterministic repeated visits; not necessarily independent utterances."
+    ]
+  }
+}
