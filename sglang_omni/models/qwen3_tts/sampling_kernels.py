@@ -828,6 +828,9 @@ if has_triton_runtime():
         max_top_k: tl.constexpr,
         block_k: tl.constexpr,
         has_top_p: tl.constexpr,
+        radix_bits: tl.constexpr,
+        radix_bin_count: tl.constexpr,
+        radix_pass_count: tl.constexpr,
         vocab_size: tl.constexpr,
     ):
         row = tl.program_id(0)
@@ -844,20 +847,29 @@ if has_triton_runtime():
             remaining_rank = tl.full((), max_top_k, tl.int32)
             higher_count = tl.full((), 0, tl.int32)
             selection_complete = False
-            radix_bins = tl.arange(0, 256)
-            for radix_pass in tl.static_range(0, 8):
+            radix_bins = tl.arange(0, radix_bin_count)
+            radix_mask: tl.constexpr = radix_bin_count - 1
+            for radix_pass in tl.static_range(0, radix_pass_count):
                 if not selection_complete:
-                    shift = 56 - radix_pass * 8
-                    digits = ((packed >> shift) & 255).to(tl.int32)
+                    shift = 64 - radix_bits - radix_pass * radix_bits
+                    digits = ((packed >> shift) & radix_mask).to(tl.int32)
                     matches_prefix = (packed & prefix_mask) == prefix
-                    histogram = tl.histogram(digits, num_bins=256, mask=matches_prefix)
-                    descending_bins = tl.gather(histogram, 255 - radix_bins, axis=0)
+                    histogram = tl.histogram(
+                        digits, num_bins=radix_bin_count, mask=matches_prefix
+                    )
+                    descending_bins = tl.gather(
+                        histogram, radix_mask - radix_bins, axis=0
+                    )
                     descending_rank = tl.cumsum(descending_bins, axis=0)
                     selected_rank = tl.min(
-                        tl.where(descending_rank >= remaining_rank, radix_bins, 256),
+                        tl.where(
+                            descending_rank >= remaining_rank,
+                            radix_bins,
+                            radix_bin_count,
+                        ),
                         axis=0,
                     )
-                    selected_digit = 255 - selected_rank
+                    selected_digit = radix_mask - selected_rank
                     higher_in_prefix = tl.sum(
                         tl.where(radix_bins > selected_digit, histogram, 0), axis=0
                     )
@@ -867,7 +879,9 @@ if has_triton_runtime():
                     higher_count += higher_in_prefix
                     remaining_rank -= higher_in_prefix
                     prefix = prefix | (selected_digit.to(tl.uint64) << shift)
-                    prefix_mask = prefix_mask | (tl.full((), 255, tl.uint64) << shift)
+                    prefix_mask = prefix_mask | (
+                        tl.full((), radix_mask, tl.uint64) << shift
+                    )
                     selection_complete = higher_count + selected_group_count <= block_k
                 else:
                     pass
@@ -1689,7 +1703,9 @@ def build_speculative_probability_candidates(
             or split_candidate_keys.dtype is not torch.int64
             or not split_candidate_keys.is_contiguous()
         ):
-            raise ValueError("persistent split Top-K scratch does not match the builder")
+            raise ValueError(
+                "persistent split Top-K scratch does not match the builder"
+            )
         else:
             chunk_keys = split_candidate_keys
         seeded_top_k_chunk_kernel[(row_count, TOP_K_CHUNKS)](
@@ -1750,6 +1766,7 @@ def build_speculative_probability_candidates_radix(
     probability_output: torch.Tensor | None = None,
     token_id_output: torch.Tensor | None = None,
     radix_candidate_keys: torch.Tensor | None = None,
+    radix_bits: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Build a radix-selected candidate distribution for parity experiments."""
     block_k = fused_raw_logit_block_k(max_top_k)
@@ -1758,6 +1775,7 @@ def build_speculative_probability_candidates_radix(
         or not _TRITON_GATHER_SUPPORTED
         or block_k is None
         or max_top_k <= 32
+        or radix_bits not in (4, 8)
         or has_unbounded_top_k
         or not logits.is_cuda
         or logits.ndim != 2
@@ -1842,6 +1860,9 @@ def build_speculative_probability_candidates_radix(
         int(max_top_k),
         int(block_k),
         bool(has_top_p),
+        radix_bits=int(radix_bits),
+        radix_bin_count=1 << int(radix_bits),
+        radix_pass_count=64 // int(radix_bits),
         vocab_size=int(logits.shape[1]),
         num_warps=8,
     )
@@ -1858,14 +1879,21 @@ def build_speculative_probability_candidates_selected(
     max_top_k: int,
     has_top_p: bool,
     has_unbounded_top_k: bool,
-    backend: Literal["split_top_k", "radix_compact"],
+    backend: Literal["split_top_k", "radix_compact", "radix_compact_4bit"],
     probability_output: torch.Tensor | None = None,
     token_id_output: torch.Tensor | None = None,
     split_candidate_keys: torch.Tensor | None = None,
     radix_candidate_keys: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, Literal["split_top_k", "radix_compact"]] | None:
+) -> (
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Literal["split_top_k", "radix_compact", "radix_compact_4bit"],
+    ]
+    | None
+):
     """Build compact probabilities and report the implementation that ran."""
-    if backend == "radix_compact":
+    if backend in ("radix_compact", "radix_compact_4bit"):
         candidates = build_speculative_probability_candidates_radix(
             logits,
             temperatures,
@@ -1878,9 +1906,10 @@ def build_speculative_probability_candidates_selected(
             probability_output=probability_output,
             token_id_output=token_id_output,
             radix_candidate_keys=radix_candidate_keys,
+            radix_bits=4 if backend == "radix_compact_4bit" else 8,
         )
         if candidates is not None:
-            return candidates[0], candidates[1], "radix_compact"
+            return candidates[0], candidates[1], backend
         else:
             pass
     elif backend == "split_top_k":
