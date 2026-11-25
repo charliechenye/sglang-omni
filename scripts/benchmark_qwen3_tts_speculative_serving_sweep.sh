@@ -120,7 +120,7 @@ run_arm() {
     python "$REPO_ROOT/scripts/benchmark_qwen3_tts_speculative_serving.py" \
       --phase speculative \
       --expected-width "$width" \
-      --require-all-verifier-graph \
+      --require-all-graph \
       --minimum-speedup 0.0 \
       --result-file "$run_dir/result.json" \
       "${common_args[@]}"

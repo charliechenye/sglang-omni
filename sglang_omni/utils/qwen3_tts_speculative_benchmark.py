@@ -449,19 +449,45 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
     total_verifier_rounds = integer_stat(
         speculative_stats_after, "rounds"
     ) - integer_stat(speculative_stats_before, "rounds")
-    verifier_execution_coverage = classify_verifier_execution_coverage(
-        total_verifier_rounds,
-        eager_verifier_rounds,
-        verifier_graph_replays,
-    )
+    full_round_graph_replays = integer_stat(
+        speculative_stats_after, "full_round_graph_replays"
+    ) - integer_stat(speculative_stats_before, "full_round_graph_replays")
     graph_mode = speculative_stats_after.get("graph_mode")
     if not isinstance(graph_mode, str):
         raise RuntimeError("speculative server has no graph execution mode metric")
-    elif graph_mode not in ("verifier_only", "eager"):
+    elif graph_mode not in ("verifier_only", "full_round", "eager"):
         raise RuntimeError("speculative server has an unsupported graph execution mode")
     else:
         pass
-    graph_captures = integer_stat(speculative_stats_after, "graph_captures")
+    speculative_graph_replays = (
+        verifier_graph_replays if graph_mode == "verifier_only" else 0
+    )
+    if graph_mode == "full_round":
+        speculative_graph_replays = full_round_graph_replays
+    else:
+        pass
+    graph_execution_coverage = classify_speculative_graph_execution_coverage(
+        graph_mode,
+        total_verifier_rounds,
+        eager_verifier_rounds,
+        verifier_graph_replays,
+        full_round_graph_replays,
+    )
+    verifier_graph_captures = integer_stat(speculative_stats_after, "graph_captures")
+    full_round_graph_captures = integer_stat(
+        speculative_stats_after, "full_round_graph_captures"
+    )
+    graph_captures = (
+        full_round_graph_captures
+        if graph_mode == "full_round"
+        else verifier_graph_captures
+    )
+    opening_pair_graph_replays = integer_stat(
+        speculative_stats_after, "opening_pair_graph_replays"
+    ) - integer_stat(speculative_stats_before, "opening_pair_graph_replays")
+    opening_pair_graph_captures = integer_stat(
+        speculative_stats_after, "opening_pair_graph_captures"
+    )
     probability_backend = speculative_stats_after.get("probability_backend")
     if probability_backend not in (
         "split_top_k",
@@ -516,12 +542,13 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
         raise RuntimeError("performance gate failed: no packed verifier round ran")
     elif graph_mode == "verifier_only" and graph_captures <= 0:
         raise RuntimeError("performance gate failed: verifier graph was not captured")
+    elif graph_mode == "full_round" and full_round_graph_captures <= 0:
+        raise RuntimeError("performance gate failed: full-round graph was not captured")
     elif (
-        arguments.require_all_verifier_graph
-        and verifier_execution_coverage != "all_graph"
+        arguments.require_all_verifier_graph and graph_execution_coverage != "all_graph"
     ):
         raise RuntimeError(
-            "performance gate failed: verifier execution mixed eager and graph rounds"
+            "performance gate failed: speculative execution mixed eager and graph rounds"
         )
     elif probability_backend in ("radix_compact", "radix_compact_4bit") and (
         probability_backend_execution_counts[probability_backend] <= 0
@@ -618,7 +645,22 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
         "verifier_graph_replays": verifier_graph_replays,
         "eager_verifier_rounds": eager_verifier_rounds,
         "total_verifier_rounds": total_verifier_rounds,
-        "verifier_execution_coverage": verifier_execution_coverage,
+        "verifier_execution_coverage": (
+            classify_verifier_execution_coverage(
+                total_verifier_rounds,
+                eager_verifier_rounds,
+                verifier_graph_replays,
+            )
+            if graph_mode == "verifier_only"
+            else "not_applicable"
+        ),
+        "full_round_graph_replays": full_round_graph_replays,
+        "full_round_graph_captures": full_round_graph_captures,
+        "verifier_graph_captures": verifier_graph_captures,
+        "opening_pair_graph_replays": opening_pair_graph_replays,
+        "opening_pair_graph_captures": opening_pair_graph_captures,
+        "speculative_graph_replays": speculative_graph_replays,
+        "speculative_graph_execution_coverage": graph_execution_coverage,
         "speculative_graph_mode": graph_mode,
         "speculative_graph_captures": graph_captures,
         "probability_backend": probability_backend,
@@ -631,6 +673,15 @@ def run_speculative_phase(arguments: argparse.Namespace) -> None:
         ),
         "speculative_graph_capture_time_ms": numeric_stat(
             speculative_stats_after, "graph_capture_time_ms"
+        ),
+        "verifier_graph_capture_time_ms": numeric_stat(
+            speculative_stats_after, "verifier_graph_capture_time_ms"
+        ),
+        "full_round_graph_capture_time_ms": numeric_stat(
+            speculative_stats_after, "full_round_graph_capture_time_ms"
+        ),
+        "opening_pair_graph_capture_time_ms": numeric_stat(
+            speculative_stats_after, "opening_pair_graph_capture_time_ms"
         ),
         "speculative_configuration_time_ms": numeric_stat(
             speculative_stats_after, "configuration_time_ms"
@@ -719,6 +770,39 @@ def classify_verifier_execution_coverage(
         return "eager_only"
     else:
         return "mixed_graph_eager"
+
+
+def classify_speculative_graph_execution_coverage(
+    graph_mode: str,
+    total_rounds: int,
+    eager_rounds: int,
+    verifier_graph_replays: int,
+    full_round_graph_replays: int,
+) -> Literal["all_graph", "mixed_graph_eager", "eager_only"]:
+    """Classify rounds against the graph backend selected for the run."""
+    if graph_mode == "verifier_only":
+        if full_round_graph_replays != 0:
+            raise ValueError("verifier-only run recorded full-round graph replays")
+        else:
+            pass
+        graph_replays = verifier_graph_replays
+    elif graph_mode == "full_round":
+        if verifier_graph_replays != 0:
+            raise ValueError("full-round run recorded nested verifier graph replays")
+        else:
+            pass
+        graph_replays = full_round_graph_replays
+    elif graph_mode == "eager":
+        if verifier_graph_replays != 0 or full_round_graph_replays != 0:
+            raise ValueError("eager run recorded graph replays")
+        else:
+            pass
+        graph_replays = 0
+    else:
+        raise ValueError(f"unsupported speculative graph mode {graph_mode!r}")
+    return classify_verifier_execution_coverage(
+        total_rounds, eager_rounds, graph_replays
+    )
 
 
 def probability_backend_execution_delta(

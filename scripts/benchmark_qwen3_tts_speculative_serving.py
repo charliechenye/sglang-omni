@@ -57,7 +57,13 @@ def main() -> None:
         "--expected-acceptance-backend",
         choices=("compact", "dense_indexed"),
     )
-    parser.add_argument("--require-all-verifier-graph", action="store_true")
+    parser.add_argument(
+        "--require-all-graph",
+        "--require-all-verifier-graph",
+        dest="require_all_verifier_graph",
+        action="store_true",
+        help="require every speculative round to replay the selected graph backend",
+    )
     parser.add_argument("--result-file")
     parser.add_argument("--minimum-speedup", type=float, default=1.0)
     arguments = parser.parse_args()
