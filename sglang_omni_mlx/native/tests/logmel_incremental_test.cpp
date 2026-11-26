@@ -31,11 +31,11 @@ void Require(bool condition, const std::string &message) {
 }
 
 float SpeechLikeSample(size_t sample_index, int sample_rate, float amplitude) {
-  const float time_seconds = static_cast<float>(sample_index) /
-                             static_cast<float>(sample_rate);
+  const float time_seconds =
+      static_cast<float>(sample_index) / static_cast<float>(sample_rate);
   const float syllable_envelope =
-      0.2f + 0.8f * std::fabs(std::sin(2.0f * static_cast<float>(M_PI) *
-                                      3.7f * time_seconds));
+      0.2f + 0.8f * std::fabs(std::sin(2.0f * static_cast<float>(M_PI) * 3.7f *
+                                       time_seconds));
   return amplitude * syllable_envelope *
          (0.55f * std::sin(2.0f * static_cast<float>(M_PI) * 173.0f *
                            time_seconds) +
@@ -49,8 +49,8 @@ std::vector<float> MakeSpeechLikeAudio(size_t sample_count,
                                        float amplitude = 0.2f) {
   std::vector<float> samples(sample_count);
   for (size_t sample_index = 0; sample_index < sample_count; ++sample_index) {
-    samples[sample_index] = SpeechLikeSample(
-        sample_index, omni_common::kSampleRate, amplitude);
+    samples[sample_index] =
+        SpeechLikeSample(sample_index, omni_common::kSampleRate, amplitude);
   }
   return samples;
 }
@@ -72,8 +72,8 @@ mx::array CheckFeatures(const std::vector<float> &samples,
   Require(expected.dtype() == incremental.features.dtype(),
           case_name + ": tensor dtype changed");
   const int unequal_element_count =
-      mx::sum(mx::astype(mx::not_equal(expected, incremental.features),
-                         mx::int32))
+      mx::sum(
+          mx::astype(mx::not_equal(expected, incremental.features), mx::int32))
           .item<int>();
   const float maximum_absolute_error =
       mx::max(mx::abs(mx::subtract(expected, incremental.features)))
@@ -94,16 +94,17 @@ mx::array CheckFeatures(const std::vector<float> &samples,
     for (size_t index = 0; index < expected.size(); ++index) {
       if (expected_data[index] != incremental_data[index]) {
         std::cerr << "  element " << index << " expected=" << std::hexfloat
-                  << expected_data[index] << " incremental="
-                  << incremental_data[index] << std::defaultfloat << '\n';
+                  << expected_data[index]
+                  << " incremental=" << incremental_data[index]
+                  << std::defaultfloat << '\n';
       }
     }
   }
-  Require(unequal_element_count == 0,
-          case_name + ": unequal elements=" +
-              std::to_string(unequal_element_count) +
-              " maximum absolute error=" +
-              std::to_string(maximum_absolute_error));
+  Require(
+      unequal_element_count == 0,
+      case_name +
+          ": unequal elements=" + std::to_string(unequal_element_count) +
+          " maximum absolute error=" + std::to_string(maximum_absolute_error));
   if (expected_computed_frame_count >= 0) {
     Require(incremental.computed_frame_count == expected_computed_frame_count,
             case_name + ": computed an unexpected number of STFT frames");
@@ -121,7 +122,7 @@ void CheckGrowingAudio(omni_common::FinalStftFrame final_frame) {
   size_t sample_count = 0;
   while (sample_count < recording_samples.size()) {
     const std::array<size_t, 16> boundary_counts = {
-        0, 1, 159, 160, 161, 399, 400, 401,
+        0,   1,   159, 160,  161,  399,  400,  401,
         799, 800, 801, 1599, 1600, 1601, 3199, 3200};
     size_t next_sample_count = sample_count;
     if (sample_count < boundary_counts.size() && sample_count == 0) {
@@ -159,9 +160,9 @@ void CheckGrowingAudio(omni_common::FinalStftFrame final_frame) {
           recording_samples.size(),
           sample_count + static_cast<size_t>(append_size(append_generator)));
     }
-    const std::vector<float> snapshot_samples(
-        recording_samples.begin(),
-        recording_samples.begin() + next_sample_count);
+    const std::vector<float> snapshot_samples(recording_samples.begin(),
+                                              recording_samples.begin() +
+                                                  next_sample_count);
     CheckFeatures(snapshot_samples, final_frame,
                   cache.pcm_samples != nullptr ? &cache : nullptr, cache,
                   "growing audio length " + std::to_string(next_sample_count));
@@ -228,29 +229,27 @@ void CheckCacheInvalidation(omni_common::FinalStftFrame final_frame) {
 
   const std::vector<float> shorter_samples(original_samples.begin(),
                                            original_samples.begin() + 5000);
-  CheckFeatures(shorter_samples, final_frame, &cache, cache,
-                "shorter audio", StftFrameCount(shorter_samples.size()));
+  CheckFeatures(shorter_samples, final_frame, &cache, cache, "shorter audio",
+                StftFrameCount(shorter_samples.size()));
 
   std::vector<float> shifted_samples = original_samples;
   std::rotate(shifted_samples.begin(), shifted_samples.begin() + 1,
               shifted_samples.end());
-  CheckFeatures(shifted_samples, final_frame, &cache, cache,
-                "shifted audio", StftFrameCount(shifted_samples.size()));
+  CheckFeatures(shifted_samples, final_frame, &cache, cache, "shifted audio",
+                StftFrameCount(shifted_samples.size()));
 
   const omni_common::FinalStftFrame other_layout =
       final_frame == omni_common::FinalStftFrame::kDropped
           ? omni_common::FinalStftFrame::kKept
           : omni_common::FinalStftFrame::kDropped;
-  CheckFeatures(shifted_samples, other_layout, &cache, cache,
-                "changed layout", StftFrameCount(shifted_samples.size()));
+  CheckFeatures(shifted_samples, other_layout, &cache, cache, "changed layout",
+                StftFrameCount(shifted_samples.size()));
 
   omni_common::IncrementalLogMelCache new_session_cache;
-  CheckFeatures(shifted_samples, other_layout,
-                new_session_cache.pcm_samples != nullptr
-                    ? &new_session_cache
-                    : nullptr,
-                new_session_cache, "new session",
-                StftFrameCount(shifted_samples.size()));
+  CheckFeatures(
+      shifted_samples, other_layout,
+      new_session_cache.pcm_samples != nullptr ? &new_session_cache : nullptr,
+      new_session_cache, "new session", StftFrameCount(shifted_samples.size()));
 
   CheckFeatures(original_samples, final_frame, &earlier_snapshot, cache,
                 "copied cache snapshot", 0);
@@ -291,9 +290,10 @@ int main() {
       CheckCacheInvalidation(final_frame);
       CheckEightSecondBoundaries(final_frame);
     }
-    std::cout << "incremental LogMel parity passed for both layouts; max_abs_error="
-              << maximum_absolute_error_seen
-              << " unequal_elements=" << unequal_element_count_seen << '\n';
+    std::cout
+        << "incremental LogMel parity passed for both layouts; max_abs_error="
+        << maximum_absolute_error_seen
+        << " unequal_elements=" << unequal_element_count_seen << '\n';
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

@@ -63,15 +63,15 @@ float SyntheticSample(AudioKind audio_kind, size_t sample_index) {
   const float time_seconds = static_cast<float>(sample_index) /
                              static_cast<float>(omni_common::kSampleRate);
   const float syllable_envelope =
-      0.5f + 0.5f * std::sin(2.0f * static_cast<float>(M_PI) *
-                             3.7f * time_seconds);
+      0.5f +
+      0.5f * std::sin(2.0f * static_cast<float>(M_PI) * 3.7f * time_seconds);
   const float speech_like =
-      (0.16f * std::sin(2.0f * static_cast<float>(M_PI) * 173.0f *
-                        time_seconds) +
-       0.08f * std::sin(2.0f * static_cast<float>(M_PI) * 419.0f *
-                        time_seconds) +
-       0.03f * std::sin(2.0f * static_cast<float>(M_PI) * 911.0f *
-                        time_seconds)) *
+      (0.16f *
+           std::sin(2.0f * static_cast<float>(M_PI) * 173.0f * time_seconds) +
+       0.08f *
+           std::sin(2.0f * static_cast<float>(M_PI) * 419.0f * time_seconds) +
+       0.03f *
+           std::sin(2.0f * static_cast<float>(M_PI) * 911.0f * time_seconds)) *
       syllable_envelope;
   if (audio_kind == AudioKind::kSpeechLike) {
     return speech_like;
@@ -86,8 +86,8 @@ float SyntheticSample(AudioKind audio_kind, size_t sample_index) {
 
 std::vector<float> MakeAudioSamples(AudioKind audio_kind, int duration_seconds,
                                     const std::vector<float> &fixture_samples) {
-  const size_t sample_count = static_cast<size_t>(duration_seconds) *
-                              omni_common::kSampleRate;
+  const size_t sample_count =
+      static_cast<size_t>(duration_seconds) * omni_common::kSampleRate;
   std::vector<float> audio_samples(sample_count);
   for (size_t sample_index = 0; sample_index < sample_count; ++sample_index) {
     if (audio_kind == AudioKind::kFixture) {
@@ -115,18 +115,17 @@ double Percentile(std::vector<double> values_ms, double quantile) {
 
 double TimeFullLogMel(const std::vector<float> &audio_samples) {
   const auto start = Clock::now();
-  const mlx::core::array features = omni_common::LogMel(
-      audio_samples, omni_common::FinalStftFrame::kDropped);
+  const mlx::core::array features =
+      omni_common::LogMel(audio_samples, omni_common::FinalStftFrame::kDropped);
   mlx::core::eval(features);
   mlx::core::synchronize();
   return std::chrono::duration<double, std::milli>(Clock::now() - start)
       .count();
 }
 
-double TimeIncremental(
-    const std::vector<float> &audio_samples,
-    omni_common::IncrementalLogMelCache &cache, uint64_t &frames_processed,
-    double &host_prepare_ms) {
+double TimeIncremental(const std::vector<float> &audio_samples,
+                       omni_common::IncrementalLogMelCache &cache,
+                       uint64_t &frames_processed, double &host_prepare_ms) {
   const auto start = Clock::now();
   const omni_common::IncrementalLogMelResult result =
       omni_common::IncrementalLogMel(
@@ -163,8 +162,8 @@ double TimePrefixComparison(const omni_common::IncrementalLogMelCache &cache,
 Measurement Measure(AudioKind audio_kind, int duration_seconds,
                     int append_interval_ms,
                     const std::vector<float> &fixture_samples) {
-  const std::vector<float> recording_samples = MakeAudioSamples(
-      audio_kind, duration_seconds, fixture_samples);
+  const std::vector<float> recording_samples =
+      MakeAudioSamples(audio_kind, duration_seconds, fixture_samples);
   for (int warmup_index = 0; warmup_index < kWarmupRepeats; ++warmup_index) {
     static_cast<void>(TimeFullLogMel(recording_samples));
     omni_common::IncrementalLogMelCache cache;
@@ -180,8 +179,8 @@ Measurement Measure(AudioKind audio_kind, int duration_seconds,
   }
   const double full_logmel_ms = Percentile(full_audio_times_ms, 0.5);
 
-  const size_t append_samples = static_cast<size_t>(
-      append_interval_ms * omni_common::kSampleRate / 1000);
+  const size_t append_samples =
+      static_cast<size_t>(append_interval_ms * omni_common::kSampleRate / 1000);
   std::vector<double> baseline_refresh_times_ms;
   std::vector<double> candidate_refresh_times_ms;
   std::vector<double> candidate_host_prepare_times_ms;
@@ -190,9 +189,10 @@ Measurement Measure(AudioKind audio_kind, int duration_seconds,
     double baseline_total_ms = 0.0;
     uint64_t baseline_frames = 0;
     for (size_t snapshot_size = append_samples;
-         snapshot_size < recording_samples.size(); snapshot_size += append_samples) {
-      const std::vector<float> snapshot(recording_samples.begin(),
-                                        recording_samples.begin() + snapshot_size);
+         snapshot_size < recording_samples.size();
+         snapshot_size += append_samples) {
+      const std::vector<float> snapshot(
+          recording_samples.begin(), recording_samples.begin() + snapshot_size);
       const double elapsed_ms = TimeFullLogMel(snapshot);
       baseline_refresh_times_ms.push_back(elapsed_ms);
       baseline_total_ms += elapsed_ms;
@@ -201,15 +201,17 @@ Measurement Measure(AudioKind audio_kind, int duration_seconds,
     const double baseline_final_ms = TimeFullLogMel(recording_samples);
     baseline_refresh_times_ms.push_back(baseline_final_ms);
     baseline_total_ms += baseline_final_ms;
-    baseline_frames += static_cast<uint64_t>(StftFrameCount(recording_samples.size()));
+    baseline_frames +=
+        static_cast<uint64_t>(StftFrameCount(recording_samples.size()));
 
     double candidate_total_ms = 0.0;
     uint64_t candidate_frames = 0;
     omni_common::IncrementalLogMelCache cache;
     for (size_t snapshot_size = append_samples;
-         snapshot_size < recording_samples.size(); snapshot_size += append_samples) {
-      const std::vector<float> snapshot(recording_samples.begin(),
-                                        recording_samples.begin() + snapshot_size);
+         snapshot_size < recording_samples.size();
+         snapshot_size += append_samples) {
+      const std::vector<float> snapshot(
+          recording_samples.begin(), recording_samples.begin() + snapshot_size);
       double host_prepare_ms = 0.0;
       const double elapsed_ms =
           TimeIncremental(snapshot, cache, candidate_frames, host_prepare_ms);
@@ -223,16 +225,14 @@ Measurement Measure(AudioKind audio_kind, int duration_seconds,
         TimeIncremental(recording_samples, cache, candidate_frames,
                         candidate_final_host_prepare_ms);
     candidate_refresh_times_ms.push_back(candidate_final_ms);
-    candidate_host_prepare_times_ms.push_back(
-        candidate_final_host_prepare_ms);
+    candidate_host_prepare_times_ms.push_back(candidate_final_host_prepare_ms);
     candidate_eval_sync_times_ms.push_back(candidate_final_ms -
                                            candidate_final_host_prepare_ms);
     candidate_total_ms += candidate_final_ms;
     uint64_t repeated_frames = 0;
     double repeated_host_prepare_ms = 0.0;
-    const double repeated_ms =
-        TimeIncremental(recording_samples, cache, repeated_frames,
-                        repeated_host_prepare_ms);
+    const double repeated_ms = TimeIncremental(
+        recording_samples, cache, repeated_frames, repeated_host_prepare_ms);
     if (repeated_frames != 0) {
       throw std::runtime_error("repeated snapshot computed new STFT frames");
     } else {
@@ -243,31 +243,29 @@ Measurement Measure(AudioKind audio_kind, int duration_seconds,
         static_cast<uint64_t>(cache.pcm_samples->size() * sizeof(float)) +
         static_cast<uint64_t>(cache.power_spectrum->nbytes()) +
         static_cast<uint64_t>(cache.normalized_features->nbytes());
-    return Measurement{
-        audio_kind == AudioKind::kSpeechLike
-            ? "speech_like"
-            : audio_kind == AudioKind::kQuiet
-                  ? "quiet"
-                  : audio_kind == AudioKind::kChangingAmplitude ? "changing"
-                                                                : "fixture",
-        duration_seconds,
-        append_interval_ms,
-        full_logmel_ms,
-        baseline_total_ms,
-        candidate_total_ms,
-        baseline_final_ms,
-        candidate_final_ms,
-        Percentile(baseline_refresh_times_ms, 0.5),
-        Percentile(candidate_refresh_times_ms, 0.5),
-        Percentile(baseline_refresh_times_ms, 0.95),
-        Percentile(candidate_refresh_times_ms, 0.95),
-        Percentile(candidate_host_prepare_times_ms, 0.5),
-        Percentile(candidate_eval_sync_times_ms, 0.5),
-        repeated_ms,
-        prefix_compare_ms,
-        baseline_frames,
-        candidate_frames,
-        cache_bytes};
+    return Measurement{audio_kind == AudioKind::kSpeechLike ? "speech_like"
+                       : audio_kind == AudioKind::kQuiet    ? "quiet"
+                       : audio_kind == AudioKind::kChangingAmplitude
+                           ? "changing"
+                           : "fixture",
+                       duration_seconds,
+                       append_interval_ms,
+                       full_logmel_ms,
+                       baseline_total_ms,
+                       candidate_total_ms,
+                       baseline_final_ms,
+                       candidate_final_ms,
+                       Percentile(baseline_refresh_times_ms, 0.5),
+                       Percentile(candidate_refresh_times_ms, 0.5),
+                       Percentile(baseline_refresh_times_ms, 0.95),
+                       Percentile(candidate_refresh_times_ms, 0.95),
+                       Percentile(candidate_host_prepare_times_ms, 0.5),
+                       Percentile(candidate_eval_sync_times_ms, 0.5),
+                       repeated_ms,
+                       prefix_compare_ms,
+                       baseline_frames,
+                       candidate_frames,
+                       cache_bytes};
   };
 
   std::vector<double> baseline_totals_ms;
@@ -346,21 +344,22 @@ int main(int argc, char **argv) {
       throw std::invalid_argument(
           "usage: logmel_incremental_benchmark [fixture.wav]");
     }
-    std::cout << "audio_kind,duration_seconds,append_interval_ms,full_logmel_ms,"
-                 "baseline_total_refresh_ms,candidate_total_refresh_ms,"
-                 "baseline_final_refresh_ms,candidate_final_refresh_ms,"
-                 "baseline_p50_ms,candidate_p50_ms,baseline_p95_ms,"
-                 "candidate_p95_ms,candidate_host_prepare_p50_ms,"
-                 "candidate_eval_sync_p50_ms,candidate_repeated_ms,"
-                 "candidate_prefix_compare_ms,baseline_stft_frames,"
-                 "candidate_stft_frames,candidate_retained_cache_bytes\n";
-    for (const AudioKind audio_kind : {AudioKind::kSpeechLike,
-                                       AudioKind::kQuiet,
-                                       AudioKind::kChangingAmplitude}) {
+    std::cout
+        << "audio_kind,duration_seconds,append_interval_ms,full_logmel_ms,"
+           "baseline_total_refresh_ms,candidate_total_refresh_ms,"
+           "baseline_final_refresh_ms,candidate_final_refresh_ms,"
+           "baseline_p50_ms,candidate_p50_ms,baseline_p95_ms,"
+           "candidate_p95_ms,candidate_host_prepare_p50_ms,"
+           "candidate_eval_sync_p50_ms,candidate_repeated_ms,"
+           "candidate_prefix_compare_ms,baseline_stft_frames,"
+           "candidate_stft_frames,candidate_retained_cache_bytes\n";
+    for (const AudioKind audio_kind :
+         {AudioKind::kSpeechLike, AudioKind::kQuiet,
+          AudioKind::kChangingAmplitude}) {
       for (const int duration_seconds : kDurationsSeconds) {
         for (const int append_interval_ms : kAppendIntervalsMs) {
-          PrintMeasurement(Measure(audio_kind, duration_seconds,
-                                   append_interval_ms, {}));
+          PrintMeasurement(
+              Measure(audio_kind, duration_seconds, append_interval_ms, {}));
         }
       }
     }
