@@ -361,6 +361,16 @@ def run_benchmark(
         opening_pair_graph=opening_pair_graph,
     )
     try:
+        talker_hidden_size = int(talker.config.hidden_size)
+        if any(
+            frame.talker_hidden.numel() != talker_hidden_size
+            or frame.native_embeddings.numel() != talker_hidden_size
+            for frame in artifacts.frames
+        ):
+            raise ValueError(
+                "Frozen Talker dimensions do not match the loaded checkpoint"
+            )
+
         preflight = run_correctness_preflight(
             talker,
             artifacts,

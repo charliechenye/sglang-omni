@@ -228,6 +228,7 @@ def load_frozen_predictor_artifacts(
     captured_frames = mapped_capture_frames(capture_root)
     shard_records = require_list(summary.get("shards"), "shards")
     frames: list[FrozenPredictorFrame] = []
+    talker_hidden_size: int | None = None
     for shard_value in shard_records:
         shard = require_mapping(shard_value, "shard manifest record")
         shard_split = require_string(shard.get("split"), "shard split")
@@ -359,17 +360,24 @@ def load_frozen_predictor_artifacts(
             raw_positions = require_tensor(
                 raw_frame.get("semantic_positions"), "semantic_positions"
             ).reshape(-1)
+            if talker_hidden_size is None:
+                talker_hidden_size = talker_hidden.numel()
+                if talker_hidden_size <= 0:
+                    raise ValueError(
+                        f"captured talker hidden is empty: {frame_path}"
+                    )
+
             if layer0_code.numel() != 1:
                 raise ValueError(f"captured layer-0 code must be scalar: {frame_path}")
             elif int(layer0_code.item()) != int(codes[row_index, 0].item()):
                 raise ValueError(
                     f"captured layer-0 code differs from targets: {frame_path}"
                 )
-            elif talker_hidden.numel() != hidden_size:
+            elif talker_hidden.numel() != talker_hidden_size:
                 raise ValueError(
                     f"captured talker hidden has invalid shape: {frame_path}"
                 )
-            elif native_embeddings.numel() != hidden_size:
+            elif native_embeddings.numel() != talker_hidden_size:
                 raise ValueError(
                     f"captured native embedding has invalid shape: {frame_path}"
                 )
