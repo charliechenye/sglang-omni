@@ -3,6 +3,8 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -41,6 +43,26 @@ enum class FinalStftFrame { kDropped, kKept };
 // Whisper-style log-mel in float32 on MLX, [mel_bins, frames].
 mlx::core::array LogMel(const std::vector<float> &samples,
                         FinalStftFrame final_frame);
+
+struct IncrementalLogMelCache {
+  std::shared_ptr<const std::vector<float>> pcm_samples;
+  std::optional<mlx::core::array> power_spectrum;
+  std::optional<mlx::core::array> normalized_features;
+  FinalStftFrame final_frame = FinalStftFrame::kDropped;
+  int stable_frame_count = 0;
+};
+
+struct IncrementalLogMelResult {
+  mlx::core::array features;
+  IncrementalLogMelCache cache;
+  int computed_frame_count = 0;
+};
+
+// Reuses exact PCM-prefix FFT rows; each snapshot keeps full-shape mel
+// projection for bitwise parity.
+IncrementalLogMelResult
+IncrementalLogMel(const std::vector<float> &samples, FinalStftFrame final_frame,
+                  const IncrementalLogMelCache *previous = nullptr);
 
 // Whisper's fixed 30 s encoder window.
 inline constexpr int kWhisperWindowSampleCount = 30 * kSampleRate;

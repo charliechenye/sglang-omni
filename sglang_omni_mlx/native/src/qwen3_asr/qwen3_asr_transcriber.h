@@ -73,6 +73,7 @@ struct RetainedText {
 struct RefreshReuse {
   // The windows' mel frames, [mel_bins, frames].
   std::optional<mlx::core::array> mel;
+  std::optional<omni_common::IncrementalLogMelCache> frontend_cache;
   // Their encoder rows, [rows, hidden].
   std::optional<mlx::core::array> audio_rows;
   // The prompt's tokens before the audio.

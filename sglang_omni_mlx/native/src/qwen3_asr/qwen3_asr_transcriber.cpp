@@ -47,6 +47,12 @@ constexpr size_t kChunkSearchSamples = 5 * omni_common::kSampleRate;
 constexpr size_t kChunkEnergyWindowSamples = omni_common::kSampleRate / 10;
 constexpr size_t kMinTailSamples = 5 * omni_common::kSampleRate;
 
+omni_common::FinalStftFrame FinalFrameForLayout(AudioLayout layout) {
+  return layout == AudioLayout::kReference
+             ? omni_common::FinalStftFrame::kDropped
+             : omni_common::FinalStftFrame::kKept;
+}
+
 const std::map<std::string, std::string> &LanguageCodeToName() {
   static const std::map<std::string, std::string> table = {
       {"ar", "Arabic"},     {"yue", "Cantonese"}, {"zh", "Chinese"},
@@ -91,10 +97,7 @@ std::optional<size_t> FindSubsequence(const std::vector<int> &values,
 
 // The log-mel features the prompt's audio is encoded from.
 mx::array PromptMel(const std::vector<float> &samples, AudioLayout layout) {
-  return omni_common::LogMel(samples,
-                             layout == AudioLayout::kReference
-                                 ? omni_common::FinalStftFrame::kDropped
-                                 : omni_common::FinalStftFrame::kKept);
+  return omni_common::LogMel(samples, FinalFrameForLayout(layout));
 }
 
 } // namespace
@@ -237,7 +240,12 @@ Qwen3ASRTranscriber::BuildPrompt(const std::vector<float> &samples,
 Qwen3ASRTranscriber::RefreshPrompt Qwen3ASRTranscriber::BuildRefreshPrompt(
     const std::vector<float> &samples, const TranscriptionOptions &options,
     bool uses_draft, RefreshReuse &held) const {
-  const mx::array mel = PromptMel(samples, options.layout);
+  const omni_common::IncrementalLogMelResult frontend =
+      omni_common::IncrementalLogMel(
+          samples, FinalFrameForLayout(options.layout),
+          held.frontend_cache.has_value() ? &*held.frontend_cache : nullptr);
+  held.frontend_cache = frontend.cache;
+  const mx::array &mel = frontend.features;
   const int mel_bins = mel.shape(0);
   const int frame_count = mel.shape(-1);
   const int audio_token_count = TokenCount(frame_count, options.layout);
@@ -385,6 +393,7 @@ bool Qwen3ASRTranscriber::ExtendFinalPrefill(
   if (final_reuse.recording_start_sample != recording_start_sample) {
     final_reuse.mel.reset();
     final_reuse.audio_rows.reset();
+    final_reuse.frontend_cache.reset();
     trim_to(std::min(head_length, final_reuse.caches[0].offset()));
     final_reuse.recording_start_sample = recording_start_sample;
   } else {
@@ -423,7 +432,12 @@ bool Qwen3ASRTranscriber::ExtendFinalPrefill(
     return false;
   } else {
   }
-  const mx::array mel = PromptMel(recording_samples, options.layout);
+  const omni_common::IncrementalLogMelResult frontend =
+      omni_common::IncrementalLogMel(
+          recording_samples, FinalFrameForLayout(options.layout),
+          final_reuse.frontend_cache.has_value() ? &*final_reuse.frontend_cache
+                                                 : nullptr);
+  const mx::array &mel = frontend.features;
   const int mel_bins = mel.shape(0);
   const auto matches_mel = [&](const std::optional<mx::array> &held_mel) {
     return held_mel.has_value() && held_mel->shape(1) <= mel.shape(1) &&
@@ -444,6 +458,7 @@ bool Qwen3ASRTranscriber::ExtendFinalPrefill(
   const int held_rows =
       final_reuse.audio_rows.has_value() ? final_reuse.audio_rows->shape(0) : 0;
   if (complete_frames <= done_frames) {
+    final_reuse.frontend_cache = frontend.cache;
     return false;
   } else {
   }
@@ -475,6 +490,7 @@ bool Qwen3ASRTranscriber::ExtendFinalPrefill(
           ? mx::concatenate({*final_reuse.audio_rows, new_rows}, 0)
           : new_rows;
   mx::eval(*final_reuse.mel, *final_reuse.audio_rows);
+  final_reuse.frontend_cache = frontend.cache;
   return done_frames + new_frames < complete_frames;
 }
 

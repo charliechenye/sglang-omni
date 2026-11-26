@@ -539,6 +539,20 @@ target_compile_options(audio_chunk_test PRIVATE -Wall -Wextra)
 set_target_properties(audio_chunk_test PROPERTIES
   BUILD_RPATH "${MLX_LIBRARY_DIRS};@loader_path")
 
+add_executable(logmel_incremental_test EXCLUDE_FROM_ALL
+  tests/logmel_incremental_test.cpp)
+target_link_libraries(logmel_incremental_test PRIVATE common)
+target_compile_options(logmel_incremental_test PRIVATE -Wall -Wextra)
+set_target_properties(logmel_incremental_test PROPERTIES
+  BUILD_RPATH "${MLX_LIBRARY_DIRS};@loader_path")
+
+add_executable(logmel_incremental_benchmark EXCLUDE_FROM_ALL
+  tests/logmel_incremental_benchmark.cpp)
+target_link_libraries(logmel_incremental_benchmark PRIVATE common)
+target_compile_options(logmel_incremental_benchmark PRIVATE -Wall -Wextra)
+set_target_properties(logmel_incremental_benchmark PROPERTIES
+  BUILD_RPATH "${MLX_LIBRARY_DIRS};@loader_path")
+
 add_executable(tokenizer_preference_test EXCLUDE_FROM_ALL tests/tokenizer_preference_test.cpp)
 target_link_libraries(tokenizer_preference_test PRIVATE common)
 target_compile_options(tokenizer_preference_test PRIVATE -Wall -Wextra)

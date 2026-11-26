@@ -2,11 +2,13 @@
 #include "common/audio.h"
 
 #include <algorithm>
+#include <cassert>
 #include <cmath>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <stdexcept>
+#include <utility>
 
 namespace omni_common {
 
@@ -108,6 +110,73 @@ std::vector<float> BuildPeriodicHannWindow() {
         (1.0f - std::cos(2.0f * pi * static_cast<float>(n) / denominator));
   }
   return window;
+}
+
+int StftFrameCount(size_t sample_count) {
+  const size_t padded_sample_count =
+      std::max(sample_count, static_cast<size_t>(kFftSize));
+  return 1 + static_cast<int>(padded_sample_count / kHopLength);
+}
+
+int LogMelFrameCount(size_t sample_count, FinalStftFrame final_frame) {
+  const int stft_frame_count = StftFrameCount(sample_count);
+  return final_frame == FinalStftFrame::kDropped ? stft_frame_count - 1
+                                                 : stft_frame_count;
+}
+
+int StableLogMelFrameCount(size_t sample_count, FinalStftFrame final_frame) {
+  if (sample_count < static_cast<size_t>(kFftSize)) {
+    return 0;
+  } else {
+  }
+  // Centered frames are stable once their right half lies within the PCM.
+  const int direct_frame_count =
+      1 + static_cast<int>((sample_count - kFftSize / 2) / kHopLength);
+  return std::min(LogMelFrameCount(sample_count, final_frame),
+                  direct_frame_count);
+}
+
+mx::array ComputePowerSpectrum(const std::vector<float> &samples,
+                               int first_frame, int frame_count) {
+  std::vector<float> padded_samples = samples;
+  if (padded_samples.size() < static_cast<size_t>(kFftSize)) {
+    padded_samples.resize(kFftSize, 0.0f);
+  } else {
+  }
+  const int sample_count = static_cast<int>(padded_samples.size());
+  const mx::array audio(padded_samples.data(), {sample_count}, mx::float32);
+  constexpr int padding = kFftSize / 2;
+  const mx::array head = mx::slice(audio, {padding}, {0}, {-1});
+  const mx::array tail =
+      mx::slice(audio, {sample_count - 2}, {sample_count - padding - 2}, {-1});
+  const mx::array padded = mx::concatenate({head, audio, tail});
+  const int all_frame_count = 1 + (padded.shape(0) - kFftSize) / kHopLength;
+  assert(first_frame >= 0 && frame_count >= 0 &&
+         first_frame + frame_count <= all_frame_count);
+  mx::array frames =
+      mx::as_strided(padded, {all_frame_count, kFftSize}, {kHopLength, 1}, 0);
+  if (first_frame != 0 || frame_count != all_frame_count) {
+    frames = mx::slice(frames, {first_frame, 0},
+                       {first_frame + frame_count, kFftSize});
+  } else {
+  }
+  const mx::array window(PeriodicHannWindow().data(), {kFftSize}, mx::float32);
+  return mx::square(mx::abs(mx::fft::rfft(mx::multiply(frames, window), 1)));
+}
+
+mx::array ProjectLogMelSpectrum(const mx::array &power_spectrum) {
+  const mx::array filters(MelFilterBank().data(),
+                          {kFftSize / 2 + 1, kMelBinCount}, mx::float32);
+  return mx::log10(mx::maximum(mx::matmul(power_spectrum, filters),
+                               mx::array(kLogMelFloor)));
+}
+
+mx::array NormalizeLogMelSpectrum(const mx::array &raw_log_spectrum) {
+  const mx::array clipped_log_spectrum = mx::maximum(
+      raw_log_spectrum,
+      mx::subtract(mx::max(raw_log_spectrum), mx::array(kLogMelDynamicRange)));
+  return mx::transpose(mx::divide(
+      mx::add(clipped_log_spectrum, mx::array(4.0f)), mx::array(4.0f)));
 }
 
 } // namespace
@@ -234,39 +303,95 @@ const std::vector<float> &PeriodicHannWindow() {
 
 mx::array LogMel(const std::vector<float> &samples,
                  FinalStftFrame final_frame) {
-  std::vector<float> padded_samples = samples;
-  if (padded_samples.size() < static_cast<size_t>(kFftSize)) {
-    // Note (Jiaxin Deng): reflect padding needs more than half a window, so a
-    // tail this short (a realtime cut) is zero-filled to one window.
-    padded_samples.resize(kFftSize, 0.0f);
-  } else {
-  }
-  const int sample_count = static_cast<int>(padded_samples.size());
-  const mx::array audio(padded_samples.data(), {sample_count}, mx::float32);
-  constexpr int padding = kFftSize / 2;
-  const mx::array head = mx::slice(audio, {padding}, {0}, {-1});
-  const mx::array tail =
-      mx::slice(audio, {sample_count - 2}, {sample_count - padding - 2}, {-1});
-  const mx::array padded = mx::concatenate({head, audio, tail});
-  const int frame_count = 1 + (padded.shape(0) - kFftSize) / kHopLength;
-  const mx::array frames =
-      mx::as_strided(padded, {frame_count, kFftSize}, {kHopLength, 1}, 0);
-  const mx::array window(PeriodicHannWindow().data(), {kFftSize}, mx::float32);
-  mx::array power =
-      mx::square(mx::abs(mx::fft::rfft(mx::multiply(frames, window), 1)));
+  const int stft_frame_count = StftFrameCount(samples.size());
+  mx::array power_spectrum = ComputePowerSpectrum(samples, 0, stft_frame_count);
   if (final_frame == FinalStftFrame::kDropped) {
-    power = mx::slice(power, {0, 0}, {power.shape(0) - 1, power.shape(1)});
+    power_spectrum =
+        mx::slice(power_spectrum, {0, 0},
+                  {power_spectrum.shape(0) - 1, power_spectrum.shape(1)});
   } else {
   }
-  const mx::array filters(MelFilterBank().data(),
-                          {kFftSize / 2 + 1, kMelBinCount}, mx::float32);
-  mx::array log_spectrum = mx::log10(
-      mx::maximum(mx::matmul(power, filters), mx::array(kLogMelFloor)));
-  log_spectrum =
-      mx::maximum(log_spectrum, mx::subtract(mx::max(log_spectrum),
-                                             mx::array(kLogMelDynamicRange)));
-  return mx::transpose(
-      mx::divide(mx::add(log_spectrum, mx::array(4.0f)), mx::array(4.0f)));
+  return NormalizeLogMelSpectrum(ProjectLogMelSpectrum(power_spectrum));
+}
+
+IncrementalLogMelResult
+IncrementalLogMel(const std::vector<float> &samples, FinalStftFrame final_frame,
+                  const IncrementalLogMelCache *previous) {
+  const int output_frame_count = LogMelFrameCount(samples.size(), final_frame);
+  const int all_stft_frame_count = StftFrameCount(samples.size());
+  bool has_compatible_prefix =
+      previous != nullptr && previous->pcm_samples != nullptr &&
+      previous->power_spectrum.has_value() &&
+      previous->final_frame == final_frame &&
+      previous->pcm_samples->size() <= samples.size() &&
+      previous->power_spectrum->shape(0) ==
+          LogMelFrameCount(previous->pcm_samples->size(), final_frame) &&
+      previous->normalized_features.has_value() &&
+      previous->normalized_features->shape(0) == kMelBinCount &&
+      previous->normalized_features->shape(1) ==
+          previous->power_spectrum->shape(0) &&
+      previous->stable_frame_count >= 0 &&
+      previous->stable_frame_count <= previous->power_spectrum->shape(0) &&
+      previous->stable_frame_count <= output_frame_count &&
+      previous->power_spectrum->shape(1) == kFftSize / 2 + 1;
+  if (has_compatible_prefix) {
+    has_compatible_prefix =
+        previous->power_spectrum->dtype() == mx::float32 &&
+        previous->normalized_features->dtype() == mx::float32;
+  } else {
+  }
+  if (has_compatible_prefix) {
+    has_compatible_prefix =
+        std::equal(previous->pcm_samples->begin(), previous->pcm_samples->end(),
+                   samples.begin());
+  } else {
+  }
+  const bool is_same_snapshot =
+      has_compatible_prefix && previous->pcm_samples->size() == samples.size();
+  int computed_frame_count = 0;
+  mx::array power_spectrum(0.0f);
+  std::shared_ptr<const std::vector<float>> pcm_snapshot;
+  if (is_same_snapshot) {
+    power_spectrum = *previous->power_spectrum;
+    pcm_snapshot = previous->pcm_samples;
+  } else if (has_compatible_prefix) {
+    const int first_new_frame = previous->stable_frame_count;
+    const int new_frame_count = output_frame_count - first_new_frame;
+    if (new_frame_count == 0) {
+      power_spectrum = *previous->power_spectrum;
+    } else {
+      const mx::array new_power_spectrum =
+          ComputePowerSpectrum(samples, first_new_frame, new_frame_count);
+      power_spectrum =
+          first_new_frame > 0
+              ? mx::concatenate({mx::slice(*previous->power_spectrum, {0, 0},
+                                           {first_new_frame, kFftSize / 2 + 1}),
+                                 new_power_spectrum},
+                                0)
+              : new_power_spectrum;
+      computed_frame_count = new_frame_count;
+    }
+    pcm_snapshot = std::make_shared<const std::vector<float>>(samples);
+  } else {
+    power_spectrum = ComputePowerSpectrum(samples, 0, all_stft_frame_count);
+    if (final_frame == FinalStftFrame::kDropped) {
+      power_spectrum =
+          mx::slice(power_spectrum, {0, 0},
+                    {power_spectrum.shape(0) - 1, power_spectrum.shape(1)});
+    } else {
+    }
+    computed_frame_count = all_stft_frame_count;
+    pcm_snapshot = std::make_shared<const std::vector<float>>(samples);
+  }
+  IncrementalLogMelCache cache{
+      pcm_snapshot, power_spectrum, std::nullopt, final_frame,
+      StableLogMelFrameCount(samples.size(), final_frame)};
+  mx::array features =
+      is_same_snapshot
+          ? *previous->normalized_features
+          : NormalizeLogMelSpectrum(ProjectLogMelSpectrum(power_spectrum));
+  cache.normalized_features = features;
+  return {std::move(features), std::move(cache), computed_frame_count};
 }
 
 mx::array WhisperWindowFeatures(const float *samples, int sample_count,
