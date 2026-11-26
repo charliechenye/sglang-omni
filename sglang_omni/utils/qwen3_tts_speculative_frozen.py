@@ -286,7 +286,10 @@ def load_frozen_predictor_artifacts(
             raise ValueError("sampling tensors do not match the frozen frame schema")
         elif len(records) != frame_count:
             raise ValueError(f"record count does not match tensors in {shard_path}")
-        elif any(tuple(tensor.shape) != (frame_count,) for tensor in sampling.values()):
+        elif any(
+            tuple(tensor.shape) not in ((frame_count,), (frame_count, 1))
+            for tensor in sampling.values()
+        ):
             raise ValueError(
                 f"sampling tensors have invalid row counts in {shard_path}"
             )
@@ -324,7 +327,8 @@ def load_frozen_predictor_artifacts(
                 raw_frame.get("sampling"), f"{frame_path}.sampling"
             )
             row_sampling = {
-                name: tensor[row_index].clone() for name, tensor in sampling.items()
+                name: tensor[row_index].reshape(()).clone()
+                for name, tensor in sampling.items()
             }
             if set(raw_sampling) != set(SAMPLING_TENSOR_NAMES):
                 raise ValueError(f"captured sampling fields do not match: {frame_path}")
