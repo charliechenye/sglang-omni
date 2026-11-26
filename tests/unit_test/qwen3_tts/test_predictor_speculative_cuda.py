@@ -306,8 +306,8 @@ def test_opening_pair_graph_propagates_fatal_cuda_capture_error(
         )
         workspace = talker.ensure_code_predictor_speculative_workspace()
         signature = ("sampled", 4, False, False, False)
-        monkeypatch.setattr(
-            talker,
+        monkeypatch.setitem(
+            talker.__dict__,
             "predictor_graph_signature",
             lambda batch_size, semantic_positions: signature,
         )
@@ -316,8 +316,8 @@ def test_opening_pair_graph_propagates_fatal_cuda_capture_error(
             "get_device_graph_backend",
             lambda graph_device: object(),
         )
-        monkeypatch.setattr(
-            talker,
+        monkeypatch.setitem(
+            talker.__dict__,
             "execute_speculative_opening_pair",
             lambda *args: None,
         )
@@ -325,7 +325,9 @@ def test_opening_pair_graph_propagates_fatal_cuda_capture_error(
         def fatal_capture(*args, **kwargs):
             raise RuntimeError("CUDA error 719: unspecified launch failure")
 
-        monkeypatch.setattr(talker, "capture_code_predictor_spec_graph", fatal_capture)
+        monkeypatch.setitem(
+            talker.__dict__, "capture_code_predictor_spec_graph", fatal_capture
+        )
         layer0_codes = torch.zeros((1, 1), device=device, dtype=torch.long)
         talker_hidden = torch.zeros(
             (1, 1, TALKER_HIDDEN_SIZE), device=device, dtype=DTYPE

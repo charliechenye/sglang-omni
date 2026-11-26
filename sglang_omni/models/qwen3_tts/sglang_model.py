@@ -96,6 +96,7 @@ from sglang_omni.models.qwen3_tts.speculative_rng import (
     speculative_uniforms_frame_pool,
 )
 from sglang_omni.models.qwen3_tts.speculative_runtime import (
+    speculative_opening_code_output_view,
     speculative_sampling_fallback_reason,
 )
 from sglang_omni.models.qwen3_tts.speculative_workspace import (
@@ -2425,7 +2426,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         """Run opening pair, codebook-1 sampling, and initial round staging."""
         batch_size = int(layer0_codes.shape[0])
         predictor_dtype = self.predictor_k_cache.dtype
-        code_outputs = self.output_codes[:batch_size].unsqueeze(-1)
+        code_outputs = speculative_opening_code_output_view(
+            self.output_codes, batch_size
+        )
         summed_embeddings = self.output_embeds[:batch_size].unsqueeze(1)
         summed_embeddings.zero_()
         layer0_embed = self.get_input_embeddings()(layer0_codes).to(

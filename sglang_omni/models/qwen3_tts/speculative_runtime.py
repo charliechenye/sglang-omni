@@ -10,6 +10,13 @@ from sglang_omni.models.qwen3_tts.speculative_acceptance import (
 )
 
 
+def speculative_opening_code_output_view(
+    output_codes: torch.Tensor, batch_size: int
+) -> torch.Tensor:
+    """Return the 2D persistent code output slice used by opening-pair copies."""
+    return output_codes[:batch_size]
+
+
 def speculative_sampling_fallback_reason(
     request_ids: tuple[str, ...],
     explicit_seed_rows: tuple[bool, ...],

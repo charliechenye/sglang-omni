@@ -15,6 +15,7 @@ from sglang_omni.models.qwen3_tts.speculative_runtime import (
     accept_speculative_candidates,
     expand_compact_probability_rows,
     sample_compact_probability_rows,
+    speculative_opening_code_output_view,
     speculative_sampling_fallback_reason,
 )
 from sglang_omni.models.qwen3_tts.speculative_workspace import (
@@ -47,6 +48,29 @@ def one_hot(token: int, vocab_size: int) -> torch.Tensor:
     probabilities = torch.zeros(vocab_size, dtype=torch.float64)
     probabilities[token] = 1.0
     return probabilities
+
+
+@pytest.mark.parametrize("batch_size", [1, 2])
+def test_opening_pair_code_output_view_supports_batched_copies(
+    batch_size: int,
+) -> None:
+    output_codes = torch.full((batch_size, 16), -1, dtype=torch.long)
+    layer0_codes = torch.arange(10, 10 + batch_size, dtype=torch.long).unsqueeze(1)
+    layer1_codes = torch.arange(30, 30 + batch_size, dtype=torch.long)
+    pending_tokens = torch.full((batch_size,), -1, dtype=torch.long)
+
+    code_outputs = speculative_opening_code_output_view(output_codes, batch_size)
+    code_outputs[:, 0].copy_(layer0_codes[:, 0])
+    code_outputs[:, 1].copy_(layer1_codes)
+    pending_tokens.copy_(code_outputs[:, 1])
+
+    assert code_outputs.shape == (batch_size, 16)
+    assert code_outputs[:, 0].shape == (batch_size,)
+    assert code_outputs[:, 1].shape == (batch_size,)
+    assert pending_tokens.shape == (batch_size,)
+    torch.testing.assert_close(code_outputs[:, 0], layer0_codes[:, 0])
+    torch.testing.assert_close(code_outputs[:, 1], layer1_codes)
+    torch.testing.assert_close(pending_tokens, layer1_codes)
 
 
 def test_target_logits_observation_preserves_complete_vocabulary_vector() -> None:
