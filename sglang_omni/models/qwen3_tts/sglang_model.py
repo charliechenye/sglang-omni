@@ -1796,6 +1796,14 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         else:
             pass
         self.decode_prep_rids = rids
+        if (
+            self.code_predictor_spec_requested_width <= 0
+            or self.code_predictor_spec_effective_width <= 0
+        ):
+            return
+        else:
+            pass
+
         sampling_fallback = speculative_sampling_fallback_reason(
             self.sub_request_ids,
             self.sub_user_seed_rows,
