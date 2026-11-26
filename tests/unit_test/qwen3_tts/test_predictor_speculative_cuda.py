@@ -26,6 +26,7 @@ from sglang_omni.models.qwen3_tts.sglang_model import (
 from sglang_omni.models.qwen3_tts.speculative_acceptance import (
     SpeculativeAcceptanceBatch,
     accept_speculative_candidates_compact,
+    accept_speculative_candidates_dense_indexed,
     sample_compact_probability_rows_fused,
 )
 from sglang_omni.models.qwen3_tts.speculative_commit import (
@@ -286,6 +287,57 @@ def configure_unseeded_request(talker: Qwen3TTSTalker, batch_size: int = 1) -> N
     talker.sub_sampled_has_top_p = False
     talker.sub_sampled_max_top_k = 4
     talker.sub_sampled_has_unbounded_top_k = False
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_opening_pair_graph_propagates_fatal_cuda_capture_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configure_runtime_context(monkeypatch)
+    with get_context().override_server_args(max_running_requests=1):
+        device = torch.device("cuda")
+        talker = build_speculative_talker(device)
+        configure_unseeded_request(talker)
+        talker.configure_code_predictor_speculation(
+            4,
+            backend="eager",
+            opening_pair_graph=True,
+        )
+        workspace = talker.ensure_code_predictor_speculative_workspace()
+        signature = ("sampled", 4, False, False, False)
+        monkeypatch.setattr(
+            talker,
+            "predictor_graph_signature",
+            lambda batch_size, semantic_positions: signature,
+        )
+        monkeypatch.setattr(
+            sglang_model_module.current_platform,
+            "get_device_graph_backend",
+            lambda graph_device: object(),
+        )
+        monkeypatch.setattr(
+            talker,
+            "execute_speculative_opening_pair",
+            lambda *args: None,
+        )
+
+        def fatal_capture(*args, **kwargs):
+            raise RuntimeError("CUDA error 719: unspecified launch failure")
+
+        monkeypatch.setattr(talker, "capture_code_predictor_spec_graph", fatal_capture)
+        layer0_codes = torch.zeros((1, 1), device=device, dtype=torch.long)
+        talker_hidden = torch.zeros(
+            (1, 1, TALKER_HIDDEN_SIZE), device=device, dtype=DTYPE
+        )
+        semantic_positions = torch.zeros((1,), device=device, dtype=torch.long)
+
+        with pytest.raises(RuntimeError, match="unspecified launch failure"):
+            talker.try_replay_speculative_opening_graph(
+                layer0_codes, talker_hidden, semantic_positions, workspace
+            )
+
+    assert talker.code_predictor_spec_opening_graph_capture_failure_count == 1
 
 
 def verify_complete_frame(
@@ -788,7 +840,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
             else:
                 assert logits.shape[0] % batch_size == 0
                 assert logits.shape[0] > 0
-                controlled_probabilities = probabilities.clone()
+                controlled_probabilities = probabilities
                 controlled_probabilities[active_rows] = 0.0
                 controlled_probabilities[active_rows, 0] = 1.0
                 assert not bool((controlled_probabilities[~active_rows] != 0.0).any())

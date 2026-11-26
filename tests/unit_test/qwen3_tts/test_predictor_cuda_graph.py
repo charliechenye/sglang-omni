@@ -1168,12 +1168,16 @@ def test_a_declared_disable_also_drops_the_reference_encoder_buckets(
             probability_backend: str,
             lm_head_backend: str,
             rng_backend: str,
+            acceptance_backend: str,
+            opening_pair_graph: bool,
         ) -> None:
             assert requested_width == 0
             assert backend == "cuda_graph"
             assert probability_backend == "split_top_k"
             assert lm_head_backend == "grouped_triton"
             assert rng_backend == "per_round"
+            assert acceptance_backend == "compact"
+            assert opening_pair_graph is False
 
         def load_speech_tokenizer(self, tokenizer) -> None:
             del tokenizer

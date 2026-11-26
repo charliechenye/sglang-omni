@@ -21,6 +21,10 @@ from sglang_omni.models.qwen3_tts.speculative_workspace import (
 from sglang_omni.utils.qwen3_tts_speculative_frozen import FrozenPredictorFrame
 from sglang_omni.utils.qwen3_tts_speculative_native_replay import (
     NativePredictorReference,
+    capture_teacher_forced_predictor_reference,
+)
+from sglang_omni.utils.qwen3_tts_speculative_observation_checks import (
+    target_logits_vector_for_query,
 )
 
 
@@ -57,12 +61,11 @@ class SpeculativeRoundObservation:
 
 def compare_probability_row(
     talker: Qwen3TTSTalker,
-    frame: FrozenPredictorFrame,
     observation: SpeculativeRoundObservation,
     *,
     batch_row: int,
     query_offset: int,
-    head_index: int,
+    expected_logits: torch.Tensor,
 ) -> None:
     row_index = batch_row * observation.verify_width + query_offset
     temperature = talker.sub_temperature_tensor[batch_row : batch_row + 1]
@@ -70,7 +73,7 @@ def compare_probability_row(
     top_p = talker.sub_top_p_tensor[batch_row : batch_row + 1]
     active = torch.ones(1, device=talker.predictor_device, dtype=torch.bool)
     expected = build_speculative_probability_candidates(
-        frame.logits[head_index].reshape(1, -1).to(device=talker.predictor_device),
+        expected_logits.reshape(1, -1).to(device=talker.predictor_device),
         temperature,
         top_k,
         top_p,
@@ -112,90 +115,112 @@ def validate_speculative_observations(
     target_probability_checks = 0
     carried_hidden_checks = 0
     kv_prefix_checks = 0
-    for observation in observations:
+    for round_index, observation in enumerate(observations):
+        start_depth = observation.starting_depth
+        if not torch.equal(
+            observation.output_codes[0, 0].cpu(), reference.codes[0].cpu()
+        ):
+            raise AssertionError("speculative round changed the conditioned code")
+        else:
+            pass
+        valid_head_indices = observation.head_indices[0][observation.valid_queries[0]]
+        if valid_head_indices.numel() == 0:
+            raise AssertionError("speculative round has no valid target queries")
+        else:
+            pass
+        max_depth = int(valid_head_indices.max().item())
+        code_tokens = torch.full(
+            (max_depth + 1,),
+            -1,
+            device=talker.predictor_device,
+            dtype=torch.long,
+        )
+        if start_depth > 0:
+            code_tokens[1 : start_depth + 1] = observation.output_codes[
+                0, 1 : start_depth + 1
+            ].to(device=talker.predictor_device, dtype=torch.long)
+        else:
+            pass
+        for depth in range(start_depth + 1, max_depth + 1):
+            draft_offset = depth - start_depth - 1
+            if draft_offset >= observation.draft_tokens.shape[1]:
+                raise AssertionError("teacher-forced draft trajectory is truncated")
+            else:
+                pass
+            code_tokens[depth] = observation.draft_tokens[0, draft_offset].to(
+                device=talker.predictor_device, dtype=torch.long
+            )
+        else:
+            pass
+        teacher = capture_teacher_forced_predictor_reference(
+            talker,
+            frame,
+            code_tokens=code_tokens,
+            max_depth=max_depth,
+            request_id=f"teacher-forced-{frame.ordinal}-{round_index}",
+        )
         for query_offset in range(observation.verify_width):
             if not bool(observation.valid_queries[0, query_offset]):
                 continue
             else:
                 pass
-            start_depth = observation.starting_depth
             head_index = int(observation.head_indices[0, query_offset].item())
-            context_matches = torch.equal(
-                observation.output_codes[0, 1 : start_depth + 1].cpu(),
-                reference.codes[1 : start_depth + 1].cpu(),
+            if head_index != start_depth + query_offset:
+                raise AssertionError("target query head index is not contiguous")
+            else:
+                pass
+            expected_logits = teacher.logits_by_depth.get(head_index)
+            if expected_logits is None:
+                raise AssertionError("teacher-forced replay omitted a target head")
+            else:
+                pass
+            observed_logits = target_logits_vector_for_query(
+                observation.logits, query_offset
             )
-            if context_matches and query_offset > 0:
-                context_matches = torch.equal(
-                    observation.draft_tokens[0, :query_offset].cpu(),
-                    reference.codes[
-                        start_depth + 1 : start_depth + query_offset + 1
-                    ].cpu(),
-                )
-            else:
-                pass
-            if context_matches:
-                torch.testing.assert_close(
-                    observation.logits[0, query_offset].cpu(),
-                    reference.logits[head_index].cpu(),
-                    atol=2e-2,
-                    rtol=2e-2,
-                )
-                target_logit_checks += 1
-                compare_probability_row(
-                    talker,
-                    frame,
-                    observation,
-                    batch_row=0,
-                    query_offset=query_offset,
-                    head_index=head_index,
-                )
-                target_probability_checks += 1
-            else:
-                pass
+            torch.testing.assert_close(
+                observed_logits.cpu(), expected_logits.cpu(), atol=2e-2, rtol=2e-2
+            )
+            target_logit_checks += 1
+            compare_probability_row(
+                talker,
+                observation,
+                batch_row=0,
+                query_offset=query_offset,
+                expected_logits=expected_logits,
+            )
+            target_probability_checks += 1
 
-        accepted_context_matches = torch.equal(
-            observation.output_codes[0, 1 : observation.starting_depth + 1].cpu(),
-            reference.codes[1 : observation.starting_depth + 1].cpu(),
-        )
-        if observation.accepted_count > 0:
-            accepted_context_matches = accepted_context_matches and torch.equal(
-                observation.draft_tokens[0, : observation.accepted_count].cpu(),
-                reference.codes[
-                    observation.starting_depth
-                    + 1 : observation.starting_depth
-                    + observation.accepted_count
-                    + 1
-                ].cpu(),
-            )
-        else:
-            pass
         hidden_index = observation.ending_depth - 1
-        if accepted_context_matches and hidden_index < reference.hidden.shape[0]:
-            torch.testing.assert_close(
-                observation.preceding_hidden.cpu(),
-                reference.hidden[hidden_index].cpu(),
-                atol=2e-2,
-                rtol=2e-2,
-            )
-            carried_hidden_checks += 1
-            expected_length = observation.logical_kv_length
-            expected_keys = reference.keys_by_length.get(expected_length)
-            expected_values = reference.values_by_length.get(expected_length)
-            if expected_keys is None or expected_values is None:
-                raise AssertionError(
-                    "native replay lacks the committed valid KV prefix"
-                )
-            else:
-                pass
-            torch.testing.assert_close(
-                observation.keys, expected_keys, atol=2e-2, rtol=2e-2
-            )
-            torch.testing.assert_close(
-                observation.values, expected_values, atol=2e-2, rtol=2e-2
-            )
-            kv_prefix_checks += 1
+        expected_hidden = teacher.hidden_by_depth.get(hidden_index)
+        if expected_hidden is None:
+            raise AssertionError("teacher-forced replay omitted the carried hidden")
         else:
             pass
+        torch.testing.assert_close(
+            observation.preceding_hidden.cpu(),
+            expected_hidden.cpu(),
+            atol=2e-2,
+            rtol=2e-2,
+        )
+        carried_hidden_checks += 1
+        expected_length = observation.logical_kv_length
+        if expected_length != observation.ending_depth + 1:
+            raise AssertionError("logical KV length does not match committed depth")
+        else:
+            pass
+        expected_keys = teacher.keys_by_length.get(expected_length)
+        expected_values = teacher.values_by_length.get(expected_length)
+        if expected_keys is None or expected_values is None:
+            raise AssertionError("teacher replay lacks the committed valid KV prefix")
+        else:
+            pass
+        torch.testing.assert_close(
+            observation.keys, expected_keys, atol=2e-2, rtol=2e-2
+        )
+        torch.testing.assert_close(
+            observation.values, expected_values, atol=2e-2, rtol=2e-2
+        )
+        kv_prefix_checks += 1
     return (
         target_logit_checks,
         target_probability_checks,

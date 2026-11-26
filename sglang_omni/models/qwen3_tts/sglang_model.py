@@ -75,6 +75,7 @@ from sglang_omni.models.qwen3_tts.speaker_encoder_cuda_graph import (
     Qwen3TTSSpeakerEncoderCudaGraphRunner,
 )
 from sglang_omni.models.qwen3_tts.speculative_acceptance import (
+    SpeculativeAcceptanceBatch,
     accept_speculative_candidates_compact,
     accept_speculative_candidates_dense_indexed,
     sample_compact_probability_rows_fused,
@@ -2544,9 +2545,13 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                             run_once, graph_pool=graph_pool
                         )
                     )
-            except Exception:
+            except Exception as error:
                 self.code_predictor_spec_opening_graph_disabled.add(key)
                 self.code_predictor_spec_opening_graph_capture_failure_count += 1
+                if is_fatal_cuda_capture_error(error):
+                    raise
+                else:
+                    pass
                 logger.warning(
                     "Disabling CodePredictor opening-pair graph for key=%s",
                     key,
@@ -2599,6 +2604,8 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             pass
         num_groups = int(self.config.num_code_groups)
         vocab_size = int(self.config.code_predictor_config.vocab_size)
+        codec_tables = self.code_predictor.model.codec_embedding.weight
+        projected_tables = self.predictor_projected_embeddings
         predictor_dtype = self.predictor_k_cache.dtype
         semantic_positions = self.normalize_semantic_positions(
             semantic_positions,

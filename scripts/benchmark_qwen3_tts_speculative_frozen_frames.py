@@ -24,6 +24,7 @@ from sglang_omni.utils.qwen3_tts_speculative_frame_observation import (
     validate_speculative_observations,
 )
 from sglang_omni.utils.qwen3_tts_speculative_frame_runner import (
+    PredictorFrameTiming,
     assert_checkpoint_lm_heads,
     assert_codec_embedding_sum,
     median_frame_latency_ms,
@@ -62,9 +63,20 @@ class FrozenFrameBenchmarkResult(TypedDict):
     rng_backend: RNGBackend
     acceptance_backend: AcceptanceBackend
     opening_pair_graph_requested: bool
-    correctness_preflight: dict[str, int]
-    frame_latency_median_ms: float
-    frame_latency_p95_ms: float
+    correctness_preflight: dict[str, int | float]
+    predictor_only_latency_median_ms: float
+    predictor_only_latency_p95_ms: float
+    request_preparation_host_median_ms: float
+    request_preparation_cuda_median_ms: float
+    cache_reset_host_median_ms: float
+    cache_reset_cuda_median_ms: float
+    input_transfer_host_median_ms: float
+    input_transfer_cuda_median_ms: float
+    staging_synchronization_median_ms: float
+    predictor_host_call_median_ms: float
+    predictor_completion_wait_median_ms: float
+    output_clone_median_ms: float
+    output_clone_synchronization_median_ms: float
     measured_frames: int
     warmup_frames: int
     speculative_stats: PredictorSpeculativeStats
@@ -171,9 +183,9 @@ def run_correctness_preflight(
     carried_hidden_checks = 0
     valid_kv_prefix_checks = 0
     for frame_index, frame in enumerate(artifacts.frames):
-        request_id = f"frozen-{arm}-{frame_index}-{frame.ordinal}"
+        request_id = f"frozen-frame-{frame_index}-{frame.ordinal}"
         reference = capture_native_predictor_reference(
-            talker, frame, request_id=f"native-reference-{request_id}"
+            talker, frame, request_id=request_id
         )
         compare_native_reference(frame, reference)
         if frame_index == 0:
@@ -187,6 +199,15 @@ def run_correctness_preflight(
             speculate=speculative,
         )
         check_speculative_output(talker, codes, summed_embedding)
+        if arm == "native_graph":
+            torch.testing.assert_close(
+                codes.cpu(), reference.codes.cpu(), atol=0, rtol=0
+            )
+            torch.testing.assert_close(
+                summed_embedding.cpu(), reference.summed_embedding.cpu(), atol=0, rtol=0
+            )
+        else:
+            pass
         if speculative:
             checks = validate_speculative_observations(
                 talker, frame, reference, observations
@@ -205,6 +226,24 @@ def run_correctness_preflight(
         pass
 
     stats = talker.predictor_speculative_stats()
+    native_graph_stats = talker.predictor_graph_stats()
+    if arm == "native_graph":
+        if native_graph_stats["enabled"] is not True:
+            raise AssertionError("native Predictor CUDA Graph was not enabled")
+        elif native_graph_stats["replays"] != len(artifacts.frames):
+            raise AssertionError("native Predictor did not replay once per frame")
+        elif native_graph_stats["eager_runs"] != 0:
+            raise AssertionError("native Predictor graph preflight used eager runs")
+        elif native_graph_stats["capacity_fallbacks"] != 0:
+            raise AssertionError(
+                "native Predictor graph preflight hit capacity fallback"
+            )
+        elif native_graph_stats["capture_failures"] != 0:
+            raise AssertionError("native Predictor graph capture failed")
+        else:
+            pass
+    else:
+        pass
     if speculative and stats["frames"] != len(artifacts.frames):
         raise AssertionError("speculative frame preflight fell back to native decode")
     elif speculative and stats["native_fallback_count"] != 0:
@@ -229,7 +268,10 @@ def run_correctness_preflight(
         elif arm == "spec_full_round_graph":
             if stats["full_round_graph_replay_coverage"] != 1.0:
                 raise AssertionError("full-round preflight had eager round fallback")
-            elif stats["opening_pair_graph_replay_coverage"] != 1.0:
+            elif (
+                talker.code_predictor_spec_opening_pair_graph_enabled
+                and stats["opening_pair_graph_replay_coverage"] != 1.0
+            ):
                 raise AssertionError(
                     "opening-pair graph did not replay for every frame"
                 )
@@ -245,6 +287,10 @@ def run_correctness_preflight(
         "target_probability_support_checks": probability_checks,
         "carried_hidden_checks": carried_hidden_checks,
         "valid_kv_prefix_checks": valid_kv_prefix_checks,
+        "native_graph_replays": (
+            native_graph_stats["replays"] if arm == "native_graph" else 0
+        ),
+        "native_graph_replay_coverage": 1.0 if arm == "native_graph" else 0.0,
     }
 
 
@@ -254,36 +300,32 @@ def run_timed_pass(
     *,
     arm: PredictorArm,
     warmup_frames: int,
-) -> list[float]:
+) -> list[PredictorFrameTiming]:
     speculative = arm.startswith("spec_")
     for frame_index in range(warmup_frames):
         frame = artifacts.frames[frame_index % len(artifacts.frames)]
         run_predictor_frame(
             talker,
             frame,
-            request_id=f"timed-warmup-{arm}-{frame_index}-{frame.ordinal}",
+            request_id=f"frozen-warmup-{frame_index}-{frame.ordinal}",
             speculate=speculative,
             trace_rounds=False,
         )
     else:
         pass
-    torch.cuda.synchronize()
-    latencies: list[float] = []
+    torch.cuda.synchronize(talker.predictor_device)
+    timings: list[PredictorFrameTiming] = []
     for frame_index, frame in enumerate(artifacts.frames):
-        latencies.append(
+        timings.append(
             timed_predictor_frame(
-                lambda current_frame=frame, current_index=frame_index: run_predictor_frame(
-                    talker,
-                    current_frame,
-                    request_id=(f"timed-{arm}-{current_index}-{current_frame.ordinal}"),
-                    speculate=speculative,
-                    trace_rounds=False,
-                )
+                talker,
+                frame,
+                request_id=f"frozen-frame-{frame_index}-{frame.ordinal}",
             )
         )
     else:
         pass
-    return latencies
+    return timings
 
 
 def run_benchmark(
@@ -328,10 +370,11 @@ def run_benchmark(
         latencies = run_timed_pass(
             talker, artifacts, arm=arm, warmup_frames=warmup_frames
         )
+        predictor_only = [timing.predictor_only_ms for timing in latencies]
         stats = talker.predictor_speculative_stats()
         graph_stats = talker.predictor_graph_stats()
         return {
-            "schema": "qwen3-tts-speculative-frozen-frame-benchmark-v1",
+            "schema": "qwen3-tts-speculative-frozen-frame-benchmark-v2",
             "arm": arm,
             "model_path": model_path,
             "model_snapshot": artifacts.model_snapshot,
@@ -345,11 +388,44 @@ def run_benchmark(
             "acceptance_backend": acceptance_backend,
             "opening_pair_graph_requested": opening_pair_graph,
             "correctness_preflight": preflight,
-            "frame_latency_median_ms": median_frame_latency_ms(latencies),
-            "frame_latency_p95_ms": (
-                statistics.quantiles(latencies, n=20)[18]
-                if len(latencies) >= 2
-                else latencies[0]
+            "predictor_only_latency_median_ms": median_frame_latency_ms(predictor_only),
+            "predictor_only_latency_p95_ms": (
+                statistics.quantiles(predictor_only, n=20)[18]
+                if len(predictor_only) >= 2
+                else predictor_only[0]
+            ),
+            "request_preparation_host_median_ms": median_frame_latency_ms(
+                [timing.request_preparation_host_ms for timing in latencies]
+            ),
+            "request_preparation_cuda_median_ms": median_frame_latency_ms(
+                [timing.request_preparation_cuda_ms for timing in latencies]
+            ),
+            "cache_reset_host_median_ms": median_frame_latency_ms(
+                [timing.cache_reset_host_ms for timing in latencies]
+            ),
+            "cache_reset_cuda_median_ms": median_frame_latency_ms(
+                [timing.cache_reset_cuda_ms for timing in latencies]
+            ),
+            "input_transfer_host_median_ms": median_frame_latency_ms(
+                [timing.input_transfer_host_ms for timing in latencies]
+            ),
+            "input_transfer_cuda_median_ms": median_frame_latency_ms(
+                [timing.input_transfer_cuda_ms for timing in latencies]
+            ),
+            "staging_synchronization_median_ms": median_frame_latency_ms(
+                [timing.staging_synchronization_ms for timing in latencies]
+            ),
+            "predictor_host_call_median_ms": median_frame_latency_ms(
+                [timing.predictor_host_call_ms for timing in latencies]
+            ),
+            "predictor_completion_wait_median_ms": median_frame_latency_ms(
+                [timing.predictor_completion_wait_ms for timing in latencies]
+            ),
+            "output_clone_median_ms": median_frame_latency_ms(
+                [timing.output_clone_ms for timing in latencies]
+            ),
+            "output_clone_synchronization_median_ms": median_frame_latency_ms(
+                [timing.output_clone_synchronization_ms for timing in latencies]
             ),
             "measured_frames": len(latencies),
             "warmup_frames": warmup_frames,

@@ -38,12 +38,24 @@ from sglang_omni.utils.predictor_speculation import (
 from sglang_omni.utils.qwen3_tts_speculative_benchmark import (
     classify_speculative_graph_execution_coverage,
 )
+from sglang_omni.utils.qwen3_tts_speculative_observation_checks import (
+    target_logits_vector_for_query,
+)
 
 
 def one_hot(token: int, vocab_size: int) -> torch.Tensor:
     probabilities = torch.zeros(vocab_size, dtype=torch.float64)
     probabilities[token] = 1.0
     return probabilities
+
+
+def test_target_logits_observation_preserves_complete_vocabulary_vector() -> None:
+    logits_by_query = torch.arange(3 * 257, dtype=torch.float32).reshape(3, 257)
+
+    observed_vector = target_logits_vector_for_query(logits_by_query, 1)
+
+    assert observed_vector.shape == (257,)
+    torch.testing.assert_close(observed_vector, logits_by_query[1], atol=0, rtol=0)
 
 
 def test_cpu_grouped_lm_head_selects_rows_and_masks_padding() -> None:

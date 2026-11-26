@@ -11,6 +11,7 @@ from sglang_omni.models.qwen3_tts.sampling_kernels import (
     fused_raw_logit_block_k,
 )
 from sglang_omni.models.qwen3_tts.speculative_acceptance import (
+    SpeculativeAcceptanceBatch,
     accept_speculative_candidates_compact,
     accept_speculative_candidates_dense_indexed,
     sample_compact_probability_rows_fused,

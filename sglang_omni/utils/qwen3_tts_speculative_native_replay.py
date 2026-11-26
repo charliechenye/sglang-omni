@@ -58,6 +58,14 @@ class NativePredictorReference:
     values_by_length: dict[int, torch.Tensor]
 
 
+@dataclass(frozen=True, kw_only=True)
+class TeacherForcedPredictorReference:
+    hidden_by_depth: dict[int, torch.Tensor]
+    logits_by_depth: dict[int, torch.Tensor]
+    keys_by_length: dict[int, torch.Tensor]
+    values_by_length: dict[int, torch.Tensor]
+
+
 def head_output_logits(
     output: torch.Tensor | tuple[torch.Tensor, ...],
 ) -> torch.Tensor:
@@ -217,6 +225,82 @@ def capture_native_predictor_reference(
         hidden=torch.stack([row for row in hidden_rows if row is not None]),
         logits=torch.stack([row for row in logit_rows if row is not None]),
         projected_embeddings=torch.stack(projected_rows),
+        keys_by_length=keys_by_length,
+        values_by_length=values_by_length,
+    )
+
+
+def capture_teacher_forced_predictor_reference(
+    talker: Qwen3TTSTalker,
+    frame: FrozenPredictorFrame,
+    *,
+    code_tokens: torch.Tensor,
+    max_depth: int,
+    request_id: str,
+) -> TeacherForcedPredictorReference:
+    """Replay an observed committed prefix and draft trajectory sequentially."""
+    if code_tokens.ndim != 1 or code_tokens.numel() <= max_depth:
+        raise ValueError("teacher-forced codes must cover the requested depth")
+    elif max_depth < 1 or max_depth >= len(talker.code_predictor.lm_head):
+        raise ValueError("teacher-forced depth is outside the Predictor heads")
+    else:
+        pass
+    prepare_frozen_frame_request(talker, frame, request_id=request_id)
+    reset_single_frame_state(talker)
+    device = talker.predictor_device
+    predictor_dtype = talker.predictor_k_cache.dtype
+    layer0_code = frame.layer0_code.reshape(1, 1).to(device=device, dtype=torch.long)
+    layer0_embed = talker.get_input_embeddings()(layer0_code).to(dtype=predictor_dtype)
+    talker_hidden = frame.talker_hidden.reshape(1, 1, -1).to(
+        device=device, dtype=predictor_dtype
+    )
+    pair_embeddings = talker.code_predictor.project_input(
+        torch.cat((talker_hidden, layer0_embed), dim=1)
+    )
+    hidden_by_depth: dict[int, torch.Tensor] = {}
+    logits_by_depth: dict[int, torch.Tensor] = {}
+    keys_by_length: dict[int, torch.Tensor] = {}
+    values_by_length: dict[int, torch.Tensor] = {}
+    with torch.inference_mode():
+        pair_hidden = talker.predictor_forward_tokens(
+            token_embeds=pair_embeddings, batch_size=1, cache_len=0
+        )
+        hidden_by_depth[0] = pair_hidden[0, 1].detach().clone()
+        pair_logits = head_output_logits(
+            talker.code_predictor.lm_head[0](pair_hidden[:, 1:, :])
+        )
+        logits_by_depth[0] = pair_logits[0, -1].detach().clone()
+        keys_by_length[2] = talker.predictor_k_cache[:, :1, :2].detach().clone()
+        values_by_length[2] = talker.predictor_v_cache[:, :1, :2].detach().clone()
+        projected_tables = talker.predictor_projected_embeddings
+        codec_tables = talker.code_predictor.model.codec_embedding.weight
+        for depth in range(1, max_depth + 1):
+            token = code_tokens[depth].reshape(1).to(device=device, dtype=torch.long)
+            if projected_tables is None:
+                codec_embedding = codec_tables[depth - 1, token].reshape(1, 1, -1)
+                token_embedding = talker.code_predictor.project_input(codec_embedding)
+            else:
+                token_embedding = projected_tables[depth - 1, token].reshape(1, 1, -1)
+            hidden = talker.predictor_forward_tokens(
+                token_embeds=token_embedding,
+                batch_size=1,
+                cache_len=depth + 1,
+            )
+            hidden_by_depth[depth] = hidden[0, 0].detach().clone()
+            logits = head_output_logits(talker.code_predictor.lm_head[depth](hidden))
+            logits_by_depth[depth] = logits[0, 0].detach().clone()
+            valid_length = depth + 2
+            keys_by_length[valid_length] = (
+                talker.predictor_k_cache[:, :1, :valid_length].detach().clone()
+            )
+            values_by_length[valid_length] = (
+                talker.predictor_v_cache[:, :1, :valid_length].detach().clone()
+            )
+        else:
+            pass
+    return TeacherForcedPredictorReference(
+        hidden_by_depth=hidden_by_depth,
+        logits_by_depth=logits_by_depth,
         keys_by_length=keys_by_length,
         values_by_length=values_by_length,
     )
