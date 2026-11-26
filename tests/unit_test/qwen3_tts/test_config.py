@@ -93,6 +93,13 @@ def test_speculative_radix_probability_backend_is_wired_to_engine_stage() -> Non
         code_predictor_spec_probability_backend="radix_compact",
     )
 
+    assert (
+        config.stage_factory_kwargs("tts_engine")[
+            "code_predictor_spec_probability_backend"
+        ]
+        == "radix_compact"
+    )
+
 
 def test_speculative_four_bit_radix_backend_is_wired_to_engine_stage() -> None:
     config = Qwen3TTSPipelineConfig(
@@ -125,7 +132,7 @@ def test_speculative_kernel_ablation_backends_are_wired_to_engine_stage() -> Non
         config.stage_factory_kwargs("tts_engine")[
             "code_predictor_spec_probability_backend"
         ]
-        == "radix_compact"
+        == "split_top_k"
     )
 
 

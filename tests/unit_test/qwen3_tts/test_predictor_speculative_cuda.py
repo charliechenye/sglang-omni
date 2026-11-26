@@ -194,6 +194,7 @@ def build_speculative_talker(
     talker.code_predictor_spec_opening_graph_capture_time_ms = 0.0
     talker.code_predictor_spec_graph_memory_delta_bytes = 0
     talker.code_predictor_spec_graph_capture_time_ms = 0.0
+    talker.code_predictor_spec_verifier_graph_capture_time_ms = 0.0
     talker.code_predictor_spec_configuration_time_ms = 0.0
     talker.code_predictor_output_frame_count = 0
     talker.code_predictor_spec_frame_count = 0
@@ -874,7 +875,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                     bonus_uniforms,
                 )
             )
-            if round_index < 3:
+            if lm_head_mode == "zero" and round_index < 3:
                 rejection_offset = forced_rejection_offset if round_index == 0 else 0
                 assert bool(active_rows[1])
                 assert int(proposal_counts[1].item()) > rejection_offset
@@ -919,6 +920,106 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 bonus_uniforms,
                 outputs=outputs,
             )
+
+            # Independent acceptance oracle. The fixed test tape uses
+            # zero correction/bonus uniforms, so inverse-CDF selects
+            # the first positive mass in target candidate order.
+            assert bool((correction_uniforms == 0).all())
+            assert bool((bonus_uniforms == 0).all())
+            assert not bool(decision.invalid_rows.any())
+
+            for row in range(batch_size):
+                if not bool(active_rows[row]):
+                    assert int(decision.accepted_draft_counts[row]) == 0
+                    assert int(decision.committed_token_counts[row]) == 0
+                    assert not bool(decision.rejected_rows[row])
+                    assert not bool(decision.bonus_rows[row])
+                    continue
+
+                proposal_count = int(proposal_counts[row])
+                expected_accepted = 0
+                expected_tokens = []
+                rejected = False
+                rejected_q = {}
+
+                for offset in range(proposal_count):
+                    q_row = row * current_proposal_width + offset
+                    p_row = row * verification_width + offset
+
+                    q = {
+                        token: mass
+                        for token, mass in zip(
+                            draft_token_ids[q_row].tolist(),
+                            draft_probabilities[q_row].tolist(),
+                            strict=True,
+                        )
+                        if mass > 0.0
+                    }
+                    p_dist = {
+                        token: mass
+                        for token, mass in zip(
+                            row_target_token_ids[p_row].tolist(),
+                            row_target_probabilities[p_row].tolist(),
+                            strict=True,
+                        )
+                        if mass > 0.0
+                    }
+
+                    token = int(draft_tokens[row, offset])
+                    q_mass = q.get(token, 0.0)
+                    p_mass = p_dist.get(token, 0.0)
+
+                    assert q_mass > 0.0
+
+                    ratio = min(1.0, p_mass / q_mass)
+                    uniform = float(acceptance_uniforms[row, offset])
+
+                    if uniform >= ratio:
+                        rejected = True
+                        rejected_q = q
+                        break
+
+                    expected_tokens.append(token)
+                    expected_accepted += 1
+
+                selected_row = (
+                    row * verification_width + expected_accepted
+                )
+
+                final_candidates = []
+                for token, mass in zip(
+                    row_target_token_ids[selected_row].tolist(),
+                    row_target_probabilities[selected_row].tolist(),
+                    strict=True,
+                ):
+                    residual = (
+                        max(mass - rejected_q.get(token, 0.0), 0.0)
+                        if rejected
+                        else mass
+                    )
+                    if residual > 0.0:
+                        final_candidates.append(token)
+
+                assert final_candidates
+                expected_tokens.append(final_candidates[0])
+
+                assert (
+                    int(decision.accepted_draft_counts[row])
+                    == expected_accepted
+                )
+                assert (
+                    int(decision.committed_token_counts[row])
+                    == len(expected_tokens)
+                )
+                assert bool(decision.rejected_rows[row]) == rejected
+                assert bool(decision.bonus_rows[row]) == (not rejected)
+                assert (
+                    decision.committed_tokens[
+                        row, :len(expected_tokens)
+                    ].tolist()
+                    == expected_tokens
+                )
+
             draft_tokens_by_round.append(draft_tokens.clone())
             acceptance_records.append(
                 (
@@ -975,23 +1076,24 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
         assert len(round_verification_widths) >= 3
         first_proposal_width = round_verification_widths[0] - 1
         assert forced_rejection_offset < first_proposal_width
-        for round_index in range(3):
-            (
-                proposal_counts,
-                _,
-                accepted_counts,
-                _,
-                _,
-                bonus_rows,
-                rejected_rows,
-            ) = acceptance_records[round_index]
-            forced_offset = forced_rejection_offset if round_index == 0 else 0
-            assert rejected_rows.tolist() == [False, True]
-            assert accepted_counts.tolist() == [
-                int(proposal_counts[0].item()),
-                forced_offset,
-            ]
-            assert bonus_rows.tolist() == [True, False]
+        if lm_head_mode == "zero":
+            for round_index in range(3):
+                (
+                    proposal_counts,
+                    _,
+                    accepted_counts,
+                    _,
+                    _,
+                    bonus_rows,
+                    rejected_rows,
+                ) = acceptance_records[round_index]
+                forced_offset = forced_rejection_offset if round_index == 0 else 0
+                assert rejected_rows.tolist() == [False, True]
+                assert accepted_counts.tolist() == [
+                    int(proposal_counts[0].item()),
+                    forced_offset,
+                ]
+                assert bonus_rows.tolist() == [True, False]
 
         talker.predictor_k_cache.zero_()
         talker.predictor_v_cache.zero_()
@@ -1278,7 +1380,13 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
 
         stats = talker.predictor_speculative_stats()
         assert stats["frames"] == batch_size
-        assert stats["rejections"] == 3
+        expected_rejections = sum(
+            int(record[6].sum().item())
+            for record in acceptance_records
+        )
+        assert stats["rejections"] == expected_rejections
+        if lm_head_mode == "zero":
+            assert expected_rejections == 3
         assert stats["standalone_correction_forward_count"] == 0
 
 
@@ -1766,6 +1874,9 @@ def test_radix_probability_selection_reports_split_fallback(
         max_top_k: int,
         has_top_p: bool,
         has_unbounded_top_k: bool,
+        probability_output: torch.Tensor | None = None,
+        token_id_output: torch.Tensor | None = None,
+        split_candidate_keys: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         assert candidate_logits is logits
         assert candidate_temperatures is temperatures
@@ -1775,6 +1886,9 @@ def test_radix_probability_selection_reports_split_fallback(
         assert max_top_k == 4
         assert has_top_p is False
         assert has_unbounded_top_k is False
+        assert probability_output is None
+        assert token_id_output is None
+        assert split_candidate_keys is None
         return split_probabilities, split_token_ids
 
     monkeypatch.setattr(

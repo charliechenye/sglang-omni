@@ -122,6 +122,16 @@ def test_speculative_fused_capacity_respects_gqa_attention_tile() -> None:
             query_heads=64,
             kv_heads=4,
         )
+        == 1
+    )
+    assert (
+        resolve_fused_predictor_width(
+            8,
+            graph_batch_size=8,
+            max_rows=max_rows,
+            query_heads=128,
+            kv_heads=4,
+        )
         == 0
     )
 

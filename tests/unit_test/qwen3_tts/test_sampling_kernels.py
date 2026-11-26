@@ -42,6 +42,35 @@ pytestmark = [
 ]
 
 
+def compact_probabilities_to_dense(
+    probabilities: torch.Tensor,
+    token_ids: torch.Tensor,
+    vocab_size: int,
+) -> torch.Tensor:
+    assert probabilities.shape == token_ids.shape
+    assert bool(torch.isfinite(probabilities).all())
+    assert bool((probabilities >= 0).all())
+
+    positive = probabilities > 0
+    assert bool(
+        (
+            (token_ids[positive] >= 0)
+            & (token_ids[positive] < vocab_size)
+        ).all()
+    )
+
+    safe_ids = torch.where(
+        positive,
+        token_ids.long(),
+        torch.zeros_like(token_ids.long()),
+    )
+    dense = probabilities.new_zeros(
+        (probabilities.shape[0], vocab_size)
+    )
+    dense.scatter_add_(1, safe_ids, probabilities)
+    return dense
+
+
 @pytest.mark.parametrize("max_top_k,top_p", [(4, 0.65), (50, 0.83), (128, 1.0)])
 def test_speculative_probabilities_match_native_top_k_top_p_distribution(
     max_top_k: int, top_p: float
@@ -65,9 +94,9 @@ def test_speculative_probabilities_match_native_top_k_top_p_distribution(
         has_unbounded_top_k=False,
     )
     assert candidates is not None
-    actual = torch.zeros((5, 2048), device="cuda", dtype=torch.float32)
-    probabilities, token_ids = candidates
-    actual.scatter_add_(1, token_ids.long(), probabilities)
+    actual = compact_probabilities_to_dense(
+        *candidates, vocab_size=logits.shape[-1]
+    )
 
     scaled_logits = logits.float() / temperatures[:, None]
     native_scores, native_ids = torch.topk(scaled_logits, max_top_k, dim=-1)
@@ -120,8 +149,9 @@ def test_speculative_probabilities_preserve_native_tie_order_for_top_p() -> None
     )
     expected = torch.zeros((2, 2048), device="cuda", dtype=torch.float32)
     expected.scatter_add_(1, native_ids, native_probabilities)
-    actual = torch.zeros_like(expected)
-    actual.scatter_add_(1, actual_ids.long(), actual_probabilities)
+    actual = compact_probabilities_to_dense(
+        actual_probabilities, actual_ids, logits.shape[-1]
+    )
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
 
 
@@ -165,12 +195,23 @@ def test_speculative_radix_candidates_match_native_split_top_k(
     )
     assert native_candidates is not None
     assert radix_candidates is not None
-    native_probabilities = torch.zeros_like(logits, dtype=torch.float32)
-    radix_probabilities = torch.zeros_like(native_probabilities)
-    native_probabilities.scatter_add_(
-        1, native_candidates[1].long(), native_candidates[0]
+    native_probabilities = compact_probabilities_to_dense(
+        *native_candidates, vocab_size=logits.shape[-1]
     )
-    radix_probabilities.scatter_add_(1, radix_candidates[1].long(), radix_candidates[0])
+    radix_probabilities = compact_probabilities_to_dense(
+        *radix_candidates, vocab_size=logits.shape[-1]
+    )
+    assert torch.equal(
+        native_probabilities > 0,
+        radix_probabilities > 0,
+    )
+    for probabilities in (native_probabilities, radix_probabilities):
+        torch.testing.assert_close(
+            probabilities.sum(dim=-1),
+            active_rows.float(),
+            atol=1e-6,
+            rtol=0.0,
+        )
     torch.testing.assert_close(
         radix_probabilities, native_probabilities, atol=3e-5, rtol=3e-4
     )
