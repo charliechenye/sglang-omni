@@ -108,6 +108,7 @@ set_source_files_properties(src/common/fastconformer.cpp
 
 add_library(qwen3_asr STATIC
   src/qwen3_asr/qwen3_audio.cpp
+  src/qwen3_asr/candidate_text.cpp
   src/qwen3_asr/qwen3_asr_model.cpp
   src/qwen3_asr/qwen3_asr_transcriber.cpp
   src/qwen3_asr/realtime.cpp)
@@ -545,6 +546,13 @@ target_link_libraries(tokenizer_preference_test PRIVATE common)
 target_compile_options(tokenizer_preference_test PRIVATE -Wall -Wextra)
 set_target_properties(tokenizer_preference_test PROPERTIES
   BUILD_RPATH "${MLX_LIBRARY_DIRS};@loader_path")
+
+# Candidate token eligibility and extraction need no model checkpoint.
+add_executable(qwen3_asr_candidate_text_test EXCLUDE_FROM_ALL
+  tests/qwen3_asr_candidate_text_test.cpp
+  src/qwen3_asr/candidate_text.cpp)
+target_include_directories(qwen3_asr_candidate_text_test PRIVATE src)
+target_compile_options(qwen3_asr_candidate_text_test PRIVATE -Wall -Wextra)
 
 # MOSS realtime scheduling (first-preview gate, preview preemption) and its
 # timing lines; no checkpoint, run by mac-ci's native job.

@@ -13,77 +13,6 @@ import (
 	"strings"
 )
 
-type logEvent struct {
-	Event                       string  "json:\"event\""
-	SessionID                   uint64  "json:\"session_id\""
-	RequestID                   uint64  "json:\"request_id\""
-	Attempt                     int     "json:\"attempt\""
-	Source                      string  "json:\"source\""
-	Sequence                    uint64  "json:\"sequence\""
-	GeneratedTokenCount         int     "json:\"generated_token_count\""
-	StopToCandidateMS           float64 "json:\"stop_to_candidate_ms\""
-	CandidateEligible           bool    "json:\"candidate_eligible\""
-	LatestPreviewMatch          bool    "json:\"latest_preview_match\""
-	ExtendsLatestHypothesis     bool    "json:\"extends_latest_hypothesis\""
-	MeaningfulTextBoundary      bool    "json:\"meaningful_text_boundary\""
-	CandidateLeadMS             float64 "json:\"candidate_lead_ms\""
-	OracleCompatible            bool    "json:\"oracle_compatible\""
-	OracleIncrementalCompatible bool    "json:\"oracle_incremental_compatible\""
-	ExactTranscriptMatch        bool    "json:\"exact_transcript_match\""
-	ExactCleanupPlanMatch       bool    "json:\"exact_cleanup_plan_match\""
-	NearCleanupPlanCompatible   bool    "json:\"near_cleanup_plan_compatible\""
-	CleanupRepairEligible       bool    "json:\"cleanup_repair_eligible\""
-	CandidateUsableBeforeFinal  bool    "json:\"candidate_usable_before_final\""
-}
-
-type candidateKey struct {
-	sessionID uint64
-	requestID uint64
-	attempt   int
-	source    string
-	sequence  uint64
-}
-
-type candidate struct {
-	eligibility logEvent
-	outcome     logEvent
-	hasOutcome  bool
-}
-
-type policy struct {
-	name      string
-	threshold float64
-	matches   func(logEvent) bool
-}
-
-type policyResult struct {
-	Name                           string  "json:\"name\""
-	Threshold                      float64 "json:\"threshold,omitempty\""
-	EligibleCandidateCount         int     "json:\"eligible_candidate_count\""
-	CandidateSessionCount          int     "json:\"candidate_session_count\""
-	SelectedSessionCount           int     "json:\"selected_session_count\""
-	ResolvedSelectionCount         int     "json:\"resolved_selection_count\""
-	OracleCompatibleSelectionCount int     "json:\"oracle_compatible_selection_count\""
-	ExactTranscriptMatchCount      int     "json:\"exact_transcript_match_count\""
-	ExactCleanupPlanMatchCount     int     "json:\"exact_cleanup_plan_match_count\""
-	NearCleanupRepairCount         int     "json:\"near_cleanup_repair_count\""
-	WastedIfDispatchedCount        int     "json:\"wasted_if_dispatched_count\""
-	LeadSampleCount                int     "json:\"lead_sample_count\""
-	LeadP50MS                      float64 "json:\"lead_p50_ms\""
-	LeadP95MS                      float64 "json:\"lead_p95_ms\""
-}
-
-type replayReport struct {
-	FormatVersion                   int            "json:\"format_version\""
-	SessionCount                    int            "json:\"session_count\""
-	ReceivedCandidateCount          int            "json:\"received_candidate_count\""
-	SessionEligibilityCount         int            "json:\"session_eligibility_count\""
-	ObservedWithoutEligibilityCount int            "json:\"observed_without_eligibility_count\""
-	OracleCompatibleCandidateCount  int            "json:\"oracle_compatible_candidate_count\""
-	OracleIncrementalCandidateCount int            "json:\"oracle_incremental_candidate_count\""
-	Policies                        []policyResult "json:\"policies\""
-}
-
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -147,11 +76,9 @@ func parseThresholds(raw string) ([]int, error) {
 }
 
 func replay(reader io.Reader, tokenThresholds, timeThresholds []int) (replayReport, error) {
-	sessions := make(map[uint64][]candidate)
-	outcomes := make(map[candidateKey]logEvent)
-	seenEligibility := make(map[candidateKey]bool)
-	sessionIDs := make(map[uint64]bool)
-	receivedCandidates := 0
+	sessions := make(map[string]*sessionTrace)
+	seenCandidates := 0
+	seenEligibility := 0
 	scanner := bufio.NewScanner(reader)
 	scanner.Buffer(make([]byte, 4096), 4<<20)
 	for scanner.Scan() {
@@ -160,188 +87,208 @@ func replay(reader io.Reader, tokenThresholds, timeThresholds []int) (replayRepo
 		if start < 0 {
 			continue
 		}
-		var event logEvent
-		if err := json.Unmarshal([]byte(line[start:]), &event); err != nil {
+		var envelope map[string]json.RawMessage
+		if json.Unmarshal([]byte(line[start:]), &envelope) != nil {
 			continue
 		}
+		var eventType string
+		_ = json.Unmarshal(envelope["event"], &eventType)
 		var events []logEvent
-		if event.Event == "final_candidate_benchmark_run" {
+		if eventType == "final_candidate_benchmark_run" {
 			var benchmark struct {
+				Warmup           bool              `json:"warmup"`
+				ColdStart        bool              `json:"cold_start"`
 				ExperimentEvents []json.RawMessage `json:"experiment_events"`
 			}
 			if json.Unmarshal([]byte(line[start:]), &benchmark) == nil {
-				for _, rawEvent := range benchmark.ExperimentEvents {
+				if benchmark.Warmup || benchmark.ColdStart {
+					continue
+				}
+				for _, raw := range benchmark.ExperimentEvents {
 					var nested logEvent
-					if json.Unmarshal(rawEvent, &nested) == nil {
+					if json.Unmarshal(raw, &nested) == nil {
 						events = append(events, nested)
 					}
 				}
 			}
 		} else {
-			events = append(events, event)
+			var event logEvent
+			if json.Unmarshal([]byte(line[start:]), &event) == nil {
+				events = append(events, event)
+			}
 		}
 		for _, event := range events {
-			key := candidateKey{
-				sessionID: event.SessionID, requestID: event.RequestID,
-				attempt: event.Attempt, source: event.Source, sequence: event.Sequence,
+			if !replayEvent(event.Event) {
+				continue
+			}
+			key := eventSessionKey(event)
+			if key == "" {
+				continue
+			}
+			trace := sessions[key]
+			if trace == nil {
+				trace = &sessionTrace{
+					outcomes:            make(map[candidateKey]logEvent),
+					outcomesByIdentity:  make(map[candidateIdentity]logEvent),
+					adoptions:           make(map[uint64]logEvent),
+					adoptionsByPlanHash: make(map[string]logEvent),
+					requestStarts:       make(map[string]logEvent),
+					requestStartsByID:   make(map[uint64]logEvent),
+					requestResults:      make(map[string]logEvent),
+					requestResultsByID:  make(map[uint64]logEvent),
+					finalAvailableMS:    -1, cancelledAtMS: -1,
+				}
+				sessions[key] = trace
 			}
 			switch event.Event {
 			case "voxt_final_candidate_observed":
-				receivedCandidates++
-				sessionIDs[event.SessionID] = true
+				seenCandidates++
+				trace.observedCandidateOnly++
 			case "voxt_final_candidate_eligibility":
-				candidate := candidate{eligibility: event}
-				sessions[event.SessionID] = append(sessions[event.SessionID], candidate)
-				seenEligibility[key] = true
-				sessionIDs[event.SessionID] = true
+				seenEligibility++
+				trace.candidates = append(trace.candidates, candidate{eligibility: event})
+				if event.RecordingGenerations > trace.recordingGenerations || !trace.recordingGensKnown {
+					trace.recordingGenerations = event.RecordingGenerations
+					trace.recordingGensKnown = true
+				}
+			case "voxt_headstart_decision":
+				trace.candidates = append(trace.candidates, candidate{eligibility: event, production: true})
+				if event.RecordingGenerations > trace.recordingGenerations || !trace.recordingGensKnown {
+					trace.recordingGenerations = event.RecordingGenerations
+					trace.recordingGensKnown = true
+				}
 			case "voxt_final_candidate_outcome":
-				outcomes[key] = event
+				trace.outcomes[eventKey(key, event)] = event
+				if event.CandidatePlanHash != "" {
+					identity := candidateIdentity{
+						session: key, planSHA: event.CandidatePlanHash,
+						candidateSHA: event.TranscriptSHA256,
+					}
+					trace.outcomesByIdentity[identity] = event
+				}
+			case "voxt_headstart_adoption":
+				trace.adoptions[event.RequestID] = event
+				trace.adoptionsByPlanHash[event.RequestPlanHash] = event
+			case "voxt_headstart_request_start":
+				if previous, ok := trace.requestStarts[event.RequestPlanHash]; !ok || event.RequestStartMS < previous.RequestStartMS {
+					trace.requestStarts[event.RequestPlanHash] = event
+				}
+				trace.requestStartsByID[event.RequestID] = event
+			case "voxt_headstart_request_done":
+				trace.requestResults[event.RequestPlanHash] = event
+				trace.requestResultsByID[event.RequestID] = event
 			case "voxt_final_candidate_summary":
-				sessionIDs[event.SessionID] = true
+				if event.FinalStatus != "cancelled" && event.FinalStatus != "failed" && event.FinalAvailableMS >= 0 {
+					trace.finalAvailableMS = event.FinalAvailableMS
+					trace.finalAvailableKnown = true
+				}
+				if event.FinalStatus == "cancelled" {
+					trace.cancelledAtMS = event.CancellationMS
+					trace.cancellationKnown = event.CancellationMS >= 0
+				}
+			case "voxt_session_cancelled":
+				trace.cancelledAtMS = event.CancellationMS
+				trace.cancellationKnown = event.CancellationMS >= 0
 			}
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return replayReport{}, err
 	}
-	if len(sessionIDs) == 0 && receivedCandidates == 0 {
+	if len(sessions) == 0 {
 		return replayReport{}, errors.New("no final-candidate events found in input")
 	}
-	for sessionID, candidates := range sessions {
-		for index := range candidates {
-			key := candidateKey{
-				sessionID: candidates[index].eligibility.SessionID,
-				requestID: candidates[index].eligibility.RequestID,
-				attempt:   candidates[index].eligibility.Attempt,
-				source:    candidates[index].eligibility.Source,
-				sequence:  candidates[index].eligibility.Sequence,
-			}
-			if outcome, ok := outcomes[key]; ok {
-				candidates[index].outcome = outcome
-				candidates[index].hasOutcome = true
+	for sessionKey, trace := range sessions {
+		for index := range trace.candidates {
+			current := &trace.candidates[index]
+			if current.production {
+				identity := candidateIdentity{
+					session: sessionKey, planSHA: current.eligibility.RequestPlanHash,
+					candidateSHA: current.eligibility.CandidateSHA256,
+				}
+				if outcome, ok := trace.outcomesByIdentity[identity]; ok {
+					current.outcome = outcome
+					current.hasOutcome = true
+				}
+				resolveActualWebSocketOutcome(trace, current)
+			} else {
+				key := eventKeyForCandidate(sessionKey, current)
+				if outcome, ok := trace.outcomes[key]; ok {
+					current.outcome = outcome
+					current.hasOutcome = true
+				}
 			}
 		}
-		sort.SliceStable(candidates, func(left, right int) bool {
-			if candidates[left].eligibility.StopToCandidateMS == candidates[right].eligibility.StopToCandidateMS {
-				return candidates[left].eligibility.Sequence < candidates[right].eligibility.Sequence
+		sort.SliceStable(trace.candidates, func(left, right int) bool {
+			leftAt := candidateReadyMS(trace.candidates[left])
+			rightAt := candidateReadyMS(trace.candidates[right])
+			if leftAt == rightAt {
+				return trace.candidates[left].eligibility.Sequence < trace.candidates[right].eligibility.Sequence
 			}
-			return candidates[left].eligibility.StopToCandidateMS < candidates[right].eligibility.StopToCandidateMS
-		})
-		sessions[sessionID] = candidates
-	}
-	policies := []policy{
-		{name: "first_eligible_http", matches: func(event logEvent) bool { return event.Source == "http_final" }},
-		{name: "latest_preview_match", matches: func(event logEvent) bool {
-			return event.Source == "http_final" && event.LatestPreviewMatch
-		}},
-		{name: "meaningful_boundary", matches: func(event logEvent) bool {
-			return event.Source == "http_final" && event.MeaningfulTextBoundary
-		}},
-		{name: "extends_latest_hypothesis", matches: func(event logEvent) bool {
-			return event.Source == "http_final" && event.ExtendsLatestHypothesis
-		}},
-		{name: "websocket_control", matches: func(event logEvent) bool {
-			return event.Source == "websocket_preview"
-		}},
-	}
-	for _, threshold := range tokenThresholds {
-		policies = append(policies, policy{
-			name: "token_cadence", threshold: float64(threshold),
-			matches: func(event logEvent) bool {
-				return event.Source == "http_final" && event.GeneratedTokenCount >= threshold
-			},
+			return leftAt < rightAt
 		})
 	}
-	for _, threshold := range timeThresholds {
-		policies = append(policies, policy{
-			name: "time_cadence_ms", threshold: float64(threshold),
-			matches: func(event logEvent) bool {
-				return event.Source == "http_final" && event.StopToCandidateMS >= float64(threshold)
-			},
-		})
+	policies := buildPolicies(tokenThresholds, timeThresholds)
+	results := make(map[string]policyResult, len(policies))
+	for _, current := range policies {
+		result := evaluatePolicy(current, sessions)
+		results[current.name+":"+formatThreshold(current.threshold)] = result
 	}
-	report := replayReport{
-		FormatVersion: 1, SessionCount: len(sessionIDs),
-		ReceivedCandidateCount:          receivedCandidates,
-		SessionEligibilityCount:         len(seenEligibility),
-		ObservedWithoutEligibilityCount: max(0, receivedCandidates-len(seenEligibility)),
-	}
-	for _, outcome := range outcomes {
-		if outcome.OracleCompatible {
-			report.OracleCompatibleCandidateCount++
+	baseline := results["current_websocket_baseline:0"]
+	for index := range policies {
+		current := policies[index]
+		if !current.combined {
+			continue
 		}
-		if outcome.OracleIncrementalCompatible {
-			report.OracleIncrementalCandidateCount++
+		key := current.name + ":" + formatThreshold(current.threshold)
+		result := results[key]
+		compareToBaseline(&result, current, sessions)
+		results[key] = result
+	}
+	_ = baseline
+	report := replayReport{FormatVersion: 2, SessionCount: len(sessions), ReceivedCandidateCount: seenCandidates, SessionEligibilityCount: seenEligibility}
+	if seenCandidates > seenEligibility {
+		report.ObservedWithoutEligibilityCount = seenCandidates - seenEligibility
+	}
+	for _, trace := range sessions {
+		for _, event := range trace.outcomes {
+			if event.OracleCompatible {
+				report.OracleCompatibleCandidateCount++
+			}
+			if event.OracleIncrementalCompatible {
+				report.OracleIncrementalCandidateCount++
+			}
+		}
+		for _, current := range trace.candidates {
+			if !current.hasOutcome {
+				report.UnresolvedOutcomeCount++
+			}
 		}
 	}
 	for _, current := range policies {
-		report.Policies = append(report.Policies, evaluatePolicy(current, sessions))
+		report.Policies = append(report.Policies, results[current.name+":"+formatThreshold(current.threshold)])
 	}
 	return report, nil
 }
 
-func evaluatePolicy(current policy, sessions map[uint64][]candidate) policyResult {
-	result := policyResult{Name: current.name, Threshold: current.threshold}
-	var leads []float64
-	for _, candidates := range sessions {
-		hasCandidate := false
-		for _, currentCandidate := range candidates {
-			event := currentCandidate.eligibility
-			if currentCandidate.hasOutcome &&
-				currentCandidate.outcome.CandidateUsableBeforeFinal &&
-				event.CandidateEligible && current.matches(event) {
-				result.EligibleCandidateCount++
-				hasCandidate = true
-			}
-		}
-		if !hasCandidate {
-			continue
-		}
-		result.CandidateSessionCount++
-		for _, currentCandidate := range candidates {
-			event := currentCandidate.eligibility
-			if !currentCandidate.hasOutcome ||
-				!currentCandidate.outcome.CandidateUsableBeforeFinal ||
-				!event.CandidateEligible || !current.matches(event) {
-				continue
-			}
-			result.SelectedSessionCount++
-			if currentCandidate.hasOutcome {
-				result.ResolvedSelectionCount++
-				outcome := currentCandidate.outcome
-				if outcome.OracleCompatible {
-					result.OracleCompatibleSelectionCount++
-				}
-				if outcome.ExactTranscriptMatch {
-					result.ExactTranscriptMatchCount++
-				}
-				if outcome.ExactCleanupPlanMatch {
-					result.ExactCleanupPlanMatchCount++
-				}
-				if outcome.NearCleanupPlanCompatible && outcome.CleanupRepairEligible {
-					result.NearCleanupRepairCount++
-				}
-				if !outcome.OracleIncrementalCompatible {
-					result.WastedIfDispatchedCount++
-				}
-				if outcome.CandidateLeadMS > 0 {
-					leads = append(leads, outcome.CandidateLeadMS)
-				}
-			}
-			break
-		}
+func eventSessionKey(event logEvent) string {
+	if event.SessionID != 0 {
+		return fmt.Sprintf("session:%d", event.SessionID)
 	}
-	result.LeadSampleCount = len(leads)
-	result.LeadP50MS = percentile(leads, 0.50)
-	result.LeadP95MS = percentile(leads, 0.95)
-	return result
+	if event.RunID != "" {
+		return "run:" + event.RunID
+	}
+	return ""
 }
 
-func percentile(values []float64, fraction float64) float64 {
-	if len(values) == 0 {
-		return -1
+func replayEvent(event string) bool {
+	switch event {
+	case "voxt_final_candidate_observed", "voxt_final_candidate_eligibility",
+		"voxt_final_candidate_outcome", "voxt_final_candidate_summary",
+		"voxt_headstart_decision", "voxt_headstart_adoption",
+		"voxt_headstart_request_start", "voxt_headstart_request_done", "voxt_session_cancelled":
+		return true
+	default:
+		return false
 	}
-	sort.Float64s(values)
-	index := int(float64(len(values))*fraction + 0.999999)
-	return values[min(len(values)-1, max(0, index-1))]
 }

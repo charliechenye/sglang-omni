@@ -62,6 +62,7 @@ func newEarlyClean(r *run) *earlyClean {
 	llmCtx := r.llmCtx
 	r.m.mu.Unlock()
 	ctx, cancel := context.WithCancel(llmCtx)
+	ctx = llm.WithTraceTag(ctx, "early_cleanup")
 	e := &earlyClean{r: r, workerDone: make(chan struct{}), ctx: ctx, cancel: cancel}
 	e.cond = sync.NewCond(&e.mu)
 	go func() {
@@ -267,6 +268,15 @@ func (e *earlyClean) clean(job segJob, thinkOffUnder int) {
 		return
 	}
 	res := &segResult{sep: job.sep, replaced: job.replaced, parts: parts}
+	plan := headPlan{heard: job.replaced, rest: job.replaced}
+	requests := make([]llm.Request, len(parts))
+	for index, part := range parts {
+		req := llm.Request{Messages: llmMessages(part.Output), Skill: llm.SkillTranscribeEnhance, InputChars: chars}
+		req = r.m.cfg.llmDeadlines(req, utf8.RuneCountInString(part.Text), r.llmFloor(r.m.cfg.LLMTimeout))
+		requests[index] = req
+		plan.parts = append(plan.parts, headPart{partIndex: index, req: req, text: part.Text})
+	}
+	r.captureCleanupPlan(plan, "early_cleanup")
 	for index, p := range parts {
 		if index > 0 {
 			e.mu.Lock()
@@ -279,11 +289,10 @@ func (e *earlyClean) clean(job segJob, thinkOffUnder int) {
 			}
 			e.mu.Unlock()
 		}
-		req := llm.Request{Messages: llmMessages(p.Output), Skill: llm.SkillTranscribeEnhance, InputChars: chars}
 		if !r.cleanupMayContinue() {
 			return
 		}
-		resp, err := r.llmChatContext(e.ctx, r.m.cfg.llmDeadlines(req, utf8.RuneCountInString(p.Text), r.llmFloor(r.m.cfg.LLMTimeout)))
+		resp, err := r.llmChatContext(e.ctx, requests[index])
 		if e.ctx.Err() != nil {
 			return
 		}

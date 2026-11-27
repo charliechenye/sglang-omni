@@ -115,6 +115,12 @@ type StreamRequest struct {
 	// ShadowFinalCandidates observes advisory Final candidates without
 	// changing the stream's active candidate policy.
 	ShadowFinalCandidates bool
+	// ShadowDenseCandidates requests the bounded diagnostic publication cadence.
+	ShadowDenseCandidates bool
+	// ShadowSessionID joins shadow measurements with the owning session's
+	// actual WebSocket HeadStart decisions.
+	ShadowSessionID uint64
+	ShadowRunID     string
 	// LiveResult asks for the live text as the result, without a second
 	// pass over the whole recording at Finish, where the model makes one
 	// (settings.Audio.LiveResult); the others ignore it.
@@ -227,6 +233,7 @@ type Event struct {
 
 type CandidateMetadata struct {
 	Source                   string
+	RunID                    string
 	SessionID                uint64
 	RequestID                uint64
 	Attempt                  int

@@ -2,14 +2,16 @@ package session
 
 import (
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/sgl-project/sglang-omni/Voxt/internal/asr"
 )
 
 type heardText struct {
-	text      string
-	candidate bool
+	text       string
+	candidate  bool
+	receivedAt time.Time
 }
 
 type shadowCandidate struct {
@@ -45,6 +47,7 @@ func (r *run) hearShadowCandidate(text, preview string, metadata asr.CandidateMe
 	}
 	select {
 	case <-r.shadowCandidates:
+		r.shadowCandidateCoalesced.Add(1)
 	default:
 	}
 	r.shadowCandidates <- shadowCandidate{text: text, preview: preview, metadata: metadata}
@@ -58,7 +61,7 @@ func (r *run) hear(text string, candidate bool) {
 	case <-r.heard:
 	default:
 	}
-	r.heard <- heardText{text: text, candidate: candidate}
+	r.heard <- heardText{text: text, candidate: candidate, receivedAt: time.Now()}
 }
 
 // withoutEndWord is text without word at its end, and whether word was

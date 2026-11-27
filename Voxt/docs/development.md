@@ -30,7 +30,7 @@ open --env VOXT_EXPERIMENT_CLEANUP_FALLBACK_MS=1500 build/darwin-arm64/Voxt.app
 
 Use `0` to disable it. Values from 1 to 60000 enable the experiment; invalid or larger values are ignored with a warning in the session log. The option applies only to ordinary Transcribe dictation.
 
-**Authoritative Final candidate experiment:** `VOXT_EXPERIMENT_FINAL_CANDIDATES=shadow` enables transcript-free observation of target-verified Qwen3-ASR Final candidates in Voxt. Unset or any other value keeps the experiment off. It records candidate timing and cleanup-plan compatibility without sending more LLM requests or changing the result. The active mode is intentionally unavailable until real-model measurements establish an incremental opportunity. See [authoritative-final-candidates.md](authoritative-final-candidates.md) for the path audit, benchmark setup and replay command.
+**Authoritative Final candidate experiment:** `VOXT_EXPERIMENT_FINAL_CANDIDATES=shadow` enables bounded observation of target-verified Qwen3-ASR Final candidates; `shadow_dense` enables the denser diagnostic cadence. Unset or any other value keeps the experiment off. Both modes retain WebSocket HeadStart and send no additional LLM requests. Active mode is unavailable. See [authoritative-final-candidates.md](authoritative-final-candidates.md) for the findings table, Mac screening matrix, runtime provenance procedure and replay command.
 
 **The release build** is one command, on the Mac: `scripts/release.sh` builds the helper and the Omni runtime, packages and signs the app, and checks the result (`--runtimes DIR` takes prebuilt runtimes; with a Developer ID identity, `--notarize` notarises it; over ssh it runs through `scripts/mac-gui.sh`). A release is that build on GitHub: a `voxt-vX.Y.Z` tag runs the Voxt Release workflow, which signs it with the Developer ID of the team RY2TQTYSKQ, notarises it and puts its disk image and signed update files on a draft GitHub release. Local builds without a feed keep the GitHub update check. See [docs/release.md](release.md).
 
@@ -94,7 +94,7 @@ This table lists every `VOXTNEW_*` variable that the Go code, the Swift helper o
 | `VOXTNEW_FINAL_CANDIDATE_BENCH_LLM_REMOTE` | Set to `0` to mark a local endpoint for readiness reporting. | `1` |
 | `VOXTNEW_FINAL_CANDIDATE_BENCH_OUTPUT` | Benchmark log path; the script also writes a JSONL file beside it. | `build/final-candidate-benchmark.log` |
 | `VOXTNEW_FINAL_CANDIDATE_BENCH_PLAYBACK_FACTOR` | Audio playback speed multiplier; `1` is real time, `0` sends frames as fast as possible. | `1` |
-| `VOXTNEW_FINAL_CANDIDATE_BENCH_ROUNDS` | Number of interleaved measured OFF/SHADOW pairs per scenario. | `5` |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_ROUNDS` | Number of interleaved measured OFF/SHADOW and OFF/SHADOW_DENSE pairs per scenario. | `5` |
 | `VOXTNEW_FINAL_CANDIDATE_BENCH_SCENARIO` | Label for the single-fixture scenario. | WAV filename without extension |
 | `VOXTNEW_FINAL_CANDIDATE_BENCH_SCENARIOS` | JSON scenario manifest for multiple language, length, dictionary, draft and piece cases. | Unset: use one WAV fixture |
 | `VOXTNEW_FINAL_CANDIDATE_BENCH_WARMUPS` | Warmup sessions per arm and scenario; the first OFF session also records cold startup. | `1` |

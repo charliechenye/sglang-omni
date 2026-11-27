@@ -50,6 +50,7 @@ struct TranscriptionOptions {
   // while greedy decoding agrees; those past the token budget are left out.
   std::vector<int> guessed_token_ids;
   omni_common::TranscriptCandidatePublisher candidate_publisher;
+  int candidate_interval_tokens = 8;
 };
 
 // The canonical prompt name for a Qwen3-ASR language code or name. Like
@@ -214,13 +215,13 @@ private:
               const TranscriptionOptions &options) const;
   bool HasTranscriptToken(const std::vector<int> &output_ids,
                           const TranscriptionOptions &options) const;
-  void PublishCandidate(const std::vector<int> &output_ids,
-                        const TranscriptionOptions &options,
-                        std::chrono::steady_clock::time_point started_at,
-                        const std::optional<std::chrono::steady_clock::time_point>
-                            &first_transcript_token_at,
-                        int &last_candidate_token_count,
-                        int &sequence) const;
+  void
+  PublishCandidate(const std::vector<int> &output_ids,
+                   const TranscriptionOptions &options,
+                   std::chrono::steady_clock::time_point started_at,
+                   const std::optional<std::chrono::steady_clock::time_point>
+                       &first_transcript_token_at,
+                   int &last_candidate_token_count, int &sequence) const;
 
   Qwen3ASR model_;
   omni_common::Tokenizer tokenizer_;

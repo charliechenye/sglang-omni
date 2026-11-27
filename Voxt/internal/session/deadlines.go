@@ -16,6 +16,12 @@ type CleanupLatencyPolicy struct {
 	AutoFallbackAfter time.Duration
 }
 
+type requestOriginContextKey struct{}
+
+type requestOriginContextValue struct {
+	call *headCall
+}
+
 // llmPrefillPerChar is a request's extra time per character of the input
 // before its answer starts: a long selection's prompt takes seconds to
 // read.
@@ -80,6 +86,11 @@ func (r *run) llmChatContext(parent context.Context, req llm.Request) (llm.Respo
 	}
 	ctx, cancel := context.WithTimeout(parent, req.Timeout)
 	defer cancel()
+	traceTag := llm.TraceTag(parent)
+	if traceTag == "" {
+		traceTag = "cleanup"
+	}
+	ctx = llm.WithTraceTag(ctx, traceTag)
 	hint := ""
 	switch {
 	case len(r.req.Images) > 0:
@@ -109,6 +120,21 @@ func (r *run) llmChatContext(parent context.Context, req llm.Request) (llm.Respo
 	if parent.Err() != nil || r.ctx.Err() != nil {
 		return llm.Response{}, context.Canceled
 	}
+	requestStartedAt := time.Now()
+	if origin, ok := parent.Value(requestOriginContextKey{}).(requestOriginContextValue); ok {
+		stopAt := r.monotonicStoppedAt()
+		shouldLog := false
+		if origin.call != nil {
+			origin.call.mu.Lock()
+			origin.call.requestStartedAt = requestStartedAt
+			shouldLog = !stopAt.IsZero() && !origin.call.requestStartLogged
+			origin.call.requestStartLogged = origin.call.requestStartLogged || shouldLog
+			origin.call.mu.Unlock()
+		}
+		if shouldLog {
+			r.logHeadStartRequestStart(origin.call, requestStartedAt, stopAt)
+		}
+	}
 	resp, err := client.Chat(ctx, req)
 	if err == nil && resp.ImagesDropped && hint != "" {
 		// The model answered from the text alone: the card must not
@@ -132,6 +158,19 @@ func (r *run) llmChatContext(parent context.Context, req llm.Request) (llm.Respo
 		err = fmt.Errorf("no answer within %v: %w", req.Timeout.Round(time.Second/10), err)
 	}
 	return resp, err
+}
+
+func (r *run) logHeadStartRequestStart(call *headCall, requestStartedAt, stopAt time.Time) {
+	if call == nil || stopAt.IsZero() {
+		return
+	}
+	r.logShadowEvent(map[string]any{
+		"event": "voxt_headstart_request_start", "run_id": r.id,
+		"session_id": r.shadowSessionID, "request_id": call.requestID,
+		"source": call.origin, "request_plan_sha256": r.head.partPlanHash(headPart{req: call.req}),
+		"stop_to_request_start_ms": float64(requestStartedAt.Sub(stopAt).Microseconds()) / 1000,
+		"request_start_valid":      true,
+	})
 }
 
 // asrLimit is how long recognition may take after Stop for a recording

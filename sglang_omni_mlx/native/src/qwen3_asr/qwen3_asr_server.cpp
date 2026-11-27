@@ -46,6 +46,18 @@ public:
     CancelShadowFinals();
     TranscriptionOptions options;
     options.candidate_publisher = std::move(candidate_publisher);
+    if (options.candidate_publisher) {
+      const std::string cadence =
+          asr_service::TextField(form, "candidate_cadence").value_or("");
+      if (cadence == "" || cadence == "bounded") {
+        options.candidate_interval_tokens = 8;
+      } else if (cadence == "dense") {
+        options.candidate_interval_tokens = 2;
+      } else {
+        throw std::invalid_argument(
+            "candidate_cadence must be bounded or dense");
+      }
+    }
     const auto language = asr_service::TextField(form, "language");
     options.language = language.has_value()
                            ? qwen3_asr::NormalizeLanguage(*language)

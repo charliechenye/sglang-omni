@@ -14,6 +14,7 @@
 #include "common/kv_cache.h"
 #include "common/text.h"
 #include "common/transcription.h"
+#include "qwen3_asr/candidate_text.h"
 
 namespace qwen3_asr {
 
@@ -38,7 +39,6 @@ constexpr const char *kAudioPad = "<|audio_pad|>";
 constexpr int kOutputTokensPerAudioSecond = 10;
 constexpr int kMinDefaultOutputTokens = 128;
 constexpr int kFirstCandidateTokenCount = 4;
-constexpr int kMinimumCandidateTokenInterval = 8;
 constexpr int kCandidateCountForGrowingInterval = 8;
 constexpr int kMaximumCandidateSnapshots = 64;
 // The last mel frames, whose STFT windows take the reflected tail, change as
@@ -76,73 +76,6 @@ std::string Strip(const std::string &text) {
   while (end > begin && is_space(text[end - 1]))
     --end;
   return text.substr(begin, end - begin);
-}
-
-std::optional<size_t> FindSubsequence(const std::vector<int> &values,
-                                      const std::vector<int> &pattern) {
-  if (pattern.size() > values.size()) {
-    return std::nullopt;
-  } else {
-  }
-  for (size_t start = 0; start + pattern.size() <= values.size(); ++start) {
-    if (std::equal(pattern.begin(), pattern.end(), values.begin() + start)) {
-      return start;
-    } else {
-    }
-  }
-  return std::nullopt;
-}
-
-bool IsValidCandidateText(const std::string &text) {
-  for (size_t i = 0; i < text.size();) {
-    const unsigned char first = static_cast<unsigned char>(text[i]);
-    if (first < 0x80) {
-      if (first < 0x20 || first == 0x7f) {
-        return false;
-      } else {
-        ++i;
-      }
-    } else {
-      size_t width = 0;
-      uint32_t codepoint = 0;
-      if ((first & 0xe0) == 0xc0) {
-        width = 2;
-        codepoint = first & 0x1f;
-      } else if ((first & 0xf0) == 0xe0) {
-        width = 3;
-        codepoint = first & 0x0f;
-      } else if ((first & 0xf8) == 0xf0) {
-        width = 4;
-        codepoint = first & 0x07;
-      } else {
-        return false;
-      }
-      if (i + width > text.size()) {
-        return false;
-      } else {
-      }
-      for (size_t j = 1; j < width; ++j) {
-        const unsigned char continuation =
-            static_cast<unsigned char>(text[i + j]);
-        if ((continuation & 0xc0) != 0x80) {
-          return false;
-        } else {
-        }
-        codepoint = (codepoint << 6) | (continuation & 0x3f);
-      }
-      if ((width == 2 && codepoint < 0x80) ||
-          (width == 3 && codepoint < 0x800) ||
-          (width == 4 && codepoint < 0x10000) || codepoint > 0x10ffff ||
-          (codepoint >= 0xd800 && codepoint <= 0xdfff) ||
-          (codepoint >= 0x80 && codepoint <= 0x9f) ||
-          codepoint == 0xfffd) {
-        return false;
-      } else {
-      }
-      i += width;
-    }
-  }
-  return true;
 }
 
 // The log-mel features the prompt's audio is encoded from.
@@ -579,9 +512,10 @@ TranscriptionResult Qwen3ASRTranscriber::Transcribe(
           if (!first_transcript_token_elapsed_ms.has_value() &&
               candidate.first_transcript_token_elapsed_ms > 0.0) {
             first_transcript_token_elapsed_ms =
-                std::chrono::duration<double, std::milli>(
-                    chunk_started_at - request_started_at)
-                    .count() + candidate.first_transcript_token_elapsed_ms;
+                std::chrono::duration<double, std::milli>(chunk_started_at -
+                                                          request_started_at)
+                    .count() +
+                candidate.first_transcript_token_elapsed_ms;
           } else {
           }
           candidate.first_transcript_token_elapsed_ms =
@@ -619,9 +553,10 @@ TranscriptionResult Qwen3ASRTranscriber::Transcribe(
     if (publisher && !first_transcript_token_elapsed_ms.has_value() &&
         chunk.first_transcript_token_elapsed_ms > 0.0) {
       first_transcript_token_elapsed_ms =
-          std::chrono::duration<double, std::milli>(
-              chunk_started_at - request_started_at)
-              .count() + chunk.first_transcript_token_elapsed_ms;
+          std::chrono::duration<double, std::milli>(chunk_started_at -
+                                                    request_started_at)
+              .count() +
+          chunk.first_transcript_token_elapsed_ms;
     } else {
     }
     texts.push_back(chunk.text);
@@ -664,33 +599,42 @@ TranscriptionResult Qwen3ASRTranscriber::TranscribeChunk(
   FinishReason finish_reason = FinishReason::kLength;
   bool stopped_on_token_loop = false;
   const auto started_at = std::chrono::steady_clock::now();
-  std::optional<std::chrono::steady_clock::time_point> first_transcript_token_at;
+  std::optional<std::chrono::steady_clock::time_point>
+      first_transcript_token_at;
   int last_candidate_token_count = 0;
   int candidate_sequence = 0;
   // Adds a token to the output; true once the output is complete.
   const auto commit = [&](int token_id) {
     output_ids.push_back(token_id);
+    const bool stop_token = is_stop(token_id);
+    const bool token_loop =
+        !stop_token && options.stop_on_token_loop && IsTokenLoop(output_ids);
+    const bool token_budget_reached =
+        !stop_token && !token_loop &&
+        static_cast<int>(output_ids.size()) >= max_new_tokens;
     if (options.candidate_publisher && !first_transcript_token_at.has_value() &&
-        HasTranscriptToken(output_ids, options)) {
+        !stop_token && !token_loop && HasTranscriptToken(output_ids, options)) {
       first_transcript_token_at = std::chrono::steady_clock::now();
     } else {
     }
-    if (is_stop(token_id)) {
+    if (options.candidate_publisher &&
+        ShouldPublishCandidateSnapshot(stop_token, token_loop,
+                                       token_budget_reached)) {
+      PublishCandidate(output_ids, options, started_at,
+                       first_transcript_token_at, last_candidate_token_count,
+                       candidate_sequence);
+    } else {
+    }
+    if (stop_token) {
       finish_reason = FinishReason::kStop;
       return true;
-    } else if (options.stop_on_token_loop && IsTokenLoop(output_ids)) {
+    } else if (token_loop) {
       finish_reason = FinishReason::kStop;
       stopped_on_token_loop = true;
       return true;
-    } else if (static_cast<int>(output_ids.size()) >= max_new_tokens) {
+    } else if (token_budget_reached) {
       return true;
     } else {
-      if (options.candidate_publisher) {
-        PublishCandidate(output_ids, options, started_at,
-                         first_transcript_token_at,
-                         last_candidate_token_count, candidate_sequence);
-      } else {
-      }
       return false;
     }
   };
@@ -796,8 +740,8 @@ TranscriptionResult Qwen3ASRTranscriber::TranscribeChunk(
                      draft_statistics);
   if (first_transcript_token_at.has_value()) {
     result.first_transcript_token_elapsed_ms =
-        std::chrono::duration<double, std::milli>(
-            *first_transcript_token_at - started_at)
+        std::chrono::duration<double, std::milli>(*first_transcript_token_at -
+                                                  started_at)
             .count();
   } else {
   }
@@ -843,7 +787,8 @@ struct Qwen3ASRTranscriber::BatchRow {
   std::vector<int> output_ids;
   int last_candidate_token_count = 0;
   int candidate_sequence = 0;
-  std::optional<std::chrono::steady_clock::time_point> first_transcript_token_at;
+  std::optional<std::chrono::steady_clock::time_point>
+      first_transcript_token_at;
 };
 
 void Qwen3ASRTranscriber::TranscribeBatch(
@@ -893,32 +838,40 @@ bool Qwen3ASRTranscriber::AcceptToken(BatchRow &row, int token_id,
                                       const TranscriptionOptions &options,
                                       BatchOutcome &outcome) const {
   row.output_ids.push_back(token_id);
+  const bool stop_token = IsStopToken(token_id, options);
+  const bool token_loop =
+      !stop_token && options.stop_on_token_loop && IsTokenLoop(row.output_ids);
+  const bool token_budget_reached =
+      !stop_token && !token_loop &&
+      static_cast<int>(row.output_ids.size()) >= row.max_new_tokens;
   if (options.candidate_publisher &&
-      !row.first_transcript_token_at.has_value() &&
-      HasTranscriptToken(row.output_ids, options)) {
+      !row.first_transcript_token_at.has_value() && !stop_token &&
+      !token_loop && HasTranscriptToken(row.output_ids, options)) {
     row.first_transcript_token_at = std::chrono::steady_clock::now();
   } else {
   }
-  if (IsStopToken(token_id, options)) {
+  if (options.candidate_publisher &&
+      ShouldPublishCandidateSnapshot(stop_token, token_loop,
+                                     token_budget_reached)) {
+    PublishCandidate(row.output_ids, options, row.started_at,
+                     row.first_transcript_token_at,
+                     row.last_candidate_token_count, row.candidate_sequence);
+  } else {
+  }
+  if (stop_token) {
     outcome.result =
         FinishedResult(row.output_ids, options, FinishReason::kStop, false);
-  } else if (options.stop_on_token_loop && IsTokenLoop(row.output_ids)) {
+  } else if (token_loop) {
     outcome.result =
         FinishedResult(row.output_ids, options, FinishReason::kStop, true);
-  } else if (static_cast<int>(row.output_ids.size()) >= row.max_new_tokens) {
+  } else if (token_budget_reached) {
     outcome.result =
         FinishedResult(row.output_ids, options, FinishReason::kLength, false);
   } else {
-    if (options.candidate_publisher) {
-      PublishCandidate(row.output_ids, options, row.started_at,
-                       row.first_transcript_token_at,
-                       row.last_candidate_token_count,
-                       row.candidate_sequence);
-    } else {
-    }
     return false;
   }
-  if (options.candidate_publisher && row.first_transcript_token_at.has_value()) {
+  if (options.candidate_publisher &&
+      row.first_transcript_token_at.has_value()) {
     outcome.result->first_transcript_token_elapsed_ms =
         std::chrono::duration<double, std::milli>(
             *row.first_transcript_token_at - row.started_at)
@@ -958,7 +911,7 @@ std::pair<std::string, std::optional<std::string>>
 Qwen3ASRTranscriber::SplitOutput(const std::vector<int> &output_ids,
                                  const TranscriptionOptions &options) const {
   const std::optional<size_t> marker =
-      FindSubsequence(output_ids, asr_text_ids_);
+      FindCandidateMarker(output_ids, asr_text_ids_);
   std::optional<std::string> detected;
   if (!options.language.has_value() && marker.has_value()) {
     const std::string prefix = Strip(tokenizer_.Decode(
@@ -1000,41 +953,39 @@ void Qwen3ASRTranscriber::PublishCandidate(
     const std::optional<std::chrono::steady_clock::time_point>
         &first_transcript_token_at,
     int &last_candidate_token_count, int &sequence) const {
-  if (!options.candidate_publisher ||
-      sequence >= kMaximumCandidateSnapshots) {
+  if (!options.candidate_publisher || sequence >= kMaximumCandidateSnapshots) {
     return;
   } else {
   }
   const int generated_token_count = static_cast<int>(output_ids.size());
   const int interval =
-      std::max(kMinimumCandidateTokenInterval,
+      std::max(options.candidate_interval_tokens,
                last_candidate_token_count / kCandidateCountForGrowingInterval);
   const int next_candidate_token_count =
-      last_candidate_token_count == 0
-          ? kFirstCandidateTokenCount
-          : last_candidate_token_count + interval;
+      last_candidate_token_count == 0 ? kFirstCandidateTokenCount
+                                      : last_candidate_token_count + interval;
   if (generated_token_count < next_candidate_token_count) {
     return;
   } else {
   }
   last_candidate_token_count = generated_token_count;
   const auto snapshot_started_at = std::chrono::steady_clock::now();
-  if (!FindSubsequence(output_ids, asr_text_ids_).has_value()) {
+  const bool explicit_language =
+      NormalizeLanguage(options.language.value_or("")).has_value();
+  const auto text = ExtractCandidateText(
+      output_ids, asr_text_ids_, explicit_language, options.prefix_text,
+      [this](const std::vector<int> &ids, bool skip_special_tokens) {
+        return tokenizer_.Decode(ids, skip_special_tokens);
+      });
+  if (!text.has_value()) {
     return;
   } else {
   }
-  auto [text, language] = SplitOutput(output_ids, options);
-  text = options.prefix_text + text;
-  if (text.empty() || text.find("<|") != std::string::npos ||
-      !IsValidCandidateText(text)) {
-    return;
-  } else {
-  }
+  const auto language = SplitOutput(output_ids, options).second;
   ++sequence;
-  const double elapsed_ms =
-      std::chrono::duration<double, std::milli>(
-          std::chrono::steady_clock::now() - started_at)
-          .count();
+  const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - started_at)
+                                .count();
   const double first_token_elapsed_ms =
       first_transcript_token_at.has_value()
           ? std::chrono::duration<double, std::milli>(
@@ -1045,7 +996,7 @@ void Qwen3ASRTranscriber::PublishCandidate(
       std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - snapshot_started_at)
           .count();
-  options.candidate_publisher({text, static_cast<uint64_t>(sequence),
+  options.candidate_publisher({*text, static_cast<uint64_t>(sequence),
                                generated_token_count, language, elapsed_ms,
                                first_token_elapsed_ms, snapshot_build_ms});
 }
@@ -1053,13 +1004,9 @@ void Qwen3ASRTranscriber::PublishCandidate(
 bool Qwen3ASRTranscriber::HasTranscriptToken(
     const std::vector<int> &output_ids,
     const TranscriptionOptions &options) const {
-  if (NormalizeLanguage(options.language.value_or("")).has_value()) {
-    return !output_ids.empty();
-  } else {
-  }
-  const auto marker = FindSubsequence(output_ids, asr_text_ids_);
-  return marker.has_value() &&
-         output_ids.size() > *marker + asr_text_ids_.size();
+  return HasCandidateTranscriptToken(
+      output_ids, asr_text_ids_,
+      NormalizeLanguage(options.language.value_or("")).has_value());
 }
 
 omni_server::BatchRunner BatchableTranscriptionRunner() {

@@ -48,6 +48,7 @@ func (s *live) finalPass(pcm []byte) {
 		if s.shadowCandidates {
 			onCandidate = func(candidate finalCandidate) {
 				candidate.text = joinParts(append(slices.Clone(texts), candidate.text))
+				candidate.metadata.RunID = s.req.ShadowRunID
 				candidate.metadata.SessionID = s.shadowID
 				candidate.metadata.Attempt = attempt
 				if candidate.text == "" {
@@ -67,6 +68,14 @@ func (s *live) finalPass(pcm []byte) {
 				}
 			}
 		}
+		var measurement *candidateMeasurement
+		if s.shadowCandidates {
+			cadence := ""
+			if s.req.ShadowDenseCandidates {
+				cadence = "dense"
+			}
+			measurement = &candidateMeasurement{runID: s.req.ShadowRunID, sessionID: s.shadowID, cadence: cadence}
+		}
 		hint := language
 		var known prior
 		if s.a.spec.Kind == kindQwen3ASR {
@@ -85,14 +94,14 @@ func (s *live) finalPass(pcm []byte) {
 				}
 			}
 		}
-		text, language, err = s.a.final(s.ctx, s.l, tail, hint, finalBias, known, onCandidate)
+		text, language, err = s.a.final(s.ctx, s.l, tail, hint, finalBias, known, onCandidate, measurement)
 		if err != nil && s.ctx.Err() == nil && !s.l.p.alive() {
 			// The server died under the recording (a crash, memory pressure): the audio is all here, so once more on a new one.
 			if l, aerr := s.a.rt.acquire(s.ctx, s.a.spec, s.a.dir, s.a.draft); aerr == nil {
 				s.a.rt.logf("warning", "%s: its server died during the session (%v): the Final runs again on a new one", s.a.spec.ID, err)
 				attempt = 2
 				finalAttempt = attempt
-				text, language, err = s.a.final(s.ctx, l, tail, hint, finalBias, known, onCandidate)
+				text, language, err = s.a.final(s.ctx, l, tail, hint, finalBias, known, onCandidate, measurement)
 				l.release()
 			}
 		}
@@ -116,7 +125,7 @@ func (s *live) finalPass(pcm []byte) {
 		}
 		metadata := asr.CandidateMetadata{}
 		if s.shadowID != 0 {
-			metadata = asr.CandidateMetadata{Source: "http_final", SessionID: s.shadowID, Attempt: finalAttempt, ReceivedAt: time.Now()}
+			metadata = asr.CandidateMetadata{Source: "http_final", RunID: s.req.ShadowRunID, SessionID: s.shadowID, Attempt: finalAttempt, ReceivedAt: time.Now()}
 		} else {
 		}
 		s.end(asr.Event{Kind: asr.EventError, Err: err, Candidate: metadata})
@@ -126,7 +135,7 @@ func (s *live) finalPass(pcm []byte) {
 	res := asr.Result{Text: text, Lang: language, Duration: asr.Duration(pcm, sampleRate), Model: s.a.spec.ID, Latency: took}
 	metadata := asr.CandidateMetadata{}
 	if s.shadowID != 0 {
-		metadata = asr.CandidateMetadata{Source: "http_final", SessionID: s.shadowID, Attempt: finalAttempt, ReceivedAt: time.Now()}
+		metadata = asr.CandidateMetadata{Source: "http_final", RunID: s.req.ShadowRunID, SessionID: s.shadowID, Attempt: finalAttempt, ReceivedAt: time.Now()}
 	} else {
 	}
 	s.end(asr.Event{Kind: asr.EventFinal, Text: text, Result: res, Candidate: metadata})

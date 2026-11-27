@@ -2,70 +2,78 @@
 
 ## Status
 
-`SHADOW_READY_FOR_MODEL_VALIDATION`
+`SHADOW_FIXES_COMPLETE_READY_FOR_SCREENING`
 
-The experiment defaults OFF. Set `VOXT_EXPERIMENT_FINAL_CANDIDATES=shadow` to observe candidates for Qwen3-ASR live Final requests. There is no `active` mode: the first stage must establish a causal opportunity with real measurements before an LLM trigger is considered.
+The experiment is OFF by default. `VOXT_EXPERIMENT_FINAL_CANDIDATES=shadow` enables bounded candidate observations; `shadow_dense` enables the denser diagnostic cadence. Both retain existing WebSocket HeadStart behavior and send no candidate-triggered LLM request. There is no active mode. Real-model screening has not been run, so this status makes no claim about opportunity, ASR quality, or latency improvement.
 
-This checkout has no local Omni runtime, Qwen3-ASR weights, draft weights, benchmark WAVs or benchmark endpoint configured. Mocked tests do not establish ASR quality or a latency benefit. The real-model run remains outstanding.
+No model weights were downloaded. Local fixtures cover about 3 seconds of English and about 10 seconds of English and Chinese. This checkout has no suitable 30-second fixtures, so the 30-second cells remain for the Mac operator to supply.
 
-## Code path audit
+## Findings and fixes
 
-1. The native transcription handler accepts `include_transcript_candidates=true` only with streaming, calls the model's optional candidate preparation hook, and uses a request-local one-slot coalescing mailbox. The inference worker publishes into the mailbox; only the HTTP handler writes SSE. Candidate events are drained before `transcript.text.done` or the error event, then `[DONE]`. See `sglang_omni_mlx/native/src/common/asr_service.cpp` (`HandleTranscriptions`, `CandidateMailbox`, `CandidateEvent`) and `sglang_omni_mlx/native/src/common/asr_service.h` (`ServedModel::PrepareWithCandidates`).
-2. Qwen3-ASR wires the publisher into its normal transcriber options. Snapshots are taken from `commit` after plain decode or target verification, and from `AcceptToken` in batched decoding. Rejected guesses and draft proposals never reach these callbacks; accepted target-verified tokens do. Final Prefill Reuse keeps the same commit callback. Large native audio requests join completed window text with the current snapshot. See `sglang_omni_mlx/native/src/qwen3_asr/qwen3_asr_server.cpp` and `qwen3_asr_transcriber.cpp` (`Transcribe`, `TranscribeChunk`, `AcceptToken`, `PublishCandidate`, `SplitOutput`).
-3. Candidate text passes through `SplitOutput`, prefix reconstruction and conservative checks for ASR markers, control bytes, invalid UTF-8 and special-token strings. The authoritative `FinishedResult` path is unchanged. Candidate snapshots begin at four committed tokens, then use a bounded cadence, with at most 64 snapshots per native request. Per-request counters retain the total build time and publication count when the mailbox coalesces older snapshots.
-4. Voxt requests candidates only for the default-off shadow switch, Qwen3-ASR, and non-`LiveResult` streams. `final.go` parses candidates separately from `transcript.text.done` and ignores any candidate after Final. `live_final.go` joins prior recording pieces to each whole-request candidate and fences each request attempt. `asr.go` normalization and dictionary-echo checks suppress candidates that cannot safely be compared. Other providers and multiple Voxt Final HTTP chunks are excluded with a reason log; this does not serialize their existing batch path.
-5. Session shadow candidates use a separate event and channel. `headstart_shadow.go` prepares a measurement-only cleanup plan through the existing compatibility code and records hashes, lengths, timing, gates and compatibility. It does not call `submitLate`, spend the late-generation allowance, mutate visible text or alter delivery. Candidate events that cannot enter the session event queue are recorded as suppressed.
+| Finding | Fix | Regression evidence |
+| --- | --- | --- |
+| Explicit-language decoding already has the ASR marker in the prompt, so requiring it in generated tokens suppresses candidates. | Candidate extraction accepts committed transcript tokens in explicit mode, requires a complete marker plus transcript tokens in automatic mode, and rejects unfinished markers, special spellings, invalid UTF-8, controls, EOS, loops, and the final budget snapshot. Authoritative `FinishedResult` is unchanged. | Native weight-free test `qwen3_asr_candidate_text_test`; Go event tests in `Voxt/internal/omni/final_candidates_test.go`. |
+| Replay selected candidates using eventual outcome and could erase a failed first attempt. | Replay makes causal selections first using only fields known at dispatch time; retrospective outcome joins by stable request/candidate identity after selection. A failed or unresolved selection stays in history and keeps its simulated budget. | `TestReplayDoesNotSkipFailedFirstAttemptUsingFutureOutcome`; cancellation, Final-boundary, and missing-outcome cases in `Voxt/cmd/final-candidate-replay/main_test.go`. |
+| HTTP and WebSocket candidates were modeled in separate budgets, and late WebSocket observations could misstate production eligibility. | Production WebSocket decision events record arrival, processing, preparation, dispatch, gates, budget, request plan, request IDs, and request starts. Baseline replay uses actual decisions. Combined policies put HTTP and WebSocket candidates through one policy-specific budget. | Shared-budget, production-event, baseline-adoption, recording-budget, and Final-boundary tests in `Voxt/cmd/final-candidate-replay/main_test.go`. |
+| Retrospective hashing and compatibility analysis ran before Final returned to cleanup. | Final handling retains bounded immutable observations. Candidate processing records its causal timing before Final; summary, hashing, and oracle comparison run after normal delivery. The benchmark waits for its own report only after terminal delivery. | Session shadow test and the reporting wait in `TestMacE2EFinalCandidateBenchmark`; replay tests use separate eligibility and outcome events. |
+| Shadow plans could differ from the request Cleanup actually sends after normalization and preparation; completed early-cleanup pieces could be counted as requests sent again. | Cleanup captures only unanswered production request parts at construction, preserves original part indices, and compares them with candidate parts through existing request compatibility checks. Completed pieces remain in their earlier cleanup records and are not counted as fresh requests to avoid. | `TestShadowPlanCompatibilityUsesPendingCleanupPartIndices` plus cleanup/request-plan and replay compatibility tests. |
+| Candidate arrival time was mistaken for dispatch readiness. | Logs keep generated, received, processing, plan-ready, dispatch-ready, Final-available, and actual request-start times separately. A candidate processed after observable Final is dropped. Arrival and dispatch-ready lead are reported separately. | Session candidate-order and replay Final-during-preparation tests. |
+| Provider first-token time was overwritten by later deltas, and requests starting before Stop were omitted. | The benchmark records the first nonempty provider delta once and retains negative Stop-relative request/token offsets with validity fields. Request kinds, request IDs, and adoption outcomes are recorded separately. | First-token and pre-Stop timing tests in `Voxt/mac_e2e_final_candidates_report_test.go`. |
+| Intended HeadStart scenario labels were being confused with measured adoption. | Each request has an observed outcome keyed by stable request ID; exact adoption, repair adoption, partial multipart adoption, miss, failure, fallback, and no-cleanup are distinct from `headstart_case`. | `measuredHeadstartOutcomes` report tests and replay actual-adoption tests. |
+| Fake text I/O could be mistaken for macOS insertion time. | Output distinguishes cleanup completion, result readiness, delivery request, simulated delivery completion, and session terminal. Delivery is labeled `simulated_fake_text_io`. | Benchmark pair/run schema and fake text I/O timestamp capture. |
+| Warmups, cold starts, failed sessions, or empty transcripts could pollute steady-state latency/parity. | Replay excludes warmups and cold starts; aggregate coverage labels cold, warmup, and steady-state samples. Pair summaries exclude cold starts and failed/degraded sessions from successful latency/parity samples. Empty transcript/result pairs are invalid. | `TestReplayKeepsRecordingTimeHeadStartBudgetAndFiltersWarmups` covers warmup and cold-start exclusion; `benchRunSuccessful` and parity validity gate aggregates. |
+| A binary hash alone could not prove the experimental source revision. | `scripts/build-omni.sh` writes provenance tying the runtime path and SHA-256 to a clean experiment/native source commit; both runner and shell gate verify it. Run rows include model IDs, fixture hash, language hint, draft/piece configuration, cleanup model, and provenance. | Provenance validation is performed before the benchmark starts. No stale or unknown runtime is treated as negative evidence. |
+| A late request from one run could be attributed to the next run through a mutable active pointer. | Runtime events carry run/session IDs and LLM requests carry stable request IDs; the log collector resolves by those IDs and does not use the next session as the request owner. | Benchmark attribution is exercised by the fake LLM/event harness; request outcome joins use request IDs. |
+| A run could report unsupported candidate transport as a no-opportunity result. | A manifest must include an explicit-language protocol smoke fixture. Each shadow arm must observe at least one HTTP candidate across the fixture's sessions; a single session with zero candidates remains a valid coverage outcome. | `TestValidateBenchScenariosRequiresExplicitProtocolSmoke`; benchmark support gate in `TestMacE2EFinalCandidateBenchmark`. |
 
-Native counters are per HTTP request. Each candidate carries its Go request ID and attempt; the authoritative Final carries the session ID and attempt used to fence candidate adoption. Durations are monotonic offsets within their owning process; the benchmark does not subtract unrelated native and Go clock timestamps.
+The runner cannot currently expose authoritative generated-token counts or detected language from both OFF and shadow arms through the public session snapshot. It reports transcript/result parity and requested language; generation-metadata parity remains unavailable to this harness. Delivery completion is simulated, not a measurement of insertion into a macOS application.
 
-## Measurements and replay
+## Screening matrix
 
-Voxt emits `voxt_final_candidate_observed`, `voxt_final_candidate_eligibility`, `voxt_final_candidate_outcome` and `voxt_final_candidate_summary` JSON log events. They contain hashes and counts instead of transcript text. For each candidate, the outcome records arrival before Final, lead time, completeness, exact transcript match, exact/near cleanup-plan compatibility, repair eligibility, existing equivalent requests, gates, attempt/session match and whether a compatible incremental request was possible.
+The runner executes OFF, SHADOW, and SHADOW_DENSE for every scenario, with one warmup and five interleaved measured repetitions per arm. This is an exploratory screen, not statistically conclusive validation. Each treatment pair is compared to OFF on the same fixture and settings.
 
-`earliest_oracle_compatible_lead_ms` is retrospective: it uses the authoritative Final to find an upper bound and is not a causal trigger or a measured latency improvement. `cmd/final-candidate-replay` evaluates causal policies from fields known at candidate time: first eligible HTTP snapshot, latest-preview match, text boundary, hypothesis extension, token/time cadence, and the existing WebSocket candidate control. Replay also filters out candidates that arrived after Final became available.
+| Duration | Automatic language | Explicit language | Local fixture status |
+| --- | --- | --- | --- |
+| About 3 seconds | English `eval/en-2.wav` | English `eval/en-2.wav` | Available; 3.86 seconds. |
+| About 10 seconds | English `eval/en-1.wav`; Chinese `eval/zh-filler-1.wav` | English `eval/en-1.wav`; Chinese `eval/zh-filler-1.wav` | Available; 9.68 and 10.30 seconds. |
+| About 30 seconds | English fixture required | Chinese fixture required | None available locally; add local 16 kHz mono PCM WAV files before screening these cells. |
 
-```sh
-cd Voxt
-go run ./cmd/final-candidate-replay -input build/final-candidate-benchmark.jsonl
-```
+`Voxt/testdata/final-candidate-screening.example.json` is a runnable manifest for the available 3- and 10-second cells. `protocol_smoke` is set on an explicit English scenario. The `headstart_case` values are labels only; observed adoption is measured from request events.
 
-The replay output reports per-policy selected sessions, compatible selections, wasted-request estimates and p50/p95 lead. Cadence thresholds are offline parameters, not production settings.
+## Build and run on the Mac
 
-## Real-model benchmark
-
-The Mac runner pairs `off` and `shadow` on the same commit, ASR model, cleanup model, fixture and settings. It runs one warmup per arm and five interleaved pairs per scenario by default, reversing arm order on alternating rounds. The first model startup is labeled separately. Each run emits transcript/result SHA-256 and lengths, Stop-relative Final/LLM/cleanup/delivery timings, request timing and token usage, candidate counters and content-free experiment events. The JSONL output is suitable for the replay command above.
-
-Provide a JSON manifest with paths relative to the manifest, for example:
-
-```json
-[
-  {
-    "name": "short-en-auto-headstart-hit",
-    "audio": "short-en.wav",
-    "language": "",
-    "headstart_case": "hit",
-    "dictionary_terms": [],
-    "draft": false
-  }
-]
-```
-
-For a useful validation set, include short, medium and long English, Chinese and mixed-language recordings; explicit and automatic language detection; dictionary-heavy cases; HeadStart hit and miss cases; piece/multi-chunk cases; and draft on/off cases where available. Supply local 16 kHz mono PCM WAV files. Use `VOXTNEW_FINAL_CANDIDATE_BENCH_LLM_REMOTE=0` for a local cleanup endpoint; the current HeadStart eligibility gate is remote-only, so that arm measures ASR contention and shadow overhead rather than a local HeadStart trigger.
-
-Example invocation (use existing local paths; the script never downloads weights):
+Commit the experiment first so the provenance record names the exact source revision. Build the native runtime from this worktree; the script does not download model weights, although its pinned build dependencies must be available to the Mac:
 
 ```sh
 cd Voxt
-VOXTNEW_OMNI_RUNTIME=/path/to/qwen3_asr_server \
+OMNI_NATIVE=../sglang_omni_mlx/native scripts/build-omni.sh --out "$PWD/build/final-candidate-runtime"
+```
+
+Then run the available screening matrix against existing local model directories and a configured OpenAI-compatible cleanup endpoint:
+
+```sh
+cd Voxt
+VOXTNEW_OMNI_RUNTIME="$PWD/build/final-candidate-runtime" \
 VOXTNEW_FINAL_CANDIDATE_BENCH_ASR_MODEL_DIR=/path/to/local/qwen3_asr \
 VOXTNEW_FINAL_CANDIDATE_BENCH_LLM_ENDPOINT=https://llm.example/v1 \
 VOXTNEW_FINAL_CANDIDATE_BENCH_LLM_MODEL=cleanup-model \
-VOXTNEW_FINAL_CANDIDATE_BENCH_SCENARIOS=/path/to/scenarios.json \
+VOXTNEW_FINAL_CANDIDATE_BENCH_SCENARIOS="$PWD/testdata/final-candidate-screening.example.json" \
+VOXTNEW_FINAL_CANDIDATE_BENCH_WARMUPS=1 \
+VOXTNEW_FINAL_CANDIDATE_BENCH_ROUNDS=5 \
 scripts/benchmark-final-candidates.sh
 ```
 
-The script writes `build/final-candidate-benchmark.log` and `build/final-candidate-benchmark.jsonl` by default. Set `VOXTNEW_FINAL_CANDIDATE_BENCH_OUTPUT` to change the log path. Local LLM peak memory and Metal contention are not currently sampled; transcript quality beyond authoritative transcript hashes requires review of the selected fixture results.
+The script verifies native source commit, clean worktree, runtime path, and binary SHA-256 before running. It never downloads ASR or draft weights. To add 30-second cases, put local 16 kHz mono WAVs beside the manifest or use absolute fixture paths and add automatic/explicit English and Chinese scenarios.
 
-## Current validation boundary
+Expected outputs are `Voxt/build/final-candidate-benchmark.log` and `Voxt/build/final-candidate-benchmark.jsonl`. JSONL events are `final_candidate_benchmark_run`, `final_candidate_benchmark_pair`, `final_candidate_benchmark_summary`, `final_candidate_benchmark_coverage_summary`, plus content-free `voxt_*` experiment events. Run the causal replay and retain its JSON report:
 
-The fake SSE/native protocol tests establish request gating, event order, candidate/final separation, error handling, session isolation and that shadow mode sends no extra LLM requests. They do not prove model accuracy, candidate coverage on actual Qwen3-ASR output, or latency improvement. Real-model results must be reported by scenario with sample counts, paired deltas and p50/p95 before considering P1.
+```sh
+cd Voxt
+go run ./cmd/final-candidate-replay -input build/final-candidate-benchmark.jsonl > build/final-candidate-replay.json
+```
+
+Replay reports candidate coverage, unresolved outcomes, actual WebSocket decisions/adoptions, causal compatible selections, displaced baseline opportunities, wasted-generation estimates, and arrival/dispatch-ready lead distributions. Oracle-compatible lead remains retrospective and is not a projected end-to-end latency saving.
+
+## Validation boundary
+
+The deterministic tests establish protocol parsing, candidate eligibility/extraction, session fencing, shared-budget replay, request attribution, and benchmark record semantics. They do not establish real Qwen3-ASR candidate coverage, ASR quality/parity for real models, or end-to-end latency savings. Do not report a screening result until the real-model matrix runs. Native model-path and 30-second scenarios remain outstanding until local weights/runtime and fixtures are supplied.

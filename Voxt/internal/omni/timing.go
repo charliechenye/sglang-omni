@@ -28,7 +28,8 @@ func logCandidateRecord(rt *Runtime, event string, candidate finalCandidate, sto
 	} else {
 	}
 	record := map[string]any{
-		"event": event, "session_id": candidate.metadata.SessionID,
+		"event": event, "run_id": candidate.metadata.RunID,
+		"session_id": candidate.metadata.SessionID,
 		"request_id": candidate.metadata.RequestID, "attempt": candidate.metadata.Attempt,
 		"source": candidate.metadata.Source, "sequence": candidate.metadata.Sequence,
 		"generated_token_count":             candidate.metadata.GeneratedTokens,
@@ -52,6 +53,16 @@ func logCandidateRecord(rt *Runtime, event string, candidate finalCandidate, sto
 	if err == nil {
 		rt.logf("info", "%s", payload)
 	} else {
+	}
+}
+
+func logCandidateExclusion(rt *Runtime, runID string, sessionID uint64, reason string, chunkCount int) {
+	payload, err := json.Marshal(map[string]any{
+		"event": "voxt_final_candidates_excluded", "run_id": runID,
+		"session_id": sessionID, "reason": reason, "chunk_count": chunkCount,
+	})
+	if err == nil {
+		rt.logf("info", "%s", payload)
 	}
 }
 

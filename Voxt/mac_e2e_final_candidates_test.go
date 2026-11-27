@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"os"
 	"runtime"
@@ -11,7 +10,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sgl-project/sglang-omni/Voxt/internal/helper/proto"
 	"github.com/sgl-project/sglang-omni/Voxt/internal/llm"
 	"github.com/sgl-project/sglang-omni/Voxt/internal/models"
 	"github.com/sgl-project/sglang-omni/Voxt/internal/omni"
@@ -51,6 +49,10 @@ func TestMacE2EFinalCandidateBenchmark(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	experimentCommit, runtimeProvenance, err := readBenchRuntimeProvenance(binary)
+	if err != nil {
+		t.Fatal(err)
+	}
 	logs := &benchLog{}
 	rt := omni.NewRuntime(omni.Config{Binary: binary, Log: logs.add})
 	defer rt.Close()
@@ -74,15 +76,9 @@ func TestMacE2EFinalCandidateBenchmark(t *testing.T) {
 	var activeTerms []store.Term
 	var activeRun *benchRun
 	capture := &benchAudio{frameFactor: playbackFactor}
-	timedLLM := &benchLLM{client: client, active: func() *benchRun {
-		activeMu.Lock()
-		defer activeMu.Unlock()
-		return activeRun
-	}}
 	done := make(chan session.Snapshot, 1)
 	manager := session.New(session.Config{
 		Audio: capture,
-		Text:  benchTextIO{},
 		ResolveASR: func(context.Context, session.Kind, settings.Settings) session.ASRReadiness {
 			activeMu.Lock()
 			provider := activeASR
@@ -90,11 +86,19 @@ func TestMacE2EFinalCandidateBenchmark(t *testing.T) {
 			return session.ASRReadiness{ASR: provider, ASRInfo: session.Model{ID: modelID, Name: modelID}}
 		},
 		ResolveLLM: func(context.Context, session.Kind, settings.Settings) session.LLMReadiness {
+			activeMu.Lock()
+			owner := activeRun
+			activeMu.Unlock()
 			return session.LLMReadiness{
-				LLM: timedLLM, LLMInfo: session.Model{ID: "benchmark-openai-compatible", Name: llmModel, Remote: llmRemote},
+				LLM: &benchLLM{client: client, run: owner}, LLMInfo: session.Model{ID: "benchmark-openai-compatible", Name: llmModel, Remote: llmRemote},
 				Outcome: session.LLMAvailable,
 			}
 		},
+		Text: benchTextIO{active: func() *benchRun {
+			activeMu.Lock()
+			defer activeMu.Unlock()
+			return activeRun
+		}},
 		Settings: func() settings.Settings {
 			activeMu.Lock()
 			defer activeMu.Unlock()
@@ -135,6 +139,7 @@ func TestMacE2EFinalCandidateBenchmark(t *testing.T) {
 	}()
 
 	firstRun := true
+	allRuns := make([]*benchRun, 0, len(scenarios)*(warmups+rounds)*3)
 	for _, scenario := range scenarios {
 		pcm, audioHash, err := readBenchAudio(scenario.Audio)
 		if err != nil {
@@ -147,7 +152,7 @@ func TestMacE2EFinalCandidateBenchmark(t *testing.T) {
 		settingsForRun.Features.Transcribe.LLM = "benchmark-openai-compatible"
 		settingsForRun.Features.Transcribe.Enhance = true
 		settingsForRun.Features.Transcribe.Cleanup = true
-		settingsForRun.Features.Transcribe.ShowCard = true
+		settingsForRun.Features.Transcribe.ShowCard = false
 		settingsForRun.Dictionary.Enabled = len(terms) > 0
 		settingsForRun.Dictionary.ASRHints = true
 		settingsForRun.Dictionary.Glossary = true
@@ -171,301 +176,55 @@ func TestMacE2EFinalCandidateBenchmark(t *testing.T) {
 		activeSettings, activeASR, activeTerms = settingsForRun, currentASR, terms
 		activeMu.Unlock()
 
+		scenarioRuns := make([]*benchRun, 0, (warmups+rounds)*3)
 		for warmup := 0; warmup < warmups; warmup++ {
-			for _, arm := range []string{"off", "shadow"} {
+			for _, arm := range []string{"off", "shadow", "shadow_dense"} {
 				run := runBenchSession(t, manager, logs, capture, pcm, scenario, arm, warmup, -1, firstRun, done, &activeMu, &activeRun)
 				firstRun = false
-				emitBenchRun(t, run, audioHash, modelID, llmModel, llmRemote)
+				scenarioRuns = append(scenarioRuns, run)
+				allRuns = append(allRuns, run)
+				emitBenchRun(t, run, audioHash, modelID, llmModel, llmRemote, experimentCommit, runtimeProvenance)
 			}
 		}
-		var pairResults []benchPairResult
+		pairResults := map[string][]benchPairResult{"shadow": {}, "shadow_dense": {}}
 		for round := 1; round <= rounds; round++ {
-			arms := []string{"off", "shadow"}
-			if round%2 == 0 {
-				arms = []string{"shadow", "off"}
-			}
-			paired := make(map[string]*benchRun, 2)
+			arms := []string{"off", "shadow", "shadow_dense"}
+			rotation := (round - 1) % len(arms)
+			arms = append(arms[rotation:], arms[:rotation]...)
+			paired := make(map[string]*benchRun, len(arms))
 			for _, arm := range arms {
 				run := runBenchSession(t, manager, logs, capture, pcm, scenario, arm, -1, round, firstRun, done, &activeMu, &activeRun)
 				firstRun = false
 				paired[arm] = run
-				emitBenchRun(t, run, audioHash, modelID, llmModel, llmRemote)
+				scenarioRuns = append(scenarioRuns, run)
+				allRuns = append(allRuns, run)
+				emitBenchRun(t, run, audioHash, modelID, llmModel, llmRemote, experimentCommit, runtimeProvenance)
 			}
-			pairResults = append(pairResults, emitBenchPair(t, scenario, round, paired["off"], paired["shadow"]))
+			for _, treatment := range []string{"shadow", "shadow_dense"} {
+				pair := emitBenchPair(t, scenario, round, treatment, paired["off"], paired[treatment])
+				pairResults[treatment] = append(pairResults[treatment], pair)
+			}
 		}
-		emitBenchSummary(t, scenario, pairResults)
-	}
-}
-
-type benchScenario struct {
-	Name            string   `json:"name"`
-	Audio           string   `json:"audio"`
-	Language        string   `json:"language"`
-	HeadStartCase   string   `json:"headstart_case"`
-	DictionaryTerms []string `json:"dictionary_terms"`
-	Draft           bool     `json:"draft"`
-	PiecesAfterMS   int      `json:"pieces_after_ms"`
-	PieceMinMS      int      `json:"piece_min_ms"`
-	PieceTargetMS   int      `json:"piece_target_ms"`
-	PieceMaxMS      int      `json:"piece_max_ms"`
-}
-
-type benchCall struct {
-	StartAt, FirstTokenAt, DoneAt time.Time
-	InputChars                    int
-	Usage                         llm.Usage
-	Succeeded                     bool
-}
-
-type benchRun struct {
-	mu             sync.Mutex
-	Scenario       benchScenario
-	Arm            string
-	Warmup         bool
-	Round          int
-	ColdStart      bool
-	StartedAt      time.Time
-	StoppedAt      time.Time
-	Snapshot       session.Snapshot
-	RecordingAt    time.Time
-	FinalAt        time.Time
-	FirstDraftAt   time.Time
-	CleanupDoneAt  time.Time
-	DeliveryAt     time.Time
-	SessionDoneAt  time.Time
-	LLMCalls       []benchCall
-	ExperimentLogs []json.RawMessage
-	PlaybackFactor float64
-}
-
-type benchLog struct {
-	mu     sync.Mutex
-	active *benchRun
-}
-
-func (l *benchLog) setActive(run *benchRun) {
-	l.mu.Lock()
-	l.active = run
-	l.mu.Unlock()
-}
-
-func (l *benchLog) add(_ string, message string) {
-	start := strings.IndexByte(message, '{')
-	if start < 0 {
-		return
-	}
-	var event struct {
-		Event string `json:"event"`
-	}
-	raw := json.RawMessage(message[start:])
-	if json.Unmarshal(raw, &event) != nil ||
-		!(strings.HasPrefix(event.Event, "voxt_final_candidate_") || event.Event == "omni_request_stage") {
-		return
-	}
-	l.mu.Lock()
-	if l.active != nil {
-		l.active.mu.Lock()
-		l.active.ExperimentLogs = append(l.active.ExperimentLogs, append(json.RawMessage(nil), raw...))
-		l.active.mu.Unlock()
-	}
-	l.mu.Unlock()
-}
-
-func runBenchSession(t *testing.T, manager *session.Manager, logs *benchLog, audio *benchAudio, pcm []byte, scenario benchScenario, arm string, warmup, round int, cold bool, done <-chan session.Snapshot, activeMu *sync.Mutex, activeRun **benchRun) *benchRun {
-	t.Helper()
-	mode := ""
-	if arm == "shadow" {
-		mode = "shadow"
-		if err := os.Setenv("VOXT_EXPERIMENT_FINAL_CANDIDATES", mode); err != nil {
-			t.Fatal(err)
+		for _, treatment := range []string{"shadow", "shadow_dense"} {
+			emitBenchSummary(t, scenario, treatment, pairResults[treatment])
 		}
-	} else if err := os.Unsetenv("VOXT_EXPERIMENT_FINAL_CANDIDATES"); err != nil {
-		t.Fatal(err)
-	}
-	run := &benchRun{Scenario: scenario, Arm: arm, Warmup: warmup >= 0, Round: round, ColdStart: cold, StartedAt: time.Now()}
-	run.PlaybackFactor = audio.frameFactor
-	ready := audio.prepare(pcm)
-	select {
-	case <-done:
-	default:
-	}
-	activeMu.Lock()
-	*activeRun = run
-	activeMu.Unlock()
-	logs.setActive(run)
-
-	id, err := manager.Start(session.StartRequest{Kind: store.KindTranscribe})
-	if err != nil {
-		t.Fatalf("start %s session: %v", arm, err)
-	}
-	select {
-	case <-ready:
-	case <-time.After(20 * time.Minute):
-		t.Fatalf("scenario %q audio did not finish playback", scenario.Name)
-	}
-	stopAt := time.Now()
-	manager.Stop(id)
-	run.mu.Lock()
-	run.StoppedAt = stopAt
-	run.mu.Unlock()
-	select {
-	case snapshot := <-done:
-		run.Snapshot = snapshot
-	case <-time.After(20 * time.Minute):
-		t.Fatalf("scenario %q %s session did not finish", scenario.Name, arm)
-	}
-	logs.setActive(nil)
-	activeMu.Lock()
-	*activeRun = nil
-	activeMu.Unlock()
-	return run
-}
-
-func (r *benchRun) observe(snapshot session.Snapshot) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.Snapshot = snapshot
-	now := time.Now()
-	if snapshot.State == session.Recording && r.RecordingAt.IsZero() {
-		r.RecordingAt = now
-	}
-	if snapshot.Raw != "" && r.FinalAt.IsZero() {
-		r.FinalAt = now
-	}
-	if snapshot.Draft != "" && r.FirstDraftAt.IsZero() {
-		r.FirstDraftAt = now
-	}
-	if snapshot.State == session.Delivering && r.CleanupDoneAt.IsZero() {
-		r.CleanupDoneAt = now
-	}
-	if snapshot.Result != "" && r.DeliveryAt.IsZero() {
-		r.DeliveryAt = now
-	}
-	if snapshot.State.Ended() && r.SessionDoneAt.IsZero() {
-		r.SessionDoneAt = now
-	}
-}
-
-type benchLLM struct {
-	client *llm.Client
-	active func() *benchRun
-}
-
-func (l *benchLLM) Chat(ctx context.Context, request llm.Request) (llm.Response, error) {
-	run := l.active()
-	call := benchCall{StartAt: time.Now(), InputChars: request.InputChars}
-	index := -1
-	if run != nil {
-		run.mu.Lock()
-		run.LLMCalls = append(run.LLMCalls, call)
-		index = len(run.LLMCalls) - 1
-		run.mu.Unlock()
-	}
-	originalDelta := request.OnDelta
-	request.OnDelta = func(delta string) {
-		if delta != "" && run != nil {
-			run.mu.Lock()
-			run.LLMCalls[index].FirstTokenAt = time.Now()
-			run.mu.Unlock()
-		}
-		if originalDelta != nil {
-			originalDelta(delta)
-		}
-	}
-	if originalDelta == nil {
-		request.OnDelta = nil
-	}
-	response, err := l.client.Chat(ctx, request)
-	if run != nil {
-		run.mu.Lock()
-		run.LLMCalls[index].DoneAt = time.Now()
-		run.LLMCalls[index].Usage = response.Usage
-		run.LLMCalls[index].Succeeded = err == nil
-		run.mu.Unlock()
-	}
-	return response, err
-}
-
-type benchAudio struct {
-	mu          sync.Mutex
-	pcm         []byte
-	frameFactor float64
-	ready       chan struct{}
-	stop        chan struct{}
-	stopOnce    sync.Once
-}
-
-func (a *benchAudio) prepare(pcm []byte) <-chan struct{} {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	a.pcm = pcm
-	a.ready = make(chan struct{})
-	a.stop = make(chan struct{})
-	a.stopOnce = sync.Once{}
-	return a.ready
-}
-
-func (a *benchAudio) Record(ctx context.Context, id string, params proto.CaptureParams, fn func(session.AudioEvent)) (proto.CaptureResult, error) {
-	a.mu.Lock()
-	pcm, factor, ready, stop := a.pcm, a.frameFactor, a.ready, a.stop
-	a.mu.Unlock()
-	frameMS := params.FrameMS
-	if frameMS <= 0 {
-		frameMS = 100
-	}
-	frameBytes := max(2, 16000*frameMS/1000*2)
-	fn(session.AudioEvent{Started: &proto.CaptureStartedParams{Job: id, SampleRate: 16000, DeviceName: "benchmark fixture"}})
-	frames, samples := 0, 0
-	for offset := 0; offset < len(pcm); {
-		end := min(offset+frameBytes, len(pcm))
-		if end%2 != 0 {
-			end--
-		}
-		if end <= offset {
-			break
-		}
-		frame := append([]byte(nil), pcm[offset:end]...)
-		fn(session.AudioEvent{PCM: &proto.PCMParams{Job: id, Seq: frames, Offset: samples, Data: frame}})
-		frames++
-		samples += len(frame) / 2
-		offset = end
-		if factor > 0 {
-			timer := time.NewTimer(time.Duration(float64(time.Duration(frameMS)*time.Millisecond) * factor))
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return proto.CaptureResult{}, ctx.Err()
-			case <-stop:
-				timer.Stop()
-				return proto.CaptureResult{Reason: proto.CaptureStopped, Frames: frames, Samples: samples}, nil
-			case <-timer.C:
+		if scenario.ProtocolSmoke {
+			for _, arm := range []string{"shadow", "shadow_dense"} {
+				observed := false
+				for _, run := range scenarioRuns {
+					if run.Arm != arm {
+						continue
+					}
+					if candidateProtocolCoverage(run.snapshot().ExperimentLogs).HTTPObservedCount > 0 {
+						observed = true
+						break
+					}
+				}
+				if !observed {
+					t.Fatalf("scenario %q did not demonstrate native candidate protocol support in any %s session", scenario.Name, arm)
+				}
 			}
 		}
 	}
-	close(ready)
-	select {
-	case <-ctx.Done():
-		return proto.CaptureResult{}, ctx.Err()
-	case <-stop:
-		return proto.CaptureResult{Reason: proto.CaptureStopped, Frames: frames, Samples: samples}, nil
-	}
-}
-
-func (a *benchAudio) Stop(context.Context, string) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.stop != nil {
-		a.stopOnce.Do(func() { close(a.stop) })
-	}
-	return nil
-}
-
-type benchTextIO struct{}
-
-func (benchTextIO) Focus(context.Context) (proto.FocusResult, error) {
-	return proto.FocusResult{}, nil
-}
-
-func (benchTextIO) Paste(context.Context, proto.PasteParams) (proto.PasteResult, error) {
-	return proto.PasteResult{Posted: true}, nil
+	emitCandidateCoverageSummary(t, allRuns)
 }

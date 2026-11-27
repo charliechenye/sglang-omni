@@ -4,9 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/sgl-project/sglang-omni/Voxt/internal/asr"
 	"github.com/sgl-project/sglang-omni/Voxt/internal/vad"
@@ -149,7 +147,7 @@ func (a *ASR) Transcribe(ctx context.Context, req asr.FileRequest) (asr.Result, 
 	}
 	defer l.release()
 	start := time.Now()
-	text, language, err := a.final(ctx, l, pcm, a.spec.languageHint(req.Lang), a.finalBias(a.spec.ASR.contextBias(req.Hints, req.Prompt)), prior{}, nil)
+	text, language, err := a.final(ctx, l, pcm, a.spec.languageHint(req.Lang), a.finalBias(a.spec.ASR.contextBias(req.Hints, req.Prompt)), prior{}, nil, nil)
 	if err != nil {
 		return asr.Result{}, err
 	}
@@ -219,167 +217,25 @@ func filePCM(req asr.FileRequest) ([]byte, error) {
 
 // finalBias adds MOSS's hotwords only to post-stop Finals, keeping them out
 // of live and intermediate previews.
-func (a *ASR) finalBias(b bias) bias {
-	if len(b.hotwords) > 0 {
-		if b.context == "" {
-			b.context = mossDiarizePrompt
-		}
-		b.context += " Hotwords: " + strings.Join(b.hotwords, ", ")
-	}
-	return b
-}
-
-// final transcribes quiet-cut chunks in order, with a shared token budget
-// for Qwen3-ASR and one budget per Whisper window. The first detected
-// language, when available, is passed to subsequent requests. known is of
-// the recording's start: the chunks after the first have no part of it.
-func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, b bias, known prior, onCandidate func(finalCandidate)) (string, string, error) {
-	t := a.spec.ASR
-	budget := t.tokenBudget(asr.Duration(pcm, sampleRate))
-	shared := t.TokensPerSecond > 0 // else each request has the whole budget
-	batchWhisper := a.spec.Kind == kindWhisper && a.draft == ""
-	chunks := t.splitChunks(pcm)
-	if a.spec.Kind == kindWhisper {
-		chunks = trimWhisperSilenceTail(chunks)
-	}
-	if len(chunks) > 1 {
-		known.text = "" // the text is of all the chunks: none of them is all of it
-		known.guessAutoLanguage = false
-	}
-	includeCandidates := onCandidate != nil && a.spec.Kind == kindQwen3ASR && len(chunks) == 1
-	if onCandidate != nil && !includeCandidates {
-		reason := "unsupported_model"
-		if a.spec.Kind == kindQwen3ASR {
-			reason = "multiple_final_chunks"
-		} else {
-		}
-		a.rt.logf("info", "{\"event\":\"voxt_final_candidates_excluded\",\"reason\":%q,\"chunk_count\":%d}", reason, len(chunks))
-	} else {
-	}
-	var parts []string
-	for len(chunks) > 0 {
-		if shared && budget <= 0 {
-			break
-		}
-		if batchWhisper {
-			batchPCM, chunkWindows := packWhisperChunks(chunks)
-			if len(chunkWindows) > 1 {
-				req := finalRequest{pcm: batchPCM, language: language, maxTokens: budget}
-				texts, detected, err := a.transcribeWhisperBatch(ctx, l, req, chunkWindows)
-				if err != nil {
-					return "", "", err
-				}
-				if texts != nil {
-					parts = append(parts, texts...)
-					if language == "" {
-						language = detected
-					}
-					chunks = chunks[len(chunkWindows):]
-					continue
-				}
-				// A mismatched older runtime cannot split this first batch;
-				// redo it per chunk and avoid batching the remaining chunks.
-				batchWhisper = false
-			}
-		}
-		c := chunks[0]
-		chunks = chunks[1:]
-		start := known
-		known = prior{}
-		requestID := nextOfflineRequestID()
-		pcm, ok := a.speechOnlyTimed(ctx, requestID, c.pcm)
-		if !ok {
-			continue
-		}
-		req := finalRequest{pcm: pcm, language: language, context: b.context, maxTokens: budget, layout: t.AudioLayout, known: start, includeCandidates: includeCandidates}
-		if includeCandidates {
-			req.onCandidate = func(candidate finalCandidate) {
-				originalText := candidate.text
-				text, reason, ok := a.finalCandidateText(candidate.text, b.terms)
-				candidate.text = text
-				if !ok {
-					candidate.text = originalText
-					logCandidateRecord(a.rt, "voxt_final_candidate_suppressed", candidate, time.Time{}, reason)
-				} else {
-					onCandidate(candidate)
-				}
-			}
-		} else {
-		}
-		r, err := transcribeTimed(ctx, l, req, a.rt.cfg.StallTimeout, requestID)
-		if err != nil {
-			return "", "", err
-		}
-		r.text = a.trimEcho(ctx, l, req, a.plainText(r.text), r.length, b.terms)
-		if shared {
-			budget -= r.tokens
-		}
-		if language == "" {
-			language = r.language
-		}
-		parts = append(parts, r.text)
-	}
-	return joinParts(parts), language, nil
-}
-
-func (a *ASR) finalCandidateText(text string, terms []string) (string, string, bool) {
-	text = a.plainText(text)
-	if !utf8.ValidString(text) || strings.ContainsRune(text, '\uFFFD') {
-		return "", "invalid_utf8", false
-	} else {
-	}
-	cut, _, certain := echoTail(text, terms, false)
-	if cut >= 0 && !certain {
-		return "", "uncertain_dictionary_echo", false
-	} else if cut >= 0 {
-		text = strings.TrimSpace(text[:cut])
-	} else {
-	}
-	if text == "" {
-		return "", "empty_after_normalization", false
-	} else {
-		return text, "", true
-	}
-}
-
-// transcribeWhisperBatch reassembles each quiet-cut chunk before joinParts
-// joins the chunks. The runtime uses spaces between windows of one chunk.
-func (a *ASR) transcribeWhisperBatch(ctx context.Context, l *lease, req finalRequest, chunkWindows []int) ([]string, string, error) {
-	r, err := transcribe(ctx, l, req, a.rt.cfg.StallTimeout)
-	if err != nil || r.windowTexts == nil {
-		return nil, "", err
-	}
-	if len(r.windowTexts) != len(req.pcm)/whisperWindowBytes {
-		return nil, "", &asr.Error{Kind: asr.KindProtocol, Provider: Provider, Detail: "the Whisper batch returned the wrong number of windows"}
-	}
-	parts := make([]string, 0, len(chunkWindows))
-	for _, count := range chunkWindows {
-		var windows []string
-		for _, text := range r.windowTexts[:count] {
-			if text != "" {
-				windows = append(windows, text)
-			}
-		}
-		parts = append(parts, strings.Join(windows, " "))
-		r.windowTexts = r.windowTexts[count:]
-	}
-	return parts, r.language, nil
-}
-
 // Open starts a live session: partial text while audio comes in, then
 // at Finish the Final over everything sent.
 func (a *ASR) Open(ctx context.Context, req asr.StreamRequest) (asr.Stream, error) {
 	mode := os.Getenv(experimentFinalCandidatesEnv)
-	if mode == "shadow" && req.LiveResult {
-		a.rt.logf("info", "{\"event\":\"voxt_final_candidates_excluded\",\"reason\":\"live_result\"}")
+	shadowEnabled := mode == "shadow" || mode == "shadow_dense"
+	if shadowEnabled && req.LiveResult {
+		logCandidateExclusion(a.rt, req.ShadowRunID, req.ShadowSessionID, "live_result", 0)
 		req.ShadowFinalCandidates = false
-	} else if mode == "shadow" && a.spec.Kind != kindQwen3ASR {
-		a.rt.logf("info", "{\"event\":\"voxt_final_candidates_excluded\",\"reason\":\"unsupported_model\"}")
+		req.ShadowDenseCandidates = false
+	} else if shadowEnabled && a.spec.Kind != kindQwen3ASR {
+		logCandidateExclusion(a.rt, req.ShadowRunID, req.ShadowSessionID, "unsupported_model", 0)
 		req.ShadowFinalCandidates = false
-	} else if mode == "shadow" {
+		req.ShadowDenseCandidates = false
+	} else if shadowEnabled {
 		req.ShadowFinalCandidates = true
+		req.ShadowDenseCandidates = mode == "shadow_dense"
 	} else {
 		req.ShadowFinalCandidates = false
+		req.ShadowDenseCandidates = false
 	}
 	if req.SampleRate != 0 && req.SampleRate != sampleRate {
 		return nil, &asr.Error{Kind: asr.KindAudio, Provider: Provider, Detail: fmt.Sprintf("audio must be 16 kHz, not %d Hz", req.SampleRate)}

@@ -282,7 +282,7 @@ func TestFinalPrior(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer l.release()
-		if _, _, err := a.final(ctx, l, tone(130*time.Second, 0.3), tc.lang, bias{}, tc.known, nil); err != nil {
+		if _, _, err := a.final(ctx, l, tone(130*time.Second, 0.3), tc.lang, bias{}, tc.known, nil, nil); err != nil {
 			t.Fatal(err)
 		}
 		finals := f.records("final")

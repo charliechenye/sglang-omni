@@ -94,8 +94,42 @@ if [[ "$probe" != *"--model-kind must be"* ]]; then
   echo "the staged qwen3_asr_server does not start: $probe" >&2
   exit 1
 fi
+repo_root="$(git -C "$ROOT" rev-parse --show-toplevel 2>/dev/null || true)"
+native_root="$(git -C "$NATIVE" rev-parse --show-toplevel 2>/dev/null || true)"
+experiment_commit="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+native_source_commit="$(git -C "$NATIVE" rev-parse HEAD 2>/dev/null || true)"
+native_worktree_clean=false
+if [[ -n "$repo_root" && "$repo_root" == "$native_root" &&
+      -n "$experiment_commit" && "$native_source_commit" == "$experiment_commit" &&
+      -z "$(git -C "$ROOT" status --porcelain --untracked-files=all)" ]]; then
+  native_worktree_clean=true
+fi
+[[ -n "$experiment_commit" ]] || experiment_commit=unknown
+[[ -n "$native_source_commit" ]] || native_source_commit=unknown
+runtime_binary="$OUT/bin/qwen3_asr_server"
+runtime_binary_sha256="$(shasum -a 256 "$runtime_binary" | awk '{print $1}')"
+python3 - "$OUT" "$NATIVE" "$experiment_commit" "$native_source_commit" \
+  "$native_worktree_clean" "$runtime_binary" "$runtime_binary_sha256" <<'PY'
+import json
+import pathlib
+import sys
+
+output = pathlib.Path(sys.argv[1])
+record = {
+    "schema_version": 1,
+    "build_command": "Voxt/scripts/build-omni.sh --out <runtime>",
+    "native_source_path": str(pathlib.Path(sys.argv[2]).resolve()),
+    "experiment_commit": sys.argv[3],
+    "native_source_commit": sys.argv[4],
+    "native_worktree_clean": sys.argv[5] == "true",
+    "runtime_binary_path": str(pathlib.Path(sys.argv[6]).resolve()),
+    "runtime_binary_sha256": sys.argv[7],
+}
+(output / "build-provenance.json").write_text(json.dumps(record, indent=2) + "\n")
+PY
 du -sh "$OUT/bin" | sed "s|^|staged |"
 echo "VOXTNEW_OMNI_RUNTIME=$OUT"
+echo "Runtime provenance: $OUT/build-provenance.json"
 
 if [[ $CLEAN == 1 ]]; then
   rm -rf "$WORK"

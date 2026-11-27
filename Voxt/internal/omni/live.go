@@ -381,8 +381,9 @@ func (s *live) handleSegment(ev realtimeEvent) {
 		}
 		if s.shadowCandidates {
 			metadata := asr.CandidateMetadata{
-				Source: "websocket_preview", SessionID: s.shadowID,
-				Sequence: uint64(ev.Index), ReceivedAt: time.Now(),
+				Source: "websocket_preview", RunID: s.req.ShadowRunID,
+				SessionID: s.shadowID,
+				Sequence:  uint64(ev.Index), ReceivedAt: time.Now(),
 			}
 			shadowLog = finalCandidate{text: text, metadata: metadata}
 			logShadow = s.emit(asr.Event{Kind: asr.EventShadowCandidate, Text: text, Candidate: metadata})
@@ -429,7 +430,10 @@ func (s *live) Finish() error {
 	s.lateCandidates = wantsLateCandidates(s.req, s.conn != nil, s.a.spec.Kind)
 	s.shadowCandidates = wantsShadowCandidates(s.req, s.a.spec.Kind)
 	if s.shadowCandidates {
-		s.shadowID = nextOfflineRequestID()
+		s.shadowID = s.req.ShadowSessionID
+		if s.shadowID == 0 {
+			s.shadowID = nextOfflineRequestID()
+		}
 	} else {
 	}
 	s.mu.Unlock()

@@ -111,7 +111,7 @@ func watchExactAdoption(r *run) <-chan struct{} {
 func prepareLateHeadCall(t *testing.T, r *run, model *controlledLiveLLM, text string) (headPlan, *headCall, *controlledLiveCall) {
 	t.Helper()
 	plan, ok := r.head.prepareLate(text)
-	if !ok || !r.head.submitLate(plan) {
+	if !ok || !r.head.submitLate(plan).dispatched {
 		t.Fatal("the late candidate was not submitted")
 	}
 	call := waitLiveCall(t, model, "the late candidate")
@@ -432,7 +432,7 @@ func TestHeadStartLateCandidateLimit(t *testing.T) {
 				t.Fatalf("late candidate preparation %v, want %v", ok, tc.allowed)
 			}
 			if tc.allowed {
-				if !r.head.submitLate(gen) {
+				if !r.head.submitLate(gen).dispatched {
 					t.Fatal("the prepared generation was not submitted")
 				}
 				calls = append(calls, waitLiveCall(t, model, "the late generation"))
@@ -483,7 +483,7 @@ func TestHeadStartLateCandidateRejectionsPreserveRequests(t *testing.T) {
 		t.Errorf("rejected candidates changed retained state: text %q, late %v, calls %d", r.head.text, r.head.lateAsked, len(r.head.all()))
 	}
 	gen, ok := r.head.prepareLate("we ship on friday tomorrow")
-	if !ok || !r.head.submitLate(gen) {
+	if !ok || !r.head.submitLate(gen).dispatched {
 		t.Fatal("rejected candidates consumed the late-generation allowance")
 	}
 	late := waitLiveCall(t, model, "the valid late candidate")
@@ -534,7 +534,7 @@ func TestHeadStartLateCandidateDoesNotDisplaceCompleted(t *testing.T) {
 			completed.complete(t, "We ship on Friday.", nil)
 			waitHeadCall(t, earlier, "the earlier HeadStart request")
 			gen, ok := r.head.prepareLate("we ship, on friday")
-			if !ok || !r.head.submitLate(gen) {
+			if !ok || !r.head.submitLate(gen).dispatched {
 				t.Fatal("the late candidate was not submitted")
 			}
 			late := waitLiveCall(t, model, "the late candidate")
@@ -697,9 +697,9 @@ func TestLateDispatchReturnsReadyFinal(t *testing.T) {
 	}
 	finals := make(chan streamEnd, 1)
 	finals <- streamEnd{silent: true}
-	end, err, ready := r.dispatchLate(r.ctx, finals, plan)
-	if !ready || err != nil || !end.silent {
-		t.Errorf("terminal result %+v, %v, ready %v", end, err, ready)
+	dispatch := r.dispatchLate(r.ctx, finals, plan)
+	if !dispatch.terminal || dispatch.err != nil || !dispatch.end.silent {
+		t.Errorf("terminal result %+v, %v, ready %v", dispatch.end, dispatch.err, dispatch.terminal)
 	}
 	if model.requestCount() != 0 || r.head.lateAsked || len(r.head.all()) != 0 {
 		t.Errorf("speculative request started after Final was ready: requests %d, late %v, retained %d", model.requestCount(), r.head.lateAsked, len(r.head.all()))

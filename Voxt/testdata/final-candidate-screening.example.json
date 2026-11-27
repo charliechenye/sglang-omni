@@ -1,0 +1,45 @@
+[
+  {
+    "name": "3s-english-automatic",
+    "audio": "eval/en-2.wav",
+    "language": "",
+    "headstart_case": "unclassified",
+    "draft": false
+  },
+  {
+    "name": "3s-english-explicit",
+    "audio": "eval/en-2.wav",
+    "language": "en",
+    "headstart_case": "unclassified",
+    "protocol_smoke": true,
+    "draft": false
+  },
+  {
+    "name": "10s-english-automatic",
+    "audio": "eval/en-1.wav",
+    "language": "",
+    "headstart_case": "unclassified",
+    "draft": false
+  },
+  {
+    "name": "10s-english-explicit",
+    "audio": "eval/en-1.wav",
+    "language": "en",
+    "headstart_case": "unclassified",
+    "draft": false
+  },
+  {
+    "name": "10s-chinese-automatic",
+    "audio": "eval/zh-filler-1.wav",
+    "language": "",
+    "headstart_case": "unclassified",
+    "draft": false
+  },
+  {
+    "name": "10s-chinese-explicit",
+    "audio": "eval/zh-filler-1.wav",
+    "language": "zh",
+    "headstart_case": "unclassified",
+    "draft": false
+  }
+]

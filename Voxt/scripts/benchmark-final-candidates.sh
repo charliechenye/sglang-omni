@@ -19,6 +19,39 @@ fi
 runtime="${VOXTNEW_OMNI_RUNTIME:?set the existing local Omni runtime}"
 if [[ -d "$runtime" ]]; then runtime="$runtime/bin/qwen3_asr_server"; fi
 [[ -x "$runtime" ]] || { echo "Omni runtime server binary does not exist" >&2; exit 1; }
+repo_root="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
+python3 - "$runtime" "$repo_root" <<'PY'
+import hashlib
+import json
+import pathlib
+import subprocess
+import sys
+
+binary = pathlib.Path(sys.argv[1]).resolve()
+root = pathlib.Path(sys.argv[2]).resolve()
+provenance_path = binary.parent.parent / "build-provenance.json"
+if not provenance_path.is_file():
+    raise SystemExit(f"missing runtime provenance: {provenance_path}")
+provenance = json.loads(provenance_path.read_text())
+commit = subprocess.check_output(
+    ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+).strip()
+source_path = pathlib.Path(provenance["native_source_path"]).resolve()
+expected_source = (root / "sglang_omni_mlx" / "native").resolve()
+binary_hash = hashlib.sha256(binary.read_bytes()).hexdigest()
+checks = {
+    "experiment_commit": provenance.get("experiment_commit") == commit,
+    "native_source_commit": provenance.get("native_source_commit") == commit,
+    "clean_native_worktree": provenance.get("native_worktree_clean") is True,
+    "native_source_path": source_path == expected_source,
+    "runtime_binary_path": pathlib.Path(provenance.get("runtime_binary_path", "")).resolve() == binary,
+    "runtime_binary_sha256": provenance.get("runtime_binary_sha256") == binary_hash,
+}
+failed = [name for name, passed in checks.items() if not passed]
+if failed:
+    raise SystemExit("runtime provenance check failed: " + ", ".join(failed))
+print(f"Verified native runtime provenance: {provenance_path}")
+PY
 if [[ -n "${VOXTNEW_FINAL_CANDIDATE_BENCH_DRAFT_DIR:-}" ]]; then
   [[ -d "$VOXTNEW_FINAL_CANDIDATE_BENCH_DRAFT_DIR" ]] || { echo "draft model folder does not exist" >&2; exit 1; }
 fi

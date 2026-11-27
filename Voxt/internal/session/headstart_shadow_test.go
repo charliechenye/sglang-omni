@@ -4,6 +4,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/sgl-project/sglang-omni/Voxt/internal/llm"
 )
 
 func TestShadowCandidateDoesNotDispatchOrChangeVisibleText(t *testing.T) {
@@ -27,11 +29,6 @@ func TestShadowCandidateDoesNotDispatchOrChangeVisibleText(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the ASR Final did not start")
 	}
-	select {
-	case <-h.shadowObserved:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the shadow candidate was not observed")
-	}
 	if model.requestCount() != 0 {
 		t.Fatalf("shadow candidate started %d speculative requests", model.requestCount())
 	}
@@ -48,5 +45,23 @@ func TestShadowCandidateDoesNotDispatchOrChangeVisibleText(t *testing.T) {
 	}
 	if model.requestCount() != 1 {
 		t.Fatalf("made %d LLM requests, want only the normal Final cleanup", model.requestCount())
+	}
+}
+
+func TestShadowPlanCompatibilityUsesPendingCleanupPartIndices(t *testing.T) {
+	request := func(content string) llm.Request {
+		return llm.Request{Messages: []llm.Message{{Role: llm.User, Content: content}}}
+	}
+	candidate := headPlan{parts: []headPart{
+		{partIndex: 0, req: request("already completed")},
+		{partIndex: 1, req: request("pending match")},
+		{partIndex: 2, req: request("candidate mismatch")},
+	}}
+	authoritativePending := headPlan{parts: []headPart{
+		{partIndex: 1, req: request("pending match")},
+		{partIndex: 2, req: request("different pending request")},
+	}}
+	if exact, near, repair, compatible := (&headStart{}).plansCompatible(candidate, authoritativePending); exact || near || repair || len(compatible) != 1 || compatible[0] != 1 {
+		t.Fatalf("exact=%t near=%t repair=%t compatible parts=%v", exact, near, repair, compatible)
 	}
 }

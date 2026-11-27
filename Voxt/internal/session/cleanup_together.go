@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sgl-project/sglang-omni/Voxt/internal/compose"
+	"github.com/sgl-project/sglang-omni/Voxt/internal/llm"
 )
 
 // partsTogether is how many of a long dictation's parts a remote service
@@ -18,7 +19,7 @@ const partsTogether = 4
 
 // cleanPartsTogether runs the remaining parts side by side. Drafts publish
 // in order up to the first part not answered yet.
-func (r *run) cleanPartsTogether(text string, parts []compose.Part, answered []string, request cleanupRequest) (string, string, error) {
+func (r *run) cleanPartsTogether(text string, parts []compose.Part, answered []string, requests []llm.Request, request cleanupRequest) (string, string, error) {
 	r.m.mu.Lock()
 	attempt := r.cleanupAttempt
 	r.m.mu.Unlock()
@@ -64,7 +65,8 @@ func (r *run) cleanPartsTogether(text string, parts []compose.Part, answered []s
 				return
 			}
 			p := parts[i]
-			resp, err := r.askPart(request.ctx, r.partRequest(text, p, request.thinking, func(delta string) {
+			req := requests[i]
+			req.OnDelta = func(delta string) {
 				mu.Lock()
 				defer mu.Unlock()
 				drafts[i].WriteString(delta)
@@ -72,7 +74,8 @@ func (r *run) cleanPartsTogether(text string, parts []compose.Part, answered []s
 					published = now
 					publish()
 				}
-			}), p.Text)
+			}
+			resp, err := r.askPart(request.ctx, req, p.Text)
 			if request.ctx.Err() != nil || r.ctx.Err() != nil || r.skipped.Load() || r.rethink.Load() {
 				return
 			}

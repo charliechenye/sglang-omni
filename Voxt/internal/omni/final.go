@@ -55,6 +55,7 @@ type finalRequest struct {
 	// and moves that start here.
 	pieceEnd          int
 	includeCandidates bool
+	candidateCadence  string
 	onCandidate       func(finalCandidate)
 }
 
@@ -76,6 +77,12 @@ type finalResult struct {
 type finalCandidate struct {
 	text     string
 	metadata asr.CandidateMetadata
+}
+
+type candidateMeasurement struct {
+	runID     string
+	sessionID uint64
+	cadence   string
 }
 
 // body is the request's multipart form (Voxt's OmniMultipartBody for
@@ -101,6 +108,9 @@ func (r finalRequest) body(model string) (*bytes.Buffer, string) {
 	field("include_generation_metadata", "true")
 	if r.includeCandidates {
 		field("include_transcript_candidates", "true")
+		if r.candidateCadence != "" {
+			field("candidate_cadence", r.candidateCadence)
+		}
 	}
 	if r.preview {
 		field("preview", "true")

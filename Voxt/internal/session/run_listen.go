@@ -106,13 +106,16 @@ func (r *run) listen() (string, bool) {
 		heard = r.heard
 		ch := make(chan openResult)
 		request := asr.StreamRequest{
-			SampleRate:   asr.SampleRate,
-			Lang:         r.speechLang(),
-			Hints:        append([]string(nil), r.hints()...),
-			Prompt:       r.speechContext(),
-			LiveResult:   r.settings.Audio.LiveResult,
-			EarlyPieces:  r.earlyPieces(),
-			LatePartials: latePartials,
+			SampleRate:            asr.SampleRate,
+			Lang:                  r.speechLang(),
+			Hints:                 append([]string(nil), r.hints()...),
+			Prompt:                r.speechContext(),
+			LiveResult:            r.settings.Audio.LiveResult,
+			EarlyPieces:           r.earlyPieces(),
+			LatePartials:          latePartials,
+			ShadowSessionID:       r.shadowSessionID,
+			ShadowRunID:           r.id,
+			ShadowDenseCandidates: r.shadowDense,
 		}
 		go func() {
 			s, err := st.Open(r.ctx, request)

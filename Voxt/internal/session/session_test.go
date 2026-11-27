@@ -35,9 +35,8 @@ type harness struct {
 	fallback    LLM // Translate's fallback model (nil: none)
 	resolveErr  error
 	// speech is Resolve's speech argument, call by call.
-	speech         []bool
-	logs           []string
-	shadowObserved chan struct{}
+	speech []bool
+	logs   []string
 	// vadModel is the voice activity model the services have (nil: none).
 	vadModel vad.Model
 	// remote: the language model's requests run side by side (Model.Remote).
@@ -46,8 +45,7 @@ type harness struct {
 
 func newHarness(t testing.TB, prov asr.Provider, model LLM, cfgFn func(*Config, *settings.Settings)) *harness {
 	h := &harness{t: t, audio: newFakeAudio(), text: &fakeText{focus: proto.FocusResult{PID: 812, Role: "AXTextArea", Editable: true}},
-		hist: &memHistory{dir: t.TempDir()}, rec: newRecorder(), asr: prov, llm: model,
-		shadowObserved: make(chan struct{}, 1)}
+		hist: &memHistory{dir: t.TempDir()}, rec: newRecorder(), asr: prov, llm: model}
 	if streamer, ok := prov.(*fakeStreamer); ok {
 		streamer.ensureSignals()
 	}
@@ -92,12 +90,6 @@ func newHarness(t testing.TB, prov asr.Provider, model LLM, cfgFn func(*Config, 
 			h.mu.Lock()
 			h.logs = append(h.logs, level+" "+msg)
 			h.mu.Unlock()
-			if strings.Contains(msg, "voxt_final_candidate_eligibility") {
-				select {
-				case h.shadowObserved <- struct{}{}:
-				default:
-				}
-			}
 		},
 		LLMBase: time.Second, LLMStall: 500 * time.Millisecond, LLMPerChar: time.Millisecond, LLMTimeout: 2 * time.Second,
 		ASRTimeout: 2 * time.Second, StopGrace: 200 * time.Millisecond,

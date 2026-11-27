@@ -85,6 +85,7 @@ func (r *run) ordinaryTranscribe() bool {
 // cleaned up in pieces (compose.BuildParts); where the model fails, the
 // text goes on as recognised, with a warning.
 func (r *run) transcribe(text string) {
+	defer r.recordShadowOutcomesAfterDelivery()
 	result := text
 	var problem *Problem
 	cleanupEnabled := r.transcribeCleanup()
@@ -397,8 +398,18 @@ func (r *run) cleanUpOutput(text string, request cleanupRequest) cleanupOutput {
 // could not be composed). think overrides the service's thinking (nil:
 // its setting).
 func (r *run) cleanParts(text string, parts []compose.Part, answers []string, request cleanupRequest) (string, string, error) {
+	plan := headPlan{heard: text, rest: text}
+	requests := make([]llm.Request, len(parts))
+	for index, part := range parts {
+		req := r.partRequest(text, part, request.thinking, nil)
+		requests[index] = req
+		plan.parts = append(plan.parts, headPart{partIndex: index, req: req, text: part.Text})
+	}
+	firstUnansweredPart := min(len(answers), len(plan.parts))
+	plan.parts = plan.parts[firstUnansweredPart:]
+	r.captureCleanupPlan(plan, "authoritative_cleanup")
 	if len(parts)-len(answers) > 1 && r.svc.LLMInfo.Remote && !r.m.resting(r.svc.LLMInfo.ID) {
-		return r.cleanPartsTogether(text, parts, answers, request)
+		return r.cleanPartsTogether(text, parts, answers, requests, request)
 	}
 	var failed error
 	for i := len(answers); i < len(parts); i++ {
@@ -407,7 +418,9 @@ func (r *run) cleanParts(text string, parts []compose.Part, answers []string, re
 			return text, p.Profile(), context.DeadlineExceeded
 		}
 		draft := newDrafter(r, request.ctx, parts[:i+1], answers, request.generation)
-		resp, err := r.askPart(request.ctx, r.partRequest(text, p, request.thinking, draft.add), p.Text)
+		req := requests[i]
+		req.OnDelta = draft.add
+		resp, err := r.askPart(request.ctx, req, p.Text)
 		switch {
 		case r.ctx.Err() != nil || request.ctx.Err() != nil || r.skipped.Load() || r.rethink.Load():
 			return text, p.Profile(), err

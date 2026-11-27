@@ -23,6 +23,29 @@ import (
 	"time"
 )
 
+type traceTagKey struct{}
+type traceRequestIDKey struct{}
+
+// WithTraceTag labels a request for diagnostics without changing the backend request.
+func WithTraceTag(ctx context.Context, tag string) context.Context {
+	return context.WithValue(ctx, traceTagKey{}, tag)
+}
+
+// TraceTag returns the diagnostic request label, or an empty string.
+func TraceTag(ctx context.Context) string {
+	tag, _ := ctx.Value(traceTagKey{}).(string)
+	return tag
+}
+
+func WithTraceRequestID(ctx context.Context, requestID uint64) context.Context {
+	return context.WithValue(ctx, traceRequestIDKey{}, requestID)
+}
+
+func TraceRequestID(ctx context.Context) uint64 {
+	requestID, _ := ctx.Value(traceRequestIDKey{}).(uint64)
+	return requestID
+}
+
 // Role is a chat message role.
 type Role string
 
