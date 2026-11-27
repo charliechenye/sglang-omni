@@ -70,6 +70,35 @@ def test_opted_in_candidates_precede_the_authoritative_final(
     assert all(event["generated_token_count"] > 0 for event in candidates)
     assert candidates[-1]["published_candidate_count"] == 2
     assert candidates[-1]["snapshot_build_ms_total"] >= candidates[-1]["snapshot_build_ms"]
+    summary = next(event for event in events if event["type"] == "transcript.text.candidate_summary")
+    assert summary["published_candidate_count"] == 2
+    assert summary["coalesced_candidate_count"] + len(candidates) == 2
+    assert events[-1]["type"] == "transcript.text.done"
+    assert payloads[-1] == "[DONE]"
+
+
+def test_supported_candidate_transport_with_no_publishable_candidate(
+    asr_server: SupervisedServer,
+) -> None:
+    response = asr_server.post_form(
+        {
+            "stream": "true",
+            "include_transcript_candidates": "true",
+            "include_generation_metadata": "true",
+        },
+        silent_wav(FRAME_COUNT),
+    )
+    payloads = sse_payloads(response.body)
+    events = [json.loads(payload) for payload in payloads[:-1]]
+    protocol = next(event for event in events if event["type"] == "transcript.text.candidate_protocol")
+    summary = next(event for event in events if event["type"] == "transcript.text.candidate_summary")
+    assert protocol["supported"] is True
+    assert summary == {
+        "type": "transcript.text.candidate_summary",
+        "published_candidate_count": 0,
+        "coalesced_candidate_count": 0,
+    }
+    assert not any(event["type"] == "transcript.text.candidate" for event in events)
     assert events[-1]["type"] == "transcript.text.done"
     assert payloads[-1] == "[DONE]"
 

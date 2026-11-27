@@ -108,23 +108,29 @@ type run struct {
 	// box's (Config.BoxInput) when the answer is asked for.
 	typed string
 	// heard carries whole-text updates and advisory candidates to the session owner.
-	heard              chan heardText
-	shadowCandidates   chan shadowCandidate
-	shadowTraceEnabled bool
-	shadowDense        bool
-	shadowSessionID    uint64
+	heard                   chan heardText
+	shadowCandidates        chan shadowCandidate
+	shadowTraceEnabled      bool
+	shadowCandidatesEnabled bool
+	shadowDense             bool
+	shadowSessionID         uint64
 	// Shadow analysis is retained in this bounded buffer during Final and
 	// emitted only after cleanup and delivery have completed.
-	shadowMu                 sync.Mutex
-	shadowObservations       []shadowObservation
-	shadowObservationCap     bool
-	shadowObservationDropped uint64
-	shadowCandidateCoalesced atomic.Uint64
-	shadowFinal              *streamEnd
-	cleanupPlanSequence      atomic.Uint64
-	cleanupPlanMu            sync.Mutex
-	cleanupPlans             []headPlan
-	llmRequestSequence       atomic.Uint64
+	shadowMu                        sync.Mutex
+	shadowObservations              []shadowObservation
+	shadowHeadStartDecisions        []shadowHeadStartDecision
+	shadowHeadStartDecisionsDropped uint64
+	shadowObservationCap            bool
+	shadowObservationDropped        uint64
+	shadowCandidateCoalesced        atomic.Uint64
+	shadowFinal                     *streamEnd
+	shadowInitialBudget             initialHeadBudget
+	shadowInitialBudgetKnown        bool
+	shadowReportOnce                sync.Once
+	cleanupPlanSequence             atomic.Uint64
+	cleanupPlanMu                   sync.Mutex
+	cleanupPlans                    []headPlan
+	llmRequestSequence              atomic.Uint64
 	// svcResolved is closed when the session's services are resolved
 	// (useServices): the early clean-up's worker waits for it (and r.ctx).
 	svcResolved      chan struct{}

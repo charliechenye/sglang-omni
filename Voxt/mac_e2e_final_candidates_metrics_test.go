@@ -75,6 +75,7 @@ func TestCandidateNativeStatsIncludesCoalescedBuildTotals(t *testing.T) {
 func TestCandidateProtocolCoverageKeepsNoCandidateAndSuppressionReasons(t *testing.T) {
 	events := []json.RawMessage{
 		json.RawMessage(`{"event":"voxt_final_candidate_protocol","enabled":true,"cadence":"dense","decode_path":"http_final_single_chunk"}`),
+		json.RawMessage(`{"event":"voxt_final_candidate_protocol_result","candidate_protocol_requested":true,"candidate_protocol_known":true,"candidate_protocol_supported":true,"native_published_candidate_count":3,"native_coalesced_candidate_count":1,"decode_paths":["target_verified_guess","autoregressive"]}`),
 		json.RawMessage(`{"event":"voxt_final_candidate_suppressed","source":"http_final","reason":"session_inactive"}`),
 		json.RawMessage(`{"event":"voxt_final_candidate_eligibility","candidate_processing_ms":1.5,"candidate_gate_ms":0.25}`),
 		json.RawMessage(`{"event":"voxt_final_candidate_summary","observations_capped":true,"observations_dropped":2,"candidate_channel_coalesced":3,"candidate_channel_pending":1}`),
@@ -82,6 +83,11 @@ func TestCandidateProtocolCoverageKeepsNoCandidateAndSuppressionReasons(t *testi
 	coverage := candidateProtocolCoverage(events)
 	if !coverage.ProtocolReported || !coverage.ProtocolEnabled || coverage.Cadence != "dense" {
 		t.Fatalf("protocol state = %+v", coverage)
+	}
+	if !coverage.ProtocolResultReported || !coverage.ProtocolKnown || !coverage.ProtocolSupported ||
+		!coverage.ProtocolRequested || coverage.NativePublishedCount != 3 || coverage.NativeCoalescedCount != 1 ||
+		coverage.DecodePath != "target_verified_guess,autoregressive" {
+		t.Fatalf("protocol result metadata = %+v", coverage)
 	}
 	if coverage.HTTPObservedCount != 0 || coverage.SuppressedCount != 1 || coverage.SuppressionReasons["session_inactive"] != 1 {
 		t.Fatalf("candidate coverage = %+v", coverage)
@@ -91,6 +97,18 @@ func TestCandidateProtocolCoverageKeepsNoCandidateAndSuppressionReasons(t *testi
 	}
 	if coverage.CandidateProcessingMSTotal != 1.5 || coverage.CandidateGateMSTotal != 0.25 {
 		t.Fatalf("Go processing totals = %.2f, %.2f", coverage.CandidateProcessingMSTotal, coverage.CandidateGateMSTotal)
+	}
+}
+
+func TestPendingHeadStartRequestsUseStableRequestIDs(t *testing.T) {
+	logs := []json.RawMessage{
+		json.RawMessage(`{"event":"voxt_headstart_decision","request_ids":[8,9]}`),
+		json.RawMessage(`{"event":"voxt_headstart_request_start","request_id":10}`),
+		json.RawMessage(`{"event":"voxt_headstart_request_done","request_id":8}`),
+		json.RawMessage(`{"event":"voxt_headstart_request_done","request_id":10}`),
+	}
+	if pending := pendingHeadStartRequestIDs(logs); len(pending) != 1 || pending[0] != 9 {
+		t.Fatalf("pending requests = %v, want [9]", pending)
 	}
 }
 

@@ -42,21 +42,42 @@ func (h *headStart) transcriptPlan(live string) (headPlan, string) {
 }
 
 type shadowObservation struct {
-	candidate            shadowCandidate
-	plan                 headPlan
-	processingAt         time.Time
-	planReadyAt          time.Time
-	dispatchReadyAt      time.Time
-	reason               string
-	recordingGenerations int
-	budgetAvailable      bool
-	llmReady             bool
-	cleanupEligible      bool
-	existingRequests     int
-	previewMatch         bool
-	extendsPreview       bool
-	textBoundary         bool
-	eligible             bool
+	candidate                     shadowCandidate
+	plan                          headPlan
+	processingAt                  time.Time
+	planReadyAt                   time.Time
+	dispatchReadyAt               time.Time
+	reason                        string
+	recordingGenerations          int
+	budgetAvailable               bool
+	llmReady                      bool
+	cleanupEligible               bool
+	existingRequests              int
+	previewMatch                  bool
+	extendsPreview                bool
+	textBoundary                  bool
+	eligible                      bool
+	counterfactualStateUnresolved bool
+}
+
+type shadowHeadStartDecision struct {
+	update          heardText
+	plan            headPlan
+	sequence        uint64
+	reason          string
+	before          lateGateState
+	after           lateGateState
+	processingAt    time.Time
+	planReadyAt     time.Time
+	dispatchReadyAt time.Time
+	dispatchAt      time.Time
+	requestIDs      []uint64
+	dispatched      bool
+}
+
+func cloneHeadPlan(plan headPlan) headPlan {
+	plan.parts = append([]headPart(nil), plan.parts...)
+	return plan
 }
 
 func (h *headStart) planHash(plan headPlan) string {
@@ -83,7 +104,7 @@ func (h *headStart) partPlanHash(part headPart) string {
 }
 
 func (r *run) captureCleanupPlan(plan headPlan, source string) {
-	if len(plan.parts) == 0 {
+	if !r.shadowTraceEnabled || len(plan.parts) == 0 {
 		return
 	}
 	planID := r.cleanupPlanSequence.Add(1)
@@ -112,6 +133,9 @@ func (r *run) captureCleanupPlan(plan headPlan, source string) {
 }
 
 func (r *run) logShadowEvent(record map[string]any) {
+	if !r.shadowTraceEnabled {
+		return
+	}
 	payload, err := json.Marshal(record)
 	if err == nil {
 		r.logf("info", "%s", payload)
@@ -127,9 +151,14 @@ func (r *run) observeShadowCandidate(candidate shadowCandidate) shadowObservatio
 	} else {
 	}
 	budgetAvailable, llmReady, cleanupEligible := r.head.lateGates()
-	r.head.mu.Lock()
-	recordingGenerations := len(r.head.gens)
-	r.head.mu.Unlock()
+	r.shadowMu.Lock()
+	initial := r.shadowInitialBudget
+	initialKnown := r.shadowInitialBudgetKnown
+	r.shadowMu.Unlock()
+	recordingGenerations := 0
+	if initialKnown {
+		recordingGenerations = initial.RecordingGenerations
+	}
 	existingRequests := 0
 	for _, part := range plan.parts {
 		if part.reuse != nil {
@@ -145,6 +174,15 @@ func (r *run) observeShadowCandidate(candidate shadowCandidate) shadowObservatio
 		strings.HasPrefix(candidate.text, candidate.preview)
 	dispatchReadyAt := time.Now()
 	eligible := reason == "" && plan.hasFresh() && budgetAvailable && llmReady && cleanupEligible
+	counterfactualStateUnresolved := false
+	r.shadowMu.Lock()
+	for _, decision := range r.shadowHeadStartDecisions {
+		if decision.dispatched && !decision.dispatchAt.IsZero() && decision.dispatchAt.Before(processingAt) {
+			counterfactualStateUnresolved = true
+			break
+		}
+	}
+	r.shadowMu.Unlock()
 	return shadowObservation{
 		candidate: candidate, plan: plan,
 		processingAt: processingAt, planReadyAt: planReadyAt, dispatchReadyAt: dispatchReadyAt,
@@ -152,5 +190,6 @@ func (r *run) observeShadowCandidate(candidate shadowCandidate) shadowObservatio
 		budgetAvailable: budgetAvailable, llmReady: llmReady, cleanupEligible: cleanupEligible,
 		existingRequests: existingRequests, previewMatch: previewMatch, extendsPreview: extendsPreview,
 		textBoundary: strings.ContainsRune("。.!！?？,，;；:：", lastRune), eligible: eligible,
+		counterfactualStateUnresolved: counterfactualStateUnresolved,
 	}
 }

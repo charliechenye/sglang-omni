@@ -116,6 +116,7 @@ func (r *run) listen() (string, bool) {
 			ShadowSessionID:       r.shadowSessionID,
 			ShadowRunID:           r.id,
 			ShadowDenseCandidates: r.shadowDense,
+			ShadowInstrumentation: r.shadowTraceEnabled,
 		}
 		go func() {
 			s, err := st.Open(r.ctx, request)

@@ -219,6 +219,8 @@ func (m *Manager) Start(req StartRequest) (string, error) {
 		stop: make(chan struct{}), recorded: make(chan struct{}), pcm: newPCMBuffer(),
 		svcResolved: make(chan struct{}), cleanupWake: make(chan struct{}, 1), cleanupGeneration: 1,
 	}
+	r.head.r = r
+	r.configureFinalCandidateExperiment()
 	r.llmCtx, r.llmStop = context.WithCancel(ctx)
 	r.think = req.Thinking
 	m.cur = r
@@ -438,6 +440,9 @@ func (m *Manager) end(r *run, st State, fn func(*Snapshot), kept func(Snapshot))
 		m.bg = nil
 		m.backgroundPub.enqueue(publication{snapshot: s, kept: kept})
 		m.mu.Unlock()
+		if r.shadowTraceEnabled {
+			r.finalizeShadowReport(s)
+		}
 		return true
 	}
 	if fn != nil {
@@ -453,6 +458,9 @@ func (m *Manager) end(r *run, st State, fn func(*Snapshot), kept func(Snapshot))
 	s := m.snap.clone()
 	m.foregroundPub.enqueue(publication{snapshot: s, kept: kept})
 	m.mu.Unlock()
+	if r.shadowTraceEnabled {
+		r.finalizeShadowReport(s)
+	}
 	return true
 }
 

@@ -4,21 +4,38 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"time"
 	"unicode/utf8"
 )
 
-func (r *run) recordShadowOutcomesAfterDelivery() {
-	r.shadowMu.Lock()
-	observations := append([]shadowObservation(nil), r.shadowObservations...)
-	capped := r.shadowObservationCap
-	dropped := r.shadowObservationDropped
-	end := r.shadowFinal
-	r.shadowMu.Unlock()
-	if end != nil {
-		r.recordShadowOutcomes(*end, observations, capped, dropped,
-			r.shadowCandidateCoalesced.Load(), len(r.shadowCandidates))
+func (r *run) finalizeShadowReport(snapshot Snapshot) {
+	if !r.shadowTraceEnabled {
+		return
 	}
+	r.shadowReportOnce.Do(func() {
+		r.shadowMu.Lock()
+		observations := append([]shadowObservation(nil), r.shadowObservations...)
+		decisions := append([]shadowHeadStartDecision(nil), r.shadowHeadStartDecisions...)
+		capped := r.shadowObservationCap
+		dropped := r.shadowObservationDropped + r.shadowHeadStartDecisionsDropped
+		end := r.shadowFinal
+		initialBudgetKnown := r.shadowInitialBudgetKnown
+		initialBudget := r.shadowInitialBudget
+		r.shadowMu.Unlock()
+		final := streamEnd{}
+		if end != nil {
+			final = *end
+		} else {
+			final.err = errors.New("authoritative Final was not observed")
+		}
+		if final.candidate.SessionID == 0 {
+			final.candidate.SessionID = r.shadowSessionID
+		}
+		r.recordShadowOutcomes(final, observations, decisions, capped, dropped,
+			r.shadowCandidateCoalesced.Load(), len(r.shadowCandidates), snapshot,
+			initialBudgetKnown, initialBudget)
+	})
 }
 
 func (r *run) latestCleanupPlan() (headPlan, bool) {
@@ -32,11 +49,9 @@ func (r *run) latestCleanupPlan() (headPlan, bool) {
 	return plan, true
 }
 
-func (r *run) recordShadowOutcomes(end streamEnd, observations []shadowObservation, capped bool,
-	dropped, coalesced uint64, pending int) {
-	if len(observations) == 0 && end.candidate.SessionID == 0 {
-		return
-	}
+func (r *run) recordShadowOutcomes(end streamEnd, observations []shadowObservation,
+	decisions []shadowHeadStartDecision, capped bool, dropped, coalesced uint64, pending int,
+	snapshot Snapshot, initialBudgetKnown bool, initialBudget initialHeadBudget) {
 	stopAt := r.monotonicStoppedAt()
 	stopOffsetMS := func(at time.Time) float64 {
 		if stopAt.IsZero() || at.IsZero() {
@@ -94,14 +109,15 @@ func (r *run) recordShadowOutcomes(end streamEnd, observations []shadowObservati
 			"recording_headstart_generations":   observation.recordingGenerations,
 			"candidate_eligible_without_budget": observation.reason == "" && observation.plan.hasFresh() &&
 				observation.llmReady && observation.cleanupEligible,
-			"candidate_eligible": observation.eligible,
+			"candidate_eligible":              observation.eligible,
+			"fresh_request_part_count":        len(observation.plan.parts) - observation.existingRequests,
+			"effective_multipart_limit":       initialBudget.MultipartLimit,
+			"counterfactual_state_unresolved": observation.counterfactualStateUnresolved,
 		})
 	}
+	finalPlan, hasAuthoritativePlan := r.latestCleanupPlan()
+	finalStatus := terminalShadowStatus(r, snapshot, end, hasAuthoritativePlan)
 	if end.err != nil || end.finalAvailableAt.IsZero() {
-		finalStatus := "failed"
-		if r.cancelled.Load() || r.ctx.Err() != nil {
-			finalStatus = "cancelled"
-		}
 		for _, observation := range observations {
 			metadata := observation.candidate.metadata
 			retired := metadata.Source == "http_final" &&
@@ -126,19 +142,32 @@ func (r *run) recordShadowOutcomes(end streamEnd, observations []shadowObservati
 				r.logf("info", "%s", payload)
 			}
 		}
+		r.recordWebSocketDecisionOutcomes(decisions, headPlan{}, false, end.finalAvailableAt)
 		summary, err := json.Marshal(map[string]any{
-			"event":                       "voxt_final_candidate_summary",
-			"run_id":                      r.id,
-			"session_id":                  end.candidate.SessionID,
-			"authoritative_attempt":       end.candidate.Attempt,
-			"observed_candidate_count":    len(observations),
-			"observations_capped":         capped,
-			"observations_dropped":        dropped,
-			"candidate_channel_coalesced": coalesced,
-			"candidate_channel_pending":   pending,
-			"final_status":                finalStatus,
-			"stop_to_final_available_ms":  shadowStopToFinalMS(r, end),
-			"cancellation_at_ms":          shadowCancellationMS(r, end),
+			"event":                                    "voxt_final_candidate_summary",
+			"run_id":                                   r.id,
+			"session_id":                               end.candidate.SessionID,
+			"authoritative_attempt":                    end.candidate.Attempt,
+			"observed_candidate_count":                 len(observations),
+			"observed_websocket_decision_count":        len(decisions),
+			"observations_capped":                      capped,
+			"observations_dropped":                     dropped,
+			"candidate_channel_coalesced":              coalesced,
+			"candidate_channel_pending":                pending,
+			"final_status":                             finalStatus,
+			"terminal_status":                          finalStatus,
+			"terminal_state":                           snapshot.State,
+			"problem":                                  problemCode(snapshot.Problem),
+			"candidate_observation_status":             candidateObservationStatus(r, len(observations)),
+			"authoritative_cleanup_plan_available":     hasAuthoritativePlan,
+			"initial_headstart_budget_known":           initialBudgetKnown,
+			"initial_recording_generation_count":       initialBudget.RecordingGenerations,
+			"initial_late_generation_allowance":        initialBudget.LateAllowance,
+			"initial_late_generation_already_consumed": initialBudget.LateAlreadyConsumed,
+			"effective_generation_limit":               initialBudget.GenerationLimit,
+			"effective_multipart_limit":                initialBudget.MultipartLimit,
+			"stop_to_final_available_ms":               shadowStopToFinalMS(r, end),
+			"cancellation_at_ms":                       shadowCancellationMS(r, end),
 		})
 		if err == nil {
 			r.logf("info", "%s", summary)
@@ -146,7 +175,6 @@ func (r *run) recordShadowOutcomes(end streamEnd, observations []shadowObservati
 		return
 	}
 
-	finalPlan, hasAuthoritativePlan := r.latestCleanupPlan()
 	finalReason := ""
 	finalPlanHash := ""
 	if !hasAuthoritativePlan {
@@ -276,31 +304,161 @@ func (r *run) recordShadowOutcomes(end streamEnd, observations []shadowObservati
 		}
 	}
 	summary := map[string]any{
-		"event":                                   "voxt_final_candidate_summary",
-		"run_id":                                  r.id,
-		"session_id":                              end.candidate.SessionID,
-		"authoritative_attempt":                   end.candidate.Attempt,
-		"observed_candidate_count":                len(observations),
-		"observations_capped":                     capped,
-		"observations_dropped":                    dropped,
-		"candidate_channel_coalesced":             coalesced,
-		"candidate_channel_pending":               pending,
-		"earliest_usable_lead_ms":                 earliestUsableLeadMS,
-		"earliest_oracle_compatible_lead_ms":      earliestCompatibleLeadMS,
-		"earliest_http_usable_lead_ms":            earliestHTTPUsableLeadMS,
-		"earliest_websocket_usable_lead_ms":       earliestWebSocketUsableLeadMS,
-		"http_precedes_websocket_ms":              float64(-1),
-		"authoritative_final_available_offset_ms": stopToFinalMS,
-		"stop_to_final_available_ms":              stopToFinalMS,
+		"event":                                    "voxt_final_candidate_summary",
+		"run_id":                                   r.id,
+		"session_id":                               end.candidate.SessionID,
+		"authoritative_attempt":                    end.candidate.Attempt,
+		"observed_candidate_count":                 len(observations),
+		"observed_websocket_decision_count":        len(decisions),
+		"observations_capped":                      capped,
+		"observations_dropped":                     dropped,
+		"candidate_channel_coalesced":              coalesced,
+		"candidate_channel_pending":                pending,
+		"earliest_usable_lead_ms":                  earliestUsableLeadMS,
+		"earliest_oracle_compatible_lead_ms":       earliestCompatibleLeadMS,
+		"earliest_http_usable_lead_ms":             earliestHTTPUsableLeadMS,
+		"earliest_websocket_usable_lead_ms":        earliestWebSocketUsableLeadMS,
+		"http_precedes_websocket_ms":               float64(-1),
+		"authoritative_final_available_offset_ms":  stopToFinalMS,
+		"stop_to_final_available_ms":               stopToFinalMS,
+		"final_status":                             finalStatus,
+		"terminal_status":                          finalStatus,
+		"terminal_state":                           snapshot.State,
+		"problem":                                  problemCode(snapshot.Problem),
+		"candidate_observation_status":             candidateObservationStatus(r, len(observations)),
+		"authoritative_cleanup_plan_available":     hasAuthoritativePlan,
+		"initial_headstart_budget_known":           initialBudgetKnown,
+		"initial_recording_generation_count":       initialBudget.RecordingGenerations,
+		"initial_late_generation_allowance":        initialBudget.LateAllowance,
+		"initial_late_generation_already_consumed": initialBudget.LateAlreadyConsumed,
+		"effective_generation_limit":               initialBudget.GenerationLimit,
+		"effective_multipart_limit":                initialBudget.MultipartLimit,
 	}
 	if earliestHTTPUsableLeadMS >= 0 && earliestWebSocketUsableLeadMS >= 0 {
 		summary["http_precedes_websocket_ms"] = earliestHTTPUsableLeadMS - earliestWebSocketUsableLeadMS
 	} else {
 	}
+	r.recordWebSocketDecisionOutcomes(decisions, finalPlan, hasAuthoritativePlan, end.finalAvailableAt)
 	payload, err := json.Marshal(summary)
 	if err == nil {
 		r.logf("info", "%s", payload)
 	}
+}
+
+func (r *run) recordWebSocketDecisionOutcomes(decisions []shadowHeadStartDecision, finalPlan headPlan, hasFinalPlan bool, finalAvailableAt time.Time) {
+	for _, decision := range decisions {
+		candidateHash := decisionCandidateHash(decision.update.text)
+		planHash := ""
+		if len(decision.plan.parts) > 0 {
+			planHash = r.head.planHash(decision.plan)
+		}
+		unresolved := planHash == "" || !hasFinalPlan || finalAvailableAt.IsZero() ||
+			decision.dispatchReadyAt.IsZero() || !decision.dispatchReadyAt.Before(finalAvailableAt)
+		exact, near, repair := false, false, false
+		compatibleParts := []int{}
+		freshCompatibleParts := 0
+		existingEquivalentRequests := 0
+		for _, part := range decision.plan.parts {
+			if part.reuse != nil {
+				existingEquivalentRequests++
+			}
+		}
+		if !unresolved {
+			exact, near, repair, compatibleParts = r.head.plansCompatible(decision.plan, finalPlan)
+			compatible := make(map[int]bool, len(compatibleParts))
+			for _, index := range compatibleParts {
+				compatible[index] = true
+			}
+			for _, part := range decision.plan.parts {
+				if compatible[part.partIndex] && part.reuse == nil {
+					freshCompatibleParts++
+				}
+			}
+		}
+		r.logShadowEvent(map[string]any{
+			"event": "voxt_headstart_decision_outcome", "run_id": r.id,
+			"session_id": r.shadowSessionID, "source": websocketDecisionSource(decision.update),
+			"sequence": decision.sequence, "request_ids": decision.requestIDs,
+			"candidate_sha256": candidateHash, "candidate_plan_sha256": planHash,
+			"dispatched": decision.dispatched, "outcome_unresolved": unresolved,
+			"outcome_reason":           decision.reason,
+			"exact_cleanup_plan_match": exact, "near_cleanup_plan_compatible": near && !exact,
+			"cleanup_repair_eligible":        repair,
+			"oracle_compatible":              len(compatibleParts) > 0,
+			"fresh_compatible_cleanup_parts": freshCompatibleParts,
+			"existing_equivalent_requests":   existingEquivalentRequests,
+			"oracle_incremental_compatible":  len(compatibleParts) > 0 && freshCompatibleParts > 0,
+		})
+	}
+}
+
+func websocketDecisionSource(update heardText) string {
+	if update.candidate {
+		return "websocket_candidate"
+	}
+	return "websocket_preview"
+}
+
+func decisionCandidateHash(text string) string {
+	hash := sha256.Sum256([]byte(text))
+	return hex.EncodeToString(hash[:])
+}
+
+func terminalShadowStatus(r *run, snapshot Snapshot, end streamEnd, hasCleanupPlan bool) string {
+	if snapshot.State == Cancelled || r.cancelled.Load() {
+		return "cancelled"
+	}
+	if snapshot.Problem != nil && snapshot.Problem.Code == ProblemNoSpeech {
+		return "no_speech"
+	}
+	if snapshot.Problem != nil && snapshot.Problem.Degraded || r.asrDegraded != nil {
+		return "salvaged_degraded_result"
+	}
+	if snapshot.State == Failed {
+		if snapshot.Problem != nil && snapshot.Problem.Code == ProblemASR {
+			return "asr_failure"
+		}
+		return "session_failure"
+	}
+	if snapshot.State == Done && snapshot.Raw == "" && snapshot.Result == "" {
+		return "empty_transcript"
+	}
+	if end.err != nil || end.finalAvailableAt.IsZero() {
+		if r.req.Kind != "transcribe" {
+			return "unsupported_path"
+		}
+		return "missing_final_observation"
+	}
+	if !r.transcribeCleanup() || r.svc.LLM == nil {
+		return "cleanup_not_requested"
+	}
+	if snapshot.Raw == "" && end.res.Text == "" {
+		return "empty_transcript"
+	}
+	if !hasCleanupPlan {
+		return "missing_authoritative_cleanup_plan"
+	}
+	if len(r.shadowObservations) == 0 {
+		return "successful_final_no_candidates"
+	}
+	return "successful_final"
+}
+
+func candidateObservationStatus(r *run, count int) string {
+	if !r.shadowCandidatesEnabled {
+		return "candidate_protocol_disabled_by_arm"
+	}
+	if count == 0 {
+		return "no_candidate_observed_or_unsupported_path"
+	}
+	return "candidates_observed"
+}
+
+func problemCode(problem *Problem) string {
+	if problem == nil {
+		return ""
+	}
+	return problem.Code
 }
 
 func shadowStopToFinalMS(r *run, end streamEnd) float64 {

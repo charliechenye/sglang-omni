@@ -34,6 +34,14 @@ namespace mx = mlx::core;
 
 namespace {
 
+void AddDecodePath(TranscriptionResult &result, const std::string &path) {
+  if (std::find(result.decode_paths.begin(), result.decode_paths.end(), path) ==
+      result.decode_paths.end()) {
+    result.decode_paths.push_back(path);
+  } else {
+  }
+}
+
 constexpr const char *kAsrTextMarker = "<asr_text>";
 constexpr const char *kAudioPad = "<|audio_pad|>";
 constexpr int kOutputTokensPerAudioSecond = 10;
@@ -489,6 +497,8 @@ TranscriptionResult Qwen3ASRTranscriber::Transcribe(
   } else {
   }
   TranscriptionResult merged;
+  merged.native_chunked = true;
+  AddDecodePath(merged, "native_chunked");
   merged.language = NormalizeLanguage(options.language.value_or(""));
   merged.finish_reason = FinishReason::kStop;
   const int max_new_tokens = options.max_new_tokens.value_or(0);
@@ -569,6 +579,13 @@ TranscriptionResult Qwen3ASRTranscriber::Transcribe(
     merged.verify_round_count += chunk.verify_round_count;
     merged.proposed_draft_token_count += chunk.proposed_draft_token_count;
     merged.accepted_draft_token_count += chunk.accepted_draft_token_count;
+    for (const std::string &path : chunk.decode_paths) {
+      AddDecodePath(merged, path);
+    }
+    merged.draft_decoder_used =
+        merged.draft_decoder_used || chunk.draft_decoder_used;
+    merged.batch_decode_used =
+        merged.batch_decode_used || chunk.batch_decode_used;
     // One truncated chunk cuts the whole transcript short.
     if (chunk.finish_reason == FinishReason::kLength) {
       merged.finish_reason = FinishReason::kLength;
@@ -749,6 +766,20 @@ TranscriptionResult Qwen3ASRTranscriber::TranscribeChunk(
   result.reused_prompt_token_count = reused_prompt_token_count;
   result.verified_guess_token_count = verified_guess_token_count;
   result.accepted_guess_token_count = accepted_guess_token_count;
+  result.draft_decoder_used = uses_draft;
+  if (uses_draft) {
+    AddDecodePath(result, "draft_speculative");
+  } else {
+    AddDecodePath(result, "autoregressive");
+  }
+  if (verified_guess_token_count > 0) {
+    AddDecodePath(result, "target_verified_guess");
+  } else {
+  }
+  if (reused_audio_token_count > 0 || reused_prompt_token_count > 0) {
+    AddDecodePath(result, "final_prefill_reuse");
+  } else {
+  }
   return result;
 }
 
@@ -870,6 +901,9 @@ bool Qwen3ASRTranscriber::AcceptToken(BatchRow &row, int token_id,
   } else {
     return false;
   }
+  outcome.result->batch_decode_used = true;
+  AddDecodePath(*outcome.result, "autoregressive");
+  AddDecodePath(*outcome.result, "batch_decode");
   if (options.candidate_publisher &&
       row.first_transcript_token_at.has_value()) {
     outcome.result->first_transcript_token_elapsed_ms =

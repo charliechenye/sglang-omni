@@ -1,59 +1,85 @@
 package main
 
 type logEvent struct {
-	Event                       string   `json:"event"`
-	RunID                       string   `json:"run_id"`
-	SessionID                   uint64   `json:"session_id"`
-	RequestID                   uint64   `json:"request_id"`
-	Attempt                     int      `json:"attempt"`
-	Source                      string   `json:"source"`
-	Sequence                    uint64   `json:"sequence"`
-	GeneratedTokenCount         int      `json:"generated_token_count"`
-	StopToCandidateMS           float64  `json:"stop_to_candidate_ms"`
-	StopToEligibilityMS         float64  `json:"stop_to_eligibility_ms"`
-	DispatchReadyMS             float64  `json:"dispatch_ready_ms"`
-	PlanReadyMS                 float64  `json:"candidate_plan_ready_ms"`
-	FinalAvailableMS            float64  `json:"stop_to_final_available_ms"`
-	CandidateEligible           bool     `json:"candidate_eligible"`
-	EligibleWithoutBudget       *bool    `json:"candidate_eligible_without_budget"`
-	PreparationSucceeded        bool     `json:"preparation_succeeded"`
-	LLMReady                    bool     `json:"llm_readiness_open"`
-	CleanupEligible             bool     `json:"cleanup_eligible"`
-	Dispatched                  bool     `json:"dispatched"`
-	RequestIDs                  []uint64 `json:"request_ids"`
-	RecordingGenerations        int      `json:"recording_headstart_generations"`
-	LateBudgetBefore            bool     `json:"late_generation_budget_before"`
-	LatestPreviewMatch          bool     `json:"latest_preview_match"`
-	ExtendsLatestHypothesis     bool     `json:"extends_latest_hypothesis"`
-	MeaningfulTextBoundary      bool     `json:"meaningful_text_boundary"`
-	CandidateLeadMS             float64  `json:"candidate_lead_ms"`
-	OracleCompatible            bool     `json:"oracle_compatible"`
-	OracleIncrementalCompatible bool     `json:"oracle_incremental_compatible"`
-	ExactTranscriptMatch        bool     `json:"exact_transcript_match"`
-	ExactCleanupPlanMatch       bool     `json:"exact_cleanup_plan_match"`
-	NearCleanupPlanCompatible   bool     `json:"near_cleanup_plan_compatible"`
-	CleanupRepairEligible       bool     `json:"cleanup_repair_eligible"`
-	CandidateUsableBeforeFinal  bool     `json:"candidate_usable_before_final"`
-	OutcomeUnresolved           bool     `json:"outcome_unresolved"`
-	FinalStatus                 string   `json:"final_status"`
-	RejectionReason             string   `json:"rejection_reason"`
-	Outcome                     string   `json:"outcome"`
-	Adopted                     bool     `json:"adopted"`
-	Succeeded                   bool     `json:"succeeded"`
-	PlanReason                  string   `json:"plan_reason"`
-	PlanHash                    string   `json:"plan_sha256"`
-	CandidatePlanHash           string   `json:"candidate_plan_sha256"`
-	RequestPlanHash             string   `json:"request_plan_sha256"`
-	PartPlanHashes              []string `json:"part_request_sha256"`
-	TranscriptSHA256            string   `json:"transcript_sha256"`
-	CandidateSHA256             string   `json:"candidate_sha256"`
-	RequestStartMS              float64  `json:"stop_to_request_start_ms"`
-	RequestStartValid           bool     `json:"request_start_valid"`
-	CandidateArrivalMS          float64  `json:"candidate_arrived_ms"`
-	CandidateArrivalValid       bool     `json:"candidate_arrival_valid"`
-	ArrivalLeadMS               float64  `json:"arrival_lead_ms"`
-	CancellationMS              float64  `json:"cancellation_at_ms"`
-	TerminalMS                  float64  `json:"stop_to_terminal_ms"`
+	Event                           string   `json:"event"`
+	RunID                           string   `json:"run_id"`
+	SessionID                       uint64   `json:"session_id"`
+	RequestID                       uint64   `json:"request_id"`
+	Attempt                         int      `json:"attempt"`
+	Source                          string   `json:"source"`
+	Sequence                        uint64   `json:"sequence"`
+	GeneratedTokenCount             int      `json:"generated_token_count"`
+	StopToCandidateMS               float64  `json:"stop_to_candidate_ms"`
+	StopToEligibilityMS             float64  `json:"stop_to_eligibility_ms"`
+	DispatchReadyMS                 float64  `json:"dispatch_ready_ms"`
+	PlanReadyMS                     float64  `json:"candidate_plan_ready_ms"`
+	FinalAvailableMS                float64  `json:"stop_to_final_available_ms"`
+	CandidateEligible               bool     `json:"candidate_eligible"`
+	EligibleWithoutBudget           *bool    `json:"candidate_eligible_without_budget"`
+	PreparationSucceeded            bool     `json:"preparation_succeeded"`
+	LLMReady                        bool     `json:"llm_readiness_open"`
+	CleanupEligible                 bool     `json:"cleanup_eligible"`
+	Dispatched                      bool     `json:"dispatched"`
+	RequestIDs                      []uint64 `json:"request_ids"`
+	RecordingGenerations            int      `json:"recording_headstart_generations"`
+	LateBudgetBefore                bool     `json:"late_generation_budget_before"`
+	LatestPreviewMatch              bool     `json:"latest_preview_match"`
+	ExtendsLatestHypothesis         bool     `json:"extends_latest_hypothesis"`
+	MeaningfulTextBoundary          bool     `json:"meaningful_text_boundary"`
+	CandidateLeadMS                 float64  `json:"candidate_lead_ms"`
+	OracleCompatible                bool     `json:"oracle_compatible"`
+	OracleIncrementalCompatible     bool     `json:"oracle_incremental_compatible"`
+	ExactTranscriptMatch            bool     `json:"exact_transcript_match"`
+	ExactCleanupPlanMatch           bool     `json:"exact_cleanup_plan_match"`
+	NearCleanupPlanCompatible       bool     `json:"near_cleanup_plan_compatible"`
+	CleanupRepairEligible           bool     `json:"cleanup_repair_eligible"`
+	CandidateUsableBeforeFinal      bool     `json:"candidate_usable_before_final"`
+	OutcomeUnresolved               bool     `json:"outcome_unresolved"`
+	FinalStatus                     string   `json:"final_status"`
+	RejectionReason                 string   `json:"rejection_reason"`
+	Outcome                         string   `json:"outcome"`
+	Adopted                         bool     `json:"adopted"`
+	Succeeded                       bool     `json:"succeeded"`
+	PlanReason                      string   `json:"plan_reason"`
+	PlanHash                        string   `json:"plan_sha256"`
+	CandidatePlanHash               string   `json:"candidate_plan_sha256"`
+	RequestPlanHash                 string   `json:"request_plan_sha256"`
+	PartPlanHashes                  []string `json:"part_request_sha256"`
+	TranscriptSHA256                string   `json:"transcript_sha256"`
+	CandidateSHA256                 string   `json:"candidate_sha256"`
+	RequestStartMS                  float64  `json:"stop_to_request_start_ms"`
+	RequestStartValid               bool     `json:"request_start_valid"`
+	CandidateArrivalMS              float64  `json:"candidate_arrived_ms"`
+	CandidateArrivalValid           bool     `json:"candidate_arrival_valid"`
+	ArrivalLeadMS                   float64  `json:"arrival_lead_ms"`
+	CancellationMS                  float64  `json:"cancellation_at_ms"`
+	TerminalMS                      float64  `json:"stop_to_terminal_ms"`
+	InitialBudgetKnown              *bool    `json:"initial_headstart_budget_known"`
+	InitialRecordingGenerations     int      `json:"recording_generation_count"`
+	InitialRecordingGenerationCount int      `json:"initial_recording_generation_count"`
+	InitialLateAllowance            int      `json:"initial_late_generation_allowance"`
+	InitialLateConsumed             bool     `json:"late_generation_already_consumed"`
+	InitialLateConsumedSummary      bool     `json:"initial_late_generation_already_consumed"`
+	GenerationLimit                 int      `json:"effective_generation_limit"`
+	MultipartLimit                  int      `json:"effective_multipart_limit"`
+	FreshRequestPartCount           int      `json:"fresh_request_part_count"`
+	FreshCompatiblePartCount        int      `json:"fresh_compatible_cleanup_parts"`
+	ExistingEquivalentRequests      int      `json:"existing_equivalent_requests"`
+	CounterfactualStateUnresolved   bool     `json:"counterfactual_state_unresolved"`
+	DispatchReadyBeforeFinal        bool     `json:"dispatch_ready_before_final"`
+	TerminalState                   string   `json:"terminal_state"`
+	Problem                         string   `json:"problem"`
+	Arm                             string   `json:"arm"`
+	Scenario                        string   `json:"scenario"`
+	Round                           int      `json:"round"`
+	RunStatus                       string   `json:"status"`
+	AudioSHA256                     string   `json:"audio_sha256"`
+	LanguageHint                    string   `json:"language_hint"`
+	LanguageMode                    string   `json:"language_mode"`
+	EffectiveLanguage               string   `json:"effective_language"`
+	Draft                           bool     `json:"draft"`
+	Warmup                          bool     `json:"warmup"`
+	ColdStart                       bool     `json:"cold_start"`
 }
 
 type candidateKey struct {
@@ -71,18 +97,19 @@ type candidateIdentity struct {
 }
 
 type candidate struct {
-	eligibility             logEvent
-	outcome                 logEvent
-	hasOutcome              bool
-	production              bool
-	actualAdoptionCount     int
-	hasActualOutcome        bool
-	exactAdoptionCount      int
-	nearRepairAdoptionCount int
-	failedRequestCount      int
-	partialAdoption         bool
-	actualRequestStartMS    float64
-	actualRequestStartKnown bool
+	eligibility                   logEvent
+	outcome                       logEvent
+	hasOutcome                    bool
+	production                    bool
+	actualAdoptionCount           int
+	hasActualOutcome              bool
+	exactAdoptionCount            int
+	nearRepairAdoptionCount       int
+	failedRequestCount            int
+	partialAdoption               bool
+	actualRequestStartMS          float64
+	actualRequestStartKnown       bool
+	counterfactualStateUnresolved bool
 }
 
 type sessionTrace struct {
@@ -90,17 +117,32 @@ type sessionTrace struct {
 	outcomes              map[candidateKey]logEvent
 	outcomesByIdentity    map[candidateIdentity]logEvent
 	adoptions             map[uint64]logEvent
-	adoptionsByPlanHash   map[string]logEvent
-	requestStarts         map[string]logEvent
 	requestStartsByID     map[uint64]logEvent
-	requestResults        map[string]logEvent
 	requestResultsByID    map[uint64]logEvent
 	finalAvailableMS      float64
 	finalAvailableKnown   bool
 	cancelledAtMS         float64
 	cancellationKnown     bool
+	arm                   string
+	scenario              string
+	round                 int
+	runID                 string
+	audioSHA256           string
+	languageHint          string
+	languageMode          string
+	effectiveLanguage     string
+	draft                 bool
+	warmup                bool
+	coldStart             bool
+	runStatus             string
+	runProblem            string
+	benchmark             bool
+	initialBudgetKnown    bool
 	recordingGenerations  int
-	recordingGensKnown    bool
+	lateAllowance         int
+	lateAlreadyConsumed   bool
+	generationLimit       int
+	multipartLimit        int
 	observedCandidateOnly int
 }
 
@@ -114,6 +156,12 @@ type policy struct {
 type policyResult struct {
 	Name                            string  `json:"name"`
 	Threshold                       float64 `json:"threshold,omitempty"`
+	SessionCount                    int     `json:"session_count"`
+	SuccessfulSessionCount          int     `json:"successful_session_count"`
+	FailedSessionCount              int     `json:"failed_session_count"`
+	CancelledSessionCount           int     `json:"cancelled_session_count"`
+	NoCandidateSessionCount         int     `json:"no_candidate_session_count"`
+	UnresolvedPairCount             int     `json:"unresolved_pair_count"`
 	EligibleCandidateCount          int     `json:"eligible_candidate_count"`
 	CandidateSessionCount           int     `json:"candidate_session_count"`
 	SelectedSessionCount            int     `json:"selected_session_count"`
@@ -138,16 +186,26 @@ type policyResult struct {
 	ArrivalLeadP95MS                float64 `json:"arrival_lead_p95_ms"`
 	DispatchReadyLeadP50MS          float64 `json:"dispatch_ready_lead_p50_ms"`
 	DispatchReadyLeadP95MS          float64 `json:"dispatch_ready_lead_p95_ms"`
-	IncrementalCompatibleSelections int     `json:"incremental_compatible_selections"`
+	IncrementalCompatibleSelections int     `json:"potential_incremental_compatible_selections"`
 	PreservedCompatibleSelections   int     `json:"preserved_compatible_selections"`
 	DisplacedCompatibleSelections   int     `json:"displaced_compatible_selections"`
+	CompatibleFreshRequestParts     int     `json:"compatible_fresh_request_parts"`
+	ExistingRecordingCoverageParts  int     `json:"existing_recording_coverage_parts"`
 	NewWastedGenerations            int     `json:"new_wasted_generations"`
 	AvoidedWastedGenerations        int     `json:"avoided_wasted_generations"`
 	IncrementalDispatchReadyLeadMS  float64 `json:"incremental_dispatch_ready_lead_ms"`
+	EarlierCompatibleSelections     int     `json:"earlier_compatible_selections"`
+	LaterCompatibleSelections       int     `json:"later_compatible_selections"`
+	PairedLeadSampleCount           int     `json:"paired_lead_sample_count"`
+	PairedLeadP50MS                 float64 `json:"paired_lead_p50_ms"`
+	PairedLeadP95MS                 float64 `json:"paired_lead_p95_ms"`
+	counterfactualSelectionUnknown  bool    `json:"-"`
 }
 
 type replayReport struct {
 	FormatVersion                   int            `json:"format_version"`
+	SelectedArm                     string         `json:"selected_arm,omitempty"`
+	Arms                            []armReport    `json:"arms,omitempty"`
 	SessionCount                    int            `json:"session_count"`
 	ReceivedCandidateCount          int            `json:"received_candidate_count"`
 	SessionEligibilityCount         int            `json:"session_eligibility_count"`
@@ -156,4 +214,48 @@ type replayReport struct {
 	OracleIncrementalCandidateCount int            `json:"oracle_incremental_candidate_count"`
 	UnresolvedOutcomeCount          int            `json:"unresolved_outcome_count"`
 	Policies                        []policyResult `json:"policies"`
+}
+
+type armReport struct {
+	Arm                string           `json:"arm"`
+	SessionCount       int              `json:"session_count"`
+	SteadySessionCount int              `json:"steady_session_count"`
+	WarmupSessionCount int              `json:"warmup_session_count"`
+	ColdStartCount     int              `json:"cold_start_session_count"`
+	Runs               []sessionSummary `json:"runs"`
+	Policies           []policyResult   `json:"policies"`
+	Scenarios          []scenarioReport `json:"scenarios"`
+}
+
+type scenarioReport struct {
+	Scenario           string         `json:"scenario"`
+	SessionCount       int            `json:"session_count"`
+	SteadySessionCount int            `json:"steady_session_count"`
+	WarmupSessionCount int            `json:"warmup_session_count"`
+	ColdStartCount     int            `json:"cold_start_session_count"`
+	Policies           []policyResult `json:"policies"`
+}
+
+type sessionSummary struct {
+	RunID                       string `json:"run_id"`
+	Arm                         string `json:"arm"`
+	Scenario                    string `json:"scenario"`
+	Round                       int    `json:"round"`
+	AudioSHA256                 string `json:"audio_sha256"`
+	LanguageHint                string `json:"language_hint"`
+	LanguageMode                string `json:"language_mode"`
+	EffectiveLanguage           string `json:"effective_language,omitempty"`
+	Draft                       bool   `json:"draft"`
+	Warmup                      bool   `json:"warmup"`
+	ColdStart                   bool   `json:"cold_start"`
+	Status                      string `json:"status"`
+	Problem                     string `json:"problem,omitempty"`
+	CandidateCount              int    `json:"candidate_count"`
+	UnresolvedCount             int    `json:"unresolved_candidate_count"`
+	InitialBudgetKnown          bool   `json:"initial_headstart_budget_known"`
+	InitialRecordingGenerations int    `json:"initial_recording_generation_count"`
+	InitialLateAllowance        int    `json:"initial_late_generation_allowance"`
+	InitialLateConsumed         bool   `json:"initial_late_generation_already_consumed"`
+	GenerationLimit             int    `json:"effective_generation_limit"`
+	MultipartLimit              int    `json:"effective_multipart_limit"`
 }

@@ -31,6 +31,28 @@ func TestFinalCandidateEventsRemainSeparateFromTheAuthoritativeResult(t *testing
 	}
 }
 
+func TestFinalCandidateProtocolAndActualDecodeMetadataAreParsed(t *testing.T) {
+	var protocol candidateProtocolMetadata
+	if !applyCandidateProtocolEvent(`{"type":"transcript.text.candidate_protocol","supported":true,"protocol_version":1,"candidate_cadence":"dense"}`, &protocol) {
+		t.Fatal("candidate protocol marker was not parsed")
+	}
+	if !applyCandidateProtocolEvent(`{"type":"transcript.text.candidate_summary","published_candidate_count":5,"coalesced_candidate_count":2}`, &protocol) {
+		t.Fatal("candidate protocol summary was not parsed")
+	}
+	result := finalResult{}
+	applyCandidateProtocolMetadata(&result, protocol)
+	if !result.candidateProtocolKnown || !result.candidateProtocolSupported || result.candidateCadence != "dense" ||
+		result.nativePublishedCandidates != 5 || result.nativeCoalescedCandidates != 2 {
+		t.Fatalf("protocol result %+v", result)
+	}
+
+	parsed, _, err := parseEvent(`{"type":"transcript.text.done","text":"authoritative","generation_metadata":{"generated_token_count":4,"language":"English","finish_reason":"stop","decode_paths":["draft_speculative","target_verified_guess"],"draft_decoder_used":true,"batch_decode_used":false,"native_chunked":false}}`)
+	if err != nil || parsed == nil || len(parsed.decodePaths) != 2 || parsed.decodePaths[0] != "draft_speculative" ||
+		!parsed.draftDecoderUsed || parsed.batchDecodeUsed || parsed.nativeChunked {
+		t.Fatalf("actual decode metadata result=%+v error=%v", parsed, err)
+	}
+}
+
 func TestFinalCandidateBeforeErrorRemainsAdvisory(t *testing.T) {
 	httpServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")

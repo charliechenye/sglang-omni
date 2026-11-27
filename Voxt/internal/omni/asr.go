@@ -222,6 +222,7 @@ func filePCM(req asr.FileRequest) ([]byte, error) {
 func (a *ASR) Open(ctx context.Context, req asr.StreamRequest) (asr.Stream, error) {
 	mode := os.Getenv(experimentFinalCandidatesEnv)
 	shadowEnabled := mode == "shadow" || mode == "shadow_dense"
+	req.ShadowInstrumentation = mode == "instrumented" || shadowEnabled
 	if shadowEnabled && req.LiveResult {
 		logCandidateExclusion(a.rt, req.ShadowRunID, req.ShadowSessionID, "live_result", 0)
 		req.ShadowFinalCandidates = false

@@ -54,6 +54,11 @@ struct TranscriptionResult {
   // verification, including a token that ends decoding by EOS, budget, or loop
   // detection.
   int accepted_guess_token_count = 0;
+  // Actual decoder paths, distinct from requested draft or guess settings.
+  std::vector<std::string> decode_paths;
+  bool draft_decoder_used = false;
+  bool batch_decode_used = false;
+  bool native_chunked = false;
   // Time from Qwen3-ASR request start to its first committed transcript token
   // when candidate observation is enabled; zero otherwise.
   double first_transcript_token_elapsed_ms = 0.0;

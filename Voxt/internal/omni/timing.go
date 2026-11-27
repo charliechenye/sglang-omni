@@ -4,10 +4,55 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
 )
+
+func requestedLanguageMode(language string) string {
+	if strings.TrimSpace(language) == "" {
+		return "automatic"
+	}
+	return "explicit"
+}
+
+func logFinalCandidateProtocolResult(rt *Runtime, measurement *candidateMeasurement,
+	requestID uint64, request finalRequest, result finalResult,
+	nativeSSEReceived, goSuppressed uint64, snapshotBuildMSTotal float64) {
+	payload, err := json.Marshal(map[string]any{
+		"event":  "voxt_final_candidate_protocol_result",
+		"run_id": measurement.runID, "session_id": measurement.sessionID,
+		"request_id": requestID, "requested_path": "authoritative_final_http",
+		"candidate_protocol_requested": request.includeCandidates,
+		"candidate_protocol_known":     result.candidateProtocolKnown,
+		"candidate_protocol_supported": result.candidateProtocolSupported,
+		"candidate_cadence":            result.candidateCadence,
+		"language_mode":                requestedLanguageMode(request.language),
+		"effective_language":           result.language,
+		"generated_token_count":        result.tokens, "finish_reason": result.finishReason,
+		"verified_guess_token_count": result.verifiedGuessTokens,
+		"accepted_guess_token_count": result.acceptedGuessTokens,
+		"draft_decoder_used":         result.draftDecoderUsed,
+		"verify_round_count":         result.verifyRounds,
+		"proposed_draft_token_count": result.proposedDraftTokens,
+		"accepted_draft_token_count": result.acceptedDraftTokens,
+		"reused_audio_token_count":   result.reusedAudioTokens,
+		"reused_prompt_token_count":  result.reusedPromptTokens,
+		"decode_paths":               result.decodePaths, "batch_decode_used": result.batchDecodeUsed,
+		"native_chunked":                      result.nativeChunked,
+		"native_published_candidate_count":    result.nativePublishedCandidates,
+		"native_coalesced_candidate_count":    result.nativeCoalescedCandidates,
+		"native_sse_candidate_received_count": nativeSSEReceived,
+		"go_candidate_suppressed_count":       goSuppressed,
+		"native_snapshot_build_ms_total":      snapshotBuildMSTotal,
+		"preview_guess_requested":             request.known.text != "" || request.known.guessAutoLanguage,
+		"realtime_prefill_reuse_requested":    request.known.session != "",
+	})
+	if err == nil {
+		rt.logf("info", "%s", payload)
+	}
+}
 
 // requestStage is one content-free timing span in an offline Final request.
 type requestStage struct {

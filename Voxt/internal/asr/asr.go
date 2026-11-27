@@ -115,6 +115,7 @@ type StreamRequest struct {
 	// ShadowFinalCandidates observes advisory Final candidates without
 	// changing the stream's active candidate policy.
 	ShadowFinalCandidates bool
+	ShadowInstrumentation bool
 	// ShadowDenseCandidates requests the bounded diagnostic publication cadence.
 	ShadowDenseCandidates bool
 	// ShadowSessionID joins shadow measurements with the owning session's

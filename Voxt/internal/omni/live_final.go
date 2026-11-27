@@ -69,7 +69,7 @@ func (s *live) finalPass(pcm []byte) {
 			}
 		}
 		var measurement *candidateMeasurement
-		if s.shadowCandidates {
+		if s.req.ShadowInstrumentation {
 			cadence := ""
 			if s.req.ShadowDenseCandidates {
 				cadence = "dense"

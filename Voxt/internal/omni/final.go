@@ -61,12 +61,29 @@ type finalRequest struct {
 
 // finalResult is a request's answer.
 type finalResult struct {
-	text        string
-	tokens      int    // generated
-	language    string // detected (or the hint), "" when none
-	length      bool   // the budget ended it
-	windowTexts []string
-	segments    []struct {
+	text                       string
+	tokens                     int    // generated
+	language                   string // detected (or the hint), "" when none
+	length                     bool   // the budget ended it
+	windowTexts                []string
+	finishReason               string
+	verifiedGuessTokens        int
+	acceptedGuessTokens        int
+	proposedDraftTokens        int
+	acceptedDraftTokens        int
+	verifyRounds               int
+	reusedAudioTokens          int
+	reusedPromptTokens         int
+	decodePaths                []string
+	draftDecoderUsed           bool
+	batchDecodeUsed            bool
+	nativeChunked              bool
+	candidateProtocolKnown     bool
+	candidateProtocolSupported bool
+	candidateCadence           string
+	nativePublishedCandidates  uint64
+	nativeCoalescedCandidates  uint64
+	segments                   []struct {
 		Start   float64 `json:"start"`
 		End     float64 `json:"end"`
 		Speaker string  `json:"speaker"`
@@ -186,6 +203,7 @@ func transcribeTimed(ctx context.Context, l *lease, r finalRequest, stall time.D
 	defer func() { logRequestStage(l.s.rt, requestID, "final", "sse", started, 0, 0) }()
 	rd := bufio.NewReaderSize(resp.Body, 64<<10)
 	var done *finalResult
+	var candidateMetadata candidateProtocolMetadata
 	for {
 		watch.Reset(stall)
 		line, err := rd.ReadString('\n')
@@ -209,11 +227,18 @@ func transcribeTimed(ctx context.Context, l *lease, r finalRequest, stall time.D
 			}
 			return *done, nil
 		}
+		if applyCandidateProtocolEvent(payload, &candidateMetadata) {
+			if done != nil {
+				applyCandidateProtocolMetadata(done, candidateMetadata)
+			}
+			continue
+		}
 		res, candidate, err := parseEvent(payload)
 		if err != nil {
 			return finalResult{}, err
 		}
 		if res != nil {
+			applyCandidateProtocolMetadata(res, candidateMetadata)
 			done = res
 		} else if candidate != nil && done == nil && r.onCandidate != nil {
 			candidate.metadata.RequestID = requestID
@@ -224,6 +249,48 @@ func transcribeTimed(ctx context.Context, l *lease, r finalRequest, stall time.D
 		} else {
 		}
 	}
+}
+
+type candidateProtocolMetadata struct {
+	known     bool
+	supported bool
+	cadence   string
+	published uint64
+	coalesced uint64
+}
+
+func applyCandidateProtocolEvent(payload string, metadata *candidateProtocolMetadata) bool {
+	var event struct {
+		Type      string `json:"type"`
+		Supported *bool  `json:"supported"`
+		Cadence   string `json:"candidate_cadence"`
+		Published uint64 `json:"published_candidate_count"`
+		Coalesced uint64 `json:"coalesced_candidate_count"`
+	}
+	if json.Unmarshal([]byte(payload), &event) != nil {
+		return false
+	}
+	switch event.Type {
+	case "transcript.text.candidate_protocol":
+		metadata.known = event.Supported != nil
+		metadata.supported = event.Supported != nil && *event.Supported
+		metadata.cadence = event.Cadence
+		return true
+	case "transcript.text.candidate_summary":
+		metadata.published = event.Published
+		metadata.coalesced = event.Coalesced
+		return true
+	default:
+		return false
+	}
+}
+
+func applyCandidateProtocolMetadata(result *finalResult, metadata candidateProtocolMetadata) {
+	result.candidateProtocolKnown = metadata.known
+	result.candidateProtocolSupported = metadata.supported
+	result.candidateCadence = metadata.cadence
+	result.nativePublishedCandidates = metadata.published
+	result.nativeCoalescedCandidates = metadata.coalesced
 }
 
 // parseEvent reads one server-sent event: the result for
@@ -240,10 +307,21 @@ func parseEvent(payload string) (*finalResult, *finalCandidate, error) {
 			Text    string  `json:"text"`
 		} `json:"segments"`
 		Metadata *struct {
-			Tokens      *int     `json:"generated_token_count"`
-			Language    *string  `json:"language"`
-			Finish      string   `json:"finish_reason"`
-			WindowTexts []string `json:"window_texts"`
+			Tokens              *int     `json:"generated_token_count"`
+			Language            *string  `json:"language"`
+			Finish              string   `json:"finish_reason"`
+			WindowTexts         []string `json:"window_texts"`
+			VerifiedGuessTokens int      `json:"verified_guess_token_count"`
+			AcceptedGuessTokens int      `json:"accepted_guess_token_count"`
+			ProposedDraftTokens int      `json:"proposed_draft_token_count"`
+			AcceptedDraftTokens int      `json:"accepted_draft_token_count"`
+			VerifyRounds        int      `json:"verify_round_count"`
+			ReusedAudioTokens   int      `json:"reused_audio_token_count"`
+			ReusedPromptTokens  int      `json:"reused_prompt_token_count"`
+			DecodePaths         []string `json:"decode_paths"`
+			DraftDecoderUsed    bool     `json:"draft_decoder_used"`
+			BatchDecodeUsed     bool     `json:"batch_decode_used"`
+			NativeChunked       bool     `json:"native_chunked"`
 		} `json:"generation_metadata"`
 		Error *struct {
 			Type string `json:"type"`
@@ -261,7 +339,19 @@ func parseEvent(payload string) (*finalResult, *finalCandidate, error) {
 				return nil, nil, &asr.Error{Kind: asr.KindProtocol, Provider: Provider, Detail: "the generation metadata is incomplete"}
 			}
 			r.tokens, r.length = *m.Tokens, m.Finish == "length"
+			r.finishReason = m.Finish
 			r.windowTexts = m.WindowTexts
+			r.verifiedGuessTokens = m.VerifiedGuessTokens
+			r.acceptedGuessTokens = m.AcceptedGuessTokens
+			r.proposedDraftTokens = m.ProposedDraftTokens
+			r.acceptedDraftTokens = m.AcceptedDraftTokens
+			r.verifyRounds = m.VerifyRounds
+			r.reusedAudioTokens = m.ReusedAudioTokens
+			r.reusedPromptTokens = m.ReusedPromptTokens
+			r.decodePaths = m.DecodePaths
+			r.draftDecoderUsed = m.DraftDecoderUsed
+			r.batchDecodeUsed = m.BatchDecodeUsed
+			r.nativeChunked = m.NativeChunked
 			if m.Language != nil {
 				r.language = *m.Language
 			}

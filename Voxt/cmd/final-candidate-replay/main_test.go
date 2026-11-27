@@ -9,7 +9,26 @@ import (
 
 func replayLines(t *testing.T, events ...map[string]any) replayReport {
 	t.Helper()
+	return replayLinesWithBudget(t, true, events...)
+}
+
+func replayLinesWithBudget(t *testing.T, addBudget bool, events ...map[string]any) replayReport {
+	t.Helper()
 	var lines []string
+	seenSessions := make(map[uint64]bool)
+	for _, event := range events {
+		if sessionID, ok := event["session_id"].(uint64); ok && sessionID != 0 {
+			seenSessions[sessionID] = true
+		}
+		if sessionID, ok := event["session_id"].(int); ok && sessionID > 0 {
+			seenSessions[uint64(sessionID)] = true
+		}
+	}
+	if addBudget {
+		for sessionID := range seenSessions {
+			lines = append(lines, "info omni: "+mustJSON(t, initialBudget(sessionID, 1, 1)))
+		}
+	}
 	for _, event := range events {
 		raw, err := json.Marshal(event)
 		if err != nil {
@@ -24,6 +43,16 @@ func replayLines(t *testing.T, events ...map[string]any) replayReport {
 	return report
 }
 
+func initialBudget(sessionID uint64, generations, allowance int) map[string]any {
+	return map[string]any{
+		"event": "voxt_headstart_initial_budget", "session_id": sessionID,
+		"recording_generation_count":        generations,
+		"initial_late_generation_allowance": allowance,
+		"late_generation_already_consumed":  allowance == 0,
+		"effective_generation_limit":        3, "effective_multipart_limit": 4,
+	}
+}
+
 func httpCandidate(sessionID uint64, requestID uint64, attempt int, sequence uint64, ready float64, parts ...string) map[string]any {
 	return map[string]any{
 		"event": "voxt_final_candidate_eligibility", "session_id": sessionID,
@@ -32,6 +61,7 @@ func httpCandidate(sessionID uint64, requestID uint64, attempt int, sequence uin
 		"stop_to_eligibility_ms": ready, "candidate_eligible": true,
 		"candidate_eligible_without_budget": true,
 		"generated_token_count":             16, "part_request_sha256": parts,
+		"fresh_request_part_count":        len(parts),
 		"recording_headstart_generations": 1,
 	}
 }
@@ -42,8 +72,35 @@ func candidateOutcome(sessionID uint64, requestID uint64, attempt int, source st
 		"request_id": requestID, "attempt": attempt, "source": source,
 		"sequence": sequence, "authoritative_final_available": true,
 		"outcome_unresolved": false, "oracle_compatible": compatible,
-		"oracle_incremental_compatible": compatible,
-		"exact_cleanup_plan_match":      compatible,
+		"oracle_incremental_compatible":  compatible,
+		"fresh_compatible_cleanup_parts": boolInt(compatible),
+		"exact_cleanup_plan_match":       compatible,
+	}
+}
+
+func websocketDispatch(sessionID, requestID, sequence uint64, ready float64, candidateHash, planHash string) map[string]any {
+	return map[string]any{
+		"event": "voxt_headstart_decision", "session_id": sessionID,
+		"source": "websocket_preview", "sequence": sequence,
+		"candidate_sha256": candidateHash, "request_plan_sha256": planHash,
+		"candidate_plan_ready_ms": ready, "dispatch_ready_ms": ready,
+		"preparation_succeeded": true, "candidate_eligible": true,
+		"dispatched": true, "candidate_eligible_without_budget": true,
+		"recording_headstart_generations": 1,
+		"request_ids":                     []uint64{requestID},
+		"part_request_sha256":             []string{planHash}, "fresh_request_part_count": 1,
+	}
+}
+
+func websocketDecisionOutcome(sessionID, sequence uint64, candidateHash, planHash string, compatible bool) map[string]any {
+	return map[string]any{
+		"event": "voxt_headstart_decision_outcome", "session_id": sessionID,
+		"source": "websocket_preview", "sequence": sequence,
+		"candidate_sha256": candidateHash, "candidate_plan_sha256": planHash,
+		"outcome_unresolved": false, "oracle_compatible": compatible,
+		"oracle_incremental_compatible":  compatible,
+		"fresh_compatible_cleanup_parts": boolInt(compatible),
+		"exact_cleanup_plan_match":       compatible,
 	}
 }
 
@@ -113,47 +170,52 @@ func TestCurrentBaselineUsesActualWebSocketDispatchNotLateShadowObservation(t *t
 	dispatch := map[string]any{
 		"event": "voxt_headstart_decision", "session_id": 3,
 		"source": "websocket_preview", "sequence": 9,
+		"candidate_sha256": "candidate-ws", "request_plan_sha256": "plan-ws",
 		"candidate_plan_ready_ms": 60, "dispatch_ready_ms": 60,
 		"preparation_succeeded": true, "candidate_eligible": true,
 		"dispatched": true, "candidate_eligible_without_budget": true,
 		"recording_headstart_generations": 1,
+		"request_ids":                     []uint64{301},
 		"part_request_sha256":             []string{"p"},
 	}
 	requestDone := map[string]any{
 		"event": "voxt_headstart_request_done", "session_id": 3,
-		"request_plan_sha256": "p", "succeeded": true,
+		"request_id": 301, "request_plan_sha256": "p", "succeeded": true,
 	}
 	adopted := map[string]any{
 		"event": "voxt_headstart_adoption", "session_id": 3,
-		"request_plan_sha256": "p", "adopted": true, "outcome": "exact_match",
+		"request_id": 301, "request_plan_sha256": "p", "adopted": true, "outcome": "exact_match",
 	}
-	report := replayLines(t, shadowObservation, dispatch, requestDone, adopted, finalSummary(3, 200, "completed"))
+	report := replayLines(t, shadowObservation, dispatch, requestDone, adopted,
+		websocketDecisionOutcome(3, 9, "candidate-ws", "plan-ws", true), finalSummary(3, 200, "completed"))
 	baseline := policyByName(t, report, "current_websocket_baseline", 0)
 	if baseline.SelectedSessionCount != 1 || baseline.ActualAdoptionCount != 1 || baseline.ExactAdoptionCount != 1 {
 		t.Fatalf("baseline must use actual dispatch and adoption events: %+v", baseline)
 	}
 }
 
-func TestCombinedComparisonCountsActualBaselineAdoptions(t *testing.T) {
+func TestCombinedComparisonUsesComparableCompatibilityAndReportsEarlierLead(t *testing.T) {
 	http := httpCandidate(9, 90, 1, 1, 80, "http-part")
-	ws := map[string]any{
-		"event": "voxt_headstart_decision", "session_id": 9,
-		"source": "websocket_preview", "sequence": 2,
-		"candidate_plan_ready_ms": 100, "dispatch_ready_ms": 100,
-		"preparation_succeeded": true, "candidate_eligible": true,
-		"dispatched": true, "candidate_eligible_without_budget": true,
-		"recording_headstart_generations": 1,
-		"part_request_sha256":             []string{"ws-part"},
-	}
+	ws := websocketDispatch(9, 901, 2, 100, "ws-candidate", "ws-plan")
 	wsAdoption := map[string]any{
 		"event": "voxt_headstart_adoption", "session_id": 9,
-		"request_plan_sha256": "ws-part", "adopted": true, "outcome": "exact_match",
+		"request_id": 901, "request_plan_sha256": "ws-part", "adopted": true, "outcome": "exact_match",
 	}
+	wsRequestDone := map[string]any{"event": "voxt_headstart_request_done", "session_id": 9,
+		"request_id": 901, "succeeded": true}
 	report := replayLines(t, http, candidateOutcome(9, 90, 1, "http_final", 1, true),
-		ws, wsAdoption, finalSummary(9, 300, "completed"))
+		ws, wsAdoption, wsRequestDone,
+		websocketDecisionOutcome(9, 2, "ws-candidate", "ws-plan", true),
+		finalSummary(9, 300, "completed"),
+		initialBudget(9, 1, 1))
 	combined := policyByName(t, report, "combined_first_eligible", 0)
-	if combined.IncrementalCompatibleSelections != 0 || combined.PreservedCompatibleSelections != 1 {
-		t.Fatalf("real WebSocket adoption must count as baseline-compatible: %+v", combined)
+	if combined.IncrementalCompatibleSelections != 0 || combined.PreservedCompatibleSelections != 1 ||
+		combined.EarlierCompatibleSelections != 1 || combined.PairedLeadSampleCount != 1 || combined.PairedLeadP50MS != 20 {
+		t.Fatalf("same compatibility count must retain the earlier HTTP opportunity: %+v", combined)
+	}
+	baseline := policyByName(t, report, "current_websocket_baseline", 0)
+	if baseline.ActualAdoptionCount != 1 || baseline.OracleCompatibleSelectionCount != 1 {
+		t.Fatalf("actual adoption and oracle compatibility must remain separate: %+v", baseline)
 	}
 }
 
@@ -181,8 +243,8 @@ func TestCombinedPolicyKeepsRecordingBudgetAndFinalBoundary(t *testing.T) {
 	covered := httpCandidate(11, 110, 1, 1, 20, "covered")
 	covered["recording_headstart_generations"] = 3
 	finalFirst := httpCandidate(12, 120, 1, 1, 50, "late")
-	report := replayLines(t, covered, candidateOutcome(11, 110, 1, "http_final", 1, true),
-		finalSummary(11, 100, "completed"), finalFirst,
+	report := replayLines(t, initialBudget(11, 3, 0), covered, candidateOutcome(11, 110, 1, "http_final", 1, true),
+		finalSummary(11, 100, "completed"), initialBudget(12, 0, 1), finalFirst,
 		candidateOutcome(12, 120, 1, "http_final", 1, true), finalSummary(12, 50, "completed"))
 	combined := policyByName(t, report, "combined_first_eligible", 0)
 	if combined.SelectedSessionCount != 0 {
@@ -190,10 +252,160 @@ func TestCombinedPolicyKeepsRecordingBudgetAndFinalBoundary(t *testing.T) {
 	}
 }
 
+func TestInitialBudgetControlsZeroTwoAndThreeRecordingGenerations(t *testing.T) {
+	zero := httpCandidate(31, 310, 1, 1, 20, "zero")
+	two := httpCandidate(32, 320, 1, 1, 20, "two")
+	three := httpCandidate(33, 330, 1, 1, 20, "three")
+	report := replayLines(t,
+		initialBudget(31, 0, 1), zero, candidateOutcome(31, 310, 1, "http_final", 1, true), finalSummary(31, 200, "completed"),
+		initialBudget(32, 2, 1), two, candidateOutcome(32, 320, 1, "http_final", 1, true), finalSummary(32, 200, "completed"),
+		initialBudget(33, 3, 0), three, candidateOutcome(33, 330, 1, "http_final", 1, true), finalSummary(33, 200, "completed"),
+	)
+	combined := policyByName(t, report, "combined_first_eligible", 0)
+	if combined.SelectedSessionCount != 2 || combined.UnresolvedCounterfactualCount != 0 {
+		t.Fatalf("replay did not use the per-session initial allowance: %+v", combined)
+	}
+}
+
+func TestLateWebSocketDispatchDoesNotRetroactivelyEraseInitialAllowance(t *testing.T) {
+	ws := websocketDispatch(34, 341, 1, 120, "ws-34", "ws-plan-34")
+	lateHTTP := httpCandidate(34, 342, 1, 2, 160, "http-part")
+	lateHTTP["recording_headstart_generations"] = 3 // includes the real late generation
+	lateHTTP["counterfactual_state_unresolved"] = true
+	report := replayLines(t, initialBudget(34, 2, 1), ws,
+		websocketDecisionOutcome(34, 1, "ws-34", "ws-plan-34", true),
+		lateHTTP, candidateOutcome(34, 342, 1, "http_final", 2, true), finalSummary(34, 300, "completed"))
+	combined := policyByName(t, report, "combined_first_eligible", 0)
+	if combined.SelectedSessionCount != 1 || combined.OracleCompatibleSelectionCount != 1 || combined.UnresolvedCounterfactualCount == 0 {
+		t.Fatalf("later mutable state should be unresolved while the initial WebSocket slot remains visible: %+v", combined)
+	}
+}
+
+func TestMissingInitialBudgetIsUnresolved(t *testing.T) {
+	candidate := httpCandidate(35, 350, 1, 1, 20, "missing-budget")
+	report := replayLinesWithBudget(t, false, candidate,
+		candidateOutcome(35, 350, 1, "http_final", 1, true), finalSummary(35, 200, "completed"))
+	combined := policyByName(t, report, "combined_first_eligible", 0)
+	if combined.SelectedSessionCount != 0 || combined.UnresolvedCounterfactualCount == 0 || combined.UnresolvedPairCount == 0 {
+		t.Fatalf("missing initial budget must not be inferred from later events: %+v", combined)
+	}
+}
+
+func TestComparisonKeepsMissingFinalAndMissingBaselineOutcomeUnresolved(t *testing.T) {
+	withoutFinal := httpCandidate(38, 380, 1, 1, 20, "no-final")
+	withoutFinal["counterfactual_state_unresolved"] = true
+	missingBaselineOutcome := websocketDispatch(39, 391, 1, 40, "ws-39", "ws-plan-39")
+	missingBaselineOutcome["outcome_unresolved"] = true
+	report := replayLines(t,
+		withoutFinal, candidateOutcome(38, 380, 1, "http_final", 1, true),
+		missingBaselineOutcome, finalSummary(39, 100, "completed"),
+	)
+	combined := policyByName(t, report, "combined_first_eligible", 0)
+	if combined.UnresolvedPairCount != 2 || combined.IncrementalCompatibleSelections != 0 ||
+		combined.DisplacedCompatibleSelections != 0 {
+		t.Fatalf("incomplete baseline or final evidence was scored as zero: %+v", combined)
+	}
+}
+
+func TestMultipartReuseDoesNotCountAsFreshSpeculation(t *testing.T) {
+	candidate := httpCandidate(36, 360, 1, 1, 20, "reuse", "fresh")
+	candidate["existing_equivalent_requests"] = 1
+	candidate["fresh_request_part_count"] = 1
+	outcome := candidateOutcome(36, 360, 1, "http_final", 1, true)
+	outcome["fresh_compatible_cleanup_parts"] = 1
+	report := replayLines(t, initialBudget(36, 2, 1), candidate, outcome, finalSummary(36, 200, "completed"))
+	selected := policyByName(t, report, "http_diagnostic", 0)
+	if selected.SelectedSessionCount != 1 || selected.CompatibleFreshRequestParts != 1 || selected.ExistingRecordingCoverageParts != 1 {
+		t.Fatalf("reused multipart work was counted as a new request: %+v", selected)
+	}
+}
+
+func TestComparablePairPreservesNegativeLeadWhenAlternativeIsLater(t *testing.T) {
+	trace := map[string]*sessionTrace{
+		"s": {
+			initialBudgetKnown: true, lateAllowance: 1, generationLimit: 3, multipartLimit: 4,
+			finalAvailableKnown: true, finalAvailableMS: 500,
+			candidates: []candidate{
+				{production: true, eligibility: logEvent{Source: "websocket_preview", Dispatched: true, DispatchReadyMS: 300, PlanReadyMS: 300}, outcome: logEvent{OracleCompatible: true}, hasOutcome: true},
+				{eligibility: logEvent{Source: "http_final", StopToEligibilityMS: 350, CandidateEligible: true, PartPlanHashes: []string{"http-37"}, FreshRequestPartCount: 1}, outcome: logEvent{OracleCompatible: true}, hasOutcome: true},
+			},
+		},
+	}
+	current := policy{name: "combined_http_only", combined: true, match: func(item candidate) bool { return item.eligibility.Source == "http_final" }}
+	result := policyResult{}
+	compareToBaseline(&result, current, trace)
+	if result.LaterCompatibleSelections != 1 || result.PairedLeadSampleCount != 1 || result.PairedLeadP50MS != -50 {
+		t.Fatalf("negative paired lead was lost: %+v", result)
+	}
+}
+
+func TestBenchmarkArmsScenariosAndAllRunDenominatorsStaySeparate(t *testing.T) {
+	rows := []map[string]any{
+		{"event": "final_candidate_benchmark_run", "run_id": "off-warm", "arm": "off", "scenario": "en-1", "round": -1, "warmup": true, "status": "done"},
+		{"event": "final_candidate_benchmark_run", "run_id": "off-fail", "arm": "off", "scenario": "en-1", "round": 1, "status": "failed", "problem": "asr"},
+		{
+			"event": "final_candidate_benchmark_run", "run_id": "shadow-one", "arm": "shadow", "scenario": "en-1", "round": 1,
+			"audio_sha256": "fixture-en", "language_hint": "English", "language_mode": "explicit", "status": "done",
+			"experiment_events": []map[string]any{
+				initialBudget(101, 1, 1), httpCandidate(101, 1010, 1, 1, 40, "part"),
+				candidateOutcome(101, 1010, 1, "http_final", 1, true), finalSummary(101, 100, "completed"),
+			},
+		},
+		{"event": "final_candidate_benchmark_run", "run_id": "dense-cold", "arm": "shadow_dense", "scenario": "zh-1", "round": -1, "cold_start": true, "status": "done"},
+		{
+			"event": "final_candidate_benchmark_run", "run_id": "dense-empty", "arm": "shadow_dense", "scenario": "zh-1", "round": 1,
+			"language_hint": "Chinese", "language_mode": "explicit", "status": "done",
+			"experiment_events": []map[string]any{initialBudget(103, 1, 1), finalSummary(103, 100, "successful_final_no_candidates")},
+		},
+	}
+	var lines []string
+	for _, row := range rows {
+		lines = append(lines, mustJSON(t, row))
+	}
+	report, err := replay(strings.NewReader(strings.Join(lines, "\n")), []int{8}, []int{250})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Arms) != 3 || report.SessionCount != 5 {
+		t.Fatalf("run identities or arms were lost: %+v", report)
+	}
+	arm := func(name string) armReport {
+		t.Helper()
+		for _, current := range report.Arms {
+			if current.Arm == name {
+				return current
+			}
+		}
+		t.Fatalf("missing arm %q", name)
+		return armReport{}
+	}
+	off := arm("off")
+	shadow := arm("shadow")
+	dense := arm("shadow_dense")
+	if off.SessionCount != 2 || off.WarmupSessionCount != 1 || off.SteadySessionCount != 1 ||
+		policyByName(t, replayReport{Policies: off.Policies}, "combined_first_eligible", 0).FailedSessionCount != 1 {
+		t.Fatalf("OFF denominator or warmup classification is wrong: %+v", off)
+	}
+	if shadow.SessionCount != 1 || shadow.Scenarios[0].Scenario != "en-1" || shadow.Runs[0].AudioSHA256 != "fixture-en" {
+		t.Fatalf("shadow scenario dimensions were not preserved: %+v", shadow)
+	}
+	densePolicy := policyByName(t, replayReport{Policies: dense.Policies}, "combined_first_eligible", 0)
+	if dense.SessionCount != 2 || dense.ColdStartCount != 1 || dense.SteadySessionCount != 1 || densePolicy.SessionCount != 1 || densePolicy.NoCandidateSessionCount != 1 {
+		t.Fatalf("dense zero-candidate and cold-start denominator is wrong: %+v %+v", dense, densePolicy)
+	}
+	filtered, err := replayForArm(strings.NewReader(strings.Join(lines, "\n")), []int{8}, []int{250}, "shadow")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if filtered.SelectedArm != "shadow" || filtered.SessionCount != 1 || len(filtered.Arms) != 1 || filtered.Arms[0].Arm != "shadow" {
+		t.Fatalf("arm filter mixed runs: %+v", filtered)
+	}
+}
+
 func TestReplayReportsFinalDuringPreparationCancellationAndMissingOutcome(t *testing.T) {
-	finalDuringPrep := httpCandidate(4, 40, 1, 1, 100)
-	cancelled := httpCandidate(5, 50, 1, 1, 75)
-	missingOutcome := httpCandidate(6, 60, 1, 1, 30)
+	finalDuringPrep := httpCandidate(4, 40, 1, 1, 100, "final-prep")
+	cancelled := httpCandidate(5, 50, 1, 1, 75, "cancelled")
+	missingOutcome := httpCandidate(6, 60, 1, 1, 30, "missing-outcome")
 	report := replayLines(t,
 		finalDuringPrep, finalSummary(4, 100, "completed"),
 		cancelled, finalSummary(5, 50, "cancelled"),
@@ -226,6 +438,7 @@ func TestReplayKeepsRecordingTimeHeadStartBudgetAndFiltersWarmups(t *testing.T) 
 	input := strings.Join([]string{
 		"info omni: " + string(encoded),
 		"info omni: " + string(coldStartEncoded),
+		fmt.Sprintf("info omni: %s", mustJSON(t, initialBudget(7, 3, 0))),
 		fmt.Sprintf("info omni: %s", mustJSON(t, fullBudget)),
 		fmt.Sprintf("info omni: %s", mustJSON(t, finalSummary(7, 100, "completed"))),
 	}, "\n")
@@ -233,8 +446,9 @@ func TestReplayKeepsRecordingTimeHeadStartBudgetAndFiltersWarmups(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.SessionCount != 1 {
-		t.Fatalf("warmup session was included: %+v", report)
+	if report.SessionCount != 3 || len(report.Arms) != 1 || report.Arms[0].SteadySessionCount != 1 ||
+		report.Arms[0].WarmupSessionCount != 1 || report.Arms[0].ColdStartCount != 1 {
+		t.Fatalf("warmup/cold sessions were lost or pooled into steady metrics: %+v", report)
 	}
 	combined := policyByName(t, report, "combined_first_eligible", 0)
 	if combined.SelectedSessionCount != 0 {

@@ -85,7 +85,6 @@ func (r *run) ordinaryTranscribe() bool {
 // cleaned up in pieces (compose.BuildParts); where the model fails, the
 // text goes on as recognised, with a warning.
 func (r *run) transcribe(text string) {
-	defer r.recordShadowOutcomesAfterDelivery()
 	result := text
 	var problem *Problem
 	cleanupEnabled := r.transcribeCleanup()

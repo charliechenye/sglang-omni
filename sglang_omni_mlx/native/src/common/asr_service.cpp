@@ -56,7 +56,12 @@ public:
     snapshot->published_candidate_count = ++published_candidate_count_;
     snapshot->snapshot_build_ms_total =
         snapshot_build_ms_total_ += snapshot->snapshot_build_ms;
-    delete latest_.exchange(snapshot, std::memory_order_acq_rel);
+    auto *replaced = latest_.exchange(snapshot, std::memory_order_acq_rel);
+    if (replaced != nullptr) {
+      ++coalesced_candidate_count_;
+    } else {
+    }
+    delete replaced;
     Signal();
   }
 
@@ -69,6 +74,9 @@ public:
   bool WaitFor(std::chrono::milliseconds duration) {
     return ready_.try_acquire_for(duration);
   }
+
+  uint64_t PublishedCount() const { return published_candidate_count_; }
+  uint64_t CoalescedCount() const { return coalesced_candidate_count_; }
 
   void Complete() {
     closed_.store(true, std::memory_order_release);
@@ -89,6 +97,7 @@ private:
   // One model-worker producer updates these before publishing the snapshot;
   // the HTTP writer only reads the copied fields after latest_.exchange.
   uint64_t published_candidate_count_ = 0;
+  uint64_t coalesced_candidate_count_ = 0;
   double snapshot_build_ms_total_ = 0.0;
   std::atomic<bool> signaled_{false};
   std::atomic<bool> closed_{false};
@@ -140,9 +149,32 @@ Json DoneEvent(const TranscriptionResult &result,
           result.accepted_draft_token_count;
     } else {
     }
+    event["generation_metadata"]["verified_guess_token_count"] =
+        result.verified_guess_token_count;
+    event["generation_metadata"]["accepted_guess_token_count"] =
+        result.accepted_guess_token_count;
+    event["generation_metadata"]["decode_paths"] = result.decode_paths;
+    event["generation_metadata"]["draft_decoder_used"] =
+        result.draft_decoder_used;
+    event["generation_metadata"]["batch_decode_used"] =
+        result.batch_decode_used;
+    event["generation_metadata"]["native_chunked"] = result.native_chunked;
   } else {
   }
   return event;
+}
+
+Json CandidateProtocolEvent(const std::string &cadence) {
+  return {{"type", "transcript.text.candidate_protocol"},
+          {"supported", true},
+          {"protocol_version", 1},
+          {"candidate_cadence", cadence}};
+}
+
+Json CandidateSummaryEvent(const CandidateMailbox &mailbox) {
+  return {{"type", "transcript.text.candidate_summary"},
+          {"published_candidate_count", mailbox.PublishedCount()},
+          {"coalesced_candidate_count", mailbox.CoalescedCount()}};
 }
 
 const Json &FailureEvent() {
@@ -208,6 +240,8 @@ int HandleTranscriptions(mg_connection *connection, void *data) {
   const std::shared_ptr<CandidateMailbox> candidate_mailbox =
       include_transcript_candidates ? std::make_shared<CandidateMailbox>()
                                     : nullptr;
+  const std::string candidate_cadence =
+      TextField(*form, "candidate_cadence").value_or("bounded");
   Transcription transcription;
   try {
     std::vector<float> samples =
@@ -257,6 +291,10 @@ int HandleTranscriptions(mg_connection *connection, void *data) {
   mg_printf(connection, "HTTP/1.1 200 OK\r\nContent-Type: "
                         "text/event-stream\r\nCache-Control: no-cache\r\n"
                         "Connection: close\r\n\r\n");
+  if (candidate_mailbox != nullptr) {
+    WriteSse(connection, CandidateProtocolEvent(candidate_cadence).dump());
+  } else {
+  }
   // Note (Jiaxin Deng): SSE comment heartbeats fail to write once the peer is
   // gone, which cancels the decode it was waiting for.
   const auto heartbeat_interval =
@@ -292,6 +330,10 @@ int HandleTranscriptions(mg_connection *connection, void *data) {
       WriteSse(connection, CandidateEvent(*candidate).dump());
     } else {
     }
+  }
+  if (candidate_mailbox != nullptr) {
+    WriteSse(connection, CandidateSummaryEvent(*candidate_mailbox).dump());
+  } else {
   }
   try {
     const TranscriptionResult result = future.get();

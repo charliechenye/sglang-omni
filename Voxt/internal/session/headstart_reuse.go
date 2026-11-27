@@ -189,6 +189,9 @@ func (r *run) askPart(ctx context.Context, req llm.Request, text string) (llm.Re
 }
 
 func (r *run) logHeadStartAdoption(req llm.Request, requestID uint64, source, outcome string, adopted bool) {
+	if !r.shadowTraceEnabled {
+		return
+	}
 	r.logShadowEvent(map[string]any{
 		"event": "voxt_headstart_adoption", "run_id": r.id,
 		"session_id": r.shadowSessionID, "request_id": requestID, "source": source,

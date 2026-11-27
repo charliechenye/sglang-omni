@@ -111,13 +111,6 @@ type headCall struct {
 // prepareHeadInputs allocates partial and pause channels before ASR workers
 // start when Head Start could become eligible later.
 func (r *run) prepareHeadInputs(endWord bool) bool {
-	r.head.r = r
-	mode := os.Getenv("VOXT_EXPERIMENT_FINAL_CANDIDATES")
-	r.shadowTraceEnabled = mode == "shadow" || mode == "shadow_dense"
-	r.shadowDense = mode == "shadow_dense"
-	if r.shadowTraceEnabled && r.shadowSessionID == 0 {
-		r.shadowSessionID = shadowSessionIDs.Add(1)
-	}
 	possible := r.req.Kind == store.KindTranscribe && !r.settings.Features.Transcribe.CleanAfterStop && r.shot == nil && len(r.req.Images) == 0
 	if possible {
 		if r.init.split && !r.init.cleanupDecisionReady {
@@ -132,10 +125,20 @@ func (r *run) prepareHeadInputs(endWord bool) bool {
 	if (endWord || possible) && r.heard == nil {
 		r.heard, r.silent = make(chan heardText, 1), make(chan bool, 1)
 	}
-	if r.shadowCandidates == nil {
+	if r.shadowCandidatesEnabled && r.shadowCandidates == nil {
 		r.shadowCandidates = make(chan shadowCandidate, 1)
 	}
 	return possible
+}
+
+func (r *run) configureFinalCandidateExperiment() {
+	mode := os.Getenv("VOXT_EXPERIMENT_FINAL_CANDIDATES")
+	r.shadowTraceEnabled = mode == "instrumented" || mode == "shadow" || mode == "shadow_dense"
+	r.shadowCandidatesEnabled = mode == "shadow" || mode == "shadow_dense"
+	r.shadowDense = mode == "shadow_dense"
+	if r.shadowTraceEnabled && r.shadowSessionID == 0 {
+		r.shadowSessionID = shadowSessionIDs.Add(1)
+	}
 }
 
 // startHead decides eligibility only after cleanup readiness is known.
@@ -265,6 +268,33 @@ type lateGateState struct {
 	CleanupEligible       bool
 	RecordingGenerations  int
 	LateAlreadyDispatched bool
+}
+
+type initialHeadBudget struct {
+	RecordingGenerations int
+	LateAllowance        int
+	LateAlreadyConsumed  bool
+	GenerationLimit      int
+	MultipartLimit       int
+}
+
+// initialBudget is captured by the session owner at entry to waitFinal. The
+// recording loop has already submitted its final pre-Stop text, and only that
+// owner can add another generation, so this is the causal state at the Final
+// handoff before any late WebSocket candidate can dispatch.
+func (h *headStart) initialBudget() initialHeadBudget {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	budget := initialHeadBudget{
+		RecordingGenerations: len(h.gens),
+		LateAlreadyConsumed:  h.lateAsked,
+		GenerationLimit:      headKeep,
+		MultipartLimit:       partsTogether,
+	}
+	if !h.lateAsked && len(h.gens) < headKeep {
+		budget.LateAllowance = 1
+	}
+	return budget
 }
 
 func (s lateGateState) eligible() bool {

@@ -24,17 +24,35 @@ func (r *run) waitFinal(ctx context.Context, finals <-chan streamEnd, heard <-ch
 	observationsCapped := false
 	var observationsDropped uint64
 	var headStartSequence uint64
+	if r.shadowTraceEnabled {
+		initial := r.head.initialBudget()
+		r.shadowMu.Lock()
+		r.shadowInitialBudget = initial
+		r.shadowInitialBudgetKnown = true
+		r.shadowMu.Unlock()
+		r.logShadowEvent(map[string]any{
+			"event": "voxt_headstart_initial_budget", "run_id": r.id,
+			"session_id":                        r.shadowSessionID,
+			"recording_generation_count":        initial.RecordingGenerations,
+			"initial_late_generation_allowance": initial.LateAllowance,
+			"late_generation_already_consumed":  initial.LateAlreadyConsumed,
+			"effective_generation_limit":        initial.GenerationLimit,
+			"effective_multipart_limit":         initial.MultipartLimit,
+		})
+	}
 	finish := func(end streamEnd, err error) (streamEnd, error) {
 		if err != nil && end.finalAvailableAt.IsZero() {
 			end.finalAvailableAt = time.Now()
 		}
-		r.shadowMu.Lock()
-		r.shadowObservations = append([]shadowObservation(nil), observations...)
-		r.shadowObservationCap = observationsCapped
-		r.shadowObservationDropped = observationsDropped
-		final := end
-		r.shadowFinal = &final
-		r.shadowMu.Unlock()
+		if r.shadowTraceEnabled {
+			r.shadowMu.Lock()
+			r.shadowObservations = append([]shadowObservation(nil), observations...)
+			r.shadowObservationCap = observationsCapped
+			r.shadowObservationDropped = observationsDropped
+			final := end
+			r.shadowFinal = &final
+			r.shadowMu.Unlock()
+		}
 		return end, err
 	}
 	for {
@@ -160,7 +178,7 @@ func (r *run) dispatchLate(ctx context.Context, finals <-chan streamEnd, plan he
 func (r *run) logHeadStartDecision(update heardText, sequence uint64, plan headPlan, reason string,
 	before, after lateGateState, processingAt, planReadyAt, dispatchReadyAt, dispatchAt time.Time,
 	requestIDs []uint64, dispatched bool) {
-	if !r.head.enabled.Load() {
+	if !r.shadowTraceEnabled || !r.head.enabled.Load() {
 		return
 	}
 	textHash := sha256.Sum256([]byte(update.text))
@@ -185,31 +203,45 @@ func (r *run) logHeadStartDecision(update heardText, sequence uint64, plan headP
 	if update.candidate {
 		source = "websocket_candidate"
 	}
+	decision := shadowHeadStartDecision{
+		update: update, plan: cloneHeadPlan(plan), sequence: sequence, reason: reason,
+		before: before, after: after, processingAt: processingAt, planReadyAt: planReadyAt,
+		dispatchReadyAt: dispatchReadyAt, dispatchAt: dispatchAt,
+		requestIDs: append([]uint64(nil), requestIDs...), dispatched: dispatched,
+	}
+	r.shadowMu.Lock()
+	if len(r.shadowHeadStartDecisions) < 128 {
+		r.shadowHeadStartDecisions = append(r.shadowHeadStartDecisions, decision)
+	} else {
+		r.shadowHeadStartDecisionsDropped++
+	}
+	r.shadowMu.Unlock()
 	r.logShadowEvent(map[string]any{
 		"event": "voxt_headstart_decision", "run_id": r.id,
 		"session_id": r.shadowSessionID,
 		"source":     source, "sequence": sequence,
-		"candidate_sha256":                  hex.EncodeToString(textHash[:]),
-		"candidate_arrived_ms":              toStopMS(update.receivedAt),
-		"candidate_processing_started_ms":   toStopMS(processingAt),
-		"candidate_plan_ready_ms":           toStopMS(planReadyAt),
-		"dispatch_ready_ms":                 toStopMS(dispatchReadyAt),
-		"dispatch_at_ms":                    toStopMS(dispatchAt),
-		"request_ids":                       requestIDs,
-		"candidate_processing_ms":           float64(planReadyAt.Sub(processingAt).Microseconds()) / 1000,
-		"preparation_succeeded":             planUsable,
-		"candidate_eligible_without_budget": eligibleWithoutBudget,
-		"candidate_eligible":                dispatched,
-		"dispatched":                        dispatched,
-		"rejection_reason":                  reason,
-		"late_generation_budget_before":     before.BudgetAvailable,
-		"late_generation_budget_after":      after.BudgetAvailable && !dispatched,
-		"late_already_dispatched_before":    before.LateAlreadyDispatched,
-		"recording_headstart_generations":   before.RecordingGenerations,
-		"llm_readiness_open":                before.LLMReady,
-		"cleanup_eligible":                  before.CleanupEligible,
-		"request_plan_sha256":               planHash,
-		"part_request_sha256":               partHashes,
+		"candidate_sha256":                        hex.EncodeToString(textHash[:]),
+		"candidate_arrived_ms":                    toStopMS(update.receivedAt),
+		"candidate_processing_started_ms":         toStopMS(processingAt),
+		"candidate_plan_ready_ms":                 toStopMS(planReadyAt),
+		"dispatch_ready_ms":                       toStopMS(dispatchReadyAt),
+		"dispatch_at_ms":                          toStopMS(dispatchAt),
+		"request_ids":                             requestIDs,
+		"candidate_processing_ms":                 float64(planReadyAt.Sub(processingAt).Microseconds()) / 1000,
+		"preparation_succeeded":                   planUsable,
+		"candidate_eligible_without_budget":       eligibleWithoutBudget,
+		"candidate_eligible":                      dispatched,
+		"dispatched":                              dispatched,
+		"rejection_reason":                        reason,
+		"late_generation_budget_before":           before.BudgetAvailable,
+		"late_generation_budget_after":            after.BudgetAvailable && !dispatched,
+		"late_already_dispatched_before":          before.LateAlreadyDispatched,
+		"recording_headstart_generations":         before.RecordingGenerations,
+		"initial_recording_headstart_generations": r.shadowInitialBudget.RecordingGenerations,
+		"llm_readiness_open":                      before.LLMReady,
+		"cleanup_eligible":                        before.CleanupEligible,
+		"request_plan_sha256":                     planHash,
+		"part_request_sha256":                     partHashes,
 	})
 }
 

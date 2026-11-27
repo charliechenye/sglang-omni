@@ -1,6 +1,8 @@
 package session
 
 import (
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -63,5 +65,83 @@ func TestShadowPlanCompatibilityUsesPendingCleanupPartIndices(t *testing.T) {
 	}}
 	if exact, near, repair, compatible := (&headStart{}).plansCompatible(candidate, authoritativePending); exact || near || repair || len(compatible) != 1 || compatible[0] != 1 {
 		t.Fatalf("exact=%t near=%t repair=%t compatible parts=%v", exact, near, repair, compatible)
+	}
+}
+
+func TestFinalCandidateExperimentModesKeepProductionOffUninstrumented(t *testing.T) {
+	for _, mode := range []string{"", "instrumented", "shadow", "shadow_dense"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv("VOXT_EXPERIMENT_FINAL_CANDIDATES", mode)
+			var logs []string
+			manager := &Manager{cfg: Config{Log: func(_, message string) { logs = append(logs, message) }}}
+			r := &run{m: manager, id: "mode-test"}
+			r.head.r = r
+			r.configureFinalCandidateExperiment()
+			r.prepareHeadInputs(false)
+			plan := headPlan{parts: []headPart{{partIndex: 0, req: llm.Request{Messages: []llm.Message{{Role: llm.User, Content: "content"}}}}}}
+			r.captureCleanupPlan(plan, "authoritative_cleanup")
+
+			switch mode {
+			case "":
+				if r.shadowTraceEnabled || r.shadowCandidatesEnabled || r.shadowCandidates != nil || len(r.cleanupPlans) != 0 || len(logs) != 0 {
+					t.Fatalf("production OFF allocated or emitted experiment state: trace=%t candidates=%t channel=%t plans=%d logs=%d", r.shadowTraceEnabled, r.shadowCandidatesEnabled, r.shadowCandidates != nil, len(r.cleanupPlans), len(logs))
+				}
+			case "instrumented":
+				if !r.shadowTraceEnabled || r.shadowCandidatesEnabled || r.shadowCandidates != nil || len(r.cleanupPlans) != 1 || len(logs) != 2 {
+					t.Fatalf("instrumented baseline must capture traces without candidate transport: trace=%t candidates=%t channel=%t plans=%d logs=%d", r.shadowTraceEnabled, r.shadowCandidatesEnabled, r.shadowCandidates != nil, len(r.cleanupPlans), len(logs))
+				}
+			default:
+				if !r.shadowTraceEnabled || !r.shadowCandidatesEnabled || r.shadowCandidates == nil || len(r.cleanupPlans) != 1 || len(logs) != 2 {
+					t.Fatalf("shadow mode must capture traces and allocate its candidate channel: trace=%t candidates=%t channel=%t plans=%d logs=%d", r.shadowTraceEnabled, r.shadowCandidatesEnabled, r.shadowCandidates != nil, len(r.cleanupPlans), len(logs))
+				}
+			}
+		})
+	}
+}
+
+func TestTerminalShadowReportIsExactlyOnceOnCancellation(t *testing.T) {
+	var logs []string
+	manager := &Manager{cfg: Config{Log: func(_, message string) { logs = append(logs, message) }}}
+	r := &run{
+		m: manager, id: "cancel-test", shadowTraceEnabled: true,
+		shadowCandidatesEnabled: true, shadowSessionID: 73,
+		shadowFinal: &streamEnd{err: errors.New("cancelled before Final")},
+	}
+	snapshot := Snapshot{State: Cancelled}
+	r.finalizeShadowReport(snapshot)
+	r.finalizeShadowReport(snapshot)
+	count := 0
+	for _, message := range logs {
+		if strings.Contains(message, `"event":"voxt_final_candidate_summary"`) {
+			count++
+			if !strings.Contains(message, `"terminal_status":"cancelled"`) {
+				t.Fatalf("terminal summary lost cancellation status: %s", message)
+			}
+		}
+	}
+	if count != 1 {
+		t.Fatalf("got %d terminal summaries, want exactly one: %v", count, logs)
+	}
+}
+
+func TestTerminalShadowStatusDistinguishesFailureAndEmptyFinal(t *testing.T) {
+	r := &run{}
+	cases := []struct {
+		name     string
+		snapshot Snapshot
+		end      streamEnd
+		want     string
+	}{
+		{name: "no speech", snapshot: Snapshot{State: Done, Problem: &Problem{Code: ProblemNoSpeech}}, want: "no_speech"},
+		{name: "empty final", snapshot: Snapshot{State: Done}, end: streamEnd{finalAvailableAt: time.Now()}, want: "empty_transcript"},
+		{name: "ASR error", snapshot: Snapshot{State: Failed, Problem: &Problem{Code: ProblemASR}}, end: streamEnd{err: errors.New("ASR failed")}, want: "asr_failure"},
+		{name: "unsupported path", snapshot: Snapshot{State: Recording}, end: streamEnd{err: errors.New("unsupported")}, want: "unsupported_path"},
+	}
+	for _, test := range cases {
+		t.Run(test.name, func(t *testing.T) {
+			if got := terminalShadowStatus(r, test.snapshot, test.end, false); got != test.want {
+				t.Fatalf("terminalShadowStatus() = %q, want %q", got, test.want)
+			}
+		})
 	}
 }

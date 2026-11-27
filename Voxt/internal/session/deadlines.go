@@ -120,19 +120,21 @@ func (r *run) llmChatContext(parent context.Context, req llm.Request) (llm.Respo
 	if parent.Err() != nil || r.ctx.Err() != nil {
 		return llm.Response{}, context.Canceled
 	}
-	requestStartedAt := time.Now()
-	if origin, ok := parent.Value(requestOriginContextKey{}).(requestOriginContextValue); ok {
-		stopAt := r.monotonicStoppedAt()
-		shouldLog := false
-		if origin.call != nil {
-			origin.call.mu.Lock()
-			origin.call.requestStartedAt = requestStartedAt
-			shouldLog = !stopAt.IsZero() && !origin.call.requestStartLogged
-			origin.call.requestStartLogged = origin.call.requestStartLogged || shouldLog
-			origin.call.mu.Unlock()
-		}
-		if shouldLog {
-			r.logHeadStartRequestStart(origin.call, requestStartedAt, stopAt)
+	if r.shadowTraceEnabled {
+		requestStartedAt := time.Now()
+		if origin, ok := parent.Value(requestOriginContextKey{}).(requestOriginContextValue); ok {
+			stopAt := r.monotonicStoppedAt()
+			shouldLog := false
+			if origin.call != nil {
+				origin.call.mu.Lock()
+				origin.call.requestStartedAt = requestStartedAt
+				shouldLog = !stopAt.IsZero() && !origin.call.requestStartLogged
+				origin.call.requestStartLogged = origin.call.requestStartLogged || shouldLog
+				origin.call.mu.Unlock()
+			}
+			if shouldLog {
+				r.logHeadStartRequestStart(origin.call, requestStartedAt, stopAt)
+			}
 		}
 	}
 	resp, err := client.Chat(ctx, req)
@@ -161,7 +163,7 @@ func (r *run) llmChatContext(parent context.Context, req llm.Request) (llm.Respo
 }
 
 func (r *run) logHeadStartRequestStart(call *headCall, requestStartedAt, stopAt time.Time) {
-	if call == nil || stopAt.IsZero() {
+	if !r.shadowTraceEnabled || call == nil || stopAt.IsZero() {
 		return
 	}
 	r.logShadowEvent(map[string]any{

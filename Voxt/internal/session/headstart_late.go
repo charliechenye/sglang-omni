@@ -63,31 +63,43 @@ func (h *headStart) start(req llm.Request, text string, late bool) *headCall {
 	if late {
 		origin = "headstart_late"
 	}
-	requestID := r.llmRequestSequence.Add(1)
+	requestID := uint64(0)
+	if r.shadowTraceEnabled {
+		requestID = r.llmRequestSequence.Add(1)
+	}
 	c := &headCall{req: req, requestID: requestID, text: text, late: late, origin: origin, cancel: cancel, done: make(chan struct{})}
-	ctx = context.WithValue(ctx, requestOriginContextKey{}, requestOriginContextValue{call: c})
-	ctx = llm.WithTraceTag(ctx, origin)
+	if r.shadowTraceEnabled {
+		ctx = context.WithValue(ctx, requestOriginContextKey{}, requestOriginContextValue{call: c})
+		ctx = llm.WithTraceTag(ctx, origin)
+		ctx = llm.WithTraceRequestID(ctx, requestID)
+	}
 	req.OnDelta = c.add
-	ctx = llm.WithTraceRequestID(ctx, requestID)
-	h.mu.Lock()
-	h.requestCalls = append(h.requestCalls, c)
-	h.mu.Unlock()
+	if r.shadowTraceEnabled {
+		h.mu.Lock()
+		h.requestCalls = append(h.requestCalls, c)
+		h.mu.Unlock()
+	}
 	go func() {
 		defer close(c.done)
 		defer cancel()
 		c.resp, c.err = r.llmChatContext(ctx, req)
-		r.logShadowEvent(map[string]any{
-			"event": "voxt_headstart_request_done", "run_id": r.id,
-			"session_id": r.shadowSessionID, "request_id": requestID,
-			"source": origin, "succeeded": c.err == nil,
-			"request_plan_sha256": r.head.partPlanHash(headPart{req: req}),
-		})
+		if r.shadowTraceEnabled {
+			r.logShadowEvent(map[string]any{
+				"event": "voxt_headstart_request_done", "run_id": r.id,
+				"session_id": r.shadowSessionID, "request_id": requestID,
+				"source": origin, "succeeded": c.err == nil,
+				"request_plan_sha256": r.head.partPlanHash(headPart{req: req}),
+			})
+		}
 		r.m.noteRate(h.service, c.resp, c.err)
 	}()
 	return c
 }
 
 func (h *headStart) logRequestStartsAfterStop(stopAt time.Time) {
+	if h.r == nil || !h.r.shadowTraceEnabled {
+		return
+	}
 	h.mu.Lock()
 	calls := append([]*headCall(nil), h.requestCalls...)
 	h.mu.Unlock()

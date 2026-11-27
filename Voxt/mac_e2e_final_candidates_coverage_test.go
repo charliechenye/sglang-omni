@@ -11,8 +11,15 @@ import (
 type benchCandidateCoverage struct {
 	ProtocolReported           bool           `json:"protocol_reported"`
 	ProtocolEnabled            bool           `json:"protocol_enabled"`
+	ProtocolResultReported     bool           `json:"protocol_result_reported"`
+	ProtocolKnown              bool           `json:"protocol_known"`
+	ProtocolSupported          bool           `json:"protocol_supported"`
+	ProtocolRequested          bool           `json:"protocol_requested"`
 	Cadence                    string         `json:"cadence,omitempty"`
 	DecodePath                 string         `json:"decode_path,omitempty"`
+	DecodePaths                []string       `json:"decode_paths,omitempty"`
+	NativePublishedCount       uint64         `json:"native_published_candidate_count"`
+	NativeCoalescedCount       uint64         `json:"native_coalesced_candidate_count"`
 	ExclusionReasons           []string       `json:"exclusion_reasons,omitempty"`
 	HTTPObservedCount          int            `json:"http_observed_candidate_count"`
 	WebSocketObservedCount     int            `json:"websocket_observed_candidate_count"`
@@ -67,18 +74,24 @@ func candidateProtocolCoverage(events []json.RawMessage) benchCandidateCoverage 
 	exclusionReasons := make(map[string]bool)
 	for _, raw := range events {
 		var event struct {
-			Event               string  `json:"event"`
-			Source              string  `json:"source"`
-			Reason              string  `json:"reason"`
-			Cadence             string  `json:"cadence"`
-			DecodePath          string  `json:"decode_path"`
-			Enabled             bool    `json:"enabled"`
-			ProcessingMS        float64 `json:"candidate_processing_ms"`
-			GateMS              float64 `json:"candidate_gate_ms"`
-			ObservationsCapped  bool    `json:"observations_capped"`
-			ObservationsDropped uint64  `json:"observations_dropped"`
-			ChannelCoalesced    uint64  `json:"candidate_channel_coalesced"`
-			ChannelPending      int     `json:"candidate_channel_pending"`
+			Event               string   `json:"event"`
+			Source              string   `json:"source"`
+			Reason              string   `json:"reason"`
+			Cadence             string   `json:"cadence"`
+			DecodePath          string   `json:"decode_path"`
+			DecodePaths         []string `json:"decode_paths"`
+			Enabled             bool     `json:"enabled"`
+			Requested           bool     `json:"candidate_protocol_requested"`
+			Known               bool     `json:"candidate_protocol_known"`
+			Supported           bool     `json:"candidate_protocol_supported"`
+			Published           uint64   `json:"native_published_candidate_count"`
+			Coalesced           uint64   `json:"native_coalesced_candidate_count"`
+			ProcessingMS        float64  `json:"candidate_processing_ms"`
+			GateMS              float64  `json:"candidate_gate_ms"`
+			ObservationsCapped  bool     `json:"observations_capped"`
+			ObservationsDropped uint64   `json:"observations_dropped"`
+			ChannelCoalesced    uint64   `json:"candidate_channel_coalesced"`
+			ChannelPending      int      `json:"candidate_channel_pending"`
 		}
 		if json.Unmarshal(raw, &event) != nil {
 			continue
@@ -87,10 +100,20 @@ func candidateProtocolCoverage(events []json.RawMessage) benchCandidateCoverage 
 		case "voxt_final_candidate_protocol":
 			coverage.ProtocolReported = true
 			coverage.ProtocolEnabled = event.Enabled
+			coverage.ProtocolRequested = event.Requested || event.Enabled
 			coverage.Cadence, coverage.DecodePath = event.Cadence, event.DecodePath
 			if event.Reason != "" {
 				exclusionReasons[event.Reason] = true
 			}
+		case "voxt_final_candidate_protocol_result":
+			coverage.ProtocolResultReported = true
+			coverage.ProtocolRequested = event.Requested
+			coverage.ProtocolKnown = event.Known
+			coverage.ProtocolSupported = event.Supported
+			coverage.NativePublishedCount = event.Published
+			coverage.NativeCoalescedCount = event.Coalesced
+			coverage.DecodePaths = event.DecodePaths
+			coverage.DecodePath = strings.Join(event.DecodePaths, ",")
 		case "voxt_final_candidates_excluded":
 			if event.Reason != "" {
 				exclusionReasons[event.Reason] = true

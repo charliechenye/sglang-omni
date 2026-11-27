@@ -64,6 +64,10 @@ mkdir -p "$(dirname "$output")"
 export VOXTNEW_FINAL_CANDIDATE_BENCH=1
 export VOXTNEW_FINAL_CANDIDATE_BENCH_ROUNDS="${VOXTNEW_FINAL_CANDIDATE_BENCH_ROUNDS:-5}"
 export VOXTNEW_FINAL_CANDIDATE_BENCH_WARMUPS="${VOXTNEW_FINAL_CANDIDATE_BENCH_WARMUPS:-1}"
+set +e
 go test -count=1 -run '^TestMacE2EFinalCandidateBenchmark$' -v -timeout 2h . 2>&1 | tee "$output"
+test_status=${PIPESTATUS[0]}
+set -e
 sed -n 's/^FINAL_CANDIDATE_BENCH //p' "$output" > "$jsonl"
 printf 'Machine-readable results: %s\n' "$jsonl"
+exit "$test_status"

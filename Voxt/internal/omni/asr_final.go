@@ -38,8 +38,13 @@ func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, 
 		known.guessAutoLanguage = false
 	}
 	includeCandidates := onCandidate != nil && a.spec.Kind == kindQwen3ASR && len(chunks) == 1
-	if onCandidate != nil {
-		event := map[string]any{"event": "voxt_final_candidate_protocol", "enabled": includeCandidates}
+	if measurement != nil {
+		event := map[string]any{
+			"event": "voxt_final_candidate_protocol", "enabled": includeCandidates,
+			"candidate_protocol_requested": includeCandidates,
+			"requested_path":               "authoritative_final_http",
+			"language_mode":                requestedLanguageMode(language),
+		}
 		if measurement != nil {
 			event["run_id"], event["session_id"] = measurement.runID, measurement.sessionID
 		}
@@ -48,18 +53,22 @@ func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, 
 			if measurement != nil && measurement.cadence == "dense" {
 				cadence = "dense"
 			}
-			event["cadence"], event["decode_path"] = cadence, "http_final_single_chunk"
+			event["cadence"] = cadence
+		} else if onCandidate == nil {
+			event["reason"] = "instrumented_baseline"
 		} else if a.spec.Kind != kindQwen3ASR {
-			event["reason"], event["decode_path"] = "unsupported_model", "unsupported_model"
+			event["reason"] = "unsupported_model"
+		} else if len(chunks) > 1 {
+			event["reason"] = "multiple_final_chunks"
 		} else {
-			event["reason"], event["decode_path"] = "multiple_final_chunks", "http_final_multiple_chunks"
+			event["reason"] = "candidate_publication_unavailable"
 		}
 		payload, err := json.Marshal(event)
 		if err == nil {
 			a.rt.logf("info", "%s", payload)
 		}
 	}
-	if onCandidate != nil && !includeCandidates {
+	if measurement != nil && onCandidate != nil && !includeCandidates {
 		reason := "unsupported_model"
 		if a.spec.Kind == kindQwen3ASR {
 			reason = "multiple_final_chunks"
@@ -112,12 +121,19 @@ func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, 
 			candidateCadence = measurement.cadence
 		}
 		req := finalRequest{pcm: pcm, language: language, context: b.context, maxTokens: budget, layout: t.AudioLayout, known: start, includeCandidates: includeCandidates, candidateCadence: candidateCadence}
+		var nativeSSEReceived, goSuppressed uint64
+		var snapshotBuildMSTotal float64
 		if includeCandidates {
 			req.onCandidate = func(candidate finalCandidate) {
+				nativeSSEReceived++
+				if candidate.metadata.SnapshotBuildMSTotal > snapshotBuildMSTotal {
+					snapshotBuildMSTotal = candidate.metadata.SnapshotBuildMSTotal
+				}
 				originalText := candidate.text
 				text, reason, ok := a.finalCandidateText(candidate.text, b.terms)
 				candidate.text = text
 				if !ok {
+					goSuppressed++
 					candidate.text = originalText
 					logCandidateRecord(a.rt, "voxt_final_candidate_suppressed", candidate, time.Time{}, reason)
 				} else {
@@ -129,6 +145,9 @@ func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, 
 		r, err := transcribeTimed(ctx, l, req, a.rt.cfg.StallTimeout, requestID)
 		if err != nil {
 			return "", "", err
+		}
+		if measurement != nil {
+			logFinalCandidateProtocolResult(a.rt, measurement, requestID, req, r, nativeSSEReceived, goSuppressed, snapshotBuildMSTotal)
 		}
 		r.text = a.trimEcho(ctx, l, req, a.plainText(r.text), r.length, b.terms)
 		if shared {

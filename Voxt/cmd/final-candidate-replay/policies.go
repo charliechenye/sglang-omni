@@ -8,7 +8,8 @@ import (
 func buildPolicies(tokenThresholds, timeThresholds []int) []policy {
 	websocket := func(current candidate) bool {
 		return current.production &&
-			(current.eligibility.Source == "websocket_preview" || current.eligibility.Source == "websocket_candidate")
+			(current.eligibility.Source == "websocket_preview" || current.eligibility.Source == "websocket_candidate") &&
+			current.eligibility.Dispatched
 	}
 	httpCandidate := func(current candidate) bool { return current.eligibility.Source == "http_final" }
 	policies := []policy{
@@ -62,6 +63,24 @@ func evaluatePolicy(current policy, sessions map[string]*sessionTrace) policyRes
 	result := policyResult{Name: current.name, Threshold: current.threshold}
 	var arrivalLeads, dispatchLeads, actualRequestStarts []float64
 	for _, trace := range sessions {
+		result.SessionCount++
+		if trace.runStatus == "failed" || trace.runStatus == "asr_failure" {
+			result.FailedSessionCount++
+		} else if trace.runStatus == "cancelled" {
+			result.CancelledSessionCount++
+		} else if trace.runStatus == "done" && trace.runProblem == "" {
+			result.SuccessfulSessionCount++
+		}
+		hasHTTP := false
+		for _, currentCandidate := range trace.candidates {
+			if currentCandidate.eligibility.Source == "http_final" {
+				hasHTTP = true
+				break
+			}
+		}
+		if !hasHTTP && trace.observedCandidateOnly == 0 {
+			result.NoCandidateSessionCount++
+		}
 		selected := selectCandidates(current, trace, &result)
 		if len(selected) == 0 {
 			continue
@@ -87,6 +106,8 @@ func evaluatePolicy(current policy, sessions map[string]*sessionTrace) policyRes
 					actualRequestStarts = append(actualRequestStarts, chosen.actualRequestStartMS)
 				}
 				if chosen.hasOutcome && !chosen.outcome.OutcomeUnresolved {
+					result.CompatibleFreshRequestParts += chosen.outcome.FreshCompatiblePartCount
+					result.ExistingRecordingCoverageParts += chosen.eligibility.ExistingEquivalentRequests
 					if chosen.outcome.OracleCompatible {
 						result.OracleCompatibleSelectionCount++
 					}
@@ -121,6 +142,8 @@ func evaluatePolicy(current policy, sessions map[string]*sessionTrace) policyRes
 				}
 			}
 			outcome := chosen.outcome
+			result.CompatibleFreshRequestParts += outcome.FreshCompatiblePartCount
+			result.ExistingRecordingCoverageParts += chosen.eligibility.ExistingEquivalentRequests
 			if outcome.OracleCompatible {
 				result.OracleCompatibleSelectionCount++
 			}
@@ -194,20 +217,28 @@ func selectCandidates(current policy, trace *sessionTrace, result *policyResult)
 	if current.name == "websocket_control" {
 		current.match = func(candidate candidate) bool {
 			return candidate.production &&
-				(candidate.eligibility.Source == "websocket_preview" || candidate.eligibility.Source == "websocket_candidate")
+				(candidate.eligibility.Source == "websocket_preview" || candidate.eligibility.Source == "websocket_candidate") &&
+				candidate.eligibility.Dispatched
 		}
 	}
-	remaining := 0
-	if trace.recordingGensKnown {
-		if trace.recordingGenerations < 3 {
-			remaining = 1
+	if !trace.initialBudgetKnown || trace.generationLimit <= 0 || trace.multipartLimit <= 0 {
+		for _, candidate := range trace.candidates {
+			if current.match(candidate) && candidateEligibleWithoutBudget(candidate) {
+				result.UnresolvedCounterfactualCount++
+				result.counterfactualSelectionUnknown = true
+				break
+			}
 		}
-	} else {
-		result.UnresolvedCounterfactualCount++
 		return nil
 	}
+	remaining := trace.lateAllowance
 	if remaining == 0 {
 		return nil
+	}
+	for _, candidate := range trace.candidates {
+		if current.match(candidate) && candidateEligibleWithoutBudget(candidate) && candidate.counterfactualStateUnresolved {
+			result.UnresolvedCounterfactualCount++
+		}
 	}
 	terminalAt := trace.finalAvailableMS
 	terminalKnown := trace.finalAvailableKnown
@@ -220,10 +251,28 @@ func selectCandidates(current policy, trace *sessionTrace, result *policyResult)
 		if !current.match(candidate) || !candidateEligibleWithoutBudget(candidate) {
 			continue
 		}
+		if remaining == 0 {
+			break
+		}
+		if candidate.counterfactualStateUnresolved {
+			result.counterfactualSelectionUnknown = true
+			break
+		}
+		partCount := len(candidate.eligibility.PartPlanHashes)
+		freshParts := candidateFreshPartCount(candidate)
+		if partCount == 0 {
+			result.UnresolvedCounterfactualCount++
+			result.counterfactualSelectionUnknown = true
+			break
+		}
+		if partCount > trace.multipartLimit || freshParts <= 0 {
+			continue
+		}
 		readyAt := candidateReadyMS(candidate)
 		if readyAt < 0 || !terminalKnown {
 			result.UnresolvedCounterfactualCount++
-			continue
+			result.counterfactualSelectionUnknown = true
+			break
 		}
 		if terminalAt <= readyAt {
 			continue
@@ -238,53 +287,68 @@ func selectCandidates(current policy, trace *sessionTrace, result *policyResult)
 }
 
 func compareToBaseline(result *policyResult, current policy, sessions map[string]*sessionTrace) {
+	var pairedLeadDeltas []float64
 	for _, trace := range sessions {
+		if !trace.finalAvailableKnown {
+			result.UnresolvedPairCount++
+			continue
+		}
 		baseline := selectCandidates(policy{name: "current_websocket_baseline", match: func(candidate candidate) bool { return candidate.production && candidate.eligibility.Dispatched }}, trace, &policyResult{})
-		alternative := selectCandidates(current, trace, &policyResult{})
-		baseCompatible, baseWasted := scoreCounts(baseline, true)
-		altCompatible, altWasted := scoreCounts(alternative, false)
-		result.IncrementalCompatibleSelections += max(0, altCompatible-baseCompatible)
-		result.PreservedCompatibleSelections += min(altCompatible, baseCompatible)
-		result.DisplacedCompatibleSelections += max(0, baseCompatible-altCompatible)
-		result.NewWastedGenerations += max(0, altWasted-baseWasted)
-		result.AvoidedWastedGenerations += max(0, baseWasted-altWasted)
-		if altCompatible > baseCompatible {
-			for _, item := range alternative {
-				if item.hasOutcome && item.outcome.OracleIncrementalCompatible && trace.finalAvailableKnown {
-					lead := trace.finalAvailableMS - candidateReadyMS(item)
-					if lead > 0 {
-						result.IncrementalDispatchReadyLeadMS += lead
-						break
-					}
+		alternativeSelection := policyResult{}
+		alternative := selectCandidates(current, trace, &alternativeSelection)
+		if alternativeSelection.counterfactualSelectionUnknown {
+			result.UnresolvedPairCount++
+			continue
+		}
+		baseKnown, baseCompatible, baseWasted, baseSelection := comparableCounts(baseline)
+		altKnown, altCompatible, altWasted, altSelection := comparableCounts(alternative)
+		if !baseKnown || !altKnown {
+			result.UnresolvedPairCount++
+			continue
+		}
+		result.NewWastedGenerations += max(0, boolInt(altWasted)-boolInt(baseWasted))
+		result.AvoidedWastedGenerations += max(0, boolInt(baseWasted)-boolInt(altWasted))
+		switch {
+		case altCompatible && baseCompatible:
+			result.PreservedCompatibleSelections++
+			if trace.finalAvailableKnown && altSelection != nil && baseSelection != nil {
+				delta := candidateReadyMS(*baseSelection) - candidateReadyMS(*altSelection)
+				pairedLeadDeltas = append(pairedLeadDeltas, delta)
+				result.IncrementalDispatchReadyLeadMS += delta
+				if delta > 0 {
+					result.EarlierCompatibleSelections++
+				} else if delta < 0 {
+					result.LaterCompatibleSelections++
 				}
 			}
+		case altCompatible:
+			result.IncrementalCompatibleSelections++
+		case baseCompatible:
+			result.DisplacedCompatibleSelections++
 		}
 	}
+	result.PairedLeadSampleCount = len(pairedLeadDeltas)
+	result.PairedLeadP50MS = percentile(pairedLeadDeltas, 0.50)
+	result.PairedLeadP95MS = percentile(pairedLeadDeltas, 0.95)
 }
 
-func scoreCounts(items []candidate, actualBaseline bool) (compatible, wasted int) {
-	for _, item := range items {
-		if actualBaseline {
-			if !item.hasActualOutcome {
-				continue
-			}
-			if item.actualAdoptionCount > 0 {
-				compatible++
-			} else {
-				wasted++
-			}
-			continue
-		}
-		if !item.hasOutcome || item.outcome.OutcomeUnresolved {
-			continue
-		}
-		if item.outcome.OracleIncrementalCompatible {
-			compatible++
-		} else {
-			wasted++
-		}
+func comparableCounts(items []candidate) (known, compatible, wasted bool, selected *candidate) {
+	if len(items) == 0 {
+		return true, false, false, nil
 	}
-	return compatible, wasted
+	item := items[0]
+	if !item.hasOutcome || item.outcome.OutcomeUnresolved {
+		return false, false, false, &item
+	}
+	compatible = item.outcome.OracleCompatible
+	return true, compatible, !compatible, &item
+}
+
+func candidateFreshPartCount(current candidate) int {
+	if current.eligibility.FreshRequestPartCount > 0 {
+		return current.eligibility.FreshRequestPartCount
+	}
+	return max(0, len(current.eligibility.PartPlanHashes)-current.eligibility.ExistingEquivalentRequests)
 }
 
 func percentile(values []float64, fraction float64) float64 {
