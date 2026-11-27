@@ -44,6 +44,12 @@ def test_a_streamed_request_ends_with_its_metadata_and_done(
                 "generated_token_count": 7,
                 "language": "English",
                 "finish_reason": "stop",
+                "verified_guess_token_count": 0,
+                "accepted_guess_token_count": 0,
+                "decode_paths": [],
+                "draft_decoder_used": False,
+                "batch_decode_used": False,
+                "native_chunked": False,
             },
         }
     ]
@@ -115,9 +121,13 @@ def test_candidate_after_transcription_error_keeps_terminal_order(
         silent_wav(FRAME_COUNT),
     )
     payloads = sse_payloads(response.body)
-    assert json.loads(payloads[0])["type"] == "transcript.text.candidate"
-    assert json.loads(payloads[1])["type"] == "error"
-    assert payloads[2] == "[DONE]"
+    events = [json.loads(payload) for payload in payloads[:-1]]
+    assert events[0]["type"] == "transcript.text.candidate_protocol"
+    assert events[0]["supported"] is True
+    assert events[1]["type"] == "transcript.text.candidate"
+    assert events[2]["type"] == "transcript.text.candidate_summary"
+    assert events[3]["type"] == "error"
+    assert payloads[-1] == "[DONE]"
 
 
 def test_candidates_require_streaming(asr_server: SupervisedServer) -> None:
@@ -153,6 +163,12 @@ def test_draft_statistics_are_reported_only_with_generation_metadata(
             "verify_round_count": 2,
             "proposed_draft_token_count": 7,
             "accepted_draft_token_count": 3,
+            "verified_guess_token_count": 0,
+            "accepted_guess_token_count": 0,
+            "decode_paths": [],
+            "draft_decoder_used": False,
+            "batch_decode_used": False,
+            "native_chunked": False,
         }
     else:
         assert "generation_metadata" not in done
