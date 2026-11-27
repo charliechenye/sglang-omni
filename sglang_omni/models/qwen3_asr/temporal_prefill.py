@@ -79,7 +79,7 @@ class Qwen3ASRTemporalPrefillAdder(PrefillAdder):
             pass
 
         canonical_prompt_token_count = len(request.full_untruncated_fill_ids)
-        canonical_full_fill_ids = request.full_untruncated_fill_ids.copy()
+        canonical_full_fill_ids = request.full_untruncated_fill_ids[:]
         multimodal_inputs = request.multimodal_inputs
         if multimodal_inputs is None or multimodal_inputs.mrope_positions is None:
             temporal_request.fallback_reason = "missing_mrope_positions"
@@ -89,9 +89,9 @@ class Qwen3ASRTemporalPrefillAdder(PrefillAdder):
             pass
         canonical_mrope_positions = multimodal_inputs.mrope_positions
         try:
-            request.full_untruncated_fill_ids.extend(
-                temporal_request.candidate_token_ids
-            )
+            speculative_fill_ids = canonical_full_fill_ids[:]
+            speculative_fill_ids.extend(temporal_request.candidate_token_ids)
+            request.full_untruncated_fill_ids = speculative_fill_ids
             extend_token_count = (
                 len(request.full_untruncated_fill_ids) - request.prefix_len
             )
