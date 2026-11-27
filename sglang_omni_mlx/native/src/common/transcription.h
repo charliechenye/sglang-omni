@@ -4,6 +4,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
@@ -53,7 +54,25 @@ struct TranscriptionResult {
   // verification, including a token that ends decoding by EOS, budget, or loop
   // detection.
   int accepted_guess_token_count = 0;
+  // Time from Qwen3-ASR request start to its first committed transcript token
+  // when candidate observation is enabled; zero otherwise.
+  double first_transcript_token_elapsed_ms = 0.0;
 };
+
+struct TranscriptCandidate {
+  std::string text;
+  uint64_t sequence = 0;
+  int generated_token_count = 0;
+  std::optional<std::string> language;
+  double elapsed_ms = 0.0;
+  double first_transcript_token_elapsed_ms = 0.0;
+  double snapshot_build_ms = 0.0;
+  uint64_t published_candidate_count = 0;
+  double snapshot_build_ms_total = 0.0;
+};
+
+using TranscriptCandidatePublisher =
+    std::function<void(TranscriptCandidate)>;
 
 // Segments as the HTTP and realtime APIs send them: start, end, speaker, text,
 // and language, emotion and event when set.

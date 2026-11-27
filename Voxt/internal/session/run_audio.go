@@ -203,6 +203,7 @@ func (r *run) feed(st asr.Stream) chan streamEnd {
 		stop := (<-chan struct{})(r.stop)
 		stopped := false
 		pendingLive := ""
+		latestPreview := ""
 		pendingStable := ""
 		pendingPieces := make([]string, 0)
 		piecesBroken := false
@@ -263,6 +264,7 @@ func (r *run) feed(st asr.Stream) chan streamEnd {
 			case asr.EventPartial:
 				noteStop()
 				text := r.inScript(ev.Text, "")
+				latestPreview = text
 				r.hearPartial(text)
 				if cleanupReady == nil {
 					if !stopped && !r.liveOff {
@@ -273,7 +275,16 @@ func (r *run) feed(st asr.Stream) chan streamEnd {
 				}
 				r.m.update(r, func(s *Snapshot) { s.Partial = text })
 			case asr.EventCandidate:
-				r.hearCandidate(r.inScript(ev.Text, ""))
+				text := r.inScript(ev.Text, "")
+				r.hearCandidate(text)
+				latestPreview = text
+			case asr.EventShadowCandidate:
+				text := r.inScript(ev.Text, "")
+				r.hearShadowCandidate(text, latestPreview, ev.Candidate)
+				if ev.Candidate.Source == "websocket_preview" {
+					latestPreview = text
+				} else {
+				}
 			case asr.EventPiece:
 				stable := r.inScript(ev.Text, "")
 				r.endLive()
@@ -295,12 +306,12 @@ func (r *run) feed(st asr.Stream) chan streamEnd {
 				res := ev.Result
 				res.Text = ev.Text
 				pendingLive = ""
-				end <- streamEnd{res: res}
+				end <- streamEnd{res: res, candidate: ev.Candidate, finalAvailableAt: time.Now()}
 				return true
 			case asr.EventError:
 				r.streamReaderOff.Store(true)
 				pendingLive = ""
-				end <- streamEnd{err: ev.Err}
+				end <- streamEnd{err: ev.Err, candidate: ev.Candidate, finalAvailableAt: time.Now()}
 				return true
 			}
 			return false

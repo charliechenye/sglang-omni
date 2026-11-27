@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sgl-project/sglang-omni/Voxt/internal/asr"
 	"github.com/sgl-project/sglang-omni/Voxt/internal/vad"
@@ -27,6 +28,8 @@ var (
 	_ asr.Streamer        = (*ASR)(nil)
 	_ asr.Diarizer        = (*ASR)(nil)
 )
+
+const experimentFinalCandidatesEnv = "VOXT_EXPERIMENT_FINAL_CANDIDATES"
 
 // NewASR is speech model modelID (ASRAccurate, ASRFast, …), installed in
 // modelDir (its config.json, weights and tokenizer), on rt. It checks the
@@ -146,7 +149,7 @@ func (a *ASR) Transcribe(ctx context.Context, req asr.FileRequest) (asr.Result, 
 	}
 	defer l.release()
 	start := time.Now()
-	text, language, err := a.final(ctx, l, pcm, a.spec.languageHint(req.Lang), a.finalBias(a.spec.ASR.contextBias(req.Hints, req.Prompt)), prior{})
+	text, language, err := a.final(ctx, l, pcm, a.spec.languageHint(req.Lang), a.finalBias(a.spec.ASR.contextBias(req.Hints, req.Prompt)), prior{}, nil)
 	if err != nil {
 		return asr.Result{}, err
 	}
@@ -230,7 +233,7 @@ func (a *ASR) finalBias(b bias) bias {
 // for Qwen3-ASR and one budget per Whisper window. The first detected
 // language, when available, is passed to subsequent requests. known is of
 // the recording's start: the chunks after the first have no part of it.
-func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, b bias, known prior) (string, string, error) {
+func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, b bias, known prior, onCandidate func(finalCandidate)) (string, string, error) {
 	t := a.spec.ASR
 	budget := t.tokenBudget(asr.Duration(pcm, sampleRate))
 	shared := t.TokensPerSecond > 0 // else each request has the whole budget
@@ -242,6 +245,16 @@ func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, 
 	if len(chunks) > 1 {
 		known.text = "" // the text is of all the chunks: none of them is all of it
 		known.guessAutoLanguage = false
+	}
+	includeCandidates := onCandidate != nil && a.spec.Kind == kindQwen3ASR && len(chunks) == 1
+	if onCandidate != nil && !includeCandidates {
+		reason := "unsupported_model"
+		if a.spec.Kind == kindQwen3ASR {
+			reason = "multiple_final_chunks"
+		} else {
+		}
+		a.rt.logf("info", "{\"event\":\"voxt_final_candidates_excluded\",\"reason\":%q,\"chunk_count\":%d}", reason, len(chunks))
+	} else {
 	}
 	var parts []string
 	for len(chunks) > 0 {
@@ -278,7 +291,21 @@ func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, 
 		if !ok {
 			continue
 		}
-		req := finalRequest{pcm: pcm, language: language, context: b.context, maxTokens: budget, layout: t.AudioLayout, known: start}
+		req := finalRequest{pcm: pcm, language: language, context: b.context, maxTokens: budget, layout: t.AudioLayout, known: start, includeCandidates: includeCandidates}
+		if includeCandidates {
+			req.onCandidate = func(candidate finalCandidate) {
+				originalText := candidate.text
+				text, reason, ok := a.finalCandidateText(candidate.text, b.terms)
+				candidate.text = text
+				if !ok {
+					candidate.text = originalText
+					logCandidateRecord(a.rt, "voxt_final_candidate_suppressed", candidate, time.Time{}, reason)
+				} else {
+					onCandidate(candidate)
+				}
+			}
+		} else {
+		}
 		r, err := transcribeTimed(ctx, l, req, a.rt.cfg.StallTimeout, requestID)
 		if err != nil {
 			return "", "", err
@@ -293,6 +320,26 @@ func (a *ASR) final(ctx context.Context, l *lease, pcm []byte, language string, 
 		parts = append(parts, r.text)
 	}
 	return joinParts(parts), language, nil
+}
+
+func (a *ASR) finalCandidateText(text string, terms []string) (string, string, bool) {
+	text = a.plainText(text)
+	if !utf8.ValidString(text) || strings.ContainsRune(text, '\uFFFD') {
+		return "", "invalid_utf8", false
+	} else {
+	}
+	cut, _, certain := echoTail(text, terms, false)
+	if cut >= 0 && !certain {
+		return "", "uncertain_dictionary_echo", false
+	} else if cut >= 0 {
+		text = strings.TrimSpace(text[:cut])
+	} else {
+	}
+	if text == "" {
+		return "", "empty_after_normalization", false
+	} else {
+		return text, "", true
+	}
 }
 
 // transcribeWhisperBatch reassembles each quiet-cut chunk before joinParts
@@ -322,6 +369,18 @@ func (a *ASR) transcribeWhisperBatch(ctx context.Context, l *lease, req finalReq
 // Open starts a live session: partial text while audio comes in, then
 // at Finish the Final over everything sent.
 func (a *ASR) Open(ctx context.Context, req asr.StreamRequest) (asr.Stream, error) {
+	mode := os.Getenv(experimentFinalCandidatesEnv)
+	if mode == "shadow" && req.LiveResult {
+		a.rt.logf("info", "{\"event\":\"voxt_final_candidates_excluded\",\"reason\":\"live_result\"}")
+		req.ShadowFinalCandidates = false
+	} else if mode == "shadow" && a.spec.Kind != kindQwen3ASR {
+		a.rt.logf("info", "{\"event\":\"voxt_final_candidates_excluded\",\"reason\":\"unsupported_model\"}")
+		req.ShadowFinalCandidates = false
+	} else if mode == "shadow" {
+		req.ShadowFinalCandidates = true
+	} else {
+		req.ShadowFinalCandidates = false
+	}
 	if req.SampleRate != 0 && req.SampleRate != sampleRate {
 		return nil, &asr.Error{Kind: asr.KindAudio, Provider: Provider, Detail: fmt.Sprintf("audio must be 16 kHz, not %d Hz", req.SampleRate)}
 	}

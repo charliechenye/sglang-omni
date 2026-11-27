@@ -34,11 +34,18 @@ public:
   asr_service::Transcription
   Prepare(std::vector<float> samples,
           const asr_service::FormFields &form) const override {
-    // note (XXXXRT666): a request does not wait behind a session's shadow
-    // Final, which is only background work.
+    return PrepareWithCandidates(std::move(samples), form, {});
+  }
+
+  asr_service::Transcription PrepareWithCandidates(
+      std::vector<float> samples, const asr_service::FormFields &form,
+      omni_common::TranscriptCandidatePublisher candidate_publisher)
+      const override {
+    // A foreground request takes priority over any background shadow Final.
     qwen3_asr::NoteForegroundRequest();
     CancelShadowFinals();
     TranscriptionOptions options;
+    options.candidate_publisher = std::move(candidate_publisher);
     const auto language = asr_service::TextField(form, "language");
     options.language = language.has_value()
                            ? qwen3_asr::NormalizeLanguage(*language)

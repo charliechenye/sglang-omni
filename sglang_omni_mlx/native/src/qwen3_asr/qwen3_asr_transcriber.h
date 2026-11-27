@@ -3,6 +3,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <exception>
 #include <filesystem>
@@ -48,6 +49,7 @@ struct TranscriptionOptions {
   // prefix, or a Final's live preview), checked in the prompt's pass and kept
   // while greedy decoding agrees; those past the token budget are left out.
   std::vector<int> guessed_token_ids;
+  omni_common::TranscriptCandidatePublisher candidate_publisher;
 };
 
 // The canonical prompt name for a Qwen3-ASR language code or name. Like
@@ -210,6 +212,15 @@ private:
   std::pair<std::string, std::optional<std::string>>
   SplitOutput(const std::vector<int> &output_ids,
               const TranscriptionOptions &options) const;
+  bool HasTranscriptToken(const std::vector<int> &output_ids,
+                          const TranscriptionOptions &options) const;
+  void PublishCandidate(const std::vector<int> &output_ids,
+                        const TranscriptionOptions &options,
+                        std::chrono::steady_clock::time_point started_at,
+                        const std::optional<std::chrono::steady_clock::time_point>
+                            &first_transcript_token_at,
+                        int &last_candidate_token_count,
+                        int &sequence) const;
 
   Qwen3ASR model_;
   omni_common::Tokenizer tokenizer_;

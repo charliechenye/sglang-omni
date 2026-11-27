@@ -68,11 +68,14 @@ type live struct {
 	pc        *pieces       // a long recording's pieces (pieces.go), nil when the model has none
 	finished  bool
 	// note (chenye): lateCandidates is on only while an opted-in Qwen3-ASR Final runs.
-	lateCandidates bool
-	ended          bool // the last event was sent (or Close): events is closed
-	events         chan asr.Event
-	asm            assembler
-	once           sync.Once // release
+	lateCandidates   bool
+	shadowCandidates bool
+	shadowID         uint64
+	stopAt           time.Time
+	ended            bool // the last event was sent (or Close): events is closed
+	events           chan asr.Event
+	asm              assembler
+	once             sync.Once // release
 	// wrapUpOnce runs the preview's wrap-up once (live_wrapup.go): a
 	// failed Final and a Salvage asked while the Final runs share it.
 	wrapUpOnce sync.Once
@@ -365,13 +368,34 @@ func (s *live) read() {
 }
 
 func (s *live) handleSegment(ev realtimeEvent) {
+	var shadowLog finalCandidate
+	logShadow, logSuppressed := false, false
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	text, ok := s.asm.apply(ev.Index, ev.Segment, s.a.plainText(ev.Text), ev.Final)
 	if ok && !s.finished {
 		s.emit(asr.Event{Kind: asr.EventPartial, Text: text})
-	} else if ok && text != "" && s.lateCandidates && s.ctx.Err() == nil {
-		s.emit(asr.Event{Kind: asr.EventCandidate, Text: text})
+	} else if ok && text != "" && s.ctx.Err() == nil {
+		if s.lateCandidates {
+			s.emit(asr.Event{Kind: asr.EventCandidate, Text: text})
+		} else {
+		}
+		if s.shadowCandidates {
+			metadata := asr.CandidateMetadata{
+				Source: "websocket_preview", SessionID: s.shadowID,
+				Sequence: uint64(ev.Index), ReceivedAt: time.Now(),
+			}
+			shadowLog = finalCandidate{text: text, metadata: metadata}
+			logShadow = s.emit(asr.Event{Kind: asr.EventShadowCandidate, Text: text, Candidate: metadata})
+			logSuppressed = !logShadow
+		} else {
+		}
+	}
+	s.mu.Unlock()
+	if logShadow {
+		logCandidateRecord(s.a.rt, "voxt_final_candidate_observed", shadowLog, s.stopAt, "")
+	} else if logSuppressed {
+		logCandidateRecord(s.a.rt, "voxt_final_candidate_suppressed", shadowLog, s.stopAt, "session_event_queue_full")
+	} else {
 	}
 }
 
@@ -387,6 +411,7 @@ func (s *live) Finish() error {
 		return nil
 	}
 	s.finished = true
+	s.stopAt = time.Now()
 	pcm := s.audio
 	if s.pc != nil && s.pc.cancelPlanning != nil {
 		s.pc.cancelPlanning()
@@ -402,6 +427,11 @@ func (s *live) Finish() error {
 	s.preview = false
 	s.finalOnly = true
 	s.lateCandidates = wantsLateCandidates(s.req, s.conn != nil, s.a.spec.Kind)
+	s.shadowCandidates = wantsShadowCandidates(s.req, s.a.spec.Kind)
+	if s.shadowCandidates {
+		s.shadowID = nextOfflineRequestID()
+	} else {
+	}
 	s.mu.Unlock()
 	go s.finalPass(pcm)
 	return nil
@@ -409,6 +439,10 @@ func (s *live) Finish() error {
 
 func wantsLateCandidates(req asr.StreamRequest, realtime bool, kind string) bool {
 	return req.LatePartials && realtime && kind == kindQwen3ASR && !req.LiveResult
+}
+
+func wantsShadowCandidates(req asr.StreamRequest, kind string) bool {
+	return req.ShadowFinalCandidates && kind == kindQwen3ASR && !req.LiveResult
 }
 
 // Salvage is the best text the stream has when its Final failed or took
@@ -451,11 +485,12 @@ func (s *live) Close() {
 func (s *live) Events() <-chan asr.Event { return s.events }
 
 // emit sends a partial if there is room for it and the final (s.mu held).
-func (s *live) emit(ev asr.Event) {
+func (s *live) emit(ev asr.Event) bool {
 	if s.ended || len(s.events) >= cap(s.events)-1 {
-		return
+		return false
 	}
 	s.events <- ev
+	return true
 }
 
 // end sends the last event (none for a zero Kind), closes the events and

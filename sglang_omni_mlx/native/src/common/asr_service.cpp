@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "common/asr_service.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstring>
 #include <future>
 #include <iostream>
+#include <memory>
+#include <semaphore>
 #include <stdexcept>
 #include <typeinfo>
 
@@ -33,6 +36,63 @@ using omni_server::WriteJson;
 
 constexpr auto kHeartbeatInterval = std::chrono::milliseconds(250);
 constexpr auto kPreviewHeartbeatInterval = std::chrono::milliseconds(50);
+
+class CandidateMailbox {
+public:
+  ~CandidateMailbox() { delete latest_.exchange(nullptr); }
+
+  void Publish(omni_common::TranscriptCandidate candidate) {
+    if (closed_.load(std::memory_order_acquire)) {
+      return;
+    } else {
+    }
+    candidate.sequence = sequence_.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto *snapshot = new omni_common::TranscriptCandidate(std::move(candidate));
+    if (closed_.load(std::memory_order_acquire)) {
+      delete snapshot;
+      return;
+    } else {
+    }
+    snapshot->published_candidate_count = ++published_candidate_count_;
+    snapshot->snapshot_build_ms_total =
+        snapshot_build_ms_total_ += snapshot->snapshot_build_ms;
+    delete latest_.exchange(snapshot, std::memory_order_acq_rel);
+    Signal();
+  }
+
+  std::unique_ptr<omni_common::TranscriptCandidate> Take() {
+    signaled_.store(false, std::memory_order_release);
+    return std::unique_ptr<omni_common::TranscriptCandidate>(
+        latest_.exchange(nullptr, std::memory_order_acq_rel));
+  }
+
+  bool WaitFor(std::chrono::milliseconds duration) {
+    return ready_.try_acquire_for(duration);
+  }
+
+  void Complete() {
+    closed_.store(true, std::memory_order_release);
+    Signal();
+  }
+
+private:
+  void Signal() {
+    if (!signaled_.exchange(true, std::memory_order_acq_rel)) {
+      ready_.release();
+    } else {
+    }
+  }
+
+  std::atomic<omni_common::TranscriptCandidate *> latest_{nullptr};
+  std::binary_semaphore ready_{0};
+  std::atomic<uint64_t> sequence_{0};
+  // One model-worker producer updates these before publishing the snapshot;
+  // the HTTP writer only reads the copied fields after latest_.exchange.
+  uint64_t published_candidate_count_ = 0;
+  double snapshot_build_ms_total_ = 0.0;
+  std::atomic<bool> signaled_{false};
+  std::atomic<bool> closed_{false};
+};
 
 struct ServerState {
   TranscriptionWorker *worker = nullptr;
@@ -99,6 +159,25 @@ bool WriteSse(mg_connection *connection, const std::string &payload) {
   return mg_write(connection, line.data(), line.size()) > 0;
 }
 
+Json CandidateEvent(const omni_common::TranscriptCandidate &candidate) {
+  Json event = {{"type", "transcript.text.candidate"},
+                {"text", candidate.text},
+                {"sequence", candidate.sequence},
+                {"generated_token_count", candidate.generated_token_count},
+                {"elapsed_ms", candidate.elapsed_ms},
+                {"first_transcript_token_elapsed_ms",
+                 candidate.first_transcript_token_elapsed_ms},
+                {"snapshot_build_ms", candidate.snapshot_build_ms},
+                {"published_candidate_count",
+                 candidate.published_candidate_count},
+                {"snapshot_build_ms_total", candidate.snapshot_build_ms_total}};
+  if (candidate.language.has_value()) {
+    event["language"] = *candidate.language;
+  } else {
+  }
+  return event;
+}
+
 int HandleTranscriptions(mg_connection *connection, void *data) {
   const auto *state = static_cast<ServerState *>(data);
   if (!omni_server::IsPost(connection)) {
@@ -113,33 +192,55 @@ int HandleTranscriptions(mg_connection *connection, void *data) {
     return BadRequest(connection, "file is required");
   } else {
   }
+  const bool stream = omni_common::FormFlag(TextField(*form, "stream"));
+  const bool include_generation_metadata =
+      omni_common::FormFlag(TextField(*form, "include_generation_metadata"));
+  const bool include_transcript_candidates =
+      omni_common::FormFlag(TextField(*form, "include_transcript_candidates"));
+  if (include_generation_metadata && !stream) {
+    return BadRequest(connection,
+                      "include_generation_metadata requires stream=true");
+  } else if (include_transcript_candidates && !stream) {
+    return BadRequest(connection,
+                      "include_transcript_candidates requires stream=true");
+  } else {
+  }
+  const std::shared_ptr<CandidateMailbox> candidate_mailbox =
+      include_transcript_candidates ? std::make_shared<CandidateMailbox>()
+                                    : nullptr;
   Transcription transcription;
   try {
-    transcription = state->model->Prepare(
-        omni_common::DecodeWav(form->at("file").value), *form);
+    std::vector<float> samples =
+        omni_common::DecodeWav(form->at("file").value);
+    if (candidate_mailbox != nullptr) {
+      transcription = state->model->PrepareWithCandidates(
+          std::move(samples), *form,
+          [candidate_mailbox](omni_common::TranscriptCandidate candidate) {
+            candidate_mailbox->Publish(std::move(candidate));
+          });
+    } else {
+      transcription = state->model->Prepare(std::move(samples), *form);
+    }
   } catch (const std::invalid_argument &error) {
     return BadRequest(connection, error.what());
   } catch (const std::out_of_range &) {
     return BadRequest(connection, "a numeric field is out of range");
   }
-  const bool stream = omni_common::FormFlag(TextField(*form, "stream"));
-  const bool include_generation_metadata =
-      omni_common::FormFlag(TextField(*form, "include_generation_metadata"));
-  if (include_generation_metadata && !stream) {
-    return BadRequest(connection,
-                      "include_generation_metadata requires stream=true");
-  } else {
-  }
   const CancelFlag cancel = omni_server::NewCancelFlag();
   auto promise = std::make_shared<std::promise<TranscriptionResult>>();
   std::future<TranscriptionResult> future = promise->get_future();
   state->worker->Submit(std::move(transcription), cancel,
-                        [promise](std::optional<TranscriptionResult> result,
-                                  std::exception_ptr error) {
+                        [promise, candidate_mailbox](
+                            std::optional<TranscriptionResult> result,
+                            std::exception_ptr error) {
                           if (error) {
                             promise->set_exception(error);
                           } else {
                             promise->set_value(std::move(*result));
+                          }
+                          if (candidate_mailbox != nullptr) {
+                            candidate_mailbox->Complete();
+                          } else {
                           }
                         });
   if (!stream) {
@@ -162,9 +263,33 @@ int HandleTranscriptions(mg_connection *connection, void *data) {
       omni_common::FormFlag(TextField(*form, "preview"))
           ? kPreviewHeartbeatInterval
           : kHeartbeatInterval;
-  while (future.wait_for(heartbeat_interval) != std::future_status::ready) {
-    if (mg_write(connection, ":\n\n", 3) <= 0) {
-      cancel->store(true);
+  if (candidate_mailbox == nullptr) {
+    while (future.wait_for(heartbeat_interval) != std::future_status::ready) {
+      if (mg_write(connection, ":\n\n", 3) <= 0) {
+        cancel->store(true);
+      } else {
+      }
+    }
+  } else {
+    while (future.wait_for(std::chrono::milliseconds(0)) !=
+           std::future_status::ready) {
+      if (candidate_mailbox->WaitFor(heartbeat_interval)) {
+        std::unique_ptr<omni_common::TranscriptCandidate> candidate =
+            candidate_mailbox->Take();
+        if (candidate != nullptr &&
+            !WriteSse(connection, CandidateEvent(*candidate).dump())) {
+          cancel->store(true);
+        } else {
+        }
+      } else if (mg_write(connection, ":\n\n", 3) <= 0) {
+        cancel->store(true);
+      } else {
+      }
+    }
+    std::unique_ptr<omni_common::TranscriptCandidate> candidate =
+        candidate_mailbox->Take();
+    if (candidate != nullptr) {
+      WriteSse(connection, CandidateEvent(*candidate).dump());
     } else {
     }
   }

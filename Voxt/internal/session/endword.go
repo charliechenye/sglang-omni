@@ -3,11 +3,19 @@ package session
 import (
 	"strings"
 	"unicode"
+
+	"github.com/sgl-project/sglang-omni/Voxt/internal/asr"
 )
 
 type heardText struct {
 	text      string
 	candidate bool
+}
+
+type shadowCandidate struct {
+	text     string
+	preview  string
+	metadata asr.CandidateMetadata
 }
 
 // endWord is the word that ends the recording (settings.Features.EndWord)
@@ -28,6 +36,18 @@ func (r *run) hearPartial(text string) {
 
 func (r *run) hearCandidate(text string) {
 	r.hear(text, true)
+}
+
+func (r *run) hearShadowCandidate(text, preview string, metadata asr.CandidateMetadata) {
+	if r.shadowCandidates == nil {
+		return
+	} else {
+	}
+	select {
+	case <-r.shadowCandidates:
+	default:
+	}
+	r.shadowCandidates <- shadowCandidate{text: text, preview: preview, metadata: metadata}
 }
 
 func (r *run) hear(text string, candidate bool) {

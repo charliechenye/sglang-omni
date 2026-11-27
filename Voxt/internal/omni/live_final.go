@@ -40,7 +40,33 @@ func (s *live) finalPass(pcm []byte) {
 	}
 	text := ""
 	var err error
+	finalAttempt := 0
 	if tail := pcm[done:]; len(tail) > 0 && (done == 0 || !s.silentTail(tail)) {
+		attempt := 1
+		finalAttempt = attempt
+		var onCandidate func(finalCandidate)
+		if s.shadowCandidates {
+			onCandidate = func(candidate finalCandidate) {
+				candidate.text = joinParts(append(slices.Clone(texts), candidate.text))
+				candidate.metadata.SessionID = s.shadowID
+				candidate.metadata.Attempt = attempt
+				if candidate.text == "" {
+					logCandidateRecord(s.a.rt, "voxt_final_candidate_suppressed", candidate, s.stopAt, "empty_after_piece_join")
+					return
+				}
+				s.mu.Lock()
+				published := false
+				if s.shadowCandidates && s.ctx.Err() == nil && !s.ended {
+					published = s.emit(asr.Event{Kind: asr.EventShadowCandidate, Text: candidate.text, Candidate: candidate.metadata})
+				}
+				s.mu.Unlock()
+				if published {
+					logCandidateRecord(s.a.rt, "voxt_final_candidate_observed", candidate, s.stopAt, "")
+				} else {
+					logCandidateRecord(s.a.rt, "voxt_final_candidate_suppressed", candidate, s.stopAt, "session_inactive_or_event_queue_full")
+				}
+			}
+		}
 		hint := language
 		var known prior
 		if s.a.spec.Kind == kindQwen3ASR {
@@ -59,12 +85,14 @@ func (s *live) finalPass(pcm []byte) {
 				}
 			}
 		}
-		text, language, err = s.a.final(s.ctx, s.l, tail, hint, finalBias, known)
+		text, language, err = s.a.final(s.ctx, s.l, tail, hint, finalBias, known, onCandidate)
 		if err != nil && s.ctx.Err() == nil && !s.l.p.alive() {
 			// The server died under the recording (a crash, memory pressure): the audio is all here, so once more on a new one.
 			if l, aerr := s.a.rt.acquire(s.ctx, s.a.spec, s.a.dir, s.a.draft); aerr == nil {
 				s.a.rt.logf("warning", "%s: its server died during the session (%v): the Final runs again on a new one", s.a.spec.ID, err)
-				text, language, err = s.a.final(s.ctx, l, tail, hint, finalBias, known)
+				attempt = 2
+				finalAttempt = attempt
+				text, language, err = s.a.final(s.ctx, l, tail, hint, finalBias, known, onCandidate)
 				l.release()
 			}
 		}
@@ -73,6 +101,7 @@ func (s *live) finalPass(pcm []byte) {
 	if err != nil {
 		s.mu.Lock()
 		s.lateCandidates = false
+		s.shadowCandidates = false
 		s.mu.Unlock()
 	}
 	s.logFinal(pcm, done, len(texts), busy, took, err)
@@ -85,12 +114,22 @@ func (s *live) finalPass(pcm []byte) {
 			// so a stuck server cannot stall the error either).
 			s.wrapUpPreview()
 		}
-		s.end(asr.Event{Kind: asr.EventError, Err: err})
+		metadata := asr.CandidateMetadata{}
+		if s.shadowID != 0 {
+			metadata = asr.CandidateMetadata{Source: "http_final", SessionID: s.shadowID, Attempt: finalAttempt, ReceivedAt: time.Now()}
+		} else {
+		}
+		s.end(asr.Event{Kind: asr.EventError, Err: err, Candidate: metadata})
 		return
 	}
 	text = joinParts(append(texts, text))
 	res := asr.Result{Text: text, Lang: language, Duration: asr.Duration(pcm, sampleRate), Model: s.a.spec.ID, Latency: took}
-	s.end(asr.Event{Kind: asr.EventFinal, Text: text, Result: res})
+	metadata := asr.CandidateMetadata{}
+	if s.shadowID != 0 {
+		metadata = asr.CandidateMetadata{Source: "http_final", SessionID: s.shadowID, Attempt: finalAttempt, ReceivedAt: time.Now()}
+	} else {
+	}
+	s.end(asr.Event{Kind: asr.EventFinal, Text: text, Result: res, Candidate: metadata})
 }
 
 // maxSilentTail is the longest tail after the pieces that is left out when it

@@ -113,6 +113,9 @@ func (r *run) prepareHeadInputs(endWord bool) bool {
 	if (endWord || possible) && r.heard == nil {
 		r.heard, r.silent = make(chan heardText, 1), make(chan bool, 1)
 	}
+	if r.shadowCandidates == nil {
+		r.shadowCandidates = make(chan shadowCandidate, 1)
+	}
 	return possible
 }
 
@@ -236,32 +239,28 @@ func (h *headStart) prepareLate(live string) (headPlan, bool) {
 	if !h.lateAllowed() {
 		return headPlan{}, false
 	}
-	heard, cleaned, ok := h.normalize(live)
-	if !ok || heard == h.text {
-		return headPlan{}, false
-	}
-	plan, ok, _ := h.prepare(cleaned)
-	if !ok {
-		return headPlan{}, false
-	}
-	plan.heard = heard
-	if !plan.hasFresh() || !h.lateAllowed() {
+	plan, reason := h.latePlan(live)
+	if reason != "" || !plan.hasFresh() || !h.lateAllowed() {
 		return headPlan{}, false
 	}
 	return plan, true
 }
 
 func (h *headStart) lateAllowed() bool {
-	if !h.enabled.Load() || h.lateAsked || h.r.ctx.Err() != nil {
-		return false
-	}
-	ctx := h.r.currentLLMContext()
-	if ctx == nil || ctx.Err() != nil || !h.r.cleanupMayContinue() || h.r.m.resting(h.service) {
-		return false
-	}
+	budgetAvailable, llmReady, cleanupEligible := h.lateGates()
+	return budgetAvailable && llmReady && cleanupEligible
+}
+
+func (h *headStart) lateGates() (bool, bool, bool) {
+	budgetAvailable := !h.lateAsked
 	h.mu.Lock()
-	defer h.mu.Unlock()
-	return len(h.gens) < headKeep
+	budgetAvailable = budgetAvailable && len(h.gens) < headKeep
+	h.mu.Unlock()
+	ctx := h.r.currentLLMContext()
+	llmReady := h.enabled.Load() && ctx != nil && ctx.Err() == nil &&
+		!h.r.m.resting(h.service)
+	cleanupEligible := h.r.ctx.Err() == nil && h.r.cleanupMayContinue()
+	return budgetAvailable, llmReady, cleanupEligible
 }
 
 func (h *headStart) submitLate(plan headPlan) bool {
@@ -372,7 +371,6 @@ func (h *headStart) drop() {
 // near is a call for a part that says what text says but for a few words
 // at most, and the words its answer must be put right for; nil for none.
 func (h *headStart) near(req llm.Request, text string) (*headCall, []spokenWord, []headChange) {
-	last := len(req.Messages) - 1
 	type match struct {
 		call    *headCall
 		old     []spokenWord
@@ -382,16 +380,11 @@ func (h *headStart) near(req llm.Request, text string) (*headCall, []spokenWord,
 	}
 	var exact, repaired []match
 	for _, c := range h.all() {
-		if len(c.req.Messages) != last+1 || last < 0 || !slices.Equal(c.req.Messages[:last], req.Messages[:last]) || !h.sameThinking(c.req, req) ||
-			strings.Replace(c.req.Messages[last].Content, c.text, text, 1) != req.Messages[last].Content {
-			continue
-		}
 		done, err := h.callError(c)
 		if c.late && done && err != nil {
 			continue
 		}
-		old := spokenWords(c.text)
-		changes, ok := headChanges(old, c.text, text)
+		old, changes, ok := h.nearCompatibility(c.req, c.text, req, text)
 		if !ok {
 			continue
 		}
@@ -424,6 +417,24 @@ func (h *headStart) near(req llm.Request, text string) (*headCall, []spokenWord,
 		return nil, nil, nil
 	}
 	return chosen.call, chosen.old, chosen.changes
+}
+
+func (h *headStart) nearCompatibility(oldRequest llm.Request, oldText string, request llm.Request, text string) ([]spokenWord, []headChange, bool) {
+	last := len(request.Messages) - 1
+	if len(oldRequest.Messages) != last+1 || last < 0 ||
+		!slices.Equal(oldRequest.Messages[:last], request.Messages[:last]) ||
+		!h.sameThinking(oldRequest, request) ||
+		strings.Replace(oldRequest.Messages[last].Content, oldText, text, 1) != request.Messages[last].Content {
+		return nil, nil, false
+	} else {
+	}
+	old := spokenWords(oldText)
+	changes, ok := headChanges(old, oldText, text)
+	if !ok {
+		return nil, nil, false
+	} else {
+		return old, changes, true
+	}
 }
 
 // askPart asks for one part's clean-up, with the answer a head start has

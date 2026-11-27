@@ -112,6 +112,9 @@ type StreamRequest struct {
 	Prompt     string
 	// note (chenye): LatePartials requests advisory whole-text candidates while an authoritative Final runs.
 	LatePartials bool
+	// ShadowFinalCandidates observes advisory Final candidates without
+	// changing the stream's active candidate policy.
+	ShadowFinalCandidates bool
 	// LiveResult asks for the live text as the result, without a second
 	// pass over the whole recording at Finish, where the model makes one
 	// (settings.Audio.LiveResult); the others ignore it.
@@ -188,6 +191,9 @@ const (
 	EventPiece
 	// note (chenye): EventCandidate is a whole provisional transcript for opted-in speculative work, never authoritative speech.
 	EventCandidate
+	// EventShadowCandidate is an observation-only transcript candidate. It
+	// must not enter visible text or the speculative cleanup path.
+	EventShadowCandidate
 )
 
 func (k EventKind) String() string {
@@ -202,6 +208,8 @@ func (k EventKind) String() string {
 		return "piece"
 	case EventCandidate:
 		return "candidate"
+	case EventShadowCandidate:
+		return "shadow_candidate"
 	}
 	return "unknown"
 }
@@ -210,10 +218,29 @@ func (k EventKind) String() string {
 type Event struct {
 	Kind EventKind
 	// note (chenye): Text is the whole transcript for EventPartial, EventCandidate, EventFinal and EventPiece.
-	Text string
+	Text      string
+	Candidate CandidateMetadata
 	// Result is the final event's details (Text repeats there).
 	Result Result
 	Err    error // EventError
+}
+
+type CandidateMetadata struct {
+	Source                   string
+	SessionID                uint64
+	RequestID                uint64
+	Attempt                  int
+	Sequence                 uint64
+	GeneratedTokens          int
+	Language                 string
+	NativeElapsedMS          float64
+	FirstTranscriptTokenMS   float64
+	SnapshotBuildMS          float64
+	PublishedCandidateCount  uint64
+	SnapshotBuildMSTotal     float64
+	RequestElapsedMS         float64
+	HTTPRequestStartOffsetMS float64
+	ReceivedAt               time.Time
 }
 
 // Config is what every remote service's New takes: the user's setup of it

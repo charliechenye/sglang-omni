@@ -40,6 +40,12 @@ public:
   // std::invalid_argument for a field it does not accept.
   virtual Transcription Prepare(std::vector<float> samples,
                                 const FormFields &form) const = 0;
+  virtual Transcription PrepareWithCandidates(
+      std::vector<float>, const FormFields &,
+      omni_common::TranscriptCandidatePublisher) const {
+    throw std::invalid_argument(
+        "include_transcript_candidates is unsupported for this model");
+  }
   // Adds handlers beyond the transcription API once the server listens.
   virtual void AddHandlers(mg_context *, omni_server::TranscriptionWorker &) {}
   // False for a model that serves no transcriptions.

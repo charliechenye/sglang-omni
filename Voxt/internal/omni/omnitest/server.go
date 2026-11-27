@@ -189,6 +189,23 @@ func final(o Opts, w http.ResponseWriter, r *http.Request) {
 		metadata["window_texts"] = o.WindowTexts
 	}
 	body := map[string]any{"type": "transcript.text.done", "text": text, "generation_metadata": metadata}
+	if fields["include_transcript_candidates"] == "true" {
+		candidates := o.Candidates
+		if len(candidates) == 0 {
+			candidates = []string{text}
+		} else {
+		}
+		for i, candidate := range candidates {
+			event, _ := json.Marshal(map[string]any{
+				"type": "transcript.text.candidate", "text": candidate,
+				"sequence": i + 1, "generated_token_count": (i + 1) * 8,
+				"elapsed_ms": float64(i+1) * 10, "language": language,
+			})
+			fmt.Fprintf(w, "data: %s\n\n", event)
+		}
+		flush()
+	} else {
+	}
 	if o.Segments {
 		first, second := "first", "second"
 		if o.SegmentTags {

@@ -135,6 +135,53 @@ func TestLive(t *testing.T) {
 	st.Close()
 }
 
+func TestShadowFinalCandidatesAreOptInAndDoNotReplaceFinal(t *testing.T) {
+	for _, mode := range []string{"", "shadow"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Setenv(experimentFinalCandidatesEnv, mode)
+			f := newFake(t, omnitest.Opts{Text: "authoritative", Candidates: []string{"provisional"}}, nil)
+			st, err := f.asr(t, ASRAccurate).Open(context.Background(), asr.StreamRequest{SampleRate: sampleRate})
+			if err != nil {
+				t.Fatal(err)
+			}
+			sendAll(t, st, tone(2500*time.Millisecond, 0.3))
+			if err := st.Finish(); err != nil {
+				t.Fatal(err)
+			}
+			events := drain(t, st)
+			finals := f.records("final")
+			if len(finals) != 1 {
+				t.Fatalf("saw %d HTTP Final requests", len(finals))
+			}
+			_, enabled := finals[0].Fields["include_transcript_candidates"]
+			if enabled != (mode == "shadow") {
+				t.Fatalf("candidate opt-in field present=%v in mode %q", enabled, mode)
+			}
+			candidateIndex, finalIndex := -1, -1
+			for index, event := range events {
+				if event.Kind == asr.EventShadowCandidate && event.Candidate.Source == "http_final" {
+					candidateIndex = index
+					if event.Text != "provisional" {
+						t.Errorf("candidate %q", event.Text)
+					}
+				}
+				if event.Kind == asr.EventFinal {
+					finalIndex = index
+					if event.Text != "authoritative" {
+						t.Errorf("final %q", event.Text)
+					}
+				}
+			}
+			if mode == "shadow" && (candidateIndex < 0 || finalIndex <= candidateIndex) {
+				t.Fatalf("events do not put the candidate before the authoritative Final: %+v", events)
+			}
+			if mode == "" && candidateIndex >= 0 {
+				t.Fatalf("disabled mode emitted a candidate: %+v", events)
+			}
+		})
+	}
+}
+
 func TestLateCandidatesAreOptIn(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -235,7 +282,7 @@ func TestFinalPrior(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer l.release()
-		if _, _, err := a.final(ctx, l, tone(130*time.Second, 0.3), tc.lang, bias{}, tc.known); err != nil {
+		if _, _, err := a.final(ctx, l, tone(130*time.Second, 0.3), tc.lang, bias{}, tc.known, nil); err != nil {
 			t.Fatal(err)
 		}
 		finals := f.records("final")

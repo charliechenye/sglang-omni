@@ -90,6 +90,13 @@ public:
   asr_service::Transcription
   Prepare(std::vector<float> samples,
           const asr_service::FormFields &form) const override {
+    return PrepareWithCandidates(std::move(samples), form, {});
+  }
+
+  asr_service::Transcription PrepareWithCandidates(
+      std::vector<float> samples, const asr_service::FormFields &form,
+      omni_common::TranscriptCandidatePublisher candidate_publisher)
+      const override {
     const std::string outcome =
         asr_service::TextField(form, "outcome").value_or("text");
     const std::optional<std::string> language =
@@ -97,6 +104,7 @@ public:
     const int max_new_tokens =
         asr_service::IntegerField(form, "max_new_tokens").value_or(0);
     return [outcome, language, max_new_tokens,
+            candidate_publisher = std::move(candidate_publisher),
             sample_count = samples.size()](const std::atomic<bool> &cancel) {
       if (outcome == "fail") {
         throw std::runtime_error("stub transcription failed");
@@ -105,6 +113,16 @@ public:
           std::this_thread::sleep_for(kBlockPollInterval);
         }
         throw omni_common::GenerationCancelled();
+      } else {
+      }
+      if (candidate_publisher && outcome == "candidates") {
+        candidate_publisher(
+            {"first committed snapshot", 0, 4, language, 3.0});
+        candidate_publisher(
+            {"latest committed snapshot", 0, 12, language, 8.0});
+      } else if (candidate_publisher && outcome == "candidate_fail") {
+        candidate_publisher({"before failure", 0, 4, language, 3.0});
+        throw std::runtime_error("stub transcription failed after candidate");
       } else {
       }
       omni_common::TranscriptionResult result;

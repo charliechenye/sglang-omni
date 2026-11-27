@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -52,7 +53,9 @@ type finalRequest struct {
 	// pieceEnd is the sample a piece of the live session's recording ends
 	// at (0: not a piece): the session decodes it from its Final's start
 	// and moves that start here.
-	pieceEnd int
+	pieceEnd          int
+	includeCandidates bool
+	onCandidate       func(finalCandidate)
 }
 
 // finalResult is a request's answer.
@@ -68,6 +71,11 @@ type finalResult struct {
 		Speaker string  `json:"speaker"`
 		Text    string  `json:"text"`
 	}
+}
+
+type finalCandidate struct {
+	text     string
+	metadata asr.CandidateMetadata
 }
 
 // body is the request's multipart form (Voxt's OmniMultipartBody for
@@ -91,6 +99,9 @@ func (r finalRequest) body(model string) (*bytes.Buffer, string) {
 	field("stop_at_end_of_text", "true")
 	field("stop_on_token_loop", "true")
 	field("include_generation_metadata", "true")
+	if r.includeCandidates {
+		field("include_transcript_candidates", "true")
+	}
 	if r.preview {
 		field("preview", "true")
 	}
@@ -124,6 +135,7 @@ func transcribe(ctx context.Context, l *lease, r finalRequest, stall time.Durati
 
 func transcribeTimed(ctx context.Context, l *lease, r finalRequest, stall time.Duration, requestID uint64) (finalResult, error) {
 	totalStarted := time.Now()
+	var httpRequestStarted time.Time
 	defer func() { logRequestStage(l.s.rt, requestID, "final", "total", totalStarted, len(r.pcm), 0) }()
 	started := time.Now()
 	body, ctype := r.body(l.endpoint().model)
@@ -144,6 +156,7 @@ func transcribeTimed(ctx context.Context, l *lease, r finalRequest, stall time.D
 	watch := time.AfterFunc(stall, func() { stalled.Store(true); cancel() })
 	defer watch.Stop()
 	started = time.Now()
+	httpRequestStarted = started
 	resp, err := loopback.Do(req)
 	logRequestStage(l.s.rt, requestID, "final", "http_headers", started, body.Len(), 0)
 	if err != nil {
@@ -186,12 +199,19 @@ func transcribeTimed(ctx context.Context, l *lease, r finalRequest, stall time.D
 			}
 			return *done, nil
 		}
-		res, err := parseEvent(payload)
+		res, candidate, err := parseEvent(payload)
 		if err != nil {
 			return finalResult{}, err
 		}
 		if res != nil {
 			done = res
+		} else if candidate != nil && done == nil && r.onCandidate != nil {
+			candidate.metadata.RequestID = requestID
+			candidate.metadata.ReceivedAt = time.Now()
+			candidate.metadata.RequestElapsedMS = float64(candidate.metadata.ReceivedAt.Sub(totalStarted).Microseconds()) / 1000
+			candidate.metadata.HTTPRequestStartOffsetMS = float64(httpRequestStarted.Sub(totalStarted).Microseconds()) / 1000
+			r.onCandidate(*candidate)
+		} else {
 		}
 	}
 }
@@ -199,7 +219,7 @@ func transcribeTimed(ctx context.Context, l *lease, r finalRequest, stall time.D
 // parseEvent reads one server-sent event: the result for
 // transcript.text.done, nil for others, an error for "error". Only the
 // error's code is kept: messages may echo the request.
-func parseEvent(payload string) (*finalResult, error) {
+func parseEvent(payload string) (*finalResult, *finalCandidate, error) {
 	var ev struct {
 		Type     string `json:"type"`
 		Text     string `json:"text"`
@@ -221,14 +241,14 @@ func parseEvent(payload string) (*finalResult, error) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(payload), &ev); err != nil || ev.Type == "" {
-		return nil, &asr.Error{Kind: asr.KindProtocol, Provider: Provider, Detail: "an unreadable transcription event"}
+		return nil, nil, &asr.Error{Kind: asr.KindProtocol, Provider: Provider, Detail: "an unreadable transcription event"}
 	}
 	switch ev.Type {
 	case "transcript.text.done":
 		r := &finalResult{text: ev.Text, segments: ev.Segments}
 		if m := ev.Metadata; m != nil {
 			if m.Tokens == nil || m.Finish == "" {
-				return nil, &asr.Error{Kind: asr.KindProtocol, Provider: Provider, Detail: "the generation metadata is incomplete"}
+				return nil, nil, &asr.Error{Kind: asr.KindProtocol, Provider: Provider, Detail: "the generation metadata is incomplete"}
 			}
 			r.tokens, r.length = *m.Tokens, m.Finish == "length"
 			r.windowTexts = m.WindowTexts
@@ -236,15 +256,59 @@ func parseEvent(payload string) (*finalResult, error) {
 				r.language = *m.Language
 			}
 		}
-		return r, nil
+		return r, nil, nil
+	case "transcript.text.candidate":
+		fields := make(map[string]json.RawMessage)
+		if json.Unmarshal([]byte(payload), &fields) != nil {
+			return nil, nil, nil
+		}
+		read := func(name string, value any) bool {
+			raw, ok := fields[name]
+			return ok && json.Unmarshal(raw, value) == nil
+		}
+		var sequence uint64
+		var generatedTokens int
+		var elapsedMS float64
+		var firstTokenMS float64
+		var snapshotBuildMS float64
+		var publishedCandidateCount uint64
+		var snapshotBuildMSTotal float64
+		var text string
+		if !read("sequence", &sequence) || sequence == 0 ||
+			!read("generated_token_count", &generatedTokens) ||
+			generatedTokens <= 0 || !read("elapsed_ms", &elapsedMS) ||
+			math.IsNaN(elapsedMS) || math.IsInf(elapsedMS, 0) || elapsedMS < 0 ||
+			!read("text", &text) || text == "" {
+			return nil, nil, nil
+		}
+		_ = read("first_transcript_token_elapsed_ms", &firstTokenMS)
+		_ = read("snapshot_build_ms", &snapshotBuildMS)
+		_ = read("published_candidate_count", &publishedCandidateCount)
+		_ = read("snapshot_build_ms_total", &snapshotBuildMSTotal)
+		candidate := &finalCandidate{
+			text: text,
+			metadata: asr.CandidateMetadata{
+				Source: "http_final", Sequence: sequence,
+				GeneratedTokens: generatedTokens, NativeElapsedMS: elapsedMS,
+				FirstTranscriptTokenMS: firstTokenMS, SnapshotBuildMS: snapshotBuildMS,
+				PublishedCandidateCount: publishedCandidateCount,
+				SnapshotBuildMSTotal:    snapshotBuildMSTotal,
+			},
+		}
+		var language string
+		if read("language", &language) {
+			candidate.metadata.Language = language
+		} else {
+		}
+		return nil, candidate, nil
 	case "error":
 		code := "error"
 		if ev.Error != nil && ev.Error.Code != "" {
 			code = ev.Error.Code
 		}
-		return nil, &asr.Error{Kind: asr.KindServer, Provider: Provider, Code: code, Detail: "the transcription failed"}
+		return nil, nil, &asr.Error{Kind: asr.KindServer, Provider: Provider, Code: code, Detail: "the transcription failed"}
 	}
-	return nil, nil
+	return nil, nil, nil
 }
 
 // stallOr is a transport error's *asr.Error, killing a stalled server.

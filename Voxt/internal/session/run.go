@@ -57,10 +57,11 @@ type run struct {
 	cleanupOutput           cleanupOutput
 	// think is the level the requests ask with: StartRequest.Thinking,
 	// then Rethink's (guarded by m.mu).
-	think    *llm.Thinking
-	stop     chan struct{}
-	stopAt   time.Time // captured by Stop before recognition or clean-up can begin
-	stopAtMu sync.Mutex
+	think           *llm.Thinking
+	stop            chan struct{}
+	stopAt          time.Time // captured by Stop before recognition or clean-up can begin
+	stopMonotonicAt time.Time
+	stopAtMu        sync.Mutex
 	// recorded is closed once listen's recording loop has the capture's
 	// end: the stream's Finish waits for it, so that the Final's answer
 	// never comes while that loop still runs.
@@ -112,7 +113,8 @@ type run struct {
 	// box's (Config.BoxInput) when the answer is asked for.
 	typed string
 	// heard carries whole-text updates and advisory candidates to the session owner.
-	heard chan heardText
+	heard            chan heardText
+	shadowCandidates chan shadowCandidate
 	// svcResolved is closed when the session's services are resolved
 	// (useServices): the early clean-up's worker waits for it (and r.ctx).
 	svcResolved      chan struct{}
@@ -159,9 +161,11 @@ type openResult struct {
 // silent when the recording ended with no speech, so nothing was sent
 // (the gate held it all) and no result will come.
 type streamEnd struct {
-	res    asr.Result
-	err    error
-	silent bool
+	res              asr.Result
+	err              error
+	silent           bool
+	candidate        asr.CandidateMetadata
+	finalAvailableAt time.Time
 }
 
 func (r *run) logf(level, format string, args ...any) {
@@ -184,6 +188,7 @@ func (r *run) recordStopAt(at time.Time) time.Time {
 	defer r.stopAtMu.Unlock()
 	if r.stopAt.IsZero() {
 		r.stopAt = at
+		r.stopMonotonicAt = time.Now()
 	}
 	return r.stopAt
 }

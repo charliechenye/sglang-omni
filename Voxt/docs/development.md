@@ -30,6 +30,8 @@ open --env VOXT_EXPERIMENT_CLEANUP_FALLBACK_MS=1500 build/darwin-arm64/Voxt.app
 
 Use `0` to disable it. Values from 1 to 60000 enable the experiment; invalid or larger values are ignored with a warning in the session log. The option applies only to ordinary Transcribe dictation.
 
+**Authoritative Final candidate experiment:** `VOXT_EXPERIMENT_FINAL_CANDIDATES=shadow` enables transcript-free observation of target-verified Qwen3-ASR Final candidates in Voxt. Unset or any other value keeps the experiment off. It records candidate timing and cleanup-plan compatibility without sending more LLM requests or changing the result. The active mode is intentionally unavailable until real-model measurements establish an incremental opportunity. See [authoritative-final-candidates.md](authoritative-final-candidates.md) for the path audit, benchmark setup and replay command.
+
 **The release build** is one command, on the Mac: `scripts/release.sh` builds the helper and the Omni runtime, packages and signs the app, and checks the result (`--runtimes DIR` takes prebuilt runtimes; with a Developer ID identity, `--notarize` notarises it; over ssh it runs through `scripts/mac-gui.sh`). A release is that build on GitHub: a `voxt-vX.Y.Z` tag runs the Voxt Release workflow, which signs it with the Developer ID of the team RY2TQTYSKQ, notarises it and puts its disk image and signed update files on a draft GitHub release. Local builds without a feed keep the GitHub update check. See [docs/release.md](release.md).
 
 From Linux, `scripts/mac.sh <command>` mirrors the project to a Mac (`MAC_HOST`, default `mac-air`; `MAC_DIR`, default `code/VoxtNew`) and runs the command there: `scripts/mac.sh 'scripts/build-helper.sh && go tool mygo build'`.
@@ -79,6 +81,23 @@ This table lists every `VOXTNEW_*` variable that the Go code, the Swift helper o
 | `VOXTNEW_DEMO_SHOTS` | Directory where `TestMeetingDemoScreenshots` writes every fixture as PNG. | Unset: assertions run without writing PNGs |
 | `VOXTNEW_DSP_OUT` | Directory where `TestCompareVariants` in `internal/dsp` writes each variant as WAV. | Unset: log only |
 | `VOXTNEW_E2E_ICONS` | Directory where the Mac end-to-end test saves the app icons that the real helper returns. | Unset: icons are not saved |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH` | `1` runs `TestMacE2EFinalCandidateBenchmark` on macOS with local model paths and an OpenAI-compatible cleanup endpoint. | Unset: the test skips |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_ASR_MODEL` | Local Qwen3-ASR catalogue id used by the final-candidate benchmark. | `asr.accurate` |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_ASR_MODEL_DIR` | Existing local Qwen3-ASR model directory; no weights are downloaded. | Unset: benchmark requires it |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_AUDIO` | One local WAV fixture when no scenario manifest is set. | Unset: set it or the scenario manifest |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_DRAFT_DIR` | Existing local Qwen3-ASR draft directory for scenarios with `draft: true`. | Unset: draft scenarios fail |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_HEADSTART_CASE` | Label (`hit`, `miss`, or another name) for the single-fixture scenario. | Unset: no label |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_LANGUAGE` | Language hint for the single-fixture scenario; empty selects automatic detection. | Unset: automatic |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_LLM_ENDPOINT` | OpenAI-compatible API root for the cleanup model, remote or local. | Unset: benchmark requires it |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_LLM_KEY` | Optional API key for the cleanup endpoint. | Unset: no key |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_LLM_MODEL` | Model id accepted by the cleanup endpoint. | Unset: benchmark requires it |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_LLM_REMOTE` | Set to `0` to mark a local endpoint for readiness reporting. | `1` |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_OUTPUT` | Benchmark log path; the script also writes a JSONL file beside it. | `build/final-candidate-benchmark.log` |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_PLAYBACK_FACTOR` | Audio playback speed multiplier; `1` is real time, `0` sends frames as fast as possible. | `1` |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_ROUNDS` | Number of interleaved measured OFF/SHADOW pairs per scenario. | `5` |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_SCENARIO` | Label for the single-fixture scenario. | WAV filename without extension |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_SCENARIOS` | JSON scenario manifest for multiple language, length, dictionary, draft and piece cases. | Unset: use one WAV fixture |
+| `VOXTNEW_FINAL_CANDIDATE_BENCH_WARMUPS` | Warmup sessions per arm and scenario; the first OFF session also records cold startup. | `1` |
 | `VOXTNEW_EVAL` | `1` runs the eval on the real models (`TestEvalASR`, [eval.md](eval.md)). | Unset: the eval skips |
 | `VOXTNEW_EVAL_ASR` | Comma-separated speech model ids for the dictionary and long-audio evals. | Dictionary eval: `asr.accurate` and `asr.fast`; long-audio eval: `asr.accurate` |
 | `VOXTNEW_EVAL_ONLY` | Comma-separated clip ids: the eval runs only these clips. | Unset: all clips |

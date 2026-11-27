@@ -30,6 +30,8 @@ type fakeStreamer struct {
 	// recording (asr.EventPiece): pieces[i-1] after the i-th send.
 	pieces              []string
 	candidates          []string
+	shadowTexts         []string
+	shadowCandidates    bool
 	salvage             string // the text its streams salvage (asr.Salvager), "" for none
 	salvageRequiresOpen bool
 	onSend              func(int) // called after the i-th send (nil: not)
@@ -101,7 +103,9 @@ func (f *fakeStreamer) Open(ctx context.Context, req asr.StreamRequest) (asr.Str
 	s := &fakeStream{
 		f: f, ctx: ctx, events: make(chan asr.Event, 1024),
 		latePartials: req.LatePartials, candidates: f.candidates,
-		partialGate: f.partialGate, partialReturnGate: f.partialReturnGate,
+		shadowCandidates: req.ShadowFinalCandidates || f.shadowCandidates,
+		shadowTexts:      f.shadowTexts,
+		partialGate:      f.partialGate, partialReturnGate: f.partialReturnGate,
 		salvageRequiresOpen: f.salvageRequiresOpen,
 	}
 	f.mu.Lock()
@@ -129,6 +133,8 @@ type fakeStream struct {
 	earlyPieces         bool
 	latePartials        bool
 	candidates          []string
+	shadowCandidates    bool
+	shadowTexts         []string
 	partialGate         <-chan struct{}
 	partialReturnGate   <-chan struct{}
 	salvageRequiresOpen bool
@@ -234,6 +240,18 @@ func (s *fakeStream) Finish() error {
 			s.emit(asr.Event{Kind: asr.EventCandidate, Text: text})
 		}
 	}
+	if s.shadowCandidates {
+		for i, text := range s.shadowTexts {
+			s.emit(asr.Event{
+				Kind: asr.EventShadowCandidate, Text: text,
+				Candidate: asr.CandidateMetadata{
+					Source: "http_final", SessionID: 1, RequestID: uint64(i + 1),
+					Attempt: 1, Sequence: uint64(i + 1), GeneratedTokens: (i + 1) * 8,
+					ReceivedAt: time.Now(),
+				},
+			})
+		}
+	}
 	if s.f.finishGate != nil {
 		select {
 		case <-s.f.finishGate:
@@ -246,7 +264,12 @@ func (s *fakeStream) Finish() error {
 	case s.f.finalErr != nil:
 		s.emit(asr.Event{Kind: asr.EventError, Err: s.f.finalErr})
 	default:
-		s.emit(asr.Event{Kind: asr.EventFinal, Text: s.f.final, Result: asr.Result{Text: s.f.final, Model: "fake-stream"}})
+		metadata := asr.CandidateMetadata{}
+		if s.shadowCandidates {
+			metadata = asr.CandidateMetadata{Source: "http_final", SessionID: 1, Attempt: 1, ReceivedAt: time.Now()}
+		} else {
+		}
+		s.emit(asr.Event{Kind: asr.EventFinal, Text: s.f.final, Result: asr.Result{Text: s.f.final, Model: "fake-stream"}, Candidate: metadata})
 	}
 	return nil
 }

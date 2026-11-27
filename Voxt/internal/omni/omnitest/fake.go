@@ -58,7 +58,8 @@ type Opts struct {
 	Log string
 	// Text is a Final's text (default "fake transcript"); "{n}" in it is
 	// the request's number (1 for the server's first Final).
-	Text string
+	Text       string
+	Candidates []string
 	// NoPromptText, when non-empty, answers a Final that has no prompt,
 	// so a hotword test can make the no-context comparison differ.
 	NoPromptText string
@@ -115,6 +116,7 @@ func Env(o Opts) []string {
 	v.Set("mode", o.Mode)
 	v.Set("log", o.Log)
 	v.Set("text", o.Text)
+	v["candidates"] = o.Candidates
 	v.Set("noprompttext", o.NoPromptText)
 	v["windows"] = o.WindowTexts
 	v.Set("delay", o.Delay.String())
@@ -141,7 +143,7 @@ func Enabled() bool { return os.Getenv(EnvFake) != "" }
 
 func opts() Opts {
 	v, _ := url.ParseQuery(os.Getenv(EnvFake))
-	o := Opts{Mode: v.Get("mode"), Log: v.Get("log"), Text: v.Get("text"), NoPromptText: v.Get("noprompttext"), WindowTexts: v["windows"]}
+	o := Opts{Mode: v.Get("mode"), Log: v.Get("log"), Text: v.Get("text"), Candidates: v["candidates"], NoPromptText: v.Get("noprompttext"), WindowTexts: v["windows"]}
 	o.Delay, _ = time.ParseDuration(v.Get("delay"))
 	o.Load, _ = time.ParseDuration(v.Get("load"))
 	o.FailFrom, _ = strconv.Atoi(v.Get("failfrom"))

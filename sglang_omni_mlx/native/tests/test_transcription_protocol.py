@@ -49,6 +49,56 @@ def test_a_streamed_request_ends_with_its_metadata_and_done(
     ]
 
 
+def test_opted_in_candidates_precede_the_authoritative_final(
+    asr_server: SupervisedServer,
+) -> None:
+    response = asr_server.post_form(
+        {
+            "outcome": "candidates",
+            "stream": "true",
+            "include_transcript_candidates": "true",
+        },
+        silent_wav(FRAME_COUNT),
+    )
+    payloads = sse_payloads(response.body)
+    events = [json.loads(payload) for payload in payloads[:-1]]
+    candidates = [event for event in events if event["type"] == "transcript.text.candidate"]
+    assert candidates
+    assert [event["sequence"] for event in candidates] == sorted(
+        event["sequence"] for event in candidates
+    )
+    assert all(event["generated_token_count"] > 0 for event in candidates)
+    assert candidates[-1]["published_candidate_count"] == 2
+    assert candidates[-1]["snapshot_build_ms_total"] >= candidates[-1]["snapshot_build_ms"]
+    assert events[-1]["type"] == "transcript.text.done"
+    assert payloads[-1] == "[DONE]"
+
+
+def test_candidate_after_transcription_error_keeps_terminal_order(
+    asr_server: SupervisedServer,
+) -> None:
+    response = asr_server.post_form(
+        {
+            "outcome": "candidate_fail",
+            "stream": "true",
+            "include_transcript_candidates": "true",
+        },
+        silent_wav(FRAME_COUNT),
+    )
+    payloads = sse_payloads(response.body)
+    assert json.loads(payloads[0])["type"] == "transcript.text.candidate"
+    assert json.loads(payloads[1])["type"] == "error"
+    assert payloads[2] == "[DONE]"
+
+
+def test_candidates_require_streaming(asr_server: SupervisedServer) -> None:
+    response = asr_server.post_form(
+        {"include_transcript_candidates": "true"}, silent_wav(FRAME_COUNT)
+    )
+    assert response.status == 400
+    assert "include_transcript_candidates requires stream=true" in response.json()["detail"]
+
+
 @pytest.mark.parametrize("include_metadata", [False, True])
 def test_draft_statistics_are_reported_only_with_generation_metadata(
     asr_server: SupervisedServer, include_metadata: bool
