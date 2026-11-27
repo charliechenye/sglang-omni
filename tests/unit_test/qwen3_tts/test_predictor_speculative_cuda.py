@@ -664,6 +664,14 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
                     assert (
                         first_round.logical_kv_length == repeat_round.logical_kv_length
                     )
+                    assert torch.equal(
+                        first_round.output_codes[
+                            :, :first_round.ending_depth + 1
+                        ],
+                        repeat_round.output_codes[
+                            :, :repeat_round.ending_depth + 1
+                        ],
+                    )
                     for field in (
                         "metadata",
                         "pending_tokens",
@@ -671,7 +679,6 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
                         "preceding_hidden",
                         "keys",
                         "values",
-                        "output_codes",
                         "logits",
                         "probabilities",
                         "token_ids",
@@ -854,6 +861,7 @@ def test_full_round_graph_capture_failure_falls_back_or_propagates(
             backend="full_round_graph",
             acceptance_backend="compact",
         )
+        talker.code_predictor_spec_opening_pair_graph_enabled = False
         original_opening_pair = talker.execute_speculative_opening_pair
         opening_pair_calls = 0
 
@@ -864,7 +872,7 @@ def test_full_round_graph_capture_failure_falls_back_or_propagates(
             workspace: PredictorSpeculativeWorkspace,
         ) -> None:
             nonlocal opening_pair_calls
-            assert workspace.device == device
+            assert workspace.device == layer0_codes.device
             opening_pair_calls += 1
             original_opening_pair(
                 layer0_codes,
