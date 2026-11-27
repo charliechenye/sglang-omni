@@ -113,7 +113,7 @@ def test_final_temporal_candidates_require_the_live_enabled_final_request(
     exclude_candidate_special: bool,
     expected_candidates: tuple[int, ...],
 ) -> None:
-    class TemporalTokenizer(Tokenizer):
+    class TemporalTokenizer:
         eos_token_id = 2
         all_special_ids = [2, 42]
 
@@ -724,7 +724,7 @@ def test_flag_off_setup_leaves_qwen_asr_components_untouched(
     ),
     [
         ([20, 22, 23, 2], (20,), 22, False),
-        ([99, 20, 21, 2], (), 99, False),
+        ([30, 20, 21, 2], (), 30, False),
         ([20, 21, 22, 2], (20, 21, 22), 2, False),
         ([20, 21, 22, 2], (), 2, True),
     ],
@@ -773,6 +773,7 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
         eos_token_ids={2},
         vocab_size=64,
     )
+    request.sampling_params.normalize(tokenizer=None)
     request.full_untruncated_fill_ids = array(
         "q", [*prompt_token_ids, *candidate_token_ids]
     )
@@ -1033,6 +1034,7 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
     def record_batch_failure(batch: ScheduleBatch, error: Exception) -> None:
         assert batch is schedule_batch
         failure_errors.append(error)
+        raise error
 
     monkeypatch.setattr(scheduler, "emit_speculative_tokens", record_emitted_tokens)
     monkeypatch.setattr(scheduler, "handle_batch_failure", record_batch_failure)
