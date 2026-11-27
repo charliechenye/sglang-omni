@@ -127,10 +127,6 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         else:
             pass
         logits_output.temporal_verification = verification
-        if int(pending_token_ids[0]) != verification.pending_token_id:
-            raise RuntimeError("Qwen3-ASR temporal pending token changed before relay")
-        else:
-            pass
         result.next_token_ids = pending_token_ids
 
     def next_input_token_ids(
