@@ -239,10 +239,31 @@ func (r *run) cleanTranscribe(text string, request cleanupRequest) cleanupOutput
 		output = r.cleanUpFirstContext(text, request)
 	}
 	r.head.drop() // what is asked again is asked anew
+	fallbackActive := false
+	cleanUp := func(request cleanupRequest) cleanupOutput {
+		if fallbackActive && r.shadowTraceEnabled {
+			r.logShadowEvent(map[string]any{
+				"event": "voxt_cleanup_fallback_started", "run_id": r.id,
+				"session_id": r.shadowSessionID,
+			})
+		}
+		output := r.cleanUpOutput(text, request)
+		if fallbackActive && r.shadowTraceEnabled {
+			outcome := "succeeded"
+			if output.err != nil {
+				outcome = "failed"
+			}
+			r.logShadowEvent(map[string]any{
+				"event": "voxt_cleanup_fallback_outcome", "run_id": r.id,
+				"session_id": r.shadowSessionID, "fallback_outcome": outcome,
+			})
+		}
+		return output
+	}
 	for {
 		if nextRequest, ok := r.takeRethink(); ok {
 			request = nextRequest
-			output = r.cleanUpOutput(text, request)
+			output = cleanUp(request)
 			output.generation = request.generation
 			continue
 		}
@@ -260,12 +281,13 @@ func (r *run) cleanTranscribe(text string, request cleanupRequest) cleanupOutput
 			// Leave it pending for the loop's single generation-capturing path.
 			continue
 		}
+		fallbackActive = true
 		nextRequest, ok := r.currentCleanupRequest()
 		if !ok {
 			continue
 		}
 		request = nextRequest
-		output = r.cleanUpOutput(text, request)
+		output = cleanUp(request)
 		output.generation = request.generation
 	}
 }

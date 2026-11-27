@@ -64,6 +64,15 @@ func evaluatePolicy(current policy, sessions map[string]*sessionTrace) policyRes
 	var arrivalLeads, dispatchLeads, actualRequestStarts []float64
 	for _, trace := range sessions {
 		result.SessionCount++
+		if current.name == "current_websocket_baseline" {
+			result.FallbackAttemptCount += trace.fallbackAttemptCount
+			result.FallbackSuccessCount += trace.fallbackSuccessCount
+			result.FallbackFailureCount += trace.fallbackFailureCount
+			resolvedFallbacks := trace.fallbackSuccessCount + trace.fallbackFailureCount
+			if unresolved := trace.fallbackAttemptCount - resolvedFallbacks; unresolved > 0 {
+				result.FallbackUnresolvedCount += unresolved
+			}
+		}
 		if trace.runStatus == "failed" || trace.runStatus == "asr_failure" {
 			result.FailedSessionCount++
 		} else if trace.runStatus == "cancelled" {
@@ -89,12 +98,16 @@ func evaluatePolicy(current policy, sessions map[string]*sessionTrace) policyRes
 		result.SelectedSessionCount += len(selected)
 		for _, chosen := range selected {
 			if current.name == "current_websocket_baseline" {
+				result.ActualHeadStartDispatchCount++
 				if !chosen.hasActualOutcome {
 					result.UnresolvedSelectionCount++
+					result.UnresolvedHeadStartDispatches++
 					continue
 				}
 				result.ResolvedSelectionCount++
+				result.ResolvedHeadStartDispatchCount++
 				result.ActualAdoptionCount += boolInt(chosen.actualAdoptionCount > 0)
+				result.ActualHeadStartMissCount += boolInt(chosen.actualAdoptionCount == 0)
 				result.ExactAdoptionCount += chosen.exactAdoptionCount
 				result.NearRepairAdoptionCount += chosen.nearRepairAdoptionCount
 				result.PartialMultipartAdoptionCount += boolInt(chosen.partialAdoption)

@@ -268,6 +268,7 @@ func TestTranscribeFallback(t *testing.T) {
 		{"both fail", &fakeLLM{err: boom}, &fakeLLM{err: boom}, "hello VoxtNew", "ollama", 1, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("VOXT_EXPERIMENT_FINAL_CANDIDATES", "instrumented")
 			h := newHarness(t, &fakeFile{text: " hello aura link "}, tc.main, func(_ *Config, s *settings.Settings) {
 				s.Features.Transcribe.Prompt = "Be brief."
 			})
@@ -286,6 +287,20 @@ func TestTranscribeFallback(t *testing.T) {
 			}
 			if es := h.hist.all(); len(es) != 1 || es[0].LLMProvider != tc.model || es[0].LLMModel != end.LLM.Model {
 				t.Errorf("entries %+v", es)
+			}
+			h.mu.Lock()
+			logs := strings.Join(h.logs, "\n")
+			h.mu.Unlock()
+			if strings.Count(logs, `"event":"voxt_cleanup_fallback_started"`) != 1 {
+				t.Errorf("fallback start was not recorded exactly once: %s", logs)
+			}
+			wantOutcome := "succeeded"
+			if tc.fallback.err != nil {
+				wantOutcome = "failed"
+			}
+			if !strings.Contains(logs, `"event":"voxt_cleanup_fallback_outcome"`) ||
+				!strings.Contains(logs, `"fallback_outcome":"`+wantOutcome+`"`) {
+				t.Errorf("fallback outcome %q was not recorded: %s", wantOutcome, logs)
 			}
 		})
 	}
@@ -367,6 +382,7 @@ func TestTranscribeFallbackRethink(t *testing.T) {
 		}
 	})
 	t.Run("rethink during the fallback asks it again", func(t *testing.T) {
+		t.Setenv("VOXT_EXPERIMENT_FINAL_CANDIDATES", "instrumented")
 		model, fallback := &fakeLLM{err: boom}, &fakeLLM{text: "Again, VoxtNew.", hang: true, hangOn: 1}
 		h := newHarness(t, &fakeFile{text: "hello aura link"}, model, nil)
 		h.fallback = fallback
@@ -383,6 +399,13 @@ func TestTranscribeFallbackRethink(t *testing.T) {
 		}
 		if p := h.text.pastes(); len(p) != 1 || p[0] != "Again, VoxtNew." {
 			t.Errorf("pasted %q", p)
+		}
+		h.mu.Lock()
+		logs := strings.Join(h.logs, "\n")
+		h.mu.Unlock()
+		if strings.Count(logs, `"event":"voxt_cleanup_fallback_started"`) != 2 ||
+			strings.Count(logs, `"event":"voxt_cleanup_fallback_outcome"`) != 2 {
+			t.Errorf("both fallback cleanup attempts need outcomes: %s", logs)
 		}
 	})
 }

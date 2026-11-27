@@ -273,6 +273,15 @@ func applyReplayEvent(trace *sessionTrace, sessionKey string, event logEvent) {
 		if event.RequestID != 0 {
 			trace.requestResultsByID[event.RequestID] = event
 		}
+	case "voxt_cleanup_fallback_started":
+		trace.fallbackAttemptCount++
+	case "voxt_cleanup_fallback_outcome":
+		switch event.FallbackOutcome {
+		case "succeeded":
+			trace.fallbackSuccessCount++
+		case "failed":
+			trace.fallbackFailureCount++
+		}
 	case "voxt_final_candidate_summary":
 		if event.InitialBudgetKnown != nil && *event.InitialBudgetKnown {
 			trace.initialBudgetKnown = true
@@ -489,7 +498,9 @@ func replayEvent(event string) bool {
 		"voxt_final_candidate_outcome", "voxt_final_candidate_summary",
 		"voxt_headstart_initial_budget", "voxt_headstart_decision_outcome",
 		"voxt_headstart_decision", "voxt_headstart_adoption",
-		"voxt_headstart_request_start", "voxt_headstart_request_done", "voxt_session_cancelled":
+		"voxt_headstart_request_start", "voxt_headstart_request_done",
+		"voxt_cleanup_fallback_started", "voxt_cleanup_fallback_outcome",
+		"voxt_session_cancelled":
 		return true
 	default:
 		return false

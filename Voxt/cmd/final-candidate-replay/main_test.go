@@ -194,6 +194,30 @@ func TestCurrentBaselineUsesActualWebSocketDispatchNotLateShadowObservation(t *t
 	}
 }
 
+func TestCurrentBaselineReportsHeadStartMissesAndFallbackOutcomes(t *testing.T) {
+	dispatch := websocketDispatch(35, 350, 1, 60, "candidate", "plan")
+	requestDone := map[string]any{
+		"event": "voxt_headstart_request_done", "session_id": 35,
+		"request_id": 350, "succeeded": true,
+	}
+	fallbackStarted := map[string]any{"event": "voxt_cleanup_fallback_started", "session_id": 35}
+	fallbackFailed := map[string]any{
+		"event": "voxt_cleanup_fallback_outcome", "session_id": 35, "fallback_outcome": "failed",
+	}
+	secondFallbackStarted := map[string]any{"event": "voxt_cleanup_fallback_started", "session_id": 36}
+	report := replayLines(t, dispatch, requestDone, fallbackStarted, fallbackFailed,
+		secondFallbackStarted, finalSummary(35, 200, "completed"), finalSummary(36, 200, "cancelled"))
+	baseline := policyByName(t, report, "current_websocket_baseline", 0)
+	if baseline.ActualHeadStartDispatchCount != 1 || baseline.ResolvedHeadStartDispatchCount != 1 ||
+		baseline.ActualHeadStartMissCount != 1 || baseline.UnresolvedHeadStartDispatches != 0 {
+		t.Fatalf("unadopted resolved dispatch must count as an actual miss: %+v", baseline)
+	}
+	if baseline.FallbackAttemptCount != 2 || baseline.FallbackSuccessCount != 0 ||
+		baseline.FallbackFailureCount != 1 || baseline.FallbackUnresolvedCount != 1 {
+		t.Fatalf("fallback attempts and outcomes were not separated: %+v", baseline)
+	}
+}
+
 func TestCombinedComparisonUsesComparableCompatibilityAndReportsEarlierLead(t *testing.T) {
 	http := httpCandidate(9, 90, 1, 1, 80, "http-part")
 	ws := websocketDispatch(9, 901, 2, 100, "ws-candidate", "ws-plan")

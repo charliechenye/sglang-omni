@@ -69,6 +69,7 @@ type logEvent struct {
 	DispatchReadyBeforeFinal        bool     `json:"dispatch_ready_before_final"`
 	TerminalState                   string   `json:"terminal_state"`
 	Problem                         string   `json:"problem"`
+	FallbackOutcome                 string   `json:"fallback_outcome"`
 	Arm                             string   `json:"arm"`
 	Scenario                        string   `json:"scenario"`
 	Round                           int      `json:"round"`
@@ -119,6 +120,9 @@ type sessionTrace struct {
 	adoptions             map[uint64]logEvent
 	requestStartsByID     map[uint64]logEvent
 	requestResultsByID    map[uint64]logEvent
+	fallbackAttemptCount  int
+	fallbackSuccessCount  int
+	fallbackFailureCount  int
 	finalAvailableMS      float64
 	finalAvailableKnown   bool
 	cancelledAtMS         float64
@@ -174,10 +178,18 @@ type policyResult struct {
 	UnresolvedSelectionCount        int     `json:"unresolved_selection_count"`
 	UnresolvedCounterfactualCount   int     `json:"unresolved_counterfactual_count"`
 	ActualAdoptionCount             int     `json:"actual_adoption_count"`
+	ActualHeadStartDispatchCount    int     `json:"actual_headstart_dispatch_count"`
+	ResolvedHeadStartDispatchCount  int     `json:"resolved_actual_headstart_dispatch_count"`
+	ActualHeadStartMissCount        int     `json:"actual_headstart_miss_count"`
+	UnresolvedHeadStartDispatches   int     `json:"unresolved_actual_headstart_dispatch_count"`
 	ExactAdoptionCount              int     `json:"exact_adoption_count"`
 	NearRepairAdoptionCount         int     `json:"near_repair_adoption_count"`
 	PartialMultipartAdoptionCount   int     `json:"partial_multipart_adoption_count"`
 	FailedSpeculativeRequestCount   int     `json:"failed_speculative_request_count"`
+	FallbackAttemptCount            int     `json:"fallback_attempt_count"`
+	FallbackSuccessCount            int     `json:"fallback_success_count"`
+	FallbackFailureCount            int     `json:"fallback_failure_count"`
+	FallbackUnresolvedCount         int     `json:"fallback_unresolved_count"`
 	ActualRequestStartSampleCount   int     `json:"actual_request_start_sample_count"`
 	ActualRequestStartP50MS         float64 `json:"actual_request_start_p50_ms"`
 	ActualRequestStartP95MS         float64 `json:"actual_request_start_p95_ms"`
