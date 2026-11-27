@@ -84,6 +84,7 @@ class Qwen3ASRTemporalRequest:
     fallback_logged: bool = False
     attempted: bool = False
     verification_committed: bool = False
+    temporal_commit_in_progress: bool = False
     accepted_token_count: int = 0
     rejected_token_count: int = 0
     zero_decode: bool = False

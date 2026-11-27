@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import logging
+from array import array
+from collections.abc import Iterable
 
-from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
+from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
@@ -16,7 +18,7 @@ from sglang_omni.models.qwen3_asr.temporal_verification import (
     Qwen3ASRTemporalRunnerOutput,
 )
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
-from sglang_omni.scheduling.types import ModelRunnerOutput
+from sglang_omni.scheduling.types import ModelRunnerOutput, SchedulerOutput
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +27,48 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
         return Qwen3ASRTemporalPrefillAdder
 
-    def get_coalesced_batch_prefill(
-        self, running_batch: ScheduleBatch
-    ) -> NextBatchPlan:
-        with self.request_admission_lock:
-            return super().get_coalesced_batch_prefill(running_batch)
+    def emit_stream_output(
+        self,
+        scheduler_output: SchedulerOutput,
+        model_output: ModelRunnerOutput,
+        skip_rids: Iterable[str] = (),
+    ) -> None:
+        if (
+            isinstance(model_output, Qwen3ASRTemporalRunnerOutput)
+            and model_output.temporal_verification is not None
+        ):
+            return
+        else:
+            super().emit_stream_output(scheduler_output, model_output, skip_rids)
+
+    def stream_output(
+        self,
+        requests: list[Req],
+        return_logprob: bool = False,
+        skip_req: Req | None = None,
+    ) -> None:
+        streamable_requests = []
+        for request in requests:
+            request_data = request.omni_data
+            if isinstance(request_data, Qwen3ASRRequestData):
+                temporal_request = request_data.temporal_request
+            else:
+                temporal_request = None
+            if (
+                temporal_request is not None
+                and temporal_request.temporal_commit_in_progress
+            ):
+                pass
+            else:
+                streamable_requests.append(request)
+        if streamable_requests:
+            super().stream_output(
+                streamable_requests,
+                return_logprob=return_logprob,
+                skip_req=skip_req,
+            )
+        else:
+            pass
 
     @staticmethod
     def make_batch_result(
@@ -123,29 +162,55 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
                     raise RuntimeError(
                         "Qwen3-ASR temporal diagnostics lost request state"
                     )
+                elif (
+                    self.model_runner is None
+                    or self.model_runner.execution_bridge is None
+                ):
+                    raise RuntimeError(
+                        "Qwen3-ASR temporal result lost its FutureMap bridge"
+                    )
                 else:
                     pass
                 self.precommit_temporal_result(schedule_batch, batch_result)
+                temporal_request.admitted = False
+                temporal_request.verification_committed = True
+                temporal_request.temporal_commit_in_progress = True
+                try:
+                    super().process_batch_result(
+                        schedule_batch, batch_result.native_result
+                    )
+                finally:
+                    temporal_request.temporal_commit_in_progress = False
+                if (
+                    not temporal_request.cancelled
+                    and request.rid not in self.aborted_request_ids
+                    and request.to_finish is None
+                    and not request.is_retracted
+                    and request.discard_output_reason is None
+                ):
+                    temporal_request.zero_decode = request.finished() or (
+                        len(request.output_ids)
+                        >= request.sampling_params.max_new_tokens
+                    )
+                    self.emit_speculative_tokens(request, request_data)
+                else:
+                    temporal_request.cancelled = True
+                if request.finished():
+                    super().stream_output(
+                        [request], return_logprob=schedule_batch.return_logprob
+                    )
+                elif not temporal_request.cancelled:
+                    self.model_runner.execution_bridge.publish_next_tokens(
+                        schedule_batch,
+                        batch_result.native_result.next_token_ids,
+                    )
+                else:
+                    pass
             except Exception as exc:
                 self.handle_batch_failure(schedule_batch, exc)
                 return
             else:
                 pass
-            super().process_batch_result(schedule_batch, batch_result.native_result)
-            temporal_request.admitted = False
-            temporal_request.verification_committed = True
-        if (
-            not temporal_request.cancelled
-            and request.rid not in self.aborted_request_ids
-            and request.to_finish is None
-            and not request.is_retracted
-            and request.discard_output_reason is None
-        ):
-            temporal_request.zero_decode = request.finished() or (
-                len(request.output_ids) >= request.sampling_params.max_new_tokens
-            )
-        else:
-            temporal_request.cancelled = True
         logger.info(
             f"qwen3_asr_temporal_verification request_id={request.rid} "
             f"candidate_tokens={len(temporal_request.candidate_token_ids)} "
@@ -167,6 +232,12 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
             not schedule_batch.forward_mode.is_extend()
             or len(schedule_batch.reqs) != 1
             or verification.row_index != 0
+            or schedule_batch.seq_lens is None
+            or schedule_batch.seq_lens.numel() != 1
+            or schedule_batch.seq_lens_cpu is None
+            or schedule_batch.seq_lens_cpu.numel() != 1
+            or schedule_batch.orig_seq_lens is None
+            or schedule_batch.orig_seq_lens.numel() != 1
         ):
             raise RuntimeError("Qwen3-ASR temporal result has an unsupported batch")
         else:
@@ -201,7 +272,10 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
             or request.kv.cache_inserted_len != 0
             or request.kv.kv_committed_len != len(request.full_untruncated_fill_ids)
             or request.kv.kv_allocated_len != len(request.full_untruncated_fill_ids)
-            or schedule_batch.seq_lens_cpu[0] != len(request.full_untruncated_fill_ids)
+            or int(schedule_batch.seq_lens_cpu[0])
+            != len(request.full_untruncated_fill_ids)
+            or tuple(request.full_untruncated_fill_ids[: verification.prompt_boundary])
+            != tuple(request.origin_input_ids)
             or request.multimodal_inputs is None
             or request.multimodal_inputs.mrope_positions is None
             or request.multimodal_inputs.mrope_positions.shape[1]
@@ -218,8 +292,34 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
 
         prompt_boundary = verification.prompt_boundary
         candidate_end = prompt_boundary + len(verification.candidate_token_ids)
+        if not 0 <= verification.pending_token_id < self.model_config.vocab_size:
+            raise RuntimeError(
+                "Qwen3-ASR pending token is outside the model vocabulary"
+            )
+        else:
+            pass
+        terminal_token_ids = set(request.eos_token_ids or ())
+        terminal_token_ids.update(request.sampling_params.stop_token_ids or ())
+        if (
+            any(
+                token_id in terminal_token_ids
+                or token_id < 0
+                or token_id >= self.model_config.vocab_size
+                for token_id in verification.candidate_token_ids
+            )
+            or any(
+                token_id in terminal_token_ids
+                for token_id in verification.accepted_prefix
+            )
+            or len(request.output_ids) + len(verification.accepted_prefix) + 1
+            > request.sampling_params.max_new_tokens
+        ):
+            raise RuntimeError("Qwen3-ASR temporal result violates token constraints")
+        else:
+            pass
         owned_boundary = verification.owned_kv_boundary
         request_pool_index = request.kv.req_pool_idx
+        assert request_pool_index is not None
         if (
             request.finished()
             or request.is_retracted
@@ -234,28 +334,59 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
             accepted_prefix = verification.accepted_prefix
             temporal_request.cancelled = False
         token_row = self.req_to_token_pool.req_to_token[request_pool_index]
+        if token_row.numel() < candidate_end:
+            raise RuntimeError("Qwen3-ASR temporal token row is shorter than its fill")
+        else:
+            pass
+        replacement_mrope_positions = request.multimodal_inputs.mrope_positions[
+            :, :owned_boundary
+        ].clone()
+        replacement_output_ids = array("q", request.output_ids)
+        replacement_output_ids.extend(accepted_prefix)
+        replacement_fill_ids = request.origin_input_ids + replacement_output_ids
+        replacement_seq_lens = schedule_batch.seq_lens.clone()
+        replacement_seq_lens[0] = owned_boundary
+        replacement_seq_lens_cpu = schedule_batch.seq_lens_cpu.clone()
+        replacement_seq_lens_cpu[0] = owned_boundary
+        replacement_orig_seq_lens = schedule_batch.orig_seq_lens.clone()
+        replacement_orig_seq_lens[0] = owned_boundary
         rejected_locations = token_row[owned_boundary:candidate_end].clone()
-        if rejected_locations.numel() > 0:
-            self.token_to_kv_pool_allocator.free(rejected_locations)
+        request.output_ids = replacement_output_ids
+        request.full_untruncated_fill_ids = replacement_fill_ids
+        request.refresh_fill_ids()
+        request.kv.kv_committed_len = owned_boundary
+        request.kv.kv_allocated_len = owned_boundary
+        request.extend_end = owned_boundary
+        schedule_batch.seq_lens = replacement_seq_lens
+        schedule_batch.seq_lens_cpu = replacement_seq_lens_cpu
+        schedule_batch.orig_seq_lens = replacement_orig_seq_lens
+        schedule_batch.seq_lens_sum = None
+        request.skip_radix_cache_insert = True
+        request.multimodal_inputs.mrope_positions = replacement_mrope_positions
+        token_row[owned_boundary:candidate_end] = 0
+        if (
+            temporal_request.cancelled
+            and not request.finished()
+            and not request.is_retracted
+        ):
+            if request.to_finish is None:
+                request.to_finish = FINISH_ABORT("cancelled before temporal commit")
+            else:
+                pass
+            if request.discard_output_reason is None:
+                request.discard_output_reason = request.to_finish
+            else:
+                pass
         else:
             pass
         temporal_request.accepted_token_count = len(accepted_prefix)
         temporal_request.rejected_token_count = len(
             verification.candidate_token_ids
         ) - len(accepted_prefix)
-        del request.full_untruncated_fill_ids[prompt_boundary:]
-        request.output_ids.extend(accepted_prefix)
-        request.refresh_fill_ids()
-        request.multimodal_inputs.mrope_positions = (
-            request.multimodal_inputs.mrope_positions[:, :prompt_boundary].clone()
-        )
-        request.kv.kv_committed_len = owned_boundary
-        request.kv.kv_allocated_len = owned_boundary
-        request.extend_end = owned_boundary
-        request.skip_radix_cache_insert = True
-        token_row[owned_boundary:candidate_end] = 0
-        schedule_batch.seq_lens[0] = owned_boundary
-        schedule_batch.seq_lens_cpu[0] = owned_boundary
+        if rejected_locations.numel() > 0:
+            self.token_to_kv_pool_allocator.free(rejected_locations)
+        else:
+            pass
 
 
 __all__ = ["Qwen3ASRTemporalScheduler"]
