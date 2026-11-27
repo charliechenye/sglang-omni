@@ -47,7 +47,13 @@ from sglang_omni.models.qwen3_tts.speculative_runtime import (
     expand_compact_probability_rows,
     sample_compact_probability_rows,
 )
+from sglang_omni.models.qwen3_tts.speculative_workspace import (
+    PredictorSpeculativeWorkspace,
+)
 from sglang_omni.utils.predictor_grouped_heads import grouped_lm_head_linear
+from sglang_omni.utils.qwen3_tts_speculative_frame_observation import (
+    observe_speculative_rounds,
+)
 from sglang_omni.vendor.sglang.layers import RMSNorm
 from tests.unit_test.qwen3_tts.test_predictor_cuda_graph import (
     DTYPE,
@@ -489,6 +495,39 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
         )
 
         probability_call_count = 0
+        candidate_view_call_count = 0
+        scratch_view_call_count = 0
+
+        if execution_backend == "full_round_graph":
+            original_candidate_view = sglang_model_module.compact_candidate_view
+            original_scratch_view = sglang_model_module.compact_scratch_view
+
+            def count_candidate_views(
+                storage: torch.Tensor, row_count: int, candidate_count: int
+            ) -> torch.Tensor:
+                nonlocal candidate_view_call_count
+                candidate_view_call_count += 1
+                return original_candidate_view(storage, row_count, candidate_count)
+
+            def count_scratch_views(
+                storage: torch.Tensor, row_count: int, columns_per_row: int
+            ) -> torch.Tensor:
+                nonlocal scratch_view_call_count
+                scratch_view_call_count += 1
+                return original_scratch_view(storage, row_count, columns_per_row)
+
+            monkeypatch.setattr(
+                sglang_model_module,
+                "compact_candidate_view",
+                count_candidate_views,
+            )
+            monkeypatch.setattr(
+                sglang_model_module,
+                "compact_scratch_view",
+                count_scratch_views,
+            )
+        else:
+            pass
 
         def controlled_probability_builder(
             logits: torch.Tensor,
@@ -595,10 +634,68 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
         )
         semantic_positions = torch.tensor([7], device=device, dtype=torch.long)
 
-        codes, summed_embedding = talker.code_predictor_forward(
-            layer0_codes, talker_hidden, semantic_positions
-        )
-        verify_complete_frame(talker, codes, summed_embedding)
+        frame_multiplier = 1
+        if execution_backend == "full_round_graph":
+            with observe_speculative_rounds(talker) as round_observations:
+                codes, summed_embedding = talker.code_predictor_forward(
+                    layer0_codes, talker_hidden, semantic_positions
+                )
+                verify_complete_frame(talker, codes, summed_embedding)
+                first_codes = codes.clone()
+                first_embedding = summed_embedding.clone()
+                first_rounds = list(round_observations)
+                warmed_probability_calls = probability_call_count
+                warmed_candidate_view_calls = candidate_view_call_count
+                warmed_scratch_view_calls = scratch_view_call_count
+                repeat_codes, repeat_embedding = talker.code_predictor_forward(
+                    layer0_codes, talker_hidden, semantic_positions
+                )
+                verify_complete_frame(talker, repeat_codes, repeat_embedding)
+                repeat_rounds = round_observations[len(first_rounds) :]
+                assert len(first_rounds) == len(repeat_rounds) == 5
+                for first_round, repeat_round in zip(
+                    first_rounds, repeat_rounds, strict=True
+                ):
+                    assert first_round.verify_width == repeat_round.verify_width
+                    assert first_round.committed_count == repeat_round.committed_count
+                    assert first_round.accepted_count == repeat_round.accepted_count
+                    assert first_round.starting_depth == repeat_round.starting_depth
+                    assert first_round.ending_depth == repeat_round.ending_depth
+                    assert (
+                        first_round.logical_kv_length == repeat_round.logical_kv_length
+                    )
+                    for field in (
+                        "metadata",
+                        "pending_tokens",
+                        "active_rows",
+                        "preceding_hidden",
+                        "keys",
+                        "values",
+                        "output_codes",
+                        "logits",
+                        "probabilities",
+                        "token_ids",
+                        "valid_queries",
+                        "head_indices",
+                        "draft_tokens",
+                        "committed_tokens",
+                    ):
+                        assert torch.equal(
+                            getattr(first_round, field), getattr(repeat_round, field)
+                        )
+                else:
+                    pass
+                assert torch.equal(first_codes, repeat_codes)
+                assert torch.equal(first_embedding, repeat_embedding)
+                assert probability_call_count == warmed_probability_calls
+                assert candidate_view_call_count == warmed_candidate_view_calls
+                assert scratch_view_call_count == warmed_scratch_view_calls
+            frame_multiplier = 2
+        else:
+            codes, summed_embedding = talker.code_predictor_forward(
+                layer0_codes, talker_hidden, semantic_positions
+            )
+            verify_complete_frame(talker, codes, summed_embedding)
 
     stats = talker.predictor_speculative_stats()
     assert stats["nvtx_enabled"] is False
@@ -606,19 +703,27 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
         assert probability_call_count > 0
     else:
         assert probability_call_count == 9
-    assert stats["frames"] == 1
+    assert stats["frames"] == frame_multiplier
     assert stats["native_fallback_count"] == 0
-    assert stats["effective_width_histogram"] == {"1": 1, "2": 1, "4": 3}
+    assert stats["effective_width_histogram"] == {
+        "1": frame_multiplier,
+        "2": frame_multiplier,
+        "4": 3 * frame_multiplier,
+    }
     assert stats["probability_backend_execution_counts"] == {
-        "split_top_k": 9,
+        "split_top_k": 9 * frame_multiplier,
         "radix_compact": 0,
         "radix_compact_4bit": 0,
     }
-    assert stats["probability_backend_fallbacks"] == (9 if top_k == 4 else 0)
+    assert stats["probability_backend_fallbacks"] == (
+        9 * frame_multiplier if top_k == 4 else 0
+    )
     assert stats["acceptance_backend"] == acceptance_backend
     assert stats["acceptance_backend_execution_counts"] == {
-        "compact": 5 if acceptance_backend == "compact" else 0,
-        "dense_indexed": 5 if acceptance_backend == "dense_indexed" else 0,
+        "compact": 5 * frame_multiplier if acceptance_backend == "compact" else 0,
+        "dense_indexed": (
+            5 * frame_multiplier if acceptance_backend == "dense_indexed" else 0
+        ),
     }
     if execution_backend == "eager":
         assert stats["eager_verifier_rounds"] == 5
@@ -631,14 +736,202 @@ def test_full_frame_w1_tail_supports_non_power_of_two_top_k(
     else:
         assert stats["eager_verifier_rounds"] == 0
         assert stats["verifier_graph_replays"] == 0
-        assert stats["full_round_graph_replays"] == 5
+        assert stats["full_round_graph_replays"] == 5 * frame_multiplier
         assert stats["full_round_graph_replay_coverage"] == 1.0
-        assert stats["full_round_graph_captures"] > 0
+        assert stats["full_round_graph_captures"] == 3
         assert stats["full_round_graph_capture_failures"] == 0
-        assert stats["opening_pair_graph_replays"] == 1
+        assert stats["opening_pair_graph_replays"] == frame_multiplier
         assert stats["opening_pair_graph_replay_coverage"] == 1.0
         assert stats["opening_pair_graph_captures"] == 1
         assert stats["opening_pair_graph_capture_failures"] == 0
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_full_round_graph_rejects_invalid_probability_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    device = torch.device("cuda")
+    configure_runtime_context(monkeypatch)
+    with get_context().override_server_args(max_running_requests=1):
+        talker = build_speculative_talker(device)
+        configure_unseeded_request(talker)
+        talker.configure_code_predictor_speculation(
+            4,
+            backend="full_round_graph",
+            acceptance_backend="compact",
+        )
+
+        def invalid_target_probability_builder(
+            logits: torch.Tensor,
+            temperatures: torch.Tensor,
+            top_ks: torch.Tensor,
+            top_ps: torch.Tensor,
+            active_rows: torch.Tensor,
+            *,
+            max_top_k: int,
+            has_top_p: bool,
+            has_unbounded_top_k: bool,
+            backend: str,
+            probability_output: torch.Tensor | None = None,
+            token_id_output: torch.Tensor | None = None,
+            split_candidate_keys: torch.Tensor | None = None,
+            radix_candidate_keys: torch.Tensor | None = None,
+        ) -> tuple[torch.Tensor, torch.Tensor, str]:
+            assert probability_output is not None
+            assert token_id_output is not None
+            assert temperatures.shape == top_ks.shape == top_ps.shape
+            assert temperatures.shape == active_rows.shape
+            assert max_top_k == 4
+            assert has_top_p is False
+            assert has_unbounded_top_k is False
+            assert split_candidate_keys is None or (
+                split_candidate_keys.shape[0] == logits.shape[0]
+            )
+            assert radix_candidate_keys is None or (
+                radix_candidate_keys.shape[0] == logits.shape[0]
+            )
+            probabilities = probability_output
+            token_ids = token_id_output
+            probabilities.zero_()
+            token_ids.fill_(-1)
+            token_ids[:, 0] = 0
+            if logits.shape[0] != 4:
+                probabilities[:, 0] = 1.0
+            else:
+                pass
+            probabilities[~active_rows] = 0.0
+            return probabilities, token_ids, backend
+
+        monkeypatch.setattr(
+            sglang_model_module,
+            "build_speculative_probability_candidates_selected",
+            invalid_target_probability_builder,
+        )
+        layer0_codes = torch.tensor([[9]], device=device, dtype=torch.long)
+        talker_hidden = torch.randn(
+            (1, 1, TALKER_HIDDEN_SIZE), device=device, dtype=DTYPE
+        )
+        semantic_positions = torch.tensor([7], device=device, dtype=torch.long)
+
+        with pytest.raises(RuntimeError, match="invalid probability mass"):
+            talker.code_predictor_forward(
+                layer0_codes, talker_hidden, semantic_positions
+            )
+
+    stats = talker.predictor_speculative_stats()
+    assert stats["frames"] == 0
+    assert stats["rounds"] == 0
+    assert stats["full_round_graph_replays"] == 1
+    assert stats["full_round_graph_captures"] == 1
+    assert stats["probability_backend_execution_counts"]["split_top_k"] == 2
+    assert stats["acceptance_backend_execution_counts"]["compact"] == 1
+
+
+@pytest.mark.parametrize(
+    ("capture_error", "fatal_capture"),
+    [
+        ("recoverable capture failure", False),
+        ("CUDA error 719: unspecified launch failure", True),
+    ],
+)
+@pytest.mark.accelerator
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@torch.inference_mode()
+def test_full_round_graph_capture_failure_falls_back_or_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+    capture_error: str,
+    fatal_capture: bool,
+) -> None:
+    device = torch.device("cuda")
+    configure_runtime_context(monkeypatch)
+    with get_context().override_server_args(max_running_requests=1):
+        talker = build_speculative_talker(device)
+        configure_unseeded_request(talker)
+        talker.configure_code_predictor_speculation(
+            4,
+            backend="full_round_graph",
+            acceptance_backend="compact",
+        )
+        original_opening_pair = talker.execute_speculative_opening_pair
+        opening_pair_calls = 0
+
+        def count_opening_pair_calls(
+            layer0_codes: torch.Tensor,
+            talker_hidden: torch.Tensor,
+            semantic_positions: torch.Tensor,
+            workspace: PredictorSpeculativeWorkspace,
+        ) -> None:
+            nonlocal opening_pair_calls
+            assert workspace.device == device
+            opening_pair_calls += 1
+            original_opening_pair(
+                layer0_codes,
+                talker_hidden,
+                semantic_positions,
+                workspace,
+            )
+
+        def fail_capture(
+            run_once: sglang_model_module.SpeculativeGraphCaptureOperation,
+            *,
+            graph_pool: sglang_model_module.DeviceGraphPool | None = None,
+        ) -> tuple[
+            sglang_model_module.ReplayableGraph,
+            sglang_model_module.SpeculativeGraphCaptureOutputs,
+            float,
+            int,
+        ]:
+            assert callable(run_once)
+            assert graph_pool is not None
+            raise RuntimeError(capture_error)
+
+        monkeypatch.setitem(
+            talker.__dict__,
+            "execute_speculative_opening_pair",
+            count_opening_pair_calls,
+        )
+        monkeypatch.setitem(
+            talker.__dict__, "capture_code_predictor_spec_graph", fail_capture
+        )
+        monkeypatch.setattr(
+            sglang_model_module.current_platform,
+            "get_device_graph_backend",
+            lambda graph_device: object(),
+        )
+        layer0_codes = torch.tensor([[9]], device=device, dtype=torch.long)
+        talker_hidden = torch.randn(
+            (1, 1, TALKER_HIDDEN_SIZE), device=device, dtype=DTYPE
+        )
+        semantic_positions = torch.tensor([7], device=device, dtype=torch.long)
+
+        if fatal_capture:
+            with pytest.raises(RuntimeError, match="unspecified launch failure"):
+                talker.code_predictor_forward(
+                    layer0_codes, talker_hidden, semantic_positions
+                )
+        else:
+            codes, summed_embedding = talker.code_predictor_forward(
+                layer0_codes, talker_hidden, semantic_positions
+            )
+            verify_complete_frame(talker, codes, summed_embedding)
+
+    stats = talker.predictor_speculative_stats()
+    assert opening_pair_calls == 1
+    assert stats["native_fallback_count"] == 0
+    assert stats["full_round_graph_replays"] == 0
+    if fatal_capture:
+        assert stats["frames"] == 0
+        assert stats["full_round_graph_capture_failures"] == 1
+        assert stats["eager_verifier_rounds"] == 0
+    else:
+        assert stats["frames"] == 1
+        assert stats["full_round_graph_capture_failures"] == len(
+            stats["effective_width_histogram"]
+        )
+        assert stats["rounds"] > 0
+        assert stats["eager_verifier_rounds"] == stats["rounds"]
 
 
 @pytest.mark.parametrize("forced_rejection_offset", [0, 1, 2])
@@ -982,9 +1275,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                     expected_tokens.append(token)
                     expected_accepted += 1
 
-                selected_row = (
-                    row * verification_width + expected_accepted
-                )
+                selected_row = row * verification_width + expected_accepted
 
                 final_candidates = []
                 for token, mass in zip(
@@ -1003,20 +1294,12 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
                 assert final_candidates
                 expected_tokens.append(final_candidates[0])
 
-                assert (
-                    int(decision.accepted_draft_counts[row])
-                    == expected_accepted
-                )
-                assert (
-                    int(decision.committed_token_counts[row])
-                    == len(expected_tokens)
-                )
+                assert int(decision.accepted_draft_counts[row]) == expected_accepted
+                assert int(decision.committed_token_counts[row]) == len(expected_tokens)
                 assert bool(decision.rejected_rows[row]) == rejected
                 assert bool(decision.bonus_rows[row]) == (not rejected)
                 assert (
-                    decision.committed_tokens[
-                        row, :len(expected_tokens)
-                    ].tolist()
+                    decision.committed_tokens[row, : len(expected_tokens)].tolist()
                     == expected_tokens
                 )
 
@@ -1381,8 +1664,7 @@ def test_forced_code_replay_matches_native_targets_and_valid_kv_prefixes(
         stats = talker.predictor_speculative_stats()
         assert stats["frames"] == batch_size
         expected_rejections = sum(
-            int(record[6].sum().item())
-            for record in acceptance_records
+            int(record[6].sum().item()) for record in acceptance_records
         )
         assert stats["rejections"] == expected_rejections
         if lm_head_mode == "zero":

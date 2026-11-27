@@ -100,6 +100,8 @@ from sglang_omni.models.qwen3_tts.speculative_runtime import (
     speculative_sampling_fallback_reason,
 )
 from sglang_omni.models.qwen3_tts.speculative_workspace import (
+    PredictorGraphSignature,
+    PredictorSpeculativeRoundGraphKey,
     PredictorSpeculativeWorkspace,
     compact_candidate_view,
     compact_scratch_view,
@@ -169,17 +171,11 @@ if QTTS_BACKEND == "cutedsl":
 else:
     pass
 
-PredictorGraphSignature: TypeAlias = tuple[
-    Literal["argmax", "sampled"], int, bool, bool, bool
-]
 PredictorGraphKey: TypeAlias = tuple[
     int, Literal["argmax", "sampled"], int, bool, bool, bool
 ]
 PredictorSpeculativeOpeningGraphKey: TypeAlias = tuple[
     int, PredictorGraphSignature, str, str, str
-]
-PredictorSpeculativeRoundGraphKey: TypeAlias = tuple[
-    int, int, PredictorGraphSignature, str, str, str, str
 ]
 SpeculativeGraphCaptureOutputs: TypeAlias = tuple[str | None, str, str] | None
 
@@ -2319,29 +2315,48 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         run_once: SpeculativeGraphCaptureOperation,
     ) -> tuple[str | None, str, str] | None:
         """Lazily capture and replay one complete, compact-acceptance round."""
-        signature = self.predictor_graph_signature(
-            batch_size, workspace.semantic_positions[:batch_size]
-        )
-        if signature is None:
-            return None
+        if workspace.full_round_graph_lookup_ready:
+            graph_entry = workspace.full_round_graph_entries.get(verify_width)
+            if graph_entry is None:
+                return None
+            else:
+                pass
+            key, graph = graph_entry
+        else:
+            signature = self.predictor_graph_signature(
+                batch_size, workspace.semantic_positions[:batch_size]
+            )
+            if signature is None:
+                return None
+            else:
+                pass
+            # Full-round graphs use exact batch shapes, so the exact live batch
+            # is its bucket. Padding the complete mutable frame state is not
+            # supported.
+            key = (
+                batch_size,
+                verify_width,
+                signature,
+                self.code_predictor_spec_probability_backend,
+                self.code_predictor_spec_lm_head_backend,
+                self.code_predictor_spec_rng_backend,
+                self.code_predictor_spec_acceptance_backend,
+            )
+            graph = self.code_predictor_spec_round_graphs.get(key)
+        if graph is not None:
+            graph.replay()
+            self.code_predictor_spec_full_round_graph_replay_count += 1
+            return (
+                graph.proposal_probability_backend,
+                graph.target_probability_backend,
+                "compact",
+            )
         else:
             pass
-        # Full-round graphs use exact batch shapes, so the exact live batch is
-        # its bucket. Padding the complete mutable frame state is not supported.
-        key = (
-            batch_size,
-            verify_width,
-            signature,
-            self.code_predictor_spec_probability_backend,
-            self.code_predictor_spec_lm_head_backend,
-            self.code_predictor_spec_rng_backend,
-            self.code_predictor_spec_acceptance_backend,
-        )
         if key in self.code_predictor_spec_round_graph_disabled:
             return None
         else:
             pass
-        graph = self.code_predictor_spec_round_graphs.get(key)
         if graph is None:
             if (
                 len(self.code_predictor_spec_round_graphs)
@@ -2410,6 +2425,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                 graph_pool=graph_pool,
             )
             self.code_predictor_spec_round_graphs[key] = graph
+            if workspace.full_round_graph_lookup_ready:
+                workspace.full_round_graph_entries[verify_width] = (key, graph)
+            else:
+                pass
             self.code_predictor_spec_full_round_graph_capture_count += 1
             self.code_predictor_spec_full_round_graph_capture_time_ms += elapsed_ms
             self.code_predictor_spec_graph_capture_time_ms += elapsed_ms
@@ -2608,6 +2627,9 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             pass
         maximum_frame_width, _ = frame_path
         workspace = self.ensure_code_predictor_speculative_workspace()
+        workspace.full_round_graph_lookup_ready = False
+        workspace.full_round_graph_entries.clear()
+        use_full_round_graph = self.code_predictor_spec_backend == "full_round_graph"
         packed_head_weights = self.code_predictor_spec_lm_head_weights
         if packed_head_weights is None:
             raise RuntimeError("grouped Predictor head weights are unavailable")
@@ -2659,6 +2681,12 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         self.code_predictor_spec_fused_predictor_forward_count += 1
         metadata_device = workspace.metadata_device
         metadata_host = workspace.metadata_host
+        metadata_device_rows = metadata_device[:batch_size]
+        metadata_host_rows = metadata_host[:batch_size]
+        metadata_host_is_pinned = metadata_host.is_pinned()
+        current_stream = self.predictor_device_module.current_stream(
+            self.predictor_device
+        )
         temperatures = self.sub_temperature_tensor[:batch_size]
         top_ks = self.sub_top_k_tensor[:batch_size]
         top_ps = self.sub_top_p_tensor[:batch_size]
@@ -2693,25 +2721,61 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
         else:
             pass
         has_top_p = bool(self.sub_sampled_has_top_p)
-        round_index = 0
-
-        staged_round_width = num_groups - 2
-        while staged_round_width > 0:
-            requested_round_width = min(maximum_frame_width, staged_round_width)
-            verify_width, verify_graph = (
-                self.resolve_code_predictor_speculative_round_path(
-                    batch_size, requested_round_width
-                )
+        if use_full_round_graph:
+            graph_signature = self.predictor_graph_signature(
+                batch_size, semantic_positions
             )
-            if (
-                self.code_predictor_spec_backend == "full_round_graph"
-                and verify_graph is not None
-            ):
-                raise RuntimeError(
-                    "full-round graph must not replay a nested verifier graph"
-                )
+            if graph_signature is not None:
+                for graph_width in range(1, maximum_frame_width + 1):
+                    graph_key = (
+                        batch_size,
+                        graph_width,
+                        graph_signature,
+                        self.code_predictor_spec_probability_backend,
+                        self.code_predictor_spec_lm_head_backend,
+                        self.code_predictor_spec_rng_backend,
+                        self.code_predictor_spec_acceptance_backend,
+                    )
+                    workspace.full_round_graph_entries[graph_width] = (
+                        graph_key,
+                        self.code_predictor_spec_round_graphs.get(graph_key),
+                    )
+                else:
+                    pass
             else:
                 pass
+            workspace.full_round_graph_lookup_ready = True
+        else:
+            pass
+        round_index = 0
+        local_round_count = 0
+        local_proposed_count = 0
+        local_accepted_count = 0
+        local_committed_count = 0
+        local_bonus_count = 0
+        local_rejection_count = 0
+        local_packed_forward_count = 0
+        local_fused_forward_count = 0
+        local_draft_evaluation_count = 0
+        local_target_evaluation_count = 0
+        local_packed_query_slots = 0
+        local_padded_query_slots = 0
+        local_eager_round_count = 0
+        local_graph_replay_count = 0
+        local_width_histogram: dict[int, int] = {}
+        local_probability_backend_counts = {
+            "split_top_k": 0,
+            "radix_compact": 0,
+            "radix_compact_4bit": 0,
+        }
+        local_acceptance_backend_counts = {"compact": 0, "dense_indexed": 0}
+
+        round_uniforms = workspace.uniforms[:batch_size]
+
+        def prepare_speculative_round_operation(
+            verify_width: int,
+            verify_graph: PredictorSpeculativeVerifyGraph | None,
+        ) -> SpeculativeGraphCaptureOperation:
             proposal_width = verify_width - 1
             round_workspace = workspace.rounds[verify_width]
             proposal_rows = batch_size * proposal_width
@@ -2768,23 +2832,6 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
             target_temperatures = round_workspace.target_temperatures[:target_rows]
             target_top_ks = round_workspace.target_top_ks[:target_rows]
             target_top_ps = round_workspace.target_top_ps[:target_rows]
-            workspace.round_index.fill_(round_index)
-            round_uniforms = workspace.uniforms[:batch_size]
-            if frame_rng_pool is not None:
-                round_uniforms[:, 0, :proposal_width].copy_(
-                    frame_rng_pool[:, 0, round_index, :proposal_width]
-                )
-                round_uniforms[:, 1, :proposal_width].copy_(
-                    frame_rng_pool[:, 1, round_index, :proposal_width]
-                )
-                round_uniforms[:, 2, :verify_width].copy_(
-                    frame_rng_pool[:, 2, round_index, :verify_width]
-                )
-                round_uniforms[:, 3, :verify_width].copy_(
-                    frame_rng_pool[:, 3, round_index, :verify_width]
-                )
-            else:
-                pass
 
             def run_round_device_ops() -> tuple[str | None, str, str]:
                 with self.code_predictor_spec_nvtx_range("proposal preparation"):
@@ -3143,7 +3190,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                         committed_depths,
                         logical_kv_lengths,
                         active_rows,
-                        metadata_device[:batch_size],
+                        metadata_device_rows,
                         num_groups,
                     )
                 return (
@@ -3152,109 +3199,208 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, nn.Module):
                     actual_acceptance_backend,
                 )
 
-            if self.code_predictor_spec_backend == "full_round_graph":
-                actual_backends = self.try_replay_full_round_graph(
-                    batch_size,
-                    verify_width,
-                    workspace,
-                    run_round_device_ops,
-                )
-                if actual_backends is None:
-                    actual_backends = run_round_device_ops()
-                    self.code_predictor_spec_eager_round_count += 1
-                else:
-                    pass
-            else:
-                actual_backends = run_round_device_ops()
-                if verify_graph is None:
-                    self.code_predictor_spec_eager_round_count += 1
-                else:
-                    self.code_predictor_spec_graph_replay_count += 1
-            (
-                actual_proposal_backend,
-                actual_target_backend,
-                actual_acceptance_backend,
-            ) = actual_backends
-            if actual_proposal_backend is not None:
-                self.record_code_predictor_spec_probability_backend(
-                    actual_proposal_backend
+            return run_round_device_ops
+
+        current_round_width = 0
+        current_round_graph: PredictorSpeculativeVerifyGraph | None = None
+        current_round_operation: SpeculativeGraphCaptureOperation | None = None
+
+        def run_round_device_ops() -> tuple[str | None, str, str]:
+            nonlocal current_round_operation
+            if current_round_operation is None:
+                current_round_operation = prepare_speculative_round_operation(
+                    current_round_width, current_round_graph
                 )
             else:
                 pass
-            self.record_code_predictor_spec_probability_backend(actual_target_backend)
-            self.code_predictor_spec_acceptance_backend_execution_counts[
-                actual_acceptance_backend
-            ] += 1
-            with self.code_predictor_spec_nvtx_range("metadata D2H"):
-                metadata_host[:batch_size].copy_(
-                    metadata_device[:batch_size],
-                    non_blocking=metadata_host.is_pinned(),
+            return current_round_operation()
+
+        staged_round_width = num_groups - 2
+        try:
+            while staged_round_width > 0:
+                requested_round_width = min(maximum_frame_width, staged_round_width)
+                verify_width, verify_graph = (
+                    self.resolve_code_predictor_speculative_round_path(
+                        batch_size, requested_round_width
+                    )
                 )
-            current_stream = self.predictor_device_module.current_stream(
-                self.predictor_device
-            )
-            with self.code_predictor_spec_nvtx_range("host synchronization"):
-                current_stream.synchronize()
-            with self.code_predictor_spec_nvtx_range("CPU orchestration"):
-                round_metadata_rows = metadata_host[:batch_size].tolist()
-                if any(row[8] != 0 for row in round_metadata_rows):
+                if use_full_round_graph and verify_graph is not None:
                     raise RuntimeError(
-                        "compact speculative acceptance produced invalid probability mass"
+                        "full-round graph must not replay a nested verifier graph"
                     )
                 else:
                     pass
-            active_count = sum(row[1] for row in round_metadata_rows)
-            self.code_predictor_spec_correction_forward_watch = any(
-                row[5] != 0 for row in round_metadata_rows
+                proposal_width = verify_width - 1
+                workspace.round_index.fill_(round_index)
+                if frame_rng_pool is not None:
+                    round_uniforms[:, 0, :proposal_width].copy_(
+                        frame_rng_pool[:, 0, round_index, :proposal_width]
+                    )
+                    round_uniforms[:, 1, :proposal_width].copy_(
+                        frame_rng_pool[:, 1, round_index, :proposal_width]
+                    )
+                    round_uniforms[:, 2, :verify_width].copy_(
+                        frame_rng_pool[:, 2, round_index, :verify_width]
+                    )
+                    round_uniforms[:, 3, :verify_width].copy_(
+                        frame_rng_pool[:, 3, round_index, :verify_width]
+                    )
+                else:
+                    pass
+
+                current_round_width = verify_width
+                current_round_graph = verify_graph
+                current_round_operation = None
+
+                if use_full_round_graph:
+                    actual_backends = self.try_replay_full_round_graph(
+                        batch_size,
+                        verify_width,
+                        workspace,
+                        run_round_device_ops,
+                    )
+                    if actual_backends is None:
+                        actual_backends = run_round_device_ops()
+                        local_eager_round_count += 1
+                    else:
+                        pass
+                else:
+                    actual_backends = run_round_device_ops()
+                    if verify_graph is None:
+                        local_eager_round_count += 1
+                    else:
+                        local_graph_replay_count += 1
+                (
+                    actual_proposal_backend,
+                    actual_target_backend,
+                    actual_acceptance_backend,
+                ) = actual_backends
+                if actual_proposal_backend is not None:
+                    local_probability_backend_counts[actual_proposal_backend] += 1
+                else:
+                    pass
+                local_probability_backend_counts[actual_target_backend] += 1
+                local_acceptance_backend_counts[actual_acceptance_backend] += 1
+                with self.code_predictor_spec_nvtx_range("metadata D2H"):
+                    metadata_host_rows.copy_(
+                        metadata_device_rows,
+                        non_blocking=metadata_host_is_pinned,
+                    )
+                with self.code_predictor_spec_nvtx_range("host synchronization"):
+                    current_stream.synchronize()
+                with self.code_predictor_spec_nvtx_range("CPU orchestration"):
+                    round_metadata_rows = metadata_host_rows.tolist()
+                    if any(row[8] != 0 for row in round_metadata_rows):
+                        raise RuntimeError(
+                            "compact speculative acceptance produced invalid probability mass"
+                        )
+                    else:
+                        pass
+                active_count = 0
+                proposed_count = 0
+                accepted_count = 0
+                committed_count = 0
+                bonus_count = 0
+                rejection_count = 0
+                valid_target_count = 0
+                next_depths: list[int] = []
+                next_active_rows: list[bool] = []
+                for row in round_metadata_rows:
+                    active_count += row[1]
+                    proposed_count += row[2]
+                    accepted_count += row[0]
+                    committed_count += row[3]
+                    bonus_count += row[4]
+                    rejection_count += row[5]
+                    valid_target_count += row[6]
+                    next_depths.append(row[7])
+                    next_active_rows.append(bool(row[1]))
+                else:
+                    pass
+                self.code_predictor_spec_correction_forward_watch = any(
+                    row[5] != 0 for row in round_metadata_rows
+                )
+                local_round_count += 1
+                local_proposed_count += proposed_count
+                local_accepted_count += accepted_count
+                local_committed_count += committed_count
+                local_bonus_count += bonus_count
+                local_rejection_count += rejection_count
+                local_packed_forward_count += 1
+                local_fused_forward_count += 1
+                local_draft_evaluation_count += proposed_count
+                local_target_evaluation_count += valid_target_count
+                local_width_histogram[verify_width] = (
+                    local_width_histogram.get(verify_width, 0) + 1
+                )
+                graph_batch_size = (
+                    batch_size if verify_graph is None else verify_graph.batch_size
+                )
+                packed_query_slots = graph_batch_size * verify_width
+                local_packed_query_slots += packed_query_slots
+                local_padded_query_slots += packed_query_slots - valid_target_count
+                round_index += 1
+                if active_count == 0:
+                    break
+                else:
+                    pass
+                staged_round_width = resolve_speculative_round_width(
+                    maximum_frame_width,
+                    maximum_frame_width,
+                    num_groups,
+                    next_depths,
+                    next_active_rows,
+                )
+        finally:
+            self.code_predictor_spec_round_count += local_round_count
+            self.code_predictor_spec_proposed_count += local_proposed_count
+            self.code_predictor_spec_accepted_count += local_accepted_count
+            self.code_predictor_spec_committed_count += local_committed_count
+            self.code_predictor_spec_bonus_count += local_bonus_count
+            self.code_predictor_spec_rejection_count += local_rejection_count
+            self.code_predictor_spec_packed_forward_count += local_packed_forward_count
+            self.code_predictor_spec_fused_predictor_forward_count += (
+                local_fused_forward_count
             )
-            self.code_predictor_spec_round_count += 1
-            self.code_predictor_spec_proposed_count += sum(
-                row[2] for row in round_metadata_rows
-            )
-            self.code_predictor_spec_accepted_count += sum(
-                row[0] for row in round_metadata_rows
-            )
-            self.code_predictor_spec_committed_count += sum(
-                row[3] for row in round_metadata_rows
-            )
-            self.code_predictor_spec_bonus_count += sum(
-                row[4] for row in round_metadata_rows
-            )
-            self.code_predictor_spec_rejection_count += sum(
-                row[5] for row in round_metadata_rows
-            )
-            self.code_predictor_spec_packed_forward_count += 1
-            self.code_predictor_spec_effective_width_histogram[verify_width] = (
-                self.code_predictor_spec_effective_width_histogram.get(verify_width, 0)
-                + 1
-            )
-            self.code_predictor_spec_fused_predictor_forward_count += 1
-            draft_evaluation_count = sum(row[2] for row in round_metadata_rows)
-            valid_target_count = sum(row[6] for row in round_metadata_rows)
             self.code_predictor_spec_draft_head_evaluation_count += (
-                draft_evaluation_count
+                local_draft_evaluation_count
             )
-            self.code_predictor_spec_target_head_evaluation_count += valid_target_count
-            graph_batch_size = (
-                batch_size if verify_graph is None else verify_graph.batch_size
+            self.code_predictor_spec_target_head_evaluation_count += (
+                local_target_evaluation_count
             )
-            packed_query_slots = graph_batch_size * verify_width
-            self.code_predictor_spec_packed_query_slots += packed_query_slots
-            self.code_predictor_spec_padded_query_slots += (
-                packed_query_slots - valid_target_count
-            )
-            round_index += 1
-            if active_count == 0:
-                break
+            self.code_predictor_spec_packed_query_slots += local_packed_query_slots
+            self.code_predictor_spec_padded_query_slots += local_padded_query_slots
+            self.code_predictor_spec_eager_round_count += local_eager_round_count
+            self.code_predictor_spec_graph_replay_count += local_graph_replay_count
+            for width, count in local_width_histogram.items():
+                self.code_predictor_spec_effective_width_histogram[width] = (
+                    self.code_predictor_spec_effective_width_histogram.get(width, 0)
+                    + count
+                )
             else:
                 pass
-            staged_round_width = resolve_speculative_round_width(
-                maximum_frame_width,
-                maximum_frame_width,
-                num_groups,
-                [row[7] for row in round_metadata_rows],
-                [bool(row[1]) for row in round_metadata_rows],
-            )
+            for backend, count in local_probability_backend_counts.items():
+                self.code_predictor_spec_probability_backend_execution_counts[
+                    backend
+                ] += count
+                if (
+                    self.code_predictor_spec_probability_backend
+                    in ("radix_compact", "radix_compact_4bit")
+                    and backend == "split_top_k"
+                ):
+                    self.code_predictor_spec_probability_backend_fallback_count += count
+                else:
+                    pass
+            else:
+                pass
+            for backend, count in local_acceptance_backend_counts.items():
+                self.code_predictor_spec_acceptance_backend_execution_counts[
+                    backend
+                ] += count
+            else:
+                pass
+            workspace.full_round_graph_lookup_ready = False
+            workspace.full_round_graph_entries.clear()
 
         self.code_predictor_spec_correction_forward_watch = False
         self.code_predictor_spec_frame_count += batch_size

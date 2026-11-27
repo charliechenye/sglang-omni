@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal, Protocol, TypeAlias
 
 import torch
 
@@ -11,6 +12,20 @@ from sglang_omni.models.qwen3_tts.speculative_acceptance import (
     SpeculativeAcceptanceBatch,
 )
 from sglang_omni.models.qwen3_tts.speculative_prepare import SpeculativeVerifierInputs
+
+PredictorGraphSignature: TypeAlias = tuple[
+    Literal["argmax", "sampled"], int, bool, bool, bool
+]
+PredictorSpeculativeRoundGraphKey: TypeAlias = tuple[
+    int, int, PredictorGraphSignature, str, str, str, str
+]
+
+
+class PredictorSpeculativeRoundGraphHandle(Protocol):
+    proposal_probability_backend: str | None
+    target_probability_backend: str
+
+    def replay(self) -> None: ...
 
 
 def compact_candidate_view(
@@ -136,6 +151,14 @@ class PredictorSpeculativeWorkspace:
         )
         self.active_rows = torch.empty(max_batch_size, device=device, dtype=torch.bool)
         self.rounds: dict[int, PredictorSpeculativeRoundWorkspace] = {}
+        self.full_round_graph_lookup_ready = False
+        self.full_round_graph_entries: dict[
+            int,
+            tuple[
+                PredictorSpeculativeRoundGraphKey,
+                PredictorSpeculativeRoundGraphHandle | None,
+            ],
+        ] = {}
         for verify_width in range(1, max_verify_width + 1):
             proposal_width = verify_width - 1
             proposal_row_count = max_batch_size * proposal_width

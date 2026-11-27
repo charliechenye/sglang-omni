@@ -52,6 +52,9 @@ class SpeculativeRoundObservation:
     accepted_count: int
     starting_depth: int
     ending_depth: int
+    metadata: torch.Tensor
+    pending_tokens: torch.Tensor
+    active_rows: torch.Tensor
     preceding_hidden: torch.Tensor
     logical_kv_length: int
     keys: torch.Tensor
@@ -331,6 +334,17 @@ def observe_speculative_rounds(
                     accepted_count=accepted_count,
                     starting_depth=starting_depth,
                     ending_depth=ending_depth,
+                    metadata=talker.code_predictor_spec_metadata_host[
+                        : talker.sub_batch_size
+                    ]
+                    .detach()
+                    .clone(),
+                    pending_tokens=workspace.pending_tokens[: talker.sub_batch_size]
+                    .detach()
+                    .clone(),
+                    active_rows=workspace.active_rows[: talker.sub_batch_size]
+                    .detach()
+                    .clone(),
                     preceding_hidden=workspace.preceding_hidden[0].detach().clone(),
                     logical_kv_length=valid_length,
                     keys=talker.predictor_k_cache[:, :1, :valid_length]
