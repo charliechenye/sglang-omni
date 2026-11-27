@@ -216,7 +216,8 @@ func (m *Manager) Start(req StartRequest) (string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &run{
 		m: m, id: m.cfg.NewID(), req: req, settings: m.cfg.Settings(), ctx: ctx, cancel: cancel,
-		stop: make(chan struct{}), recorded: make(chan struct{}), pcm: newPCMBuffer(),
+		headStartPauseMilliseconds: configuredHeadStartPauseMilliseconds(),
+		stop:                       make(chan struct{}), recorded: make(chan struct{}), pcm: newPCMBuffer(),
 		svcResolved: make(chan struct{}), cleanupWake: make(chan struct{}, 1), cleanupGeneration: 1,
 	}
 	r.llmCtx, r.llmStop = context.WithCancel(ctx)

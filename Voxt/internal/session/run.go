@@ -133,9 +133,10 @@ type run struct {
 	liveOff  bool
 	// head asks the language model about the live text ahead of the Final
 	// (headstart.go); silent tells the recording loop of the user's pauses.
-	head       headStart
-	silent     chan bool
-	pauseWatch *pauseWatch // written before feed workers start; read by the owner
+	head                       headStart
+	headStartPauseMilliseconds int // fixed when the session starts
+	silent                     chan bool
+	pauseWatch                 *pauseWatch // written before feed workers start; read by the owner
 }
 
 type capResult struct {

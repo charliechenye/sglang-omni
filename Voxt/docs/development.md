@@ -30,6 +30,14 @@ open --env VOXT_EXPERIMENT_CLEANUP_FALLBACK_MS=1500 build/darwin-arm64/Voxt.app
 
 Use `0` to disable it. Values from 1 to 60000 enable the experiment; invalid or larger values are ignored with a warning in the session log. The option applies only to ordinary Transcribe dictation.
 
+**Developer-only HeadStart pause experiment:** the default remains 500 ms and nothing is saved in user settings. After building the app, set `VOXT_EXPERIMENT_HEADSTART_PAUSE_MS` when launching the macOS bundle to try one of the fixed arms:
+
+```sh
+open --env VOXT_EXPERIMENT_HEADSTART_PAUSE_MS=300 build/darwin-arm64/Voxt.app
+```
+
+Accepted values are `100`, `150`, `300` and `500` ms; unset or invalid values use 500 ms. The dedicated HeadStart detector analyzes 20 ms frames, so 150 ms resolves to 160 ms. Captured PCM arrives in 100 ms chunks, which can delay the notification until the containing chunk is processed. This changes only speculative HeadStart timing; it does not change authoritative ASR VAD, EndWord detection, cleanup matching or final delivery.
+
 **The release build** is one command, on the Mac: `scripts/release.sh` builds the helper and the Omni runtime, packages and signs the app, and checks the result (`--runtimes DIR` takes prebuilt runtimes; with a Developer ID identity, `--notarize` notarises it; over ssh it runs through `scripts/mac-gui.sh`). A release is that build on GitHub: a `voxt-vX.Y.Z` tag runs the Voxt Release workflow, which signs it with the Developer ID of the team RY2TQTYSKQ, notarises it and puts its disk image and signed update files on a draft GitHub release. Local builds without a feed keep the GitHub update check. See [docs/release.md](release.md).
 
 From Linux, `scripts/mac.sh <command>` mirrors the project to a Mac (`MAC_HOST`, default `mac-air`; `MAC_DIR`, default `code/VoxtNew`) and runs the command there: `scripts/mac.sh 'scripts/build-helper.sh && go tool mygo build'`.
