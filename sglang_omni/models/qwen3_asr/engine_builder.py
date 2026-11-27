@@ -10,12 +10,9 @@ from typing import Callable
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
-from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_hip_version, is_gfx95_supported
 from transformers import (
@@ -42,19 +39,6 @@ from sglang_omni.models.qwen3_asr.encoder_service import (
 )
 from sglang_omni.models.qwen3_asr.request_builders import Qwen3ASRRequestData
 from sglang_omni.models.qwen3_asr.sglang_model import Qwen3ASRForConditionalGeneration
-from sglang_omni.models.qwen3_asr.temporal_prefill import (
-    Qwen3ASRTemporalPrefillCudaGraphRunner,
-)
-from sglang_omni.models.qwen3_asr.temporal_scheduler import Qwen3ASRTemporalScheduler
-from sglang_omni.models.qwen3_asr.temporal_verification import (
-    Qwen3ASRTemporalForward,
-    Qwen3ASRTemporalLogitsProcessor,
-    Qwen3ASRTemporalLogitsProcessorOutput,
-    Qwen3ASRTemporalRunnerOutput,
-    attach_temporal_forward_inputs,
-    clear_temporal_forward_inputs,
-    verify_greedy_candidates,
-)
 from sglang_omni.models.qwen3_asr.torch_mps_runner import Qwen3ASRTorchMpsModelRunner
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.npu import validate_npu_graph_environment
@@ -71,12 +55,7 @@ from sglang_omni.scheduling.generation_batch_policy import (
 )
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
-from sglang_omni.scheduling.types import (
-    DeferredAdmission,
-    ModelRunnerOutput,
-    SchedulerOutput,
-    SchedulerRequest,
-)
+from sglang_omni.scheduling.types import DeferredAdmission
 from sglang_omni.utils.gpu_compat import get_visible_gpu_sm_version
 from sglang_omni.utils.gpu_memory import format_bytes_gib, get_process_gpu_memory_bytes
 
@@ -97,160 +76,6 @@ class Qwen3ASRModelRunner(ModelRunner[Qwen3ASRRequestData]):
     speculative_repetition_penalty_owner = (
         "verify_logits" if current_platform.is_cuda() else None
     )
-
-
-class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
-    supports_speculative_async_decode: bool = False
-
-    def before_prefill(
-        self,
-        forward_batch: ForwardBatch | None,
-        schedule_batch: ScheduleBatch,
-        requests: list[SchedulerRequest],
-    ) -> None:
-        if not requests or not isinstance(requests[0].data, Qwen3ASRRequestData):
-            return
-        else:
-            pass
-        request_data = requests[0].data
-        temporal_request = request_data.temporal_request
-        if temporal_request is None:
-            return
-        else:
-            pass
-        if not temporal_request.admitted:
-            return
-        elif (
-            forward_batch is None or len(requests) != 1 or len(schedule_batch.reqs) != 1
-        ):
-            raise RuntimeError("Qwen3-ASR temporal forward lost its isolated row")
-        else:
-            pass
-        if temporal_request.prompt_boundary + len(
-            temporal_request.candidate_token_ids
-        ) != len(schedule_batch.input_ids):
-            raise RuntimeError(
-                "Qwen3-ASR temporal input boundary changed before forward"
-            )
-        else:
-            pass
-        attach_temporal_forward_inputs(
-            forward_batch,
-            Qwen3ASRTemporalForward(
-                request_id=requests[0].request_id,
-                prompt_boundary=temporal_request.prompt_boundary,
-                candidate_token_ids=temporal_request.candidate_token_ids,
-            ),
-        )
-
-    def cleanup_prefill(
-        self,
-        forward_batch: ForwardBatch | None,
-        schedule_batch: ScheduleBatch,
-        requests: list[SchedulerRequest],
-    ) -> None:
-        del schedule_batch, requests
-        clear_temporal_forward_inputs(forward_batch)
-
-    def post_prefill(
-        self,
-        result: GenerationBatchResult,
-        forward_batch: ForwardBatch | None,
-        schedule_batch: ScheduleBatch,
-        requests: list[SchedulerRequest],
-    ) -> None:
-        if not requests or not isinstance(requests[0].data, Qwen3ASRRequestData):
-            return
-        else:
-            pass
-        temporal_request = requests[0].data.temporal_request
-        if temporal_request is None or not temporal_request.admitted:
-            return
-        else:
-            pass
-        logits_output = result.logits_output
-        if not isinstance(logits_output, Qwen3ASRTemporalLogitsProcessorOutput):
-            raise RuntimeError(
-                "Qwen3-ASR admitted temporal prefill did not return a verification"
-            )
-        else:
-            pass
-        target_token_ids = logits_output.target_token_ids
-        if (
-            target_token_ids is None
-            or target_token_ids.numel() != len(temporal_request.candidate_token_ids) + 1
-            or len(schedule_batch.reqs) != 1
-            or len(schedule_batch.input_ids)
-            != temporal_request.prompt_boundary
-            + len(temporal_request.candidate_token_ids)
-        ):
-            raise RuntimeError(
-                "Qwen3-ASR temporal target rows differ from the admitted prefill"
-            )
-        elif requests[0].request_id != temporal_request.context.request_id:
-            raise RuntimeError("Qwen3-ASR temporal result lost request ownership")
-        else:
-            pass
-        verification = verify_greedy_candidates(
-            request_id=requests[0].request_id,
-            row_index=0,
-            prompt_boundary=temporal_request.prompt_boundary,
-            candidate_token_ids=temporal_request.candidate_token_ids,
-            target_token_ids=[int(token_id) for token_id in target_token_ids.tolist()],
-        )
-        logits_output.temporal_verification = verification
-        logits_output.target_token_ids = None
-        next_token_ids = result.next_token_ids
-        if next_token_ids is None:
-            next_token_ids = self.sample_next_token_ids(
-                logits_output,
-                forward_batch,
-                schedule_batch,
-                requests,
-            )
-        else:
-            pass
-        if next_token_ids is None:
-            raise RuntimeError("Qwen3-ASR temporal prefill has no pending token")
-        else:
-            pass
-        result.next_token_ids = next_token_ids.clone()
-        result.next_token_ids[verification.row_index] = verification.pending_token_id
-
-    def finalize(
-        self,
-        batch_result: GenerationBatchResult,
-        forward_batch: ForwardBatch | None,
-        schedule_batch: ScheduleBatch,
-        scheduler_output: SchedulerOutput,
-        skip_rids: set[str] | None = None,
-    ) -> ModelRunnerOutput:
-        output = super().finalize(
-            batch_result,
-            forward_batch,
-            schedule_batch,
-            scheduler_output,
-            skip_rids=skip_rids,
-        )
-        logits_output = batch_result.logits_output
-        if not isinstance(logits_output, Qwen3ASRTemporalLogitsProcessorOutput):
-            return output
-        else:
-            pass
-        verification = logits_output.temporal_verification
-        if verification is None:
-            return output
-        else:
-            pass
-        return Qwen3ASRTemporalRunnerOutput(
-            outputs=output.outputs,
-            req_ids=output.req_ids,
-            req_id_to_index=output.req_id_to_index,
-            can_run_cuda_graph=output.can_run_cuda_graph,
-            next_token_ids=output.next_token_ids,
-            host_token_ids=output.host_token_ids,
-            temporal_verification=verification,
-        )
 
 
 class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
@@ -454,6 +279,10 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         else:
             pass
         if self.enable_temporal_final_verification:
+            from sglang_omni.models.qwen3_asr.temporal_runner import (
+                Qwen3ASRTemporalModelRunner,
+            )
+
             return Qwen3ASRTemporalModelRunner(model_worker, output_proc)
         else:
             return Qwen3ASRModelRunner(model_worker, output_proc)
@@ -469,6 +298,13 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
     ) -> None:
         del device, gpu_id, server_args
         if self.enable_temporal_final_verification:
+            from sglang_omni.models.qwen3_asr.temporal_prefill import (
+                Qwen3ASRTemporalPrefillCudaGraphRunner,
+            )
+            from sglang_omni.models.qwen3_asr.temporal_verification import (
+                Qwen3ASRTemporalLogitsProcessor,
+            )
+
             model_worker.model_runner.prefill_graph_runner_class = (
                 Qwen3ASRTemporalPrefillCudaGraphRunner
             )
@@ -837,6 +673,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
             | None
         ),
         result_adapter: Callable[[Qwen3ASRRequestData], StagePayload] | None,
+        extra_scheduler_kwargs: SchedulerExtras[Qwen3ASRRequestData],
     ) -> OmniScheduler[Qwen3ASRRequestData]:
         if not self.enable_temporal_final_verification:
             return super().make_scheduler(
@@ -849,11 +686,12 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
                 model_runner=model_runner,
                 request_builder=request_builder,
                 result_adapter=result_adapter,
+                extra_scheduler_kwargs=extra_scheduler_kwargs,
             )
         else:
             pass
 
-        scheduler_kwargs = {
+        scheduler_arguments = {
             "tp_worker": model_worker,
             "tree_cache": tree_cache,
             "req_to_token_pool": req_to_token_pool,
@@ -866,9 +704,13 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
             "abort_callback": self.make_abort_callback(),
             "request_finished_callback": self.make_request_finished_callback(),
         }
-        scheduler_kwargs.update(self.extra_scheduler_callbacks())
-        scheduler_kwargs.update(self.extra_scheduler_kwargs())
-        return Qwen3ASRTemporalScheduler(**scheduler_kwargs)
+        scheduler_arguments.update(self.extra_scheduler_callbacks())
+        scheduler_arguments.update(extra_scheduler_kwargs)
+        from sglang_omni.models.qwen3_asr.temporal_scheduler import (
+            Qwen3ASRTemporalScheduler,
+        )
+
+        return Qwen3ASRTemporalScheduler(**scheduler_arguments)
 
     def make_abort_callback(self) -> Callable[[str], None] | None:
         if self.torch_mps_model_runner is None:

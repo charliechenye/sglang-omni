@@ -44,7 +44,7 @@ class Qwen3ASRTemporalVerification:
 @dataclass(slots=True)
 class Qwen3ASRTemporalLogitsProcessorOutput(LogitsProcessorOutput):
     temporal_verification: Qwen3ASRTemporalVerification | None = None
-    target_token_ids: torch.Tensor | None = None
+    pending_token_ids: torch.Tensor | None = None
 
 
 @dataclass(slots=True)
@@ -124,28 +124,34 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         hidden_states: torch.Tensor,
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata | ForwardBatch,
         aux_hidden_states: AuxHiddenStates | None = None,
         hidden_states_before_norm: torch.Tensor | None = None,
     ) -> LogitsProcessorOutput:
-        native_output = self.native_processor(
-            input_ids,
-            hidden_states,
-            lm_head,
-            logits_metadata,
-            aux_hidden_states,
-            hidden_states_before_norm,
-        )
         if not isinstance(logits_metadata, ForwardBatch):
-            return native_output
+            return self.native_processor(
+                input_ids,
+                hidden_states,
+                lm_head,
+                logits_metadata,
+                aux_hidden_states,
+                hidden_states_before_norm,
+            )
         else:
             pass
         temporal_forward = get_temporal_forward_inputs(logits_metadata)
         if temporal_forward is None:
-            return native_output
+            return self.native_processor(
+                input_ids,
+                hidden_states,
+                lm_head,
+                logits_metadata,
+                aux_hidden_states,
+                hidden_states_before_norm,
+            )
         else:
             pass
         if not logits_metadata.forward_mode.is_extend():
@@ -163,11 +169,35 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
 
         candidate_token_count = len(temporal_forward.candidate_token_ids)
         expected_input_rows = temporal_forward.prompt_boundary + candidate_token_count
+        forward_input_ids = logits_metadata.input_ids.reshape(-1)
+        expected_candidate_ids = torch.tensor(
+            temporal_forward.candidate_token_ids,
+            dtype=forward_input_ids.dtype,
+            device=forward_input_ids.device,
+        )
+        expected_positions = torch.arange(
+            expected_input_rows,
+            dtype=logits_metadata.positions.dtype,
+            device=logits_metadata.positions.device,
+        )
         if (
             temporal_forward.prompt_boundary <= 0
-            or input_ids.numel() != expected_input_rows
+            or candidate_token_count <= 0
+            or forward_input_ids.numel() != expected_input_rows
+            or (
+                input_ids is not None
+                and not torch.equal(input_ids.reshape(-1), forward_input_ids)
+            )
+            or not torch.equal(
+                forward_input_ids[-candidate_token_count:], expected_candidate_ids
+            )
+            or logits_metadata.positions.numel() != expected_input_rows
+            or not torch.equal(
+                logits_metadata.positions.reshape(-1), expected_positions
+            )
             or hidden_states.shape[0] != expected_input_rows
             or logits_metadata.extend_seq_lens_cpu != [expected_input_rows]
+            or logits_metadata.extend_prefix_lens_cpu != [0]
         ):
             raise RuntimeError(
                 "Qwen3-ASR temporal prefill does not contain its exact unpadded rows"
@@ -183,6 +213,23 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
             device=hidden_states.device,
         )
         prediction_states = hidden_states.index_select(0, prediction_indices)
+        if hidden_states_before_norm is not None:
+            selected_hidden_states_before_norm = hidden_states_before_norm.index_select(
+                0, prediction_indices
+            )
+        else:
+            selected_hidden_states_before_norm = None
+        if isinstance(aux_hidden_states, torch.Tensor):
+            selected_aux_hidden_states = aux_hidden_states.index_select(
+                0, prediction_indices
+            )
+        elif aux_hidden_states is not None:
+            selected_aux_hidden_states = [
+                auxiliary_hidden_states.index_select(0, prediction_indices)
+                for auxiliary_hidden_states in aux_hidden_states
+            ]
+        else:
+            selected_aux_hidden_states = None
         logits_metadata_view = LogitsMetadata.from_forward_batch(logits_metadata)
         assert logits_metadata_view.extend_seq_lens is not None
         temporal_metadata = replace(
@@ -196,23 +243,42 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
             next_token_logits_buffer=None,
         )
         temporal_output = self.native_processor(
-            input_ids=input_ids.reshape(-1).index_select(0, prediction_indices),
+            input_ids=None,
             hidden_states=prediction_states,
             lm_head=lm_head,
             logits_metadata=temporal_metadata,
+            aux_hidden_states=selected_aux_hidden_states,
+            hidden_states_before_norm=selected_hidden_states_before_norm,
         )
         temporal_logits = temporal_output.next_token_logits
         if temporal_logits is None:
             raise RuntimeError("Native Qwen3-ASR logits processor returned no logits")
         else:
             pass
+        temporal_token_ids = temporal_logits.argmax(-1)
+        verification = verify_greedy_candidates(
+            request_id=temporal_forward.request_id,
+            row_index=0,
+            prompt_boundary=temporal_forward.prompt_boundary,
+            candidate_token_ids=temporal_forward.candidate_token_ids,
+            target_token_ids=[
+                int(token_id) for token_id in temporal_token_ids.tolist()
+            ],
+        )
+        pending_row_index = len(verification.accepted_prefix)
         native_values = {
-            field.name: getattr(native_output, field.name)
+            field.name: getattr(temporal_output, field.name)
             for field in fields(LogitsProcessorOutput)
         }
+        native_values["next_token_logits"] = temporal_logits[
+            pending_row_index : pending_row_index + 1
+        ].clone()
         return Qwen3ASRTemporalLogitsProcessorOutput(
             **native_values,
-            target_token_ids=temporal_logits.argmax(-1),
+            temporal_verification=verification,
+            pending_token_ids=temporal_token_ids[
+                pending_row_index : pending_row_index + 1
+            ].clone(),
         )
 
 
