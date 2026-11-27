@@ -47,11 +47,9 @@ func configuredHeadStartPauseMilliseconds() int {
 // pauseWatch watches the recording for pauses: it tells r.silent when the
 // speech ends (true) and goes on (false); the newest wins.
 type pauseWatch struct {
-	r          *run
-	detector   *vad.Detector
-	frameBytes int
-	speaking   bool
-	quiet      atomic.Bool
+	r        *run
+	detector *vad.Detector
+	quiet    atomic.Bool
 }
 
 func (r *run) watchPauses() *pauseWatch {
@@ -62,10 +60,8 @@ func (r *run) watchPauses() *pauseWatch {
 	if milliseconds == 0 {
 		milliseconds = headHangover
 	}
-	frameMilliseconds := vad.Defaults().FrameMS
 	return &pauseWatch{
-		r: r, detector: vad.NewDetector(asr.SampleRate, vad.Params{FrameMS: frameMilliseconds, HangoverMS: milliseconds}),
-		frameBytes: asr.SampleRate * frameMilliseconds / 1000 * 2,
+		r: r, detector: vad.NewDetector(asr.SampleRate, vad.Params{HangoverMS: milliseconds}),
 	}
 }
 
@@ -74,23 +70,18 @@ func (w *pauseWatch) hear(pcm []byte) {
 	if w == nil {
 		return
 	}
-	transitioned := false
-	for len(pcm) > 0 {
-		frameBytes := min(len(pcm), w.frameBytes)
-		w.detector.Write(pcm[:frameBytes])
-		if speaking := w.detector.Speaking(); speaking != w.speaking {
-			w.speaking = speaking
-			transitioned = true
-		}
-		pcm = pcm[frameBytes:]
-	}
-	if transitioned {
-		w.quiet.Store(!w.speaking)
+	wasHeard := w.detector.Heard()
+	wasQuiet := w.quiet.Load()
+	w.detector.Write(pcm)
+	heard := w.detector.Heard()
+	quiet := heard && !w.detector.Speaking()
+	if quiet != wasQuiet || !wasHeard && heard {
+		w.quiet.Store(quiet)
 		select {
 		case <-w.r.silent:
 		default:
 		}
-		w.r.silent <- !w.speaking
+		w.r.silent <- quiet
 	}
 }
 

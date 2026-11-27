@@ -12,6 +12,12 @@ import (
 	"github.com/sgl-project/sglang-omni/Voxt/internal/lang"
 )
 
+func (r *run) pauseHeadIfQuiet(text string) {
+	if r.pauseWatch != nil && r.pauseWatch.quiet.Load() {
+		r.head.pause(text)
+	}
+}
+
 // listen records and recognises: the recognised text, or false when the
 // session ended (cancelled, failed, too short, nothing heard).
 func (r *run) listen() (string, bool) {
@@ -41,7 +47,6 @@ func (r *run) listen() (string, bool) {
 		said         string
 		endPause     <-chan time.Time
 		stopEndPause func() bool
-		quiet        bool // the user is silent
 		openDone     chan openResult
 		stream       asr.Stream
 		openStarted  bool
@@ -64,11 +69,10 @@ func (r *run) listen() (string, bool) {
 		if !r.head.enabled.Load() {
 			return
 		}
-		quiet = r.pauseWatch != nil && r.pauseWatch.quiet.Load()
 		if stopCh == nil {
 			r.head.ask(said)
-		} else if quiet {
-			r.head.pause(said)
+		} else {
+			r.pauseHeadIfQuiet(said)
 		}
 	}
 	maybeWarm := func() {
@@ -288,18 +292,16 @@ func (r *run) listen() (string, bool) {
 						pause <- r.now()
 					})
 				}
-				switch {
-				case stopCh == nil:
+				if stopCh == nil {
 					endPause = nil
 					r.head.ask(said)
-				case quiet:
-					r.head.pause(said)
+				} else {
+					r.pauseHeadIfQuiet(said)
 				}
 			}
 		case <-r.silent:
-			quiet = r.pauseWatch != nil && r.pauseWatch.quiet.Load()
-			if quiet && stopCh != nil {
-				r.head.pause(said)
+			if stopCh != nil {
+				r.pauseHeadIfQuiet(said)
 			}
 		case <-endPause:
 			clearEndPause()

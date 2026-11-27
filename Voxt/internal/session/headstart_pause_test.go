@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/sgl-project/sglang-omni/Voxt/internal/asr"
+	"github.com/sgl-project/sglang-omni/Voxt/internal/vad"
 )
 
 func TestHeadStartPauseConfiguration(t *testing.T) {
@@ -53,14 +54,21 @@ func TestHeadStartPauseThresholdsUseDetectorFrames(t *testing.T) {
 			for range 3 {
 				watch.hear(speechFrame)
 			}
-			if !watch.detector.Speaking() || watch.quiet.Load() {
-				t.Fatal("detector did not enter speech")
+			if watch.quiet.Load() {
+				t.Fatal("speech was reported as quiet")
 			}
-			<-r.silent
+			if got := <-r.silent; got {
+				t.Fatal("first speech notification reported quiet")
+			}
 			for range tc.frames - 1 {
 				watch.hear(quietFrame)
 				if watch.quiet.Load() {
 					t.Fatalf("pause triggered before %d detector frames", tc.frames)
+				}
+				select {
+				case got := <-r.silent:
+					t.Fatalf("unexpected pause notification before threshold: %v", got)
+				default:
 				}
 			}
 			watch.hear(quietFrame)
@@ -89,7 +97,7 @@ func TestHeadStartSpeechResumingBeforePauseThresholdDoesNotTrigger(t *testing.T)
 	for range 3 {
 		watch.hear(speechFrame)
 	}
-	if watch.quiet.Load() || !watch.detector.Speaking() {
+	if watch.quiet.Load() {
 		t.Fatal("speech resumption did not cancel the pending pause")
 	}
 	select {
@@ -99,36 +107,101 @@ func TestHeadStartSpeechResumingBeforePauseThresholdDoesNotTrigger(t *testing.T)
 	}
 }
 
-func TestHeadStartPauseWatchFindsPauseInBackloggedPCM(t *testing.T) {
-	r := &run{silent: make(chan bool, 1), headStartPauseMilliseconds: 100}
-	watch := r.watchPauses()
-	pcm := append(bytes.Repeat(frame, 10), bytes.Repeat(quietFrame, 1)...)
-	watch.hear(pcm)
-	if !watch.quiet.Load() {
-		t.Fatal("the pause was missed when speech and silence arrived together")
-	}
-	if got := <-r.silent; !got {
-		t.Fatal("the backlogged pause notification was not quiet")
+func TestHeadStartPauseWatchUsesLatestDefaultStateInBufferedPCM(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		pcm       []byte
+		want      bool
+		wantEvent bool
+	}{
+		{name: "leading silence", pcm: bytes.Repeat(quietFrame, 5), want: false, wantEvent: false},
+		{name: "speech then pause in first read", pcm: append(bytes.Repeat(frame, 3), bytes.Repeat(quietFrame, 5)...), want: true, wantEvent: true},
+		{name: "resumed speech in first read", pcm: append(append(bytes.Repeat(frame, 3), bytes.Repeat(quietFrame, 5)...), bytes.Repeat(frame, 3)...), want: false, wantEvent: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &run{silent: make(chan bool, 1), headStartPauseMilliseconds: headHangover}
+			watch := r.watchPauses()
+			watch.hear(tc.pcm)
+			if got := watch.quiet.Load(); got != tc.want {
+				t.Fatalf("quiet state %v, want %v", got, tc.want)
+			}
+			if tc.wantEvent {
+				select {
+				case got := <-r.silent:
+					if got != tc.want {
+						t.Fatalf("notification %v, want state %v", got, tc.want)
+					}
+				default:
+					t.Fatal("the first detected speech or pause state was not notified")
+				}
+				select {
+				case got := <-r.silent:
+					t.Fatalf("buffered read published an intermediate state: %v", got)
+				default:
+				}
+			} else {
+				select {
+				case got := <-r.silent:
+					t.Fatalf("leading silence sent a pause notification: %v", got)
+				default:
+				}
+			}
+		})
 	}
 }
 
-func TestHeadStartPauseWatchCoalescesBackloggedResumption(t *testing.T) {
-	r := &run{silent: make(chan bool, 1), headStartPauseMilliseconds: 100}
-	watch := r.watchPauses()
-	pcm := append(bytes.Repeat(frame, 10), bytes.Repeat(quietFrame, 1)...)
-	pcm = append(pcm, frame...)
-	watch.hear(pcm)
-	if watch.quiet.Load() {
-		t.Fatal("the pause stayed quiet after speech resumed in the same backlog")
+func TestHeadStartPauseWatchPreservesArbitraryChunkBoundaries(t *testing.T) {
+	pcm := append(bytes.Repeat(quietFrame, 2), bytes.Repeat(frame, 5)...)
+	pcm = append(pcm, bytes.Repeat(quietFrame, 8)...)
+	for _, tc := range []struct {
+		name  string
+		sizes []int
+	}{
+		{name: "aligned", sizes: []int{len(frame), len(frame), len(quietFrame), len(quietFrame)}},
+		{name: "unaligned", sizes: []int{1, 317, 1601, 79, 2203, 5, 911}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &run{silent: make(chan bool, 1), headStartPauseMilliseconds: headHangover}
+			watch := r.watchPauses()
+			referenceParams := vad.Defaults()
+			referenceParams.HangoverMS = headHangover
+			reference := vad.NewDetector(asr.SampleRate, referenceParams)
+			for offset, sizeIndex := 0, 0; offset < len(pcm); sizeIndex++ {
+				size := tc.sizes[sizeIndex%len(tc.sizes)]
+				end := min(offset+size, len(pcm))
+				chunk := pcm[offset:end]
+				offset = end
+				watch.hear(chunk)
+				reference.Write(chunk)
+				wantQuiet := reference.Heard() && !reference.Speaking()
+				if got := watch.quiet.Load(); got != wantQuiet {
+					t.Fatalf("after chunk %d, quiet=%v want %v", sizeIndex, got, wantQuiet)
+				}
+			}
+		})
+	}
+}
+
+func TestHeadStartRejectsPartialAfterSpeechResumesWithPauseNotificationPending(t *testing.T) {
+	model := newControlledLiveLLM(false)
+	t.Cleanup(model.close)
+	r := newHeadRun(t, model)
+	r.silent = make(chan bool, 1)
+	r.pauseWatch = &pauseWatch{r: r}
+	r.pauseWatch.quiet.Store(true)
+	r.pauseHeadIfQuiet("we ship on friday")
+	call := waitLiveCall(t, model, "the first quiet-state request")
+	r.pauseWatch.quiet.Store(false)
+	r.silent <- false
+	r.pauseHeadIfQuiet("we ship tomorrow")
+	if got := len(r.head.all()); got != 1 {
+		t.Fatalf("resumed speech retained %d speculative generations, want 1 while an obsolete pause notification is pending", got)
 	}
 	if got := <-r.silent; got {
-		t.Fatal("a stale quiet notification escaped the backlogged resumption")
+		t.Fatal("the pending notification did not report resumed speech")
 	}
-	select {
-	case got := <-r.silent:
-		t.Fatalf("unexpected duplicate notification: %v", got)
-	default:
-	}
+	r.head.drop()
+	givenUp(t, call, "the retained request")
 }
 
 func TestHeadStartExperimentalPauseStartsWhileRecording(t *testing.T) {
