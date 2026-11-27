@@ -7,7 +7,12 @@ import logging
 from array import array
 from collections.abc import Iterable
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    NextBatchPlan,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.managers.scheduler import GenerationBatchResult
 
@@ -24,6 +29,15 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
+    def build_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        with self.request_admission_lock:
+            plan = super().build_new_batch_prefill(running_batch)
+            if plan.batch_to_run is not None:
+                self.cur_batch = plan.batch_to_run
+            else:
+                pass
+            return plan
+
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
         return Qwen3ASRTemporalPrefillAdder
 
@@ -339,7 +353,7 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
         else:
             pass
         replacement_mrope_positions = request.multimodal_inputs.mrope_positions[
-            :, :owned_boundary
+            :, :prompt_boundary
         ].clone()
         replacement_output_ids = array("q", request.output_ids)
         replacement_output_ids.extend(accepted_prefix)

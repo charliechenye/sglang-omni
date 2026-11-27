@@ -2982,6 +2982,9 @@ class OmniScheduler(Generic[RequestDataT]):
                 finally:
                     self.waiting_queue = parked_requests + self.waiting_queue
 
+    def build_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
+        return _Upstream.get_new_batch_prefill(self, running_batch)
+
     def get_coalesced_batch_prefill(
         self, running_batch: ScheduleBatch
     ) -> NextBatchPlan:
@@ -2992,7 +2995,7 @@ class OmniScheduler(Generic[RequestDataT]):
         # so the coalesce hold-off returns an empty plan rather than None.
         waiting = self.prefill_coalesce_waiting_requests(running_batch)
         if waiting is None:
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            return self.build_new_batch_prefill(running_batch)
         else:
             pass
         now = time.perf_counter()
@@ -3011,7 +3014,7 @@ class OmniScheduler(Generic[RequestDataT]):
                 self.admit_imminent_request_builds()
             else:
                 pass
-            return _Upstream.get_new_batch_prefill(self, running_batch)
+            return self.build_new_batch_prefill(running_batch)
 
     def admit_imminent_request_builds(self) -> None:
         """Give a releasing prefill the builds that finish within the wait bound.
