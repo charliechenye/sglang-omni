@@ -187,3 +187,35 @@ def test_qwen_strategy_skips_prefix_until_language_is_known() -> None:
     )
     assert fourth.extra_params["_asr_streaming_prefix_text"] == "hello"
     assert fourth.extra_params["language"] == "English"
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_qwen_strategy_only_propagates_final_context_when_enabled(
+    enabled: bool,
+) -> None:
+    strategy = Qwen3ASRStreamingStrategy(enable_temporal_final_verification=enabled)
+    state = strategy.create_state(model_name="qwen3-asr", language="English")
+    strategy.update_hypothesis(
+        generated_text="hello world",
+        language="English",
+        state=state,
+    )
+    strategy.update_hypothesis(
+        generated_text="hello world",
+        language="English",
+        state=state,
+    )
+
+    final = strategy.build_decode_request(
+        audio=b"wav", state=state, is_final=True, request_id="final-3-1"
+    )
+    refresh = strategy.build_decode_request(
+        audio=b"wav", state=state, is_final=False, request_id="refresh-3-2"
+    )
+
+    if enabled:
+        assert final.internal_realtime_context is not None
+        assert final.internal_realtime_context.is_final
+    else:
+        assert final.internal_realtime_context is None
+    assert refresh.internal_realtime_context is None

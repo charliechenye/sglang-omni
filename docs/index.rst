@@ -244,6 +244,7 @@ Community & Resources
    developer_reference/tts_model_integration.md
    developer_reference/asr_bench.md
    developer_reference/omni_offline_bench.md
+   Qwen3-ASR Final Temporal Verification <design/qwen3_asr_temporal_final_verification.md>
    developer_reference/rl_admin_control.md
    developer_reference/ci_labels.md
    developer_reference/bump_version.md

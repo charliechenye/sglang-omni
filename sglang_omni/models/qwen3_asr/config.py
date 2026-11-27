@@ -37,6 +37,7 @@ QWEN3_ASR_TORCH_MPS_MAX_AUDIO_SECONDS = 60.0
 class Qwen3ASRFactoryArgs(FactoryArgs):
     """Qwen3-ASR's own constructor knobs, typed like the shared ones."""
 
+    enable_temporal_final_verification: bool = False
     enable_pre_lm_encoder: bool | None = None
     pre_lm_cache_max_entries: int | None = Field(default=None, ge=1)
     pre_lm_cache_size_bytes: int | None = Field(default=None, ge=1)
@@ -107,6 +108,25 @@ class Qwen3ASRPipelineConfig(PipelineConfig):
             return {"PER_STREAM_QUEUE": "1", **self.env_defaults}
         else:
             return dict(self.env_defaults)
+
+    def resolved_realtime_transcription(self) -> RealtimeTranscriptionConfig | None:
+        config = super().resolved_realtime_transcription()
+        if config is None:
+            return None
+        else:
+            pass
+        asr_stage = next(
+            (stage for stage in self.stages if stage.name == "asr"),
+            None,
+        )
+        temporal_enabled = bool(
+            asr_stage is not None
+            and asr_stage.factory.enable_temporal_final_verification
+        )
+        return replace(
+            config,
+            enable_temporal_final_verification=temporal_enabled,
+        )
 
     def resolved_stage_env_defaults(self, stage_name: str) -> dict[str, str]:
         env_defaults = super().resolved_stage_env_defaults(stage_name)

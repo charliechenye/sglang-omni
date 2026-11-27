@@ -34,6 +34,7 @@ from .messages import (
     SubmitMessage,
     parse_message,
 )
+from .realtime import RealtimeTranscriptionContext
 from .request import OmniRequest, RequestInfo, RequestState, StagePayload
 from .stage import StageInfo
 
@@ -71,5 +72,6 @@ __all__ = [
     "RequestInfo",
     "OmniRequest",
     "StagePayload",
+    "RealtimeTranscriptionContext",
     "StageInfo",
 ]

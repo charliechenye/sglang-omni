@@ -825,7 +825,9 @@ async def run_server(
                 supports_realtime_audio_output=(
                     type(pipeline_config).code2wav_stage() is not None
                 ),
-                realtime_transcription=type(pipeline_config).realtime_transcription,
+                realtime_transcription=(
+                    pipeline_config.resolved_realtime_transcription()
+                ),
                 allowed_local_media_path=allowed_local_media_path,
                 allowed_media_domains=allowed_media_domains,
                 tts_batch_max_items=tts_batch_max_items,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sglang_omni.client import GenerateRequest
+from sglang_omni.proto.realtime import RealtimeTranscriptionContext
 from sglang_omni.serve.speech_to_text import build_speech_to_text_generate_request
 
 _ROLLBACK_TOKENS = 5
@@ -18,6 +19,9 @@ class Qwen3ASRStreamingState:
 
 
 class Qwen3ASRStreamingStrategy:
+    def __init__(self, *, enable_temporal_final_verification: bool = False) -> None:
+        self.enable_temporal_final_verification = enable_temporal_final_verification
+
     def create_state(
         self, *, model_name: str, language: str | None
     ) -> Qwen3ASRStreamingState:
@@ -39,7 +43,6 @@ class Qwen3ASRStreamingStrategy:
         is_final: bool,
         request_id: str,
     ) -> GenerateRequest:
-        del is_final, request_id
         qwen_state = self.state(state)
 
         use_prefix = (
@@ -68,6 +71,17 @@ class Qwen3ASRStreamingStrategy:
                 ),
             }
         )
+        if self.enable_temporal_final_verification and is_final and use_prefix:
+            request.internal_realtime_context = RealtimeTranscriptionContext(
+                request_id=request_id,
+                segment_id=-1,
+                attempt=-1,
+                is_final=True,
+                previous_hypothesis=qwen_state.transcript,
+                language=qwen_state.language,
+            )
+        else:
+            pass
         return request
 
     def update_hypothesis(

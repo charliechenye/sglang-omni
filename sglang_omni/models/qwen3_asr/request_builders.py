@@ -37,6 +37,7 @@ from transformers import PreTrainedTokenizerBase, WhisperFeatureExtractor
 from sglang_omni.models.qwen3_asr.encoder_service import Qwen3ASRPreLMEncoderService
 from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
+from sglang_omni.proto.realtime import RealtimeTranscriptionContext
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.token_text_streaming import (
@@ -73,6 +74,23 @@ def system_turn(context: str | None) -> str:
     return f"<|im_start|>system\n{context}<|im_end|>\n"
 
 
+@dataclass(slots=True, kw_only=True)
+class Qwen3ASRTemporalRequest:
+    context: RealtimeTranscriptionContext
+    candidate_token_ids: tuple[int, ...]
+    prompt_boundary: int
+    admitted: bool = False
+    fallback_reason: str | None = None
+    fallback_logged: bool = False
+    attempted: bool = False
+    verification_committed: bool = False
+    accepted_token_count: int = 0
+    rejected_token_count: int = 0
+    zero_decode: bool = False
+    ordinary_decode_rounds: int = 0
+    cancelled: bool = False
+
+
 @dataclass
 class Qwen3ASRRequestData(SGLangARRequestData):
     enforce_request_limits: bool = True
@@ -82,6 +100,9 @@ class Qwen3ASRRequestData(SGLangARRequestData):
     language: str | None = None
     engine_start_s: float = 0.0
     streaming_prefix_text: str = ""
+    temporal_request: Qwen3ASRTemporalRequest | None = None
+    temporal_fallback_reason: str | None = None
+    temporal_fallback_logged: bool = False
 
 
 def decode_token_ids(
@@ -156,6 +177,7 @@ def make_qwen3_asr_scheduler_adapters(
     audio_encoder_service: Qwen3ASRPreLMEncoderService | None = None,
     should_wait_for_encode: Callable[[], bool] | None = None,
     greedy_only: bool = False,
+    enable_temporal_final_verification: bool = False,
 ) -> tuple[
     Callable[
         [StagePayload], Qwen3ASRRequestData | DeferredAdmission[Qwen3ASRRequestData]
@@ -252,6 +274,11 @@ def make_qwen3_asr_scheduler_adapters(
             if is_streaming_refresh and streaming_prefix
             else ([], "")
         )
+        realtime_context = None
+        if enable_temporal_final_verification:
+            realtime_context = payload.request.realtime_transcription_context
+        else:
+            pass
         temperature = float(params.get("temperature") or 0.0)
         if greedy_only and temperature != 0.0:
             raise ValueError(
@@ -265,6 +292,69 @@ def make_qwen3_asr_scheduler_adapters(
         forced_language = (
             None if requested_language is None else resolve_language(requested_language)
         )
+        temporal_candidate_token_ids: tuple[int, ...] = ()
+        temporal_fallback_reason = None
+        temporal_context_language = None
+        if (
+            isinstance(realtime_context, RealtimeTranscriptionContext)
+            and realtime_context.language is not None
+        ):
+            try:
+                temporal_context_language = resolve_language(realtime_context.language)
+            except ValueError:
+                temporal_context_language = None
+        else:
+            pass
+        if (
+            enable_temporal_final_verification
+            and isinstance(realtime_context, RealtimeTranscriptionContext)
+            and realtime_context.request_id == payload.request_id
+            and realtime_context.segment_id >= 0
+            and realtime_context.attempt > 0
+            and realtime_context.is_final
+            and is_streaming_refresh
+            and isinstance(streaming_prefix, str)
+            and bool(streaming_prefix)
+            and realtime_context.previous_hypothesis == streaming_prefix
+            and realtime_context.language is not None
+            and forced_language == temporal_context_language
+            and rollback_tokens > 0
+        ):
+            previous_token_ids = encode_literal(
+                tokenizer, realtime_context.previous_hypothesis
+            )
+            temporal_candidate_token_ids = tuple(
+                previous_token_ids[len(streaming_prefix_token_ids) :][:5]
+            )
+        else:
+            pass
+        if (
+            enable_temporal_final_verification
+            and isinstance(realtime_context, RealtimeTranscriptionContext)
+            and realtime_context.is_final
+            and not temporal_candidate_token_ids
+        ):
+            if (
+                realtime_context.request_id != payload.request_id
+                or realtime_context.segment_id < 0
+                or realtime_context.attempt <= 0
+            ):
+                temporal_fallback_reason = "invalid_realtime_context"
+            elif not is_streaming_refresh or not streaming_prefix:
+                temporal_fallback_reason = "missing_retained_prefix"
+            elif realtime_context.previous_hypothesis != streaming_prefix:
+                temporal_fallback_reason = "stale_hypothesis"
+            elif (
+                realtime_context.language is None
+                or forced_language != temporal_context_language
+            ):
+                temporal_fallback_reason = "language_mismatch"
+            elif rollback_tokens <= 0:
+                temporal_fallback_reason = "no_token_rollback"
+            else:
+                temporal_fallback_reason = "empty_candidate_suffix"
+        else:
+            pass
         # Note(Audrey): the checkpoint reads biasing text from the system turn.
         raw_context = params.get("prompt")
         bias_context = str(raw_context).strip() if raw_context else None
@@ -401,6 +491,53 @@ def make_qwen3_asr_scheduler_adapters(
         )
         _validate_context_budget(input_ids, request_max_new_tokens)
 
+        temporal_request = None
+        if temporal_candidate_token_ids:
+            candidate_limit = min(5, max(request_max_new_tokens - 1, 0))
+            candidate_token_ids = temporal_candidate_token_ids[:candidate_limit]
+            special_token_ids = {
+                int(token_id)
+                for token_id in getattr(tokenizer, "all_special_ids", [])
+                if isinstance(token_id, int)
+            }
+            stop_token_ids = {eos_token_id}
+            supplied_stop_token_ids = params.get("stop_token_ids", [])
+            if isinstance(supplied_stop_token_ids, (list, tuple)):
+                stop_token_ids.update(
+                    token_id
+                    for token_id in supplied_stop_token_ids
+                    if isinstance(token_id, int) and not isinstance(token_id, bool)
+                )
+            else:
+                pass
+            if (
+                candidate_token_ids
+                and isinstance(realtime_context, RealtimeTranscriptionContext)
+                and all(
+                    isinstance(token_id, int)
+                    and not isinstance(token_id, bool)
+                    and 0 <= token_id < vocab_size
+                    for token_id in candidate_token_ids
+                )
+                and not any(
+                    token_id in special_token_ids or token_id in stop_token_ids
+                    for token_id in candidate_token_ids
+                )
+            ):
+                temporal_request = Qwen3ASRTemporalRequest(
+                    context=realtime_context,
+                    candidate_token_ids=candidate_token_ids,
+                    prompt_boundary=len(input_ids),
+                )
+            elif not candidate_token_ids:
+                temporal_fallback_reason = "output_budget_too_small"
+            elif isinstance(realtime_context, RealtimeTranscriptionContext):
+                temporal_fallback_reason = "invalid_temporal_candidate_ids"
+            else:
+                pass
+        else:
+            pass
+
         audio_item = MultimodalDataItem(
             modality=Modality.AUDIO,
             hash=prepared.fingerprint_int,
@@ -482,6 +619,8 @@ def make_qwen3_asr_scheduler_adapters(
             language=requested_language,
             engine_start_s=time.perf_counter(),
             streaming_prefix_text=retained_prefix_text,
+            temporal_request=temporal_request,
+            temporal_fallback_reason=temporal_fallback_reason,
             stage_payload=payload,
         )
         if audio_encoder_service is None or cached_embedding is not None:
