@@ -8,7 +8,7 @@ import json
 import logging
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
 import numpy as np
@@ -747,6 +747,15 @@ class RealtimeTranscriptionSession:
             is_final=is_final,
             request_id=request_id,
         )
+        if request.internal_realtime_context is not None:
+            request.internal_realtime_context = replace(
+                request.internal_realtime_context,
+                request_id=request_id,
+                segment_id=segment.segment_id,
+                attempt=segment.decode_attempt,
+            )
+        else:
+            pass
         self.inflight_request_id = request_id
         try:
             result = await self.client.completion(request, request_id=request_id)

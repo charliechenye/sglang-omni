@@ -760,7 +760,12 @@ class Client:
             metadata["output_modalities"] = request.output_modalities
         else:
             pass
-        return OmniRequest(inputs=inputs, params=params, metadata=metadata)
+        return OmniRequest(
+            inputs=inputs,
+            params=params,
+            metadata=metadata,
+            realtime_transcription_context=request.internal_realtime_context,
+        )
 
     @staticmethod
     def default_result_builder(request_id: str, result: object) -> GenerateChunk:

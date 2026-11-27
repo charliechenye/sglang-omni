@@ -38,6 +38,7 @@ class RealtimeTranscriptionConfig:
     decode_interval_ms: int = 2000
     server_vad: bool = False
     max_segment_s: float | None = None
+    enable_temporal_final_verification: bool = False
 
     def __post_init__(self) -> None:
         if self.decode_interval_ms <= 0:
@@ -786,6 +787,10 @@ class PipelineConfig(BaseModel):
     min_tail_s: ClassVar[float] = 0.5
     condition_on_previous_text: ClassVar[bool] = False
     max_speech_input_chars: ClassVar[int | None] = MAX_SPEECH_INPUT_CHARS
+
+    def resolved_realtime_transcription(self) -> RealtimeTranscriptionConfig | None:
+        return type(self).realtime_transcription
+
     # None accepts every speech request field and ignores unknown ones.
     supported_speech_fields: ClassVar[frozenset[str] | None] = None
     stage_config_types: ClassVar[dict[str, type[StageConfig]]] = {}

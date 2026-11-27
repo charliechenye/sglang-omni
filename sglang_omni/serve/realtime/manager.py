@@ -88,12 +88,18 @@ class RealtimeSessionManager:
                 )
             else:
                 pass
+            if self.transcription_config.enable_temporal_final_verification:
+                strategy = self.transcription_config.strategy_cls(
+                    enable_temporal_final_verification=True
+                )
+            else:
+                strategy = self.transcription_config.strategy_cls()
             session: RealtimeConnection = RealtimeTranscriptionSession(
                 websocket,
                 client=self.client,
                 model_name=self.model_name,
                 transcription_config=self.transcription_config,
-                strategy=self.transcription_config.strategy_cls(),
+                strategy=strategy,
             )
         elif normalized_intent != "conversation":
             raise ValueError(

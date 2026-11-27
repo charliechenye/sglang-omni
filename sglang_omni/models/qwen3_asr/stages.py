@@ -41,6 +41,7 @@ def create_sglang_qwen3_asr_executor(
     pre_lm_max_batch_wait_ms: int = 0,
     enable_encoder_cuda_graph: bool = True,
     max_audio_clip_s: float | None = None,
+    enable_temporal_final_verification: bool = False,
     server_args_overrides: Mapping[str, object] | None = None,
 ) -> OmniScheduler[Qwen3ASRRequestData]:
     builder = Qwen3ASREngineBuilder(
@@ -73,6 +74,7 @@ def create_sglang_qwen3_asr_executor(
         pre_lm_max_batch_wait_ms=pre_lm_max_batch_wait_ms,
         enable_encoder_cuda_graph=enable_encoder_cuda_graph,
         max_audio_clip_s=max_audio_clip_s,
+        enable_temporal_final_verification=enable_temporal_final_verification,
     )
     try:
         return builder.build(
