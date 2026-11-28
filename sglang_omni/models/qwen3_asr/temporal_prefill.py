@@ -24,6 +24,9 @@ from sglang_omni.models.qwen3_asr.request_builders import (
     Qwen3ASRRequestData,
     Qwen3ASRTemporalRequest,
 )
+from sglang_omni.models.qwen3_asr.temporal_cuda_graph_runner import (
+    Qwen3ASRTemporalPrefillCudaGraphRunner,
+)
 from sglang_omni.models.qwen3_asr.temporal_verification import (
     get_temporal_forward_inputs,
 )
@@ -33,27 +36,55 @@ logger = logging.getLogger(__name__)
 
 def install_temporal_prefill_graph_gate(
     graph_runner: PrefillCudaGraphRunner,
+    *,
+    enable_temporal_cuda_graph: bool = False,
 ) -> None:
-    if hasattr(graph_runner, "qwen3_asr_temporal_native_graph_check"):
+    graph_runner.qwen3_asr_temporal_cuda_graph_enabled = enable_temporal_cuda_graph
+    native_can_run_graph = getattr(
+        graph_runner, "qwen3_asr_temporal_native_graph_check", None
+    )
+    if native_can_run_graph is None:
+        native_can_run_graph = graph_runner.can_run_graph
+        graph_runner.qwen3_asr_temporal_native_graph_check = native_can_run_graph
+    else:
+        pass
+    if hasattr(graph_runner, "qwen3_asr_temporal_graph_gate_installed"):
         return
     else:
         pass
-    native_can_run_graph = graph_runner.can_run_graph
 
     def can_run_graph(forward_batch: ForwardBatch) -> bool:
         temporal_forward = get_temporal_forward_inputs(forward_batch)
         if temporal_forward is not None:
+            supports_temporal_cuda_graph = isinstance(
+                graph_runner, Qwen3ASRTemporalPrefillCudaGraphRunner
+            )
+            if (
+                graph_runner.qwen3_asr_temporal_cuda_graph_enabled
+                and supports_temporal_cuda_graph
+            ):
+                can_replay = native_can_run_graph(forward_batch)
+                dispatch = "graph" if can_replay else "eager"
+                reason = "native_eligibility" if not can_replay else "native_bcg"
+            else:
+                can_replay = False
+                dispatch = "eager"
+                reason = (
+                    "unsupported_runner"
+                    if graph_runner.qwen3_asr_temporal_cuda_graph_enabled
+                    else "temporal_graph_disabled"
+                )
             logger.info(
                 f"qwen3_asr_temporal_dispatch request_id={temporal_forward.request_id} "
-                f"graph_runner={type(graph_runner).__name__} dispatch=eager "
-                "reason=exact_unpadded_rows"
+                f"graph_runner={type(graph_runner).__name__} dispatch={dispatch} "
+                f"reason={reason}"
             )
-            return False
+            return can_replay
         else:
             return native_can_run_graph(forward_batch)
 
     graph_runner.can_run_graph = can_run_graph
-    graph_runner.qwen3_asr_temporal_native_graph_check = native_can_run_graph
+    graph_runner.qwen3_asr_temporal_graph_gate_installed = True
 
 
 class Qwen3ASRTemporalPrefillAdder(PrefillAdder):

@@ -31,11 +31,19 @@ class Qwen3ASRTemporalForward:
     candidate_token_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Qwen3ASRTemporalGraphReplay:
+    request_id: str
+    raw_num_tokens: int
+    graph_bucket_size: int
+
+
 @dataclass(slots=True)
 class Qwen3ASRTemporalForwardContext:
     temporal_forward: Qwen3ASRTemporalForward
     owner_forward_batch_id: int
     context_token: Token[Qwen3ASRTemporalForwardContext | None] | None = None
+    graph_replay: Qwen3ASRTemporalGraphReplay | None = None
 
 
 QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT: ContextVar[
@@ -58,6 +66,7 @@ class Qwen3ASRTemporalVerification:
 class Qwen3ASRTemporalLogitsProcessorOutput(LogitsProcessorOutput):
     temporal_verification: Qwen3ASRTemporalVerification | None = None
     pending_token_ids: torch.Tensor | None = None
+    graph_replay: Qwen3ASRTemporalGraphReplay | None = None
 
 
 @dataclass(slots=True)
@@ -95,9 +104,9 @@ def attach_temporal_forward_inputs(
     return temporal_context
 
 
-def get_temporal_forward_inputs(
+def get_temporal_forward_context(
     forward_batch: ForwardBatch,
-) -> Qwen3ASRTemporalForward | None:
+) -> Qwen3ASRTemporalForwardContext | None:
     temporal_context = getattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR, None)
     active_context = QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.get()
     if temporal_context is not None:
@@ -108,15 +117,21 @@ def get_temporal_forward_inputs(
         elif active_context is not temporal_context:
             raise RuntimeError("Qwen3-ASR temporal forward context is not active")
         else:
-            return temporal_context.temporal_forward
+            return temporal_context
     elif active_context is None:
         return None
     else:
-        temporal_forward = active_context.temporal_forward
-        if forward_batch.rids != [temporal_forward.request_id]:
+        if forward_batch.rids != [active_context.temporal_forward.request_id]:
             raise RuntimeError("Qwen3-ASR temporal context belongs to another request")
         else:
-            return temporal_forward
+            return active_context
+
+
+def get_temporal_forward_inputs(
+    forward_batch: ForwardBatch,
+) -> Qwen3ASRTemporalForward | None:
+    temporal_context = get_temporal_forward_context(forward_batch)
+    return temporal_context.temporal_forward if temporal_context is not None else None
 
 
 def clear_temporal_forward_inputs(
@@ -146,6 +161,7 @@ def clear_temporal_forward_inputs(
         raise RuntimeError("Qwen3-ASR cleanup does not own the active context")
     else:
         context_token = temporal_context.context_token
+        temporal_context.graph_replay = None
         QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.reset(context_token)
         temporal_context.context_token = None
         delattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR)
@@ -206,8 +222,8 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
             )
         else:
             pass
-        temporal_forward = get_temporal_forward_inputs(logits_metadata)
-        if temporal_forward is None:
+        temporal_context = get_temporal_forward_context(logits_metadata)
+        if temporal_context is None:
             return self.native_processor(
                 input_ids,
                 hidden_states,
@@ -218,6 +234,8 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
             )
         else:
             pass
+        temporal_forward = temporal_context.temporal_forward
+        graph_replay = temporal_context.graph_replay
         if not logits_metadata.forward_mode.is_extend():
             raise RuntimeError("Qwen3-ASR temporal verification only supports prefill")
         else:
@@ -244,28 +262,95 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
             dtype=logits_metadata.positions.dtype,
             device=logits_metadata.positions.device,
         )
+        if graph_replay is None:
+            expected_batch_rows = expected_input_rows
+        else:
+            if (
+                graph_replay.request_id != temporal_forward.request_id
+                or graph_replay.raw_num_tokens != expected_input_rows
+                or graph_replay.graph_bucket_size < expected_input_rows
+            ):
+                raise RuntimeError(
+                    "Qwen3-ASR temporal graph replay boundary is invalid"
+                )
+            else:
+                pass
+            expected_batch_rows = graph_replay.graph_bucket_size
         if (
             temporal_forward.prompt_boundary <= 0
             or candidate_token_count <= 0
-            or forward_input_ids.numel() != expected_input_rows
+            or forward_input_ids.numel() != expected_batch_rows
             or (
                 input_ids is not None
-                and not torch.equal(input_ids.reshape(-1), forward_input_ids)
+                and (
+                    input_ids.numel() != expected_batch_rows
+                    or not torch.equal(
+                        input_ids.reshape(-1)[:expected_input_rows],
+                        forward_input_ids[:expected_input_rows],
+                    )
+                )
             )
             or not torch.equal(
-                forward_input_ids[-candidate_token_count:], expected_candidate_ids
+                forward_input_ids[
+                    temporal_forward.prompt_boundary : expected_input_rows
+                ],
+                expected_candidate_ids,
             )
-            or logits_metadata.positions.numel() != expected_input_rows
+            or logits_metadata.positions.numel() != expected_batch_rows
             or not torch.equal(
-                logits_metadata.positions.reshape(-1), expected_positions
+                logits_metadata.positions.reshape(-1)[:expected_input_rows],
+                expected_positions,
             )
-            or hidden_states.shape[0] != expected_input_rows
+            or hidden_states.shape[0] != expected_batch_rows
             or logits_metadata.extend_seq_lens_cpu != [expected_input_rows]
             or logits_metadata.extend_prefix_lens_cpu != [0]
         ):
             raise RuntimeError(
                 "Qwen3-ASR temporal prefill does not contain its exact unpadded rows"
             )
+        else:
+            pass
+        if graph_replay is not None:
+            sequence_lengths_cpu = logits_metadata.seq_lens_cpu
+            mrope_positions = logits_metadata.mrope_positions
+            if (
+                sequence_lengths_cpu is None
+                or len(sequence_lengths_cpu) != 1
+                or int(sequence_lengths_cpu[0]) != expected_input_rows
+                or mrope_positions is None
+                or mrope_positions.ndim != 2
+                or mrope_positions.shape[0] != 3
+                or mrope_positions.shape[1] != expected_batch_rows
+            ):
+                raise RuntimeError(
+                    "Qwen3-ASR temporal graph replay lost sequence or mRoPE metadata"
+                )
+            else:
+                pass
+            expected_mrope_positions = (
+                expected_positions[
+                    temporal_forward.prompt_boundary : expected_input_rows
+                ]
+                .unsqueeze(0)
+                .expand(3, -1)
+            )
+            mrope_positions_match = (
+                mrope_positions[
+                    :, temporal_forward.prompt_boundary : expected_input_rows
+                ]
+                == expected_mrope_positions
+            ).all()
+            if mrope_positions_match.device.type == "cuda":
+                torch._assert_async(  # noqa: leading-underscore  # avoid a device-to-host sync
+                    mrope_positions_match,
+                    "Qwen3-ASR temporal graph replay changed candidate mRoPE positions",
+                )
+            elif not bool(mrope_positions_match):
+                raise RuntimeError(
+                    "Qwen3-ASR temporal graph replay changed candidate mRoPE positions"
+                )
+            else:
+                pass
         else:
             pass
         first_prediction_row = temporal_forward.prompt_boundary - 1
@@ -343,12 +428,14 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
             pending_token_ids=temporal_token_ids[
                 pending_row_index : pending_row_index + 1
             ].clone(),
+            graph_replay=graph_replay,
         )
 
 
 __all__ = [
     "Qwen3ASRTemporalBatchResult",
     "Qwen3ASRTemporalForward",
+    "Qwen3ASRTemporalGraphReplay",
     "Qwen3ASRTemporalLogitsProcessor",
     "Qwen3ASRTemporalLogitsProcessorOutput",
     "Qwen3ASRTemporalRequest",
@@ -356,6 +443,7 @@ __all__ = [
     "Qwen3ASRTemporalVerification",
     "attach_temporal_forward_inputs",
     "clear_temporal_forward_inputs",
+    "get_temporal_forward_context",
     "get_temporal_forward_inputs",
     "verify_greedy_candidates",
 ]
