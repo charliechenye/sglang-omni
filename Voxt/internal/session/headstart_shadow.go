@@ -61,18 +61,21 @@ type shadowObservation struct {
 }
 
 type shadowHeadStartDecision struct {
-	update          heardText
-	plan            headPlan
-	sequence        uint64
-	reason          string
-	before          lateGateState
-	after           lateGateState
-	processingAt    time.Time
-	planReadyAt     time.Time
-	dispatchReadyAt time.Time
-	dispatchAt      time.Time
-	requestIDs      []uint64
-	dispatched      bool
+	update           heardText
+	plan             headPlan
+	sequence         uint64
+	reason           string
+	before           lateGateState
+	after            lateGateState
+	processingAt     time.Time
+	planReadyAt      time.Time
+	dispatchReadyAt  time.Time
+	dispatchAt       time.Time
+	requestIDs       []uint64
+	freshRequestIDs  []uint64
+	reusedRequestIDs []uint64
+	generationID     uint64
+	dispatched       bool
 }
 
 func cloneHeadPlan(plan headPlan) headPlan {

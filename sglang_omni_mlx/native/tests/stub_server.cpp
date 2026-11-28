@@ -115,7 +115,11 @@ public:
         throw omni_common::GenerationCancelled();
       } else {
       }
-      if (candidate_publisher && outcome == "candidates") {
+      const auto started_at = std::chrono::steady_clock::now();
+      if (candidate_publisher && outcome == "candidate_slow") {
+        candidate_publisher({"ongoing model candidate", 0, 4, language, 1.0});
+        std::this_thread::sleep_for(std::chrono::milliseconds(80));
+      } else if (candidate_publisher && outcome == "candidates") {
         candidate_publisher(
             {"first committed snapshot", 0, 4, language, 3.0});
         candidate_publisher(
@@ -130,6 +134,13 @@ public:
       result.language = language;
       result.generated_token_count = max_new_tokens;
       result.finish_reason = omni_common::FinishReason::kStop;
+      if (outcome == "candidate_slow") {
+        result.authoritative_completion_elapsed_ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - started_at)
+                .count();
+      } else {
+      }
       if (outcome == "segments") {
         result.segments.push_back({.start_seconds = 0.5,
                                    .end_seconds = 1.5,

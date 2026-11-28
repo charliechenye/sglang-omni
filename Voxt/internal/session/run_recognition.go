@@ -8,13 +8,16 @@ import (
 )
 
 type lateDispatchResult struct {
-	end             streamEnd
-	err             error
-	terminal        bool
-	dispatched      bool
-	requestIDs      []uint64
-	dispatchReadyAt time.Time
-	dispatchedAt    time.Time
+	end              streamEnd
+	err              error
+	terminal         bool
+	dispatched       bool
+	requestIDs       []uint64
+	freshRequestIDs  []uint64
+	reusedRequestIDs []uint64
+	generationID     uint64
+	dispatchReadyAt  time.Time
+	dispatchedAt     time.Time
 }
 
 // note (chenye): waitFinal consumes whole-text updates while the session owner
@@ -91,7 +94,7 @@ func (r *run) waitFinal(ctx context.Context, finals <-chan streamEnd, heard <-ch
 				state := r.head.lateGateState()
 				r.logHeadStartDecision(update, headStartSequence, headPlan{},
 					"authoritative_final_available_before_candidate_processing",
-					state, state, processingAt, processingAt, time.Time{}, time.Time{}, nil, false)
+					state, state, processingAt, processingAt, time.Time{}, time.Time{}, nil, nil, nil, 0, false)
 				return finish(end, err)
 			}
 			plan, ok, reason, before, after := r.head.prepareLateObserved(update.text)
@@ -99,10 +102,14 @@ func (r *run) waitFinal(ctx context.Context, finals <-chan streamEnd, heard <-ch
 			var dispatchAt time.Time
 			var dispatchReadyAt time.Time
 			var requestIDs []uint64
+			var freshRequestIDs []uint64
+			var reusedRequestIDs []uint64
+			var generationID uint64
 			dispatched := false
 			if ok {
 				dispatch := r.dispatchLate(ctx, finals, plan)
 				dispatchReadyAt, dispatchAt, requestIDs = dispatch.dispatchReadyAt, dispatch.dispatchedAt, dispatch.requestIDs
+				freshRequestIDs, reusedRequestIDs, generationID = dispatch.freshRequestIDs, dispatch.reusedRequestIDs, dispatch.generationID
 				dispatched = dispatch.dispatched
 				after = r.head.lateGateState()
 				if dispatch.terminal {
@@ -113,12 +120,12 @@ func (r *run) waitFinal(ctx context.Context, finals <-chan streamEnd, heard <-ch
 				}
 				if dispatch.terminal {
 					r.logHeadStartDecision(update, headStartSequence, plan, reason,
-						before, after, processingAt, planReadyAt, dispatchReadyAt, dispatchAt, requestIDs, dispatched)
+						before, after, processingAt, planReadyAt, dispatchReadyAt, dispatchAt, requestIDs, freshRequestIDs, reusedRequestIDs, generationID, dispatched)
 					return finish(dispatch.end, dispatch.err)
 				}
 			}
 			r.logHeadStartDecision(update, headStartSequence, plan, reason,
-				before, after, processingAt, planReadyAt, dispatchReadyAt, dispatchAt, requestIDs, dispatched)
+				before, after, processingAt, planReadyAt, dispatchReadyAt, dispatchAt, requestIDs, freshRequestIDs, reusedRequestIDs, generationID, dispatched)
 		case result := <-r.init.llmDone:
 			r.init.llmDone = nil
 			if !r.useLLMReadiness(result) {
@@ -171,13 +178,15 @@ func (r *run) dispatchLate(ctx context.Context, finals <-chan streamEnd, plan he
 	submission := r.head.submitLate(plan)
 	return lateDispatchResult{
 		terminal: false, dispatched: submission.dispatched, requestIDs: submission.requestIDs,
+		freshRequestIDs: submission.freshRequestIDs, reusedRequestIDs: submission.reusedRequestIDs,
+		generationID:    submission.generationID,
 		dispatchReadyAt: submission.dispatchReadyAt, dispatchedAt: submission.dispatchedAt,
 	}
 }
 
 func (r *run) logHeadStartDecision(update heardText, sequence uint64, plan headPlan, reason string,
 	before, after lateGateState, processingAt, planReadyAt, dispatchReadyAt, dispatchAt time.Time,
-	requestIDs []uint64, dispatched bool) {
+	requestIDs, freshRequestIDs, reusedRequestIDs []uint64, generationID uint64, dispatched bool) {
 	if !r.shadowTraceEnabled || !r.head.enabled.Load() {
 		return
 	}
@@ -207,7 +216,8 @@ func (r *run) logHeadStartDecision(update heardText, sequence uint64, plan headP
 		update: update, plan: cloneHeadPlan(plan), sequence: sequence, reason: reason,
 		before: before, after: after, processingAt: processingAt, planReadyAt: planReadyAt,
 		dispatchReadyAt: dispatchReadyAt, dispatchAt: dispatchAt,
-		requestIDs: append([]uint64(nil), requestIDs...), dispatched: dispatched,
+		requestIDs: append([]uint64(nil), requestIDs...), freshRequestIDs: append([]uint64(nil), freshRequestIDs...),
+		reusedRequestIDs: append([]uint64(nil), reusedRequestIDs...), generationID: generationID, dispatched: dispatched,
 	}
 	r.shadowMu.Lock()
 	if len(r.shadowHeadStartDecisions) < 128 {
@@ -227,6 +237,9 @@ func (r *run) logHeadStartDecision(update heardText, sequence uint64, plan headP
 		"dispatch_ready_ms":                       toStopMS(dispatchReadyAt),
 		"dispatch_at_ms":                          toStopMS(dispatchAt),
 		"request_ids":                             requestIDs,
+		"fresh_request_ids":                       freshRequestIDs,
+		"reused_request_ids":                      reusedRequestIDs,
+		"generation_id":                           generationID,
 		"candidate_processing_ms":                 float64(planReadyAt.Sub(processingAt).Microseconds()) / 1000,
 		"preparation_succeeded":                   planUsable,
 		"candidate_eligible_without_budget":       eligibleWithoutBudget,

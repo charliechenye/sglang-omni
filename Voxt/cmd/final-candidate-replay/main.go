@@ -183,22 +183,13 @@ func replayForArm(reader io.Reader, tokenThresholds, timeThresholds []int, armFi
 	for sessionKey, trace := range sessions {
 		for index := range trace.candidates {
 			current := &trace.candidates[index]
+			key := eventKeyForCandidate(sessionKey, current)
+			if outcome, ok := trace.outcomes[key]; ok {
+				current.outcome = outcome
+				current.hasOutcome = true
+			}
 			if current.production {
-				identity := candidateIdentity{
-					session: sessionKey, planSHA: current.eligibility.RequestPlanHash,
-					candidateSHA: current.eligibility.CandidateSHA256,
-				}
-				if outcome, ok := trace.outcomesByIdentity[identity]; ok {
-					current.outcome = outcome
-					current.hasOutcome = true
-				}
 				resolveActualWebSocketOutcome(trace, current)
-			} else {
-				key := eventKeyForCandidate(sessionKey, current)
-				if outcome, ok := trace.outcomes[key]; ok {
-					current.outcome = outcome
-					current.hasOutcome = true
-				}
 			}
 		}
 		sort.SliceStable(trace.candidates, func(left, right int) bool {
@@ -219,7 +210,6 @@ func replayForArm(reader io.Reader, tokenThresholds, timeThresholds []int, armFi
 func newSessionTrace() *sessionTrace {
 	return &sessionTrace{
 		outcomes:           make(map[candidateKey]logEvent),
-		outcomesByIdentity: make(map[candidateIdentity]logEvent),
 		adoptions:          make(map[uint64]logEvent),
 		requestStartsByID:  make(map[uint64]logEvent),
 		requestResultsByID: make(map[uint64]logEvent),
@@ -239,19 +229,8 @@ func applyReplayEvent(trace *sessionTrace, sessionKey string, event logEvent) {
 		trace.candidates = append(trace.candidates, candidate{eligibility: event, production: true})
 	case "voxt_final_candidate_outcome":
 		trace.outcomes[eventKey(sessionKey, event)] = event
-		if event.CandidatePlanHash != "" {
-			trace.outcomesByIdentity[candidateIdentity{
-				session: sessionKey, planSHA: event.CandidatePlanHash,
-				candidateSHA: event.TranscriptSHA256,
-			}] = event
-		}
 	case "voxt_headstart_decision_outcome":
-		if event.CandidatePlanHash != "" {
-			trace.outcomesByIdentity[candidateIdentity{
-				session: sessionKey, planSHA: event.CandidatePlanHash,
-				candidateSHA: event.CandidateSHA256,
-			}] = event
-		}
+		trace.outcomes[eventKey(sessionKey, event)] = event
 	case "voxt_headstart_initial_budget":
 		trace.initialBudgetKnown = true
 		trace.recordingGenerations = event.InitialRecordingGenerations
@@ -283,6 +262,7 @@ func applyReplayEvent(trace *sessionTrace, sessionKey string, event logEvent) {
 			trace.fallbackFailureCount++
 		}
 	case "voxt_final_candidate_summary":
+		trace.terminalDecisionComplete = event.TerminalTraceComplete && event.TerminalStatus != ""
 		if event.InitialBudgetKnown != nil && *event.InitialBudgetKnown {
 			trace.initialBudgetKnown = true
 			trace.recordingGenerations = event.InitialRecordingGenerationCount

@@ -141,12 +141,12 @@ func (r *run) askPart(ctx context.Context, req llm.Request, text string) (llm.Re
 			source = "late_websocket_headstart"
 		}
 		if c.late && h.failedLate(c) {
-			r.logHeadStartAdoption(req, c.requestID, source, "failed_speculative_request", false)
+			r.logHeadStartAdoption(req, c.requestID, c.generationID, source, "failed_speculative_request", false)
 		} else {
 			r.logf("debug", "the language model was asked about this part ahead of the final text")
 			if !c.late {
 				resp, err := c.join(req.OnDelta)
-				r.logHeadStartAdoption(req, c.requestID, source, "exact_match", err == nil)
+				r.logHeadStartAdoption(req, c.requestID, c.generationID, source, "exact_match", err == nil)
 				return resp, err
 			}
 			resp, err := c.join(nil)
@@ -158,10 +158,10 @@ func (r *run) askPart(ctx context.Context, req llm.Request, text string) (llm.Re
 				if deltas != "" && req.OnDelta != nil {
 					req.OnDelta(deltas)
 				}
-				r.logHeadStartAdoption(req, c.requestID, source, "exact_match", true)
+				r.logHeadStartAdoption(req, c.requestID, c.generationID, source, "exact_match", true)
 				return resp, nil
 			}
-			r.logHeadStartAdoption(req, c.requestID, source, "failed_speculative_request", false)
+			r.logHeadStartAdoption(req, c.requestID, c.generationID, source, "failed_speculative_request", false)
 			if ctx.Err() != nil || r.ctx.Err() != nil || !r.cleanupMayContinue() {
 				return resp, err
 			}
@@ -176,10 +176,10 @@ func (r *run) askPart(ctx context.Context, req llm.Request, text string) (llm.Re
 					outcome = "near_match_repair_adoption"
 				}
 			}
-			r.logHeadStartAdoption(req, c.requestID, "websocket_headstart", outcome, adopted)
+			r.logHeadStartAdoption(req, c.requestID, c.generationID, "websocket_headstart", outcome, adopted)
 			return resp, err
 		}
-		r.logHeadStartAdoption(req, c.requestID, "websocket_headstart", "near_match_repair_failed", false)
+		r.logHeadStartAdoption(req, c.requestID, c.generationID, "websocket_headstart", "near_match_repair_failed", false)
 	}
 	resp, err := r.llmChatContext(ctx, req)
 	if h.enabled.Load() {
@@ -188,13 +188,18 @@ func (r *run) askPart(ctx context.Context, req llm.Request, text string) (llm.Re
 	return resp, err
 }
 
-func (r *run) logHeadStartAdoption(req llm.Request, requestID uint64, source, outcome string, adopted bool) {
+func (r *run) logHeadStartAdoption(req llm.Request, requestID, generationID uint64, source, outcome string, adopted bool) {
 	if !r.shadowTraceEnabled {
 		return
+	}
+	requestOrigin := "headstart_recording"
+	if generationID > 0 {
+		requestOrigin = "headstart_late"
 	}
 	r.logShadowEvent(map[string]any{
 		"event": "voxt_headstart_adoption", "run_id": r.id,
 		"session_id": r.shadowSessionID, "request_id": requestID, "source": source,
+		"request_origin": requestOrigin, "generation_id": generationID,
 		"outcome": outcome, "adopted": adopted,
 		"request_plan_sha256": r.head.partPlanHash(headPart{req: req}),
 	})
@@ -226,7 +231,7 @@ func (h *headStart) reuse(c *headCall, old []spokenWord, changes []headChange, r
 		resp, ok := right()
 		return resp, nil, ok, ok
 	}
-	fresh := h.start(req, text, false)
+	fresh := h.start(req, text, false, 0)
 	defer fresh.cancel()
 	select {
 	case <-c.done:

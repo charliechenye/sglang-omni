@@ -127,6 +127,10 @@ Json DoneEvent(const TranscriptionResult &result,
         {"language",
          result.language.has_value() ? Json(*result.language) : Json()},
         {"finish_reason", omni_common::FinishReasonName(result.finish_reason)}};
+    if (result.authoritative_completion_elapsed_ms.has_value()) {
+      event["generation_metadata"]["authoritative_completion_elapsed_ms"] =
+          *result.authoritative_completion_elapsed_ms;
+    }
     if (!result.window_texts.empty()) {
       event["generation_metadata"]["window_texts"] = result.window_texts;
     }
@@ -191,7 +195,8 @@ bool WriteSse(mg_connection *connection, const std::string &payload) {
   return mg_write(connection, line.data(), line.size()) > 0;
 }
 
-Json CandidateEvent(const omni_common::TranscriptCandidate &candidate) {
+Json CandidateEvent(const omni_common::TranscriptCandidate &candidate,
+                    bool delivery_during_terminal_drain) {
   Json event = {{"type", "transcript.text.candidate"},
                 {"text", candidate.text},
                 {"sequence", candidate.sequence},
@@ -203,6 +208,7 @@ Json CandidateEvent(const omni_common::TranscriptCandidate &candidate) {
                 {"published_candidate_count",
                  candidate.published_candidate_count},
                 {"snapshot_build_ms_total", candidate.snapshot_build_ms_total}};
+  event["delivery_during_terminal_drain"] = delivery_during_terminal_drain;
   if (candidate.language.has_value()) {
     event["language"] = *candidate.language;
   } else {
@@ -315,7 +321,7 @@ int HandleTranscriptions(mg_connection *connection, void *data) {
         std::unique_ptr<omni_common::TranscriptCandidate> candidate =
             candidate_mailbox->Take();
         if (candidate != nullptr &&
-            !WriteSse(connection, CandidateEvent(*candidate).dump())) {
+            !WriteSse(connection, CandidateEvent(*candidate, false).dump())) {
           cancel->store(true);
         } else {
         }
@@ -324,16 +330,6 @@ int HandleTranscriptions(mg_connection *connection, void *data) {
       } else {
       }
     }
-    std::unique_ptr<omni_common::TranscriptCandidate> candidate =
-        candidate_mailbox->Take();
-    if (candidate != nullptr) {
-      WriteSse(connection, CandidateEvent(*candidate).dump());
-    } else {
-    }
-  }
-  if (candidate_mailbox != nullptr) {
-    WriteSse(connection, CandidateSummaryEvent(*candidate_mailbox).dump());
-  } else {
   }
   try {
     const TranscriptionResult result = future.get();
@@ -343,6 +339,16 @@ int HandleTranscriptions(mg_connection *connection, void *data) {
   } catch (const std::exception &error) {
     std::cerr << "transcription failed: " << typeid(error).name() << "\n";
     WriteSse(connection, FailureEvent().dump());
+  }
+  if (candidate_mailbox != nullptr) {
+    std::unique_ptr<omni_common::TranscriptCandidate> candidate =
+        candidate_mailbox->Take();
+    if (candidate != nullptr) {
+      WriteSse(connection, CandidateEvent(*candidate, true).dump());
+    } else {
+    }
+    WriteSse(connection, CandidateSummaryEvent(*candidate_mailbox).dump());
+  } else {
   }
   WriteSse(connection, "[DONE]");
   return 200;

@@ -169,7 +169,9 @@ func (r *run) logHeadStartRequestStart(call *headCall, requestStartedAt, stopAt 
 	r.logShadowEvent(map[string]any{
 		"event": "voxt_headstart_request_start", "run_id": r.id,
 		"session_id": r.shadowSessionID, "request_id": call.requestID,
-		"source": call.origin, "request_plan_sha256": r.head.partPlanHash(headPart{req: call.req}),
+		"source": call.origin, "request_origin": call.origin,
+		"generation_id":            call.generationID,
+		"request_plan_sha256":      r.head.partPlanHash(headPart{req: call.req}),
 		"stop_to_request_start_ms": float64(requestStartedAt.Sub(stopAt).Microseconds()) / 1000,
 		"request_start_valid":      true,
 	})

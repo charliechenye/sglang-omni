@@ -595,6 +595,10 @@ TranscriptionResult Qwen3ASRTranscriber::Transcribe(
   merged.text = omni_common::JoinTranscriptParts(texts);
   merged.first_transcript_token_elapsed_ms =
       first_transcript_token_elapsed_ms.value_or(0.0);
+  merged.authoritative_completion_elapsed_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - request_started_at)
+          .count();
   return merged;
 }
 
@@ -780,6 +784,10 @@ TranscriptionResult Qwen3ASRTranscriber::TranscribeChunk(
     AddDecodePath(result, "final_prefill_reuse");
   } else {
   }
+  result.authoritative_completion_elapsed_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - started_at)
+          .count();
   return result;
 }
 
@@ -912,6 +920,10 @@ bool Qwen3ASRTranscriber::AcceptToken(BatchRow &row, int token_id,
             .count();
   } else {
   }
+  outcome.result->authoritative_completion_elapsed_ms =
+      std::chrono::duration<double, std::milli>(
+          std::chrono::steady_clock::now() - row.started_at)
+          .count();
   return true;
 }
 

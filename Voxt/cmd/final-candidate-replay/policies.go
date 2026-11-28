@@ -72,6 +72,33 @@ func evaluatePolicy(current policy, sessions map[string]*sessionTrace) policyRes
 			if unresolved := trace.fallbackAttemptCount - resolvedFallbacks; unresolved > 0 {
 				result.FallbackUnresolvedCount += unresolved
 			}
+			for _, adoption := range trace.adoptions {
+				if adoption.Adopted && adoption.RequestOrigin == "headstart_recording" {
+					result.RecordingTimeAdoptionCount++
+				} else {
+				}
+			}
+			countedGenerations := make(map[uint64]bool)
+			for _, decision := range trace.candidates {
+				if !decision.production || !decision.eligibility.Dispatched || decision.eligibility.GenerationID == 0 || countedGenerations[decision.eligibility.GenerationID] {
+					continue
+				} else {
+				}
+				countedGenerations[decision.eligibility.GenerationID] = true
+				result.FreshLateGenerationDispatchCount++
+				result.ResolvedLateGenerationCount += boolInt(decision.hasActualOutcome)
+				result.FreshLateRequestCount += decision.freshRequestCount
+				result.ReusedRecordingRequestAdoptionCount += decision.reusedRecordingAdoptionCount
+				result.FreshLateRequestAdoptionCount += decision.actualAdoptionCount
+				result.FreshLateRequestNotAdoptedCount += decision.unadoptedFreshRequestCount
+				result.FreshLateRequestFailureCount += decision.failedRequestCount
+				result.FreshLateRequestCancelledCount += decision.cancelledRequestCount
+				result.FreshLateGenerationContributionCount += boolInt(decision.actualAdoptionCount > 0)
+				result.FreshLateGenerationMissCount += boolInt(decision.actualOutcomeStatus == "resolved_fresh_miss")
+				result.PartiallyResolvedLateGenerationCount += boolInt(decision.partiallyResolved)
+				result.FreshLatePartialMultipartAdoptionCount += boolInt(decision.partialAdoption)
+				result.UnresolvedLateGenerationCount += boolInt(!decision.hasActualOutcome)
+			}
 		}
 		if trace.runStatus == "failed" || trace.runStatus == "asr_failure" {
 			result.FailedSessionCount++

@@ -21,6 +21,13 @@ type logEvent struct {
 	CleanupEligible                 bool     `json:"cleanup_eligible"`
 	Dispatched                      bool     `json:"dispatched"`
 	RequestIDs                      []uint64 `json:"request_ids"`
+	FreshRequestIDs                 []uint64 `json:"fresh_request_ids"`
+	ReusedRequestIDs                []uint64 `json:"reused_request_ids"`
+	GenerationID                    uint64   `json:"generation_id"`
+	RequestOrigin                   string   `json:"request_origin"`
+	Cancelled                       bool     `json:"cancelled"`
+	TerminalStatus                  string   `json:"terminal_status"`
+	TerminalTraceComplete           bool     `json:"terminal_trace_complete"`
 	RecordingGenerations            int      `json:"recording_headstart_generations"`
 	LateBudgetBefore                bool     `json:"late_generation_budget_before"`
 	LatestPreviewMatch              bool     `json:"latest_preview_match"`
@@ -91,12 +98,6 @@ type candidateKey struct {
 	sequence uint64
 }
 
-type candidateIdentity struct {
-	session      string
-	planSHA      string
-	candidateSHA string
-}
-
 type candidate struct {
 	eligibility                   logEvent
 	outcome                       logEvent
@@ -107,6 +108,12 @@ type candidate struct {
 	exactAdoptionCount            int
 	nearRepairAdoptionCount       int
 	failedRequestCount            int
+	cancelledRequestCount         int
+	reusedRecordingAdoptionCount  int
+	unadoptedFreshRequestCount    int
+	freshRequestCount             int
+	partiallyResolved             bool
+	actualOutcomeStatus           string
 	partialAdoption               bool
 	actualRequestStartMS          float64
 	actualRequestStartKnown       bool
@@ -114,40 +121,40 @@ type candidate struct {
 }
 
 type sessionTrace struct {
-	candidates            []candidate
-	outcomes              map[candidateKey]logEvent
-	outcomesByIdentity    map[candidateIdentity]logEvent
-	adoptions             map[uint64]logEvent
-	requestStartsByID     map[uint64]logEvent
-	requestResultsByID    map[uint64]logEvent
-	fallbackAttemptCount  int
-	fallbackSuccessCount  int
-	fallbackFailureCount  int
-	finalAvailableMS      float64
-	finalAvailableKnown   bool
-	cancelledAtMS         float64
-	cancellationKnown     bool
-	arm                   string
-	scenario              string
-	round                 int
-	runID                 string
-	audioSHA256           string
-	languageHint          string
-	languageMode          string
-	effectiveLanguage     string
-	draft                 bool
-	warmup                bool
-	coldStart             bool
-	runStatus             string
-	runProblem            string
-	benchmark             bool
-	initialBudgetKnown    bool
-	recordingGenerations  int
-	lateAllowance         int
-	lateAlreadyConsumed   bool
-	generationLimit       int
-	multipartLimit        int
-	observedCandidateOnly int
+	candidates               []candidate
+	outcomes                 map[candidateKey]logEvent
+	adoptions                map[uint64]logEvent
+	requestStartsByID        map[uint64]logEvent
+	requestResultsByID       map[uint64]logEvent
+	fallbackAttemptCount     int
+	fallbackSuccessCount     int
+	fallbackFailureCount     int
+	finalAvailableMS         float64
+	finalAvailableKnown      bool
+	cancelledAtMS            float64
+	cancellationKnown        bool
+	arm                      string
+	scenario                 string
+	round                    int
+	runID                    string
+	audioSHA256              string
+	languageHint             string
+	languageMode             string
+	effectiveLanguage        string
+	draft                    bool
+	warmup                   bool
+	coldStart                bool
+	runStatus                string
+	runProblem               string
+	benchmark                bool
+	initialBudgetKnown       bool
+	recordingGenerations     int
+	lateAllowance            int
+	lateAlreadyConsumed      bool
+	generationLimit          int
+	multipartLimit           int
+	observedCandidateOnly    int
+	terminalDecisionComplete bool
 }
 
 type policy struct {
@@ -158,60 +165,74 @@ type policy struct {
 }
 
 type policyResult struct {
-	Name                            string  `json:"name"`
-	Threshold                       float64 `json:"threshold,omitempty"`
-	SessionCount                    int     `json:"session_count"`
-	SuccessfulSessionCount          int     `json:"successful_session_count"`
-	FailedSessionCount              int     `json:"failed_session_count"`
-	CancelledSessionCount           int     `json:"cancelled_session_count"`
-	NoCandidateSessionCount         int     `json:"no_candidate_session_count"`
-	UnresolvedPairCount             int     `json:"unresolved_pair_count"`
-	EligibleCandidateCount          int     `json:"eligible_candidate_count"`
-	CandidateSessionCount           int     `json:"candidate_session_count"`
-	SelectedSessionCount            int     `json:"selected_session_count"`
-	ResolvedSelectionCount          int     `json:"resolved_selection_count"`
-	OracleCompatibleSelectionCount  int     `json:"oracle_compatible_selection_count"`
-	ExactTranscriptMatchCount       int     `json:"exact_transcript_match_count"`
-	ExactCleanupPlanMatchCount      int     `json:"exact_cleanup_plan_match_count"`
-	NearCleanupRepairCount          int     `json:"near_cleanup_repair_count"`
-	WastedIfDispatchedCount         int     `json:"wasted_if_dispatched_count"`
-	UnresolvedSelectionCount        int     `json:"unresolved_selection_count"`
-	UnresolvedCounterfactualCount   int     `json:"unresolved_counterfactual_count"`
-	ActualAdoptionCount             int     `json:"actual_adoption_count"`
-	ActualHeadStartDispatchCount    int     `json:"actual_headstart_dispatch_count"`
-	ResolvedHeadStartDispatchCount  int     `json:"resolved_actual_headstart_dispatch_count"`
-	ActualHeadStartMissCount        int     `json:"actual_headstart_miss_count"`
-	UnresolvedHeadStartDispatches   int     `json:"unresolved_actual_headstart_dispatch_count"`
-	ExactAdoptionCount              int     `json:"exact_adoption_count"`
-	NearRepairAdoptionCount         int     `json:"near_repair_adoption_count"`
-	PartialMultipartAdoptionCount   int     `json:"partial_multipart_adoption_count"`
-	FailedSpeculativeRequestCount   int     `json:"failed_speculative_request_count"`
-	FallbackAttemptCount            int     `json:"fallback_attempt_count"`
-	FallbackSuccessCount            int     `json:"fallback_success_count"`
-	FallbackFailureCount            int     `json:"fallback_failure_count"`
-	FallbackUnresolvedCount         int     `json:"fallback_unresolved_count"`
-	ActualRequestStartSampleCount   int     `json:"actual_request_start_sample_count"`
-	ActualRequestStartP50MS         float64 `json:"actual_request_start_p50_ms"`
-	ActualRequestStartP95MS         float64 `json:"actual_request_start_p95_ms"`
-	LeadSampleCount                 int     `json:"lead_sample_count"`
-	ArrivalLeadP50MS                float64 `json:"arrival_lead_p50_ms"`
-	ArrivalLeadP95MS                float64 `json:"arrival_lead_p95_ms"`
-	DispatchReadyLeadP50MS          float64 `json:"dispatch_ready_lead_p50_ms"`
-	DispatchReadyLeadP95MS          float64 `json:"dispatch_ready_lead_p95_ms"`
-	IncrementalCompatibleSelections int     `json:"potential_incremental_compatible_selections"`
-	PreservedCompatibleSelections   int     `json:"preserved_compatible_selections"`
-	DisplacedCompatibleSelections   int     `json:"displaced_compatible_selections"`
-	CompatibleFreshRequestParts     int     `json:"compatible_fresh_request_parts"`
-	ExistingRecordingCoverageParts  int     `json:"existing_recording_coverage_parts"`
-	NewWastedGenerations            int     `json:"new_wasted_generations"`
-	AvoidedWastedGenerations        int     `json:"avoided_wasted_generations"`
-	IncrementalDispatchReadyLeadMS  float64 `json:"incremental_dispatch_ready_lead_ms"`
-	EarlierCompatibleSelections     int     `json:"earlier_compatible_selections"`
-	LaterCompatibleSelections       int     `json:"later_compatible_selections"`
-	PairedLeadSampleCount           int     `json:"paired_lead_sample_count"`
-	PairedLeadP50MS                 float64 `json:"paired_lead_p50_ms"`
-	PairedLeadP95MS                 float64 `json:"paired_lead_p95_ms"`
-	counterfactualSelectionUnknown  bool    `json:"-"`
+	Name                                   string  `json:"name"`
+	Threshold                              float64 `json:"threshold,omitempty"`
+	SessionCount                           int     `json:"session_count"`
+	SuccessfulSessionCount                 int     `json:"successful_session_count"`
+	FailedSessionCount                     int     `json:"failed_session_count"`
+	CancelledSessionCount                  int     `json:"cancelled_session_count"`
+	NoCandidateSessionCount                int     `json:"no_candidate_session_count"`
+	UnresolvedPairCount                    int     `json:"unresolved_pair_count"`
+	EligibleCandidateCount                 int     `json:"eligible_candidate_count"`
+	CandidateSessionCount                  int     `json:"candidate_session_count"`
+	SelectedSessionCount                   int     `json:"selected_session_count"`
+	ResolvedSelectionCount                 int     `json:"resolved_selection_count"`
+	OracleCompatibleSelectionCount         int     `json:"oracle_compatible_selection_count"`
+	ExactTranscriptMatchCount              int     `json:"exact_transcript_match_count"`
+	ExactCleanupPlanMatchCount             int     `json:"exact_cleanup_plan_match_count"`
+	NearCleanupRepairCount                 int     `json:"near_cleanup_repair_count"`
+	WastedIfDispatchedCount                int     `json:"wasted_if_dispatched_count"`
+	UnresolvedSelectionCount               int     `json:"unresolved_selection_count"`
+	UnresolvedCounterfactualCount          int     `json:"unresolved_counterfactual_count"`
+	ActualAdoptionCount                    int     `json:"actual_adoption_count"`
+	ActualHeadStartDispatchCount           int     `json:"actual_headstart_dispatch_count"`
+	ResolvedHeadStartDispatchCount         int     `json:"resolved_actual_headstart_dispatch_count"`
+	ActualHeadStartMissCount               int     `json:"actual_headstart_miss_count"`
+	UnresolvedHeadStartDispatches          int     `json:"unresolved_actual_headstart_dispatch_count"`
+	RecordingTimeAdoptionCount             int     `json:"recording_time_adoption_count"`
+	FreshLateGenerationDispatchCount       int     `json:"fresh_late_generation_dispatch_count"`
+	FreshLateGenerationMissCount           int     `json:"fresh_late_generation_miss_count"`
+	FreshLateRequestCount                  int     `json:"fresh_late_request_count"`
+	ResolvedLateGenerationCount            int     `json:"resolved_late_generation_count"`
+	ExactAdoptionCount                     int     `json:"exact_adoption_count"`
+	NearRepairAdoptionCount                int     `json:"near_repair_adoption_count"`
+	PartialMultipartAdoptionCount          int     `json:"partial_multipart_adoption_count"`
+	FailedSpeculativeRequestCount          int     `json:"failed_speculative_request_count"`
+	ReusedRecordingRequestAdoptionCount    int     `json:"reused_recording_request_adoption_count"`
+	FreshLateRequestAdoptionCount          int     `json:"fresh_late_request_adoption_count"`
+	FreshLateGenerationContributionCount   int     `json:"fresh_late_generation_incremental_contribution_count"`
+	FreshLateRequestNotAdoptedCount        int     `json:"fresh_late_request_not_adopted_count"`
+	FreshLateRequestFailureCount           int     `json:"fresh_late_request_failure_count"`
+	FreshLateRequestCancelledCount         int     `json:"fresh_late_request_cancelled_count"`
+	PartiallyResolvedLateGenerationCount   int     `json:"partially_resolved_late_generation_count"`
+	FreshLatePartialMultipartAdoptionCount int     `json:"fresh_late_partial_multipart_adoption_count"`
+	UnresolvedLateGenerationCount          int     `json:"unresolved_late_generation_count"`
+	FallbackAttemptCount                   int     `json:"fallback_attempt_count"`
+	FallbackSuccessCount                   int     `json:"fallback_success_count"`
+	FallbackFailureCount                   int     `json:"fallback_failure_count"`
+	FallbackUnresolvedCount                int     `json:"fallback_unresolved_count"`
+	ActualRequestStartSampleCount          int     `json:"actual_request_start_sample_count"`
+	ActualRequestStartP50MS                float64 `json:"actual_request_start_p50_ms"`
+	ActualRequestStartP95MS                float64 `json:"actual_request_start_p95_ms"`
+	LeadSampleCount                        int     `json:"lead_sample_count"`
+	ArrivalLeadP50MS                       float64 `json:"arrival_lead_p50_ms"`
+	ArrivalLeadP95MS                       float64 `json:"arrival_lead_p95_ms"`
+	DispatchReadyLeadP50MS                 float64 `json:"dispatch_ready_lead_p50_ms"`
+	DispatchReadyLeadP95MS                 float64 `json:"dispatch_ready_lead_p95_ms"`
+	IncrementalCompatibleSelections        int     `json:"potential_incremental_compatible_selections"`
+	PreservedCompatibleSelections          int     `json:"preserved_compatible_selections"`
+	DisplacedCompatibleSelections          int     `json:"displaced_compatible_selections"`
+	CompatibleFreshRequestParts            int     `json:"compatible_fresh_request_parts"`
+	ExistingRecordingCoverageParts         int     `json:"existing_recording_coverage_parts"`
+	NewWastedGenerations                   int     `json:"new_wasted_generations"`
+	AvoidedWastedGenerations               int     `json:"avoided_wasted_generations"`
+	IncrementalDispatchReadyLeadMS         float64 `json:"incremental_dispatch_ready_lead_ms"`
+	EarlierCompatibleSelections            int     `json:"earlier_compatible_selections"`
+	LaterCompatibleSelections              int     `json:"later_compatible_selections"`
+	PairedLeadSampleCount                  int     `json:"paired_lead_sample_count"`
+	PairedLeadP50MS                        float64 `json:"paired_lead_p50_ms"`
+	PairedLeadP95MS                        float64 `json:"paired_lead_p95_ms"`
+	counterfactualSelectionUnknown         bool    `json:"-"`
 }
 
 type replayReport struct {

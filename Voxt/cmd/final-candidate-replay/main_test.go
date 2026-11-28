@@ -108,6 +108,7 @@ func finalSummary(sessionID uint64, at float64, status string) map[string]any {
 	return map[string]any{
 		"event": "voxt_final_candidate_summary", "session_id": sessionID,
 		"stop_to_final_available_ms": at, "final_status": status,
+		"terminal_status": status, "terminal_trace_complete": true,
 	}
 }
 
@@ -215,6 +216,137 @@ func TestCurrentBaselineReportsHeadStartMissesAndFallbackOutcomes(t *testing.T) 
 	if baseline.FallbackAttemptCount != 2 || baseline.FallbackSuccessCount != 0 ||
 		baseline.FallbackFailureCount != 1 || baseline.FallbackUnresolvedCount != 1 {
 		t.Fatalf("fallback attempts and outcomes were not separated: %+v", baseline)
+	}
+}
+
+func TestLateGenerationOutcomeUsesFreshRequestIDsAndRequiresCompleteEvidence(t *testing.T) {
+	tests := []struct {
+		name                  string
+		freshRequestIDs       []uint64
+		reusedRequestIDs      []uint64
+		requestResults        map[uint64]logEvent
+		adoptions             map[uint64]logEvent
+		terminalComplete      bool
+		wantStatus            string
+		wantFreshAdoptions    int
+		wantReusedAdoptions   int
+		wantFailed            int
+		wantCancelled         int
+		wantUnadopted         int
+		wantPartial           bool
+		wantPartiallyResolved bool
+		wantResolved          bool
+	}{
+		{
+			name:            "recording request adoption does not count as late contribution",
+			freshRequestIDs: []uint64{102}, reusedRequestIDs: []uint64{101},
+			requestResults:   map[uint64]logEvent{102: {RequestID: 102, Succeeded: true}},
+			adoptions:        map[uint64]logEvent{101: {RequestID: 101, Adopted: true, RequestOrigin: "headstart_recording"}},
+			terminalComplete: true, wantStatus: "resolved_fresh_miss", wantReusedAdoptions: 1,
+			wantUnadopted: 1, wantResolved: true,
+		},
+		{
+			name:            "fresh late request adoption is incremental",
+			freshRequestIDs: []uint64{102},
+			requestResults:  map[uint64]logEvent{102: {RequestID: 102, Succeeded: true}},
+			adoptions:       map[uint64]logEvent{102: {RequestID: 102, Adopted: true, RequestOrigin: "headstart_late", Outcome: "exact_match"}},
+			wantStatus:      "resolved_fresh_adoption", wantFreshAdoptions: 1, wantResolved: true,
+		},
+		{
+			name:            "reused and fresh requests adopted separately",
+			freshRequestIDs: []uint64{102}, reusedRequestIDs: []uint64{101},
+			requestResults: map[uint64]logEvent{102: {RequestID: 102, Succeeded: true}},
+			adoptions: map[uint64]logEvent{
+				101: {RequestID: 101, Adopted: true, RequestOrigin: "headstart_recording"},
+				102: {RequestID: 102, Adopted: true, RequestOrigin: "headstart_late"},
+			},
+			wantStatus: "resolved_fresh_adoption", wantFreshAdoptions: 1, wantReusedAdoptions: 1, wantResolved: true,
+		},
+		{
+			name:             "multipart generation with one result stays partial",
+			freshRequestIDs:  []uint64{102, 103},
+			requestResults:   map[uint64]logEvent{102: {RequestID: 102, Succeeded: true}},
+			terminalComplete: true, wantStatus: "partially_resolved", wantPartiallyResolved: true,
+		},
+		{
+			name:             "resolved multipart adoption reports partial use",
+			freshRequestIDs:  []uint64{102, 103},
+			requestResults:   map[uint64]logEvent{102: {RequestID: 102, Succeeded: true}, 103: {RequestID: 103, Succeeded: true}},
+			adoptions:        map[uint64]logEvent{102: {RequestID: 102, Adopted: true, Outcome: "exact_match"}},
+			terminalComplete: true, wantStatus: "resolved_fresh_adoption", wantFreshAdoptions: 1,
+			wantUnadopted: 1, wantPartial: true, wantResolved: true,
+		},
+		{
+			name:            "successful but unadopted request needs terminal evidence",
+			freshRequestIDs: []uint64{102},
+			requestResults:  map[uint64]logEvent{102: {RequestID: 102, Succeeded: true}},
+			wantStatus:      "unresolved_terminal_decision_missing",
+		},
+		{
+			name:             "failed fresh request is reported after terminal decision",
+			freshRequestIDs:  []uint64{102},
+			requestResults:   map[uint64]logEvent{102: {RequestID: 102, Succeeded: false}},
+			terminalComplete: true, wantStatus: "resolved_fresh_miss", wantFailed: 1,
+			wantUnadopted: 1, wantResolved: true,
+		},
+		{
+			name:             "cancelled fresh request is distinguished from failure",
+			freshRequestIDs:  []uint64{102},
+			requestResults:   map[uint64]logEvent{102: {RequestID: 102, Cancelled: true}},
+			terminalComplete: true, wantStatus: "resolved_fresh_miss", wantCancelled: 1,
+			wantUnadopted: 1, wantResolved: true,
+		},
+		{
+			name:            "missing adoption and terminal decision remain unresolved",
+			freshRequestIDs: []uint64{102},
+			requestResults:  map[uint64]logEvent{102: {RequestID: 102, Succeeded: true}},
+			wantStatus:      "unresolved_terminal_decision_missing",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			trace := newSessionTrace()
+			trace.terminalDecisionComplete = test.terminalComplete
+			for requestID, result := range test.requestResults {
+				trace.requestResultsByID[requestID] = result
+			}
+			for requestID, adoption := range test.adoptions {
+				trace.adoptions[requestID] = adoption
+			}
+			current := candidate{eligibility: logEvent{
+				GenerationID: 1, RequestIDs: append(append([]uint64(nil), test.reusedRequestIDs...), test.freshRequestIDs...),
+				FreshRequestIDs: test.freshRequestIDs, ReusedRequestIDs: test.reusedRequestIDs,
+			}}
+			resolveActualWebSocketOutcome(trace, &current)
+			if current.actualOutcomeStatus != test.wantStatus || current.actualAdoptionCount != test.wantFreshAdoptions ||
+				current.reusedRecordingAdoptionCount != test.wantReusedAdoptions || current.failedRequestCount != test.wantFailed ||
+				current.cancelledRequestCount != test.wantCancelled || current.unadoptedFreshRequestCount != test.wantUnadopted ||
+				current.partialAdoption != test.wantPartial || current.partiallyResolved != test.wantPartiallyResolved ||
+				current.hasActualOutcome != test.wantResolved {
+				t.Fatalf("late generation outcome: %+v", current)
+			}
+		})
+	}
+}
+
+func TestReplaySeparatesRecordingAdoptionFromLateGenerationMiss(t *testing.T) {
+	lateDispatch := map[string]any{
+		"event": "voxt_headstart_decision", "session_id": 701,
+		"source": "websocket_candidate", "sequence": 4, "candidate_plan_ready_ms": 40,
+		"dispatch_ready_ms": 50, "dispatched": true, "request_ids": []uint64{101, 102},
+		"reused_request_ids": []uint64{101}, "fresh_request_ids": []uint64{102}, "generation_id": 1,
+	}
+	report := replayLines(t,
+		lateDispatch,
+		map[string]any{"event": "voxt_headstart_adoption", "session_id": 701, "request_id": 101, "request_origin": "headstart_recording", "adopted": true},
+		map[string]any{"event": "voxt_headstart_request_done", "session_id": 701, "request_id": 102, "request_origin": "headstart_late", "generation_id": 1, "succeeded": true},
+		finalSummary(701, 100, "completed"),
+	)
+	baseline := policyByName(t, report, "current_websocket_baseline", 0)
+	if baseline.RecordingTimeAdoptionCount != 1 || baseline.ReusedRecordingRequestAdoptionCount != 1 ||
+		baseline.FreshLateGenerationMissCount != 1 || baseline.FreshLateGenerationContributionCount != 0 ||
+		baseline.ActualHeadStartMissCount != 1 || baseline.UnresolvedLateGenerationCount != 0 {
+		t.Fatalf("recording-time reuse was credited to the late generation: %+v", baseline)
 	}
 }
 

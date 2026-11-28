@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 from pathlib import Path
+import time
 
 import pytest
 from native_server import SupervisedServer, multipart_form, silent_wav, sse_payloads
@@ -55,7 +57,7 @@ def test_a_streamed_request_ends_with_its_metadata_and_done(
     ]
 
 
-def test_opted_in_candidates_precede_the_authoritative_final(
+def test_authoritative_final_precedes_candidates_drained_after_completion(
     asr_server: SupervisedServer,
 ) -> None:
     response = asr_server.post_form(
@@ -79,7 +81,25 @@ def test_opted_in_candidates_precede_the_authoritative_final(
     summary = next(event for event in events if event["type"] == "transcript.text.candidate_summary")
     assert summary["published_candidate_count"] == 2
     assert summary["coalesced_candidate_count"] + len(candidates) == 2
-    assert events[-1]["type"] == "transcript.text.done"
+    assert candidates[-1]["delivery_during_terminal_drain"] is True
+    final_index = next(
+        index for index, event in enumerate(events)
+        if event["type"] == "transcript.text.done"
+    )
+    terminal_candidate_indices = [
+        index
+        for index, event in enumerate(events)
+        if event["type"] == "transcript.text.candidate"
+        and event["delivery_during_terminal_drain"] is True
+    ]
+    assert terminal_candidate_indices
+    assert final_index < min(terminal_candidate_indices)
+    summary_index = next(
+        index for index, event in enumerate(events)
+        if event["type"] == "transcript.text.candidate_summary"
+    )
+    assert final_index < summary_index
+    assert events[-1]["type"] == "transcript.text.candidate_summary"
     assert payloads[-1] == "[DONE]"
 
 
@@ -105,7 +125,8 @@ def test_supported_candidate_transport_with_no_publishable_candidate(
         "coalesced_candidate_count": 0,
     }
     assert not any(event["type"] == "transcript.text.candidate" for event in events)
-    assert events[-1]["type"] == "transcript.text.done"
+    assert events[1]["type"] == "transcript.text.done"
+    assert events[-1]["type"] == "transcript.text.candidate_summary"
     assert payloads[-1] == "[DONE]"
 
 
@@ -124,9 +145,57 @@ def test_candidate_after_transcription_error_keeps_terminal_order(
     events = [json.loads(payload) for payload in payloads[:-1]]
     assert events[0]["type"] == "transcript.text.candidate_protocol"
     assert events[0]["supported"] is True
-    assert events[1]["type"] == "transcript.text.candidate"
-    assert events[2]["type"] == "transcript.text.candidate_summary"
-    assert events[3]["type"] == "error"
+    error_index = next(
+        index for index, event in enumerate(events) if event["type"] == "error"
+    )
+    terminal_candidate_indices = [
+        index
+        for index, event in enumerate(events)
+        if event["type"] == "transcript.text.candidate"
+        and event["delivery_during_terminal_drain"] is True
+    ]
+    assert all(error_index < index for index in terminal_candidate_indices)
+    summary_index = next(
+        index for index, event in enumerate(events)
+        if event["type"] == "transcript.text.candidate_summary"
+    )
+    assert error_index < summary_index
+    assert events[-1]["type"] == "transcript.text.candidate_summary"
+    assert payloads[-1] == "[DONE]"
+
+
+def test_slow_sse_consumer_does_not_change_native_candidate_overlap(
+    asr_server: SupervisedServer,
+) -> None:
+    boundary, body = multipart_form(
+        {
+            "outcome": "candidate_slow",
+            "stream": "true",
+            "include_transcript_candidates": "true",
+            "include_generation_metadata": "true",
+        },
+        silent_wav(FRAME_COUNT),
+    )
+    connection = http.client.HTTPConnection("127.0.0.1", asr_server.port, timeout=3)
+    connection.request(
+        "POST",
+        "/v1/audio/transcriptions",
+        body,
+        {"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    response = connection.getresponse()
+    time.sleep(0.12)
+    payloads = sse_payloads(response.read())
+    connection.close()
+    events = [json.loads(payload) for payload in payloads if payload != "[DONE]"]
+    candidate = next(event for event in events if event["type"] == "transcript.text.candidate")
+    final = next(event for event in events if event["type"] == "transcript.text.done")
+    assert candidate["delivery_during_terminal_drain"] is False
+    native_completion_ms = final["generation_metadata"]["authoritative_completion_elapsed_ms"]
+    assert native_completion_ms - candidate["elapsed_ms"] > 0
+    assert [event["type"] for event in events].index("transcript.text.candidate") < [
+        event["type"] for event in events
+    ].index("transcript.text.done")
     assert payloads[-1] == "[DONE]"
 
 

@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"errors"
 	"time"
 	"unicode/utf8"
 
@@ -13,23 +14,34 @@ func (h *headStart) submitLate(plan headPlan) lateSubmission {
 		return lateSubmission{dispatchReadyAt: time.Now()}
 	}
 	dispatchReadyAt := time.Now()
-	calls := h.submit(plan, true)
+	h.lateGenerationSequence++
+	generationID := h.lateGenerationSequence
+	calls := h.submit(plan, true, generationID)
 	requestIDs := make([]uint64, 0, len(calls))
+	freshRequestIDs := make([]uint64, 0, len(calls))
+	reusedRequestIDs := make([]uint64, 0, len(calls))
 	for _, call := range calls {
 		requestIDs = append(requestIDs, call.requestID)
+		if call.late {
+			freshRequestIDs = append(freshRequestIDs, call.requestID)
+		} else {
+			reusedRequestIDs = append(reusedRequestIDs, call.requestID)
+		}
 	}
 	return lateSubmission{
-		requestIDs: requestIDs, dispatchReadyAt: dispatchReadyAt,
-		dispatchedAt: time.Now(), dispatched: true,
+		requestIDs: requestIDs, freshRequestIDs: freshRequestIDs,
+		reusedRequestIDs: reusedRequestIDs, generationID: generationID,
+		dispatchReadyAt: dispatchReadyAt,
+		dispatchedAt:    time.Now(), dispatched: true,
 	}
 }
 
-func (h *headStart) submit(plan headPlan, late bool) []*headCall {
+func (h *headStart) submit(plan headPlan, late bool, generationID uint64) []*headCall {
 	calls := make([]*headCall, 0, len(plan.parts))
 	for _, part := range plan.parts {
 		call := part.reuse
 		if call == nil {
-			call = h.start(part.req, part.text, late)
+			call = h.start(part.req, part.text, late, generationID)
 		}
 		calls = append(calls, call)
 	}
@@ -52,11 +64,11 @@ func (h *headStart) send(text string) bool {
 		}
 		return false
 	}
-	h.submit(plan, false)
+	h.submit(plan, false, 0)
 	return true
 }
 
-func (h *headStart) start(req llm.Request, text string, late bool) *headCall {
+func (h *headStart) start(req llm.Request, text string, late bool, generationID uint64) *headCall {
 	r := h.r
 	ctx, cancel := context.WithCancel(r.currentLLMContext())
 	origin := "headstart_recording"
@@ -67,7 +79,7 @@ func (h *headStart) start(req llm.Request, text string, late bool) *headCall {
 	if r.shadowTraceEnabled {
 		requestID = r.llmRequestSequence.Add(1)
 	}
-	c := &headCall{req: req, requestID: requestID, text: text, late: late, origin: origin, cancel: cancel, done: make(chan struct{})}
+	c := &headCall{req: req, requestID: requestID, generationID: generationID, text: text, late: late, origin: origin, cancel: cancel, done: make(chan struct{})}
 	if r.shadowTraceEnabled {
 		ctx = context.WithValue(ctx, requestOriginContextKey{}, requestOriginContextValue{call: c})
 		ctx = llm.WithTraceTag(ctx, origin)
@@ -87,7 +99,9 @@ func (h *headStart) start(req llm.Request, text string, late bool) *headCall {
 			r.logShadowEvent(map[string]any{
 				"event": "voxt_headstart_request_done", "run_id": r.id,
 				"session_id": r.shadowSessionID, "request_id": requestID,
-				"source": origin, "succeeded": c.err == nil,
+				"source": origin, "request_origin": origin,
+				"generation_id": generationID, "succeeded": c.err == nil,
+				"cancelled":           c.err != nil && (errors.Is(c.err, context.Canceled) || errors.Is(c.err, context.DeadlineExceeded)),
 				"request_plan_sha256": r.head.partPlanHash(headPart{req: req}),
 			})
 		}

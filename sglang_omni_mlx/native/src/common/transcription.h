@@ -62,6 +62,8 @@ struct TranscriptionResult {
   // Time from Qwen3-ASR request start to its first committed transcript token
   // when candidate observation is enabled; zero otherwise.
   double first_transcript_token_elapsed_ms = 0.0;
+  // Qwen3-ASR model completion on the same request-relative clock as candidates.
+  std::optional<double> authoritative_completion_elapsed_ms;
 };
 
 struct TranscriptCandidate {

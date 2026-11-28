@@ -48,9 +48,10 @@ type headStart struct {
 	under   int    // its ThinkingOffUnder
 
 	// The session goroutine's.
-	text      string // the text asked about last
-	asks      int    // texts asked about while the user speaks
-	lateAsked bool
+	text                   string // the text asked about last
+	asks                   int    // texts asked about while the user speaks
+	lateAsked              bool
+	lateGenerationSequence uint64
 
 	mu           sync.Mutex
 	final        string        // what the speech model finalised so far (asr.EventPiece)
@@ -72,10 +73,13 @@ type headPlan struct {
 }
 
 type lateSubmission struct {
-	requestIDs      []uint64
-	dispatchReadyAt time.Time
-	dispatchedAt    time.Time
-	dispatched      bool
+	requestIDs       []uint64
+	freshRequestIDs  []uint64
+	reusedRequestIDs []uint64
+	generationID     uint64
+	dispatchReadyAt  time.Time
+	dispatchedAt     time.Time
+	dispatched       bool
 }
 
 func (p headPlan) hasFresh() bool {
@@ -93,6 +97,7 @@ func (p headPlan) hasFresh() bool {
 type headCall struct {
 	req                llm.Request
 	requestID          uint64
+	generationID       uint64
 	text               string // the part's
 	late               bool
 	origin             string
