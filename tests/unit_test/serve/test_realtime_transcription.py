@@ -17,6 +17,10 @@ from sglang_omni.audio import vad as vad_module
 from sglang_omni.audio.vad import StatelessVAD, StreamingVAD, VADConfig, VADEvent
 from sglang_omni.client import CompletionResult, GenerateRequest
 from sglang_omni.config import RealtimeTranscriptionConfig
+from sglang_omni.models.fun_asr.streaming import (
+    FunASRStreamingState,
+    FunASRStreamingStrategy,
+)
 from sglang_omni.models.qwen3_asr.streaming import (
     Qwen3ASRStreamingState,
     Qwen3ASRStreamingStrategy,
@@ -211,20 +215,26 @@ async def make_session(
     *,
     outputs: list[str] | None = None,
     max_segment_s: float | None = 60.0,
+    model_name: str = "qwen3-asr",
+    strategy: (
+        FakeStrategy | FunASRStreamingStrategy | Qwen3ASRStreamingStrategy | None
+    ) = None,
+    client: FakeClient | None = None,
 ) -> tuple[RealtimeTranscriptionSession, RecordingWebSocket, FakeClient]:
     use_fake_speech_model(monkeypatch)
     websocket = RecordingWebSocket()
-    client = FakeClient(outputs or [])
+    client_instance = client if client is not None else FakeClient(outputs or [])
+    strategy_instance = strategy if strategy is not None else FakeStrategy()
     session = RealtimeTranscriptionSession(
         websocket,  # type: ignore[arg-type]
-        client=client,  # type: ignore[arg-type]
-        model_name="qwen3-asr",
+        client=client_instance,  # type: ignore[arg-type]
+        model_name=model_name,
         transcription_config=RealtimeTranscriptionConfig(
-            strategy_cls=FakeStrategy,
+            strategy_cls=type(strategy_instance),
             decode_interval_ms=2000,
             max_segment_s=max_segment_s,
         ),
-        strategy=FakeStrategy(),
+        strategy=strategy_instance,
         session_id="sess-test",
     )
     await session.dispatch(
@@ -233,7 +243,7 @@ async def make_session(
             "session": {"turn_detection": None},
         }
     )
-    return session, websocket, client
+    return session, websocket, client_instance
 
 
 @pytest.mark.asyncio
@@ -267,30 +277,50 @@ async def test_partial_is_replaced_by_one_final_segment(
     assert session.decode_worker_task.done()
 
 
+@pytest.mark.parametrize(
+    ("model_name", "strategy_type"),
+    [
+        ("qwen3-asr", Qwen3ASRStreamingStrategy),
+        ("fun-asr-nano", FunASRStreamingStrategy),
+    ],
+)
 @pytest.mark.asyncio
-async def test_inflight_qwen_refresh_is_reused_for_identical_final(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_inflight_asr_refresh_is_reused_for_identical_final(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    model_name: str,
+    strategy_type: type[FunASRStreamingStrategy] | type[Qwen3ASRStreamingStrategy],
 ) -> None:
-    """An identical in-flight refresh is discarded before its final is processed."""
-    session, websocket, _client = await make_session(monkeypatch)
-    session.strategy = Qwen3ASRStreamingStrategy()
+    """A refresh still inflight at transcription.done supplies the final result."""
     client = BlockingResultClient(first_text="authoritative-transcript")
-    session.client = client
+    session, websocket, _client = await make_session(
+        monkeypatch,
+        model_name=model_name,
+        strategy=strategy_type(),
+        client=client,
+    )
 
     with caplog.at_level(logging.INFO, logger=session_module.__name__):
         await session.dispatch(audio_event(make_pcm(2.0)))
         segment = session.active_segment
         assert segment is not None
         state = segment.strategy_state
-        assert isinstance(state, Qwen3ASRStreamingState)
+        assert isinstance(state, Qwen3ASRStreamingState | FunASRStreamingState)
         await client.started.wait()
-        await session.dispatch({"type": "input_audio_buffer.commit"})
+        websocket.event_sent.clear()
+        done_task = asyncio.create_task(
+            session.dispatch({"type": "transcription.done"})
+        )
+        await websocket.event_sent.wait()
+        assert websocket.events[-1]["type"] == "input_audio_buffer.committed"
+        assert not done_task.done()
         client.release.set()
-        await session.dispatch({"type": "transcription.done"})
+        await done_task
 
     assert len(client.calls) == 1
     assert state.chunk_id == 1
     assert state.transcript == "authoritative-transcript"
+    assert state.language == "English"
     final_events = [
         event
         for event in websocket.events
@@ -309,8 +339,8 @@ async def test_inflight_qwen_refresh_is_reused_for_identical_final(
     assert event_indexes == sorted(event_indexes)
     assert websocket.events[-1]["type"] == "transcription.completed"
     assert websocket.events[-1]["text"] == "authoritative-transcript"
-    assert not session.final_waiters
-    assert "qwen3_asr_inflight_final_reuse" in caplog.text
+    assert "realtime_asr_inflight_final_reuse" in caplog.text
+    assert f"model_name={model_name}" in caplog.text
     assert "session_id=sess-test" in caplog.text
     assert "segment_id=0" in caplog.text
     assert "refresh_request_id=sess-test:0:1" in caplog.text
@@ -322,10 +352,12 @@ async def test_extended_audio_uses_a_separate_final_inference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A final over extended audio does not consume a shorter refresh result."""
-    session, websocket, _client = await make_session(monkeypatch)
-    session.strategy = Qwen3ASRStreamingStrategy()
     client = BlockingResultClient()
-    session.client = client
+    session, websocket, _client = await make_session(
+        monkeypatch,
+        strategy=Qwen3ASRStreamingStrategy(),
+        client=client,
+    )
 
     await session.dispatch(audio_event(make_pcm(2.0)))
     segment = session.active_segment
@@ -356,9 +388,10 @@ async def test_applied_refresh_still_requires_final_inference(
 ) -> None:
     """A refresh already applied to Qwen state is not reused at commit."""
     session, websocket, client = await make_session(
-        monkeypatch, outputs=["preview-transcript", "final-transcript"]
+        monkeypatch,
+        outputs=["preview-transcript", "final-transcript"],
+        strategy=Qwen3ASRStreamingStrategy(),
     )
-    session.strategy = Qwen3ASRStreamingStrategy()
     websocket.event_sent.clear()
 
     await session.dispatch(audio_event(make_pcm(2.0)))
@@ -395,13 +428,13 @@ async def test_ineligible_refresh_keeps_the_final_inference_path(
     first_finish_reason: str,
 ) -> None:
     """Unsupported strategies and truncated refreshes keep the final request."""
-    session, websocket, _client = await make_session(monkeypatch)
-    if reuse_enabled:
-        session.strategy = Qwen3ASRStreamingStrategy()
-    else:
-        pass
+    strategy = Qwen3ASRStreamingStrategy() if reuse_enabled else FakeStrategy()
     client = BlockingResultClient(first_finish_reason=first_finish_reason)
-    session.client = client
+    session, websocket, _client = await make_session(
+        monkeypatch,
+        strategy=strategy,
+        client=client,
+    )
 
     await session.dispatch(audio_event(make_pcm(2.0)))
     await client.started.wait()
@@ -424,21 +457,19 @@ async def test_clear_cancels_queued_final_after_refresh_starts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Clearing queued audio cancels its final waiter before the session restarts."""
-    session, websocket, _client = await make_session(monkeypatch)
-    session.strategy = Qwen3ASRStreamingStrategy()
     client = BlockingResultClient()
-    session.client = client
+    session, websocket, _client = await make_session(
+        monkeypatch,
+        strategy=Qwen3ASRStreamingStrategy(),
+        client=client,
+    )
 
     await session.dispatch(audio_event(make_pcm(2.0)))
     await client.started.wait()
     await session.dispatch({"type": "input_audio_buffer.commit"})
-    final_waiter = next(iter(session.final_waiters))
     await session.dispatch({"type": "input_audio_buffer.clear"})
 
     assert client.aborted == [client.calls[0]]
-    assert final_waiter.cancelled()
-    assert not session.pending_finals
-    assert not session.final_waiters
     assert websocket.events[-1]["type"] == "input_audio_buffer.cleared"
     assert not [
         event

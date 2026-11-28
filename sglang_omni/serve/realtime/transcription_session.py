@@ -685,11 +685,19 @@ class RealtimeTranscriptionSession:
                             is_final=True,
                         )
                     elif final.reused_result is not None:
+                        reused_result = final.reused_result
                         await self.apply_completion(
                             final.segment,
-                            final.reused_result,
+                            reused_result,
                             end_sample=final.end_sample,
                             is_final=True,
+                        )
+                        logger.info(
+                            f"realtime_asr_inflight_final_reuse model_name={self.model_name} "
+                            f"session_id={self.session_id} "
+                            f"segment_id={final.segment.segment_id} "
+                            f"refresh_request_id={reused_result.request_id} "
+                            f"end_sample={final.end_sample}"
                         )
                     else:
                         await self.decode_and_emit(
@@ -782,11 +790,6 @@ class RealtimeTranscriptionSession:
                     and not final.done.done()
                 ):
                     final.reused_result = result
-                    logger.info(
-                        f"qwen3_asr_inflight_final_reuse session_id={self.session_id} "
-                        f"segment_id={segment.segment_id} refresh_request_id={request_id} "
-                        f"end_sample={end_sample}"
-                    )
                 else:
                     pass
             else:

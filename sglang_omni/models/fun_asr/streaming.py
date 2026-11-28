@@ -21,6 +21,8 @@ class FunASRStreamingState:
 
 
 class FunASRStreamingStrategy:
+    supports_inflight_final_reuse: bool = True
+
     def create_state(
         self, *, model_name: str, language: str | None
     ) -> FunASRStreamingState:

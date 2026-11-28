@@ -186,12 +186,14 @@ def test_request_builder_reconstructs_prefix_plus_continuation(
         )
     )
     data.output_ids = [101, 102]
+    data.finish_reason = "length"
     result = result_adapter(data)
 
     assert data.prompt_token_ids[-3:] == [97, 98, 99]
     assert data.streaming_prefix_text == "abc"
     assert data.req.sampling_params.repetition_penalty == 1.3
     assert result.data["text"] == "abcef"
+    assert result.data["finish_reason"] == "length"
 
 
 def test_request_builder_defaults_to_no_repetition_penalty_when_not_streaming(
@@ -267,8 +269,22 @@ def test_fun_asr_strategy_final_decode_rolls_back_like_a_partial() -> None:
         audio=b"wav", state=state, is_final=True, request_id="r-final"
     )
 
-    assert final_request.extra_params == partial_request.extra_params
+    assert strategy.supports_inflight_final_reuse is True
+    assert final_request.to_dict() == partial_request.to_dict()
+    assert final_request.model == "fun-asr-nano"
+    assert final_request.prompt == {
+        "audio_bytes": b"wav",
+        "filename": "realtime-segment.wav",
+        "content_type": "audio/wav",
+    }
+    assert final_request.extra_params["language"] == "English"
+    assert final_request.extra_params["_asr_streaming_prefix_text"] == "hello world"
     assert final_request.extra_params["_asr_streaming_rollback_chars"] == 8
+    assert final_request.sampling.temperature == 0.0
+    assert final_request.sampling.repetition_penalty == 1.3
+    assert state.chunk_id == 2
+    assert state.transcript == "hello world"
+    assert state.language == "English"
 
 
 def test_fun_asr_strategy_updates_transcript_and_language() -> None:

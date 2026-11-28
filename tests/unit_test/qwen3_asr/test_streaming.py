@@ -126,11 +126,13 @@ def test_request_builder_reconstructs_prefix_plus_continuation(
         )
     )
     data.output_ids = [34, 35]
+    data.finish_reason = "length"
     result = result_adapter(data)
 
     assert data.prompt_token_ids[-4:] == [30, 31, 32, 33]
     assert result.data["text"] == "abcdef"
     assert result.data["language"] == "English"
+    assert result.data["finish_reason"] == "length"
 
 
 def test_qwen_strategy_waits_for_unfixed_chunks_before_using_prefix() -> None:
