@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from contextvars import ContextVar
 from dataclasses import dataclass, fields, replace
 
 import torch
@@ -28,6 +29,11 @@ class Qwen3ASRTemporalForward:
     request_id: str
     prompt_boundary: int
     candidate_token_ids: tuple[int, ...]
+
+
+QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT: ContextVar[Qwen3ASRTemporalForward | None] = (
+    ContextVar("qwen3_asr_temporal_forward", default=None)
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -63,9 +69,12 @@ def attach_temporal_forward_inputs(
 ) -> None:
     if hasattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR):
         raise RuntimeError("Qwen3-ASR temporal forward state was already attached")
+    elif QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.get() is not None:
+        raise RuntimeError("Qwen3-ASR temporal forward context was already active")
     else:
         pass
     setattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR, temporal_forward)
+    QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.set(temporal_forward)
 
 
 def get_temporal_forward_inputs(
@@ -75,7 +84,7 @@ def get_temporal_forward_inputs(
     if isinstance(temporal_forward, Qwen3ASRTemporalForward):
         return temporal_forward
     else:
-        return None
+        return QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.get()
 
 
 def clear_temporal_forward_inputs(forward_batch: ForwardBatch | None) -> None:
@@ -85,6 +94,7 @@ def clear_temporal_forward_inputs(forward_batch: ForwardBatch | None) -> None:
         delattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR)
     else:
         pass
+    QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.set(None)
 
 
 def verify_greedy_candidates(

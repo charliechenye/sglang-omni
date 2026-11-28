@@ -3,13 +3,21 @@
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
 
 from sglang_omni.models.qwen3_asr.engine_builder import Qwen3ASRModelRunner
 from sglang_omni.models.qwen3_asr.request_builders import Qwen3ASRRequestData
+from sglang_omni.models.qwen3_asr.temporal_prefill import (
+    install_temporal_prefill_graph_gate,
+)
 from sglang_omni.models.qwen3_asr.temporal_verification import (
     Qwen3ASRTemporalForward,
     Qwen3ASRTemporalLogitsProcessorOutput,
@@ -22,6 +30,8 @@ from sglang_omni.scheduling.types import (
     SchedulerOutput,
     SchedulerRequest,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
@@ -67,6 +77,11 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
                 candidate_token_ids=temporal_request.candidate_token_ids,
             ),
         )
+        graph_runner = self.tp_worker.model_runner.prefill_cuda_graph_runner
+        if isinstance(graph_runner, PrefillCudaGraphRunner):
+            install_temporal_prefill_graph_gate(graph_runner)
+        else:
+            pass
 
     def cleanup_prefill(
         self,
@@ -94,7 +109,25 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         else:
             pass
         logits_output = result.logits_output
+        if result.can_run_cuda_graph:
+            logger.error(
+                f"qwen3_asr_temporal_verification_failed "
+                f"request_id={requests[0].request_id} dispatch=graph "
+                f"logits_output_type={type(logits_output).__name__} "
+                "reason=admitted_prefill_used_cuda_graph"
+            )
+            raise RuntimeError(
+                "Qwen3-ASR admitted temporal prefill unexpectedly used a CUDA graph"
+            )
+        else:
+            pass
         if not isinstance(logits_output, Qwen3ASRTemporalLogitsProcessorOutput):
+            logger.error(
+                f"qwen3_asr_temporal_verification_failed "
+                f"request_id={requests[0].request_id} dispatch=eager "
+                f"logits_output_type={type(logits_output).__name__} "
+                "reason=missing_temporal_verification"
+            )
             raise RuntimeError(
                 "Qwen3-ASR admitted temporal prefill did not return a verification"
             )
@@ -128,6 +161,13 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
             pass
         logits_output.temporal_verification = verification
         result.next_token_ids = pending_token_ids
+        logger.info(
+            f"qwen3_asr_temporal_verified request_id={requests[0].request_id} "
+            f"dispatch=eager logits_output_type={type(logits_output).__name__} "
+            f"accepted_candidate_tokens={len(verification.accepted_prefix)} "
+            f"rejected_candidate_tokens="
+            f"{len(verification.candidate_token_ids) - len(verification.accepted_prefix)}"
+        )
 
     def next_input_token_ids(
         self,

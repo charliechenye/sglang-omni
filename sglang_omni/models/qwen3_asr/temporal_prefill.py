@@ -31,13 +31,29 @@ from sglang_omni.models.qwen3_asr.temporal_verification import (
 logger = logging.getLogger(__name__)
 
 
-class Qwen3ASRTemporalPrefillCudaGraphRunner(PrefillCudaGraphRunner):
-    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:
-        if get_temporal_forward_inputs(forward_batch) is not None:
+def install_temporal_prefill_graph_gate(
+    graph_runner: PrefillCudaGraphRunner,
+) -> None:
+    if hasattr(graph_runner, "qwen3_asr_temporal_native_graph_check"):
+        return
+    else:
+        pass
+    native_can_run_graph = graph_runner.can_run_graph
+
+    def can_run_graph(forward_batch: ForwardBatch) -> bool:
+        temporal_forward = get_temporal_forward_inputs(forward_batch)
+        if temporal_forward is not None:
+            logger.info(
+                f"qwen3_asr_temporal_dispatch request_id={temporal_forward.request_id} "
+                f"graph_runner={type(graph_runner).__name__} dispatch=eager "
+                "reason=exact_unpadded_rows"
+            )
             return False
         else:
-            pass
-        return super().can_run_graph(forward_batch)
+            return native_can_run_graph(forward_batch)
+
+    graph_runner.can_run_graph = can_run_graph
+    graph_runner.qwen3_asr_temporal_native_graph_check = native_can_run_graph
 
 
 class Qwen3ASRTemporalPrefillAdder(PrefillAdder):
@@ -296,4 +312,4 @@ class Qwen3ASRTemporalPrefillAdder(PrefillAdder):
         return True
 
 
-__all__ = ["Qwen3ASRTemporalPrefillAdder", "Qwen3ASRTemporalPrefillCudaGraphRunner"]
+__all__ = ["Qwen3ASRTemporalPrefillAdder", "install_temporal_prefill_graph_gate"]
