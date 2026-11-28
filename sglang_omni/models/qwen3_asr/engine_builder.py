@@ -113,7 +113,18 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         enable_encoder_cuda_graph: bool = True,
         max_audio_clip_s: float | None = None,
         enable_temporal_final_verification: bool = False,
+        enable_temporal_prefill_cuda_graph: bool = False,
     ) -> None:
+        if (
+            enable_temporal_prefill_cuda_graph
+            and not enable_temporal_final_verification
+        ):
+            raise ValueError(
+                "Qwen3-ASR temporal prefill CUDA Graph requires "
+                "temporal final verification"
+            )
+        else:
+            pass
         if pre_lm_max_batch_size < 1:
             raise ValueError(
                 f"pre_lm_max_batch_size must be >= 1, got {pre_lm_max_batch_size}"
@@ -161,6 +172,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         self.enable_encoder_cuda_graph = enable_encoder_cuda_graph
         self.max_audio_clip_s = max_audio_clip_s
         self.enable_temporal_final_verification = enable_temporal_final_verification
+        self.enable_temporal_prefill_cuda_graph = enable_temporal_prefill_cuda_graph
         self.tokenizer: PreTrainedTokenizerBase | None = None
         self.feature_extractor: WhisperFeatureExtractor | None = None
         self.context_length = 0
@@ -283,7 +295,13 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
                 Qwen3ASRTemporalModelRunner,
             )
 
-            return Qwen3ASRTemporalModelRunner(model_worker, output_proc)
+            return Qwen3ASRTemporalModelRunner(
+                model_worker,
+                output_proc,
+                enable_temporal_prefill_cuda_graph=(
+                    self.enable_temporal_prefill_cuda_graph
+                ),
+            )
         else:
             return Qwen3ASRModelRunner(model_worker, output_proc)
 
@@ -305,6 +323,16 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
             model = model_worker.model_runner.model
             model.language_model.logits_processor = Qwen3ASRTemporalLogitsProcessor(
                 model.language_model.logits_processor
+            )
+        else:
+            pass
+        if self.enable_temporal_prefill_cuda_graph:
+            from sglang_omni.models.qwen3_asr.temporal_cuda_graph_runner import (
+                Qwen3ASRTemporalPrefillCudaGraphRunner,
+            )
+
+            model_worker.model_runner.prefill_graph_runner_class = (
+                Qwen3ASRTemporalPrefillCudaGraphRunner
             )
         else:
             pass
@@ -351,6 +379,20 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         from sglang.srt.arg_groups.model_override_base import resolved_view
 
         cfg = resolved_view(server_args)
+        if (
+            self.enable_temporal_prefill_cuda_graph
+            and cfg.cuda_graph_config.prefill.backend
+            not in (
+                CudaGraphBackend.DISABLED,
+                CudaGraphBackend.BREAKABLE,
+            )
+        ):
+            raise ValueError(
+                "Qwen3-ASR temporal prefill CUDA Graph requires a disabled or "
+                "Breakable prefill graph backend"
+            )
+        else:
+            pass
         if self.enable_temporal_final_verification:
             if not current_platform.is_cuda():
                 raise ValueError(

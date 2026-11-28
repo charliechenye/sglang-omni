@@ -38,25 +38,39 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.model_runner import (
     ModelRunnerOutput as SGLangModelRunnerOutput,
 )
+from sglang.srt.model_executor.model_runner_components import cuda_graph_setup
 from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+import sglang_omni.model_runner.sglang_model_runner as sglang_model_runner_module
+import sglang_omni.models.qwen3_asr.engine_builder as engine_builder_module
 import sglang_omni.preprocessing.transcription as transcription
+from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
+from sglang_omni.models.qwen3_asr.config import Qwen3ASRFactoryArgs
+from sglang_omni.models.qwen3_asr.engine_builder import Qwen3ASREngineBuilder
 from sglang_omni.models.qwen3_asr.request_builders import (
     Qwen3ASRRequestData,
     Qwen3ASRTemporalRequest,
     make_qwen3_asr_scheduler_adapters,
+)
+from sglang_omni.models.qwen3_asr.temporal_cuda_graph_runner import (
+    Qwen3ASRTemporalPrefillCudaGraphRunner,
 )
 from sglang_omni.models.qwen3_asr.temporal_runner import Qwen3ASRTemporalModelRunner
 from sglang_omni.models.qwen3_asr.temporal_scheduler import Qwen3ASRTemporalScheduler
 from sglang_omni.models.qwen3_asr.temporal_verification import (
     Qwen3ASRTemporalBatchResult,
     Qwen3ASRTemporalForward,
+    Qwen3ASRTemporalGraphReplay,
     Qwen3ASRTemporalLogitsProcessor,
     Qwen3ASRTemporalLogitsProcessorOutput,
     attach_temporal_forward_inputs,
@@ -68,6 +82,7 @@ from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.realtime import RealtimeTranscriptionContext
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.types import (
+    ModelRunnerOutput,
     RequestOutput,
     SchedulerOutput,
     SchedulerRequest,
@@ -76,6 +91,79 @@ from sglang_omni.scheduling.types import (
 
 class NoArgumentCallback(Protocol):
     def __call__(self) -> None: ...
+
+
+def make_temporal_forward_batch(
+    request_id: str,
+    input_token_ids: list[int],
+    *,
+    graph_bucket_size: int | None = None,
+) -> ForwardBatch:
+    raw_num_tokens = len(input_token_ids)
+    graph_bucket_size = graph_bucket_size or raw_num_tokens
+    input_ids = torch.full((graph_bucket_size,), 997, dtype=torch.long)
+    input_ids[:raw_num_tokens] = torch.tensor(input_token_ids, dtype=torch.long)
+    positions = torch.full((graph_bucket_size,), 997, dtype=torch.long)
+    positions[:raw_num_tokens] = torch.arange(raw_num_tokens, dtype=torch.long)
+    mrope_positions = positions.unsqueeze(0).expand(3, -1).clone()
+    forward_batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=1,
+        input_ids=input_ids,
+        req_pool_indices=torch.tensor([0], dtype=torch.long),
+        seq_lens=torch.tensor([raw_num_tokens], dtype=torch.long),
+        out_cache_loc=torch.arange(raw_num_tokens, dtype=torch.long),
+        seq_lens_sum=raw_num_tokens,
+        extend_seq_lens=torch.tensor([raw_num_tokens], dtype=torch.int32),
+        extend_prefix_lens=torch.tensor([0], dtype=torch.int32),
+        extend_start_loc=torch.tensor([0], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([raw_num_tokens], dtype=torch.long),
+        extend_seq_lens_cpu=[raw_num_tokens],
+        extend_prefix_lens_cpu=[0],
+        positions=positions,
+        mrope_positions=mrope_positions,
+        capture_hidden_mode=CaptureHiddenMode.NULL,
+    )
+    forward_batch.rids = [request_id]
+    return forward_batch
+
+
+def make_recording_temporal_logits_processor(
+    monkeypatch: pytest.MonkeyPatch,
+    target_token_by_row: dict[int, int],
+) -> tuple[LogitsProcessor, torch.nn.Module]:
+    class RecordingLMHead(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invocation_count = 0
+            self.selected_rows: list[int] = []
+
+        def forward(self, selected_hidden_states: torch.Tensor) -> torch.Tensor:
+            self.invocation_count += 1
+            self.selected_rows = [
+                int(row[0]) for row in selected_hidden_states.tolist()
+            ]
+            logits = torch.full((len(self.selected_rows), 32), -100.0)
+            for selected_row, input_row in enumerate(self.selected_rows):
+                target_token_id = target_token_by_row.get(input_row, 2)
+                logits[selected_row, target_token_id] = 100.0
+            return logits
+
+    native_processor = LogitsProcessor.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(native_processor)
+    native_processor.expected_aux_hidden_states = None
+    native_processor.keep_last_hidden_states = False
+
+    def run_lm_head(
+        selected_hidden_states: torch.Tensor,
+        lm_head: torch.nn.Module,
+        logits_metadata: LogitsMetadata | ForwardBatch,
+    ) -> torch.Tensor:
+        assert isinstance(logits_metadata, (LogitsMetadata, ForwardBatch))
+        return lm_head(selected_hidden_states)
+
+    monkeypatch.setattr(native_processor, "_get_logits", run_lm_head)
+    return native_processor, RecordingLMHead()
 
 
 def test_temporal_verification_commits_only_the_contiguous_target_prefix() -> None:
@@ -357,6 +445,70 @@ def test_temporal_logits_processor_uses_multimodal_forward_batch_once(
     assert lm_head.selected_rows == [4]
 
 
+@pytest.mark.parametrize("graph_bucket_size", [5, 8])
+@pytest.mark.parametrize(
+    ("target_token_by_row", "accepted_prefix", "pending_token_id"),
+    [
+        ({2: 99, 3: 21, 4: 2}, (), 99),
+        ({2: 20, 3: 99, 4: 2}, (20,), 99),
+        ({2: 20, 3: 21, 4: 2}, (20, 21), 2),
+    ],
+)
+def test_temporal_graph_verifier_uses_only_real_prediction_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    graph_bucket_size: int,
+    target_token_by_row: dict[int, int],
+    accepted_prefix: tuple[int, ...],
+    pending_token_id: int,
+) -> None:
+    request_id = "graph-final-a"
+    prompt_boundary = 3
+    candidate_token_ids = (20, 21)
+    forward_batch = make_temporal_forward_batch(
+        request_id,
+        [10, 11, 12, *candidate_token_ids],
+        graph_bucket_size=graph_bucket_size,
+    )
+    temporal_context = attach_temporal_forward_inputs(
+        forward_batch,
+        Qwen3ASRTemporalForward(
+            request_id=request_id,
+            prompt_boundary=prompt_boundary,
+            candidate_token_ids=candidate_token_ids,
+        ),
+    )
+    temporal_context.graph_replay = Qwen3ASRTemporalGraphReplay(
+        request_id=request_id,
+        raw_num_tokens=5,
+        graph_bucket_size=graph_bucket_size,
+    )
+    native_processor, lm_head = make_recording_temporal_logits_processor(
+        monkeypatch,
+        target_token_by_row,
+    )
+    temporal_processor = Qwen3ASRTemporalLogitsProcessor(native_processor)
+    hidden_states = torch.arange(graph_bucket_size, dtype=torch.float32).unsqueeze(1)
+
+    temporal_output = temporal_processor(
+        input_ids=forward_batch.input_ids,
+        hidden_states=hidden_states,
+        lm_head=lm_head,
+        logits_metadata=forward_batch,
+    )
+
+    assert isinstance(temporal_output, Qwen3ASRTemporalLogitsProcessorOutput)
+    assert temporal_output.temporal_verification is not None
+    assert temporal_output.temporal_verification.accepted_prefix == accepted_prefix
+    assert temporal_output.temporal_verification.pending_token_id == pending_token_id
+    assert temporal_output.pending_token_ids is not None
+    assert temporal_output.pending_token_ids.tolist() == [pending_token_id]
+    assert temporal_output.graph_replay is temporal_context.graph_replay
+    assert lm_head.invocation_count == 1
+    assert lm_head.selected_rows == [2, 3, 4]
+
+    clear_temporal_forward_inputs(forward_batch, temporal_context)
+
+
 def test_temporal_context_rejects_duplicate_and_cross_request_ownership() -> None:
     def make_batch(request_id: str) -> ForwardBatch:
         batch = ForwardBatch(
@@ -413,7 +565,7 @@ def test_temporal_context_rejects_duplicate_and_cross_request_ownership() -> Non
     assert get_temporal_forward_inputs(other_batch) is None
 
 
-@pytest.mark.parametrize("failure_point", ["preparation", "forward"])
+@pytest.mark.parametrize("failure_point", ["preparation", "forward", "graph_replay"])
 def test_temporal_prepare_and_forward_releases_context_after_failure(
     failure_point: str,
 ) -> None:
@@ -457,14 +609,35 @@ def test_temporal_prepare_and_forward_releases_context_after_failure(
     def fail(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError(f"forced {failure_point} failure")
 
+    if failure_point == "graph_replay":
+        graph_runner = object.__new__(Qwen3ASRTemporalPrefillCudaGraphRunner)
+        graph_runner.can_run_graph = lambda _forward_batch: True
+        graph_runner.execute = fail
+
+        def execute_graph_replay(
+            forward_batch: ForwardBatch,
+            *_args: object,
+            **_kwargs: object,
+        ) -> None:
+            assert graph_runner.can_run_graph(forward_batch)
+            graph_runner.execute(forward_batch)
+
+        prefill_cuda_graph_runner = graph_runner
+        forward_batch_generation = execute_graph_replay
+    else:
+        prefill_cuda_graph_runner = None
+        forward_batch_generation = fail if failure_point == "forward" else None
     worker = SimpleNamespace(
-        model_runner=SimpleNamespace(prefill_cuda_graph_runner=None),
-        forward_batch_generation=fail if failure_point == "forward" else None,
+        model_runner=SimpleNamespace(
+            prefill_cuda_graph_runner=prefill_cuda_graph_runner
+        ),
+        forward_batch_generation=forward_batch_generation,
     )
     runner = object.__new__(Qwen3ASRTemporalModelRunner)
     runner.tp_worker = worker
     runner.retained_prefill_input_embeds = None
     runner.retain_prefill_input_embeds = False
+    runner.enable_temporal_prefill_cuda_graph = failure_point == "graph_replay"
     runner.temporal_forward_context_stack = []
     if failure_point == "preparation":
         runner.custom_prefill_forward = fail
@@ -621,6 +794,350 @@ def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
     clear_temporal_forward_inputs(forward_batch, temporal_context)
     assert runner.can_run_graph(forward_batch)
     assert native_graph_checks == [forward_batch, forward_batch]
+
+
+@pytest.mark.parametrize("supported_runner", [False, True])
+def test_temporal_bcg_gate_falls_back_when_graph_is_unavailable(
+    supported_runner: bool,
+) -> None:
+    from sglang_omni.models.qwen3_asr.temporal_prefill import (
+        install_temporal_prefill_graph_gate,
+    )
+
+    runner_class = (
+        Qwen3ASRTemporalPrefillCudaGraphRunner
+        if supported_runner
+        else PrefillCudaGraphRunner
+    )
+    runner = object.__new__(runner_class)
+    native_graph_checks: list[ForwardBatch] = []
+
+    def check_native_graph_eligibility(forward_batch: ForwardBatch) -> bool:
+        native_graph_checks.append(forward_batch)
+        return get_temporal_forward_inputs(forward_batch) is None
+
+    runner.can_run_graph = check_native_graph_eligibility
+    forward_batch = make_temporal_forward_batch("graph-fallback", [10, 20])
+    temporal_context = attach_temporal_forward_inputs(
+        forward_batch,
+        Qwen3ASRTemporalForward(
+            request_id="graph-fallback",
+            prompt_boundary=1,
+            candidate_token_ids=(20,),
+        ),
+    )
+    install_temporal_prefill_graph_gate(
+        runner,
+        enable_temporal_cuda_graph=True,
+    )
+
+    assert not runner.can_run_graph(forward_batch)
+    if supported_runner:
+        assert native_graph_checks == [forward_batch]
+    else:
+        assert native_graph_checks == []
+    clear_temporal_forward_inputs(forward_batch, temporal_context)
+    assert runner.can_run_graph(forward_batch)
+    assert native_graph_checks == [forward_batch]
+
+
+def test_temporal_bcg_replay_survives_native_trim_and_runner_finalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_id = "graph-final-a"
+    input_token_ids = [10, 11, 12, 20, 21]
+    prompt_boundary = 3
+    candidate_token_ids = (20, 21)
+    forward_batch = make_temporal_forward_batch(request_id, input_token_ids)
+    forward_batch.kv_loc_plan = SimpleNamespace(
+        bind_replay=lambda *_args, **_kwargs: None
+    )
+    native_processor, lm_head = make_recording_temporal_logits_processor(
+        monkeypatch,
+        {2: 20, 3: 99, 4: 2},
+    )
+
+    class FakeQwen3ASRModel:
+        def __init__(self) -> None:
+            self.language_model = SimpleNamespace(
+                layer_model=SimpleNamespace(
+                    forward=lambda *_args, **_kwargs: pytest.fail(
+                        "native body replay did not replace layer_model.forward"
+                    )
+                ),
+                logits_processor=native_processor,
+            )
+
+        def forward(
+            self,
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            replay_batch: ForwardBatch,
+            **kwargs: object,
+        ) -> LogitsProcessorOutput:
+            del positions, kwargs
+            hidden_states = self.language_model.layer_model.forward(
+                input_ids, replay_batch
+            )
+            return self.language_model.logits_processor(
+                input_ids,
+                hidden_states,
+                lm_head,
+                replay_batch,
+            )
+
+    sglang_runner = object.__new__(SGLModelRunner)
+    sglang_runner.prefill_graph_runner_class = None
+    sglang_runner.model_arch_override = "Qwen3ASRForConditionalGeneration"
+    sglang_runner.model = FakeQwen3ASRModel()
+    builder = object.__new__(Qwen3ASREngineBuilder)
+    builder.enable_temporal_final_verification = True
+    builder.enable_temporal_prefill_cuda_graph = True
+    builder.uses_torch_mps = lambda: False
+    monkeypatch.setattr(
+        engine_builder_module.current_platform, "is_cuda", lambda: False
+    )
+    monkeypatch.setattr(engine_builder_module.current_platform, "is_xpu", lambda: False)
+    builder.setup_model(
+        model_worker=SimpleNamespace(model_runner=sglang_runner),
+        checkpoint_dir="unused",
+        device="cpu",
+        gpu_id=0,
+        server_args=SimpleNamespace(),
+    )
+    assert isinstance(
+        sglang_runner.model.language_model.logits_processor,
+        Qwen3ASRTemporalLogitsProcessor,
+    )
+    assert (
+        sglang_runner.prefill_graph_runner_class
+        is Qwen3ASRTemporalPrefillCudaGraphRunner
+    )
+
+    graph_runner = object.__new__(Qwen3ASRTemporalPrefillCudaGraphRunner)
+    graph_runner.model_runner = SimpleNamespace(
+        model=sglang_runner.model,
+        pp_group=SimpleNamespace(is_first_rank=True),
+        spec_algorithm=SimpleNamespace(is_speculative=lambda: False),
+        kv_index_translator=object(),
+        attn_tp_sequence_sharded=lambda _static_num_tokens: False,
+        prepare_dummy_forward_batch=lambda replay_batch: replay_batch,
+    )
+    graph_runner.buffer_registry = CudaGraphBufferRegistry(
+        device=torch.device("cpu"),
+        max_bs=1,
+        max_num_tokens=8,
+    )
+    for slot_name in ("input_ids", "positions", "out_cache_loc"):
+        graph_runner.buffer_registry.register_slot(
+            GraphSlot(
+                name=slot_name,
+                shape_fn=lambda _max_bs, max_tokens: (max_tokens,),
+                dtype=torch.long,
+                axis="tokens",
+                padding_policy=PaddingPolicy.ZERO,
+            )
+        )
+    graph_runner.buffer_registry.register_slot(
+        GraphSlot(
+            name="mrope_positions",
+            shape_fn=lambda _max_bs, max_tokens: (3, max_tokens),
+            dtype=torch.long,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+            slice_fn=lambda buffer, count: buffer[:, :count],
+        )
+    )
+    graph_runner.backend = object.__new__(BreakableCudaGraphBackend)
+    replay_hidden_states = torch.arange(8, dtype=torch.float32).unsqueeze(1)
+    graph_runner.backend.replay = lambda *_args, **_kwargs: replay_hidden_states
+    graph_runner.capture_num_tokens = [8]
+    graph_runner.max_context_size = None
+    graph_runner._is_full_backend = (
+        False  # noqa: leading-underscore  # pinned SGLang runner state
+    )
+    graph_runner._use_draft_input_embeds = (
+        False  # noqa: leading-underscore  # pinned SGLang runner state
+    )
+    graph_runner.static_draft_hidden_states = None
+    graph_runner.capture_return_pooled_hidden_states = False
+    graph_runner.enable_cp_bcg_capture = False
+    graph_runner.has_mha_companion_layers = False
+    graph_runner.is_dsv41_model = False
+    graph_runner._qwen_bcg_hc_sidechannel = (
+        False  # noqa: leading-underscore  # pinned SGLang runner state
+    )
+    graph_runner._prefill_static_buffers = (
+        None  # noqa: leading-underscore  # pinned SGLang runner state
+    )
+    graph_runner.layer_model = sglang_runner.model.language_model.layer_model
+    graph_runner._next_token_logits_buffer = (
+        lambda _rows: None
+    )  # noqa: leading-underscore  # native graph helper stub
+    graph_runner._prefill_logits_buffer_rows = (
+        lambda _batch: 1
+    )  # noqa: leading-underscore  # native graph helper stub
+    graph_runner._shape_key = lambda bucket_size, _batch: ShapeKey(
+        size=bucket_size
+    )  # noqa: leading-underscore  # native graph helper stub
+    graph_runner._prepare_forward_metadata_for_replay = (
+        lambda *_args: None
+    )  # noqa: leading-underscore  # native graph helper stub
+    graph_runner._prefill_forward_context = (
+        lambda *_args, **_kwargs: nullcontext()
+    )  # noqa: leading-underscore  # native graph helper stub
+
+    from sglang_omni.models.qwen3_asr.temporal_prefill import (
+        install_temporal_prefill_graph_gate,
+    )
+
+    native_graph_checks: list[ForwardBatch] = []
+
+    def check_native_graph_eligibility(batch: ForwardBatch) -> bool:
+        native_graph_checks.append(batch)
+        return True
+
+    graph_runner.can_run_graph = check_native_graph_eligibility
+    install_temporal_prefill_graph_gate(
+        graph_runner,
+        enable_temporal_cuda_graph=True,
+    )
+    ordinary_forward_batch = make_temporal_forward_batch("ordinary-a", [10])
+    assert graph_runner.can_run_graph(ordinary_forward_batch)
+    temporal_context = attach_temporal_forward_inputs(
+        forward_batch,
+        Qwen3ASRTemporalForward(
+            request_id=request_id,
+            prompt_boundary=prompt_boundary,
+            candidate_token_ids=candidate_token_ids,
+        ),
+    )
+    assert graph_runner.can_run_graph(forward_batch)
+
+    static_forward_batch, _shared_read_ends = graph_runner.load_batch(forward_batch)
+    assert static_forward_batch is not forward_batch
+    assert static_forward_batch.rids == [request_id]
+    assert not hasattr(static_forward_batch, "qwen3_asr_temporal_forward")
+    assert temporal_context.graph_replay == Qwen3ASRTemporalGraphReplay(
+        request_id=request_id,
+        raw_num_tokens=5,
+        graph_bucket_size=8,
+    )
+    assert get_temporal_forward_inputs(static_forward_batch) == (
+        temporal_context.temporal_forward
+    )
+
+    raw_logits_output = graph_runner._execute_body_capture(  # noqa: leading-underscore  # exercise native BCG body boundary
+        forward_batch,
+        static_forward_batch,
+        8,
+        5,
+        ShapeKey(size=8),
+    )
+    logits_output = graph_runner._trim_logits_output(  # noqa: leading-underscore  # exercise native trim override
+        raw_logits_output
+    )
+    assert isinstance(logits_output, Qwen3ASRTemporalLogitsProcessorOutput)
+    assert logits_output.temporal_verification is not None
+    assert logits_output.temporal_verification.accepted_prefix == (20,)
+    assert logits_output.pending_token_ids is not None
+    assert logits_output.pending_token_ids.tolist() == [99]
+    assert logits_output.next_token_logits is not None
+    assert logits_output.next_token_logits.shape == (1, 32)
+    assert logits_output.graph_replay == temporal_context.graph_replay
+    assert lm_head.invocation_count == 1
+    assert lm_head.selected_rows == [2, 3, 4]
+
+    ordinary_output = graph_runner._trim_logits_output(  # noqa: leading-underscore  # exercise native trim override
+        LogitsProcessorOutput(
+            next_token_logits=torch.zeros((8, 32)),
+            hidden_states=torch.arange(8, dtype=torch.float32).unsqueeze(1),
+        )
+    )
+    assert type(ordinary_output) is LogitsProcessorOutput
+    assert ordinary_output.next_token_logits is not None
+    assert ordinary_output.next_token_logits.shape == (5, 32)
+    assert ordinary_output.hidden_states is not None
+    assert ordinary_output.hidden_states.shape == (5, 1)
+
+    temporal_request = Qwen3ASRTemporalRequest(
+        context=RealtimeTranscriptionContext(
+            request_id=request_id,
+            segment_id=3,
+            attempt=1,
+            is_final=True,
+            previous_hypothesis="recognized words",
+            language="English",
+        ),
+        candidate_token_ids=candidate_token_ids,
+        prompt_boundary=prompt_boundary,
+        admitted=True,
+        attempted=True,
+    )
+    scheduler_request = SchedulerRequest(
+        request_id=request_id,
+        data=Qwen3ASRRequestData(temporal_request=temporal_request),
+    )
+    schedule_batch = SimpleNamespace(
+        reqs=[SimpleNamespace()],
+        input_ids=torch.tensor(input_token_ids, dtype=torch.long),
+    )
+    generation_result = GenerationBatchResult(
+        logits_output=logits_output,
+        next_token_ids=None,
+        can_run_cuda_graph=True,
+    )
+    temporal_runner = object.__new__(Qwen3ASRTemporalModelRunner)
+    temporal_runner.enable_temporal_prefill_cuda_graph = True
+    temporal_runner.temporal_forward_context_stack = [temporal_context]
+    temporal_runner.post_prefill(
+        generation_result,
+        forward_batch,
+        schedule_batch,
+        [scheduler_request],
+    )
+    assert generation_result.next_token_ids.tolist() == [99]
+
+    def finalize_base_result(
+        _runner: ModelRunner,
+        batch_result: GenerationBatchResult,
+        *_args: object,
+        **_kwargs: object,
+    ) -> ModelRunnerOutput:
+        return ModelRunnerOutput(
+            outputs={request_id: RequestOutput(request_id, data="pending")},
+            req_ids=[request_id],
+            req_id_to_index={request_id: 0},
+            can_run_cuda_graph=batch_result.can_run_cuda_graph,
+            next_token_ids=batch_result.next_token_ids,
+        )
+
+    monkeypatch.setattr(ModelRunner, "finalize", finalize_base_result)
+    runner_output = temporal_runner.finalize(
+        generation_result,
+        forward_batch,
+        schedule_batch,
+        SchedulerOutput(requests=[scheduler_request], batch_data=None),
+    )
+    assert runner_output.temporal_verification is logits_output.temporal_verification
+    assert runner_output.outputs[request_id].data is None
+    batch_result = Qwen3ASRTemporalScheduler.make_batch_result(runner_output)
+    assert isinstance(batch_result, Qwen3ASRTemporalBatchResult)
+    assert batch_result.temporal_verification is logits_output.temporal_verification
+    assert batch_result.native_result.next_token_ids.tolist() == [99]
+
+    temporal_runner.cleanup_prefill(
+        forward_batch,
+        schedule_batch,
+        [scheduler_request],
+    )
+    assert get_temporal_forward_inputs(static_forward_batch) is None
+    assert graph_runner.can_run_graph(ordinary_forward_batch)
+    assert native_graph_checks == [
+        ordinary_forward_batch,
+        forward_batch,
+        ordinary_forward_batch,
+    ]
 
 
 @pytest.mark.parametrize("no_copy", [False, True])
@@ -907,6 +1424,7 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
     sglang_runner.forward = native_forward
     builder = object.__new__(engine_builder.Qwen3ASREngineBuilder)
     builder.enable_temporal_final_verification = True
+    builder.enable_temporal_prefill_cuda_graph = False
     monkeypatch.setattr(builder, "uses_torch_mps", lambda: False)
     monkeypatch.setattr(engine_builder.current_platform, "is_cuda", lambda: False)
     monkeypatch.setattr(engine_builder.current_platform, "is_xpu", lambda: False)
@@ -957,6 +1475,7 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
     )
     temporal_runner = object.__new__(Qwen3ASRTemporalModelRunner)
     temporal_runner.tp_worker = model_worker
+    temporal_runner.enable_temporal_prefill_cuda_graph = False
     temporal_runner.retained_prefill_input_embeds = None
     temporal_runner.retain_prefill_input_embeds = False
     temporal_runner.temporal_forward_context_stack = []
@@ -1420,6 +1939,7 @@ def test_inherited_build_runtime_uses_the_temporal_scheduler_contract(
 
     builder = object.__new__(engine_builder.Qwen3ASREngineBuilder)
     builder.enable_temporal_final_verification = enabled
+    builder.enable_temporal_prefill_cuda_graph = False
     scheduler_kwargs_calls = 0
     scheduler_callbacks_calls = 0
     abort_callback = lambda: None
@@ -1509,6 +2029,7 @@ def test_flag_off_setup_leaves_qwen_asr_components_untouched(
 
     builder = object.__new__(engine_builder.Qwen3ASREngineBuilder)
     builder.enable_temporal_final_verification = False
+    builder.enable_temporal_prefill_cuda_graph = False
     builder.uses_torch_mps = lambda: False
     logits_processor = SimpleNamespace(name="original-logits-processor")
     graph_runner_class = SimpleNamespace(name="original-graph-runner")
@@ -1535,6 +2056,118 @@ def test_flag_off_setup_leaves_qwen_asr_components_untouched(
         logits_processor
     )
     assert model_worker.model_runner.prefill_graph_runner_class is graph_runner_class
+
+
+@pytest.mark.parametrize("temporal_graph_enabled", [False, True])
+def test_temporal_bcg_runner_is_selected_through_engine_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+    temporal_graph_enabled: bool,
+) -> None:
+    class NativePrefillRunner:
+        def __init__(self, model_runner: object) -> None:
+            self.model_runner = model_runner
+
+    monkeypatch.setattr(
+        cuda_graph_setup,
+        "PrefillCudaGraphRunner",
+        NativePrefillRunner,
+    )
+    monkeypatch.setattr(
+        sglang_model_runner_module,
+        "_PREFILL_RUNNER_DISPATCH_DEFAULT",
+        None,
+    )
+    monkeypatch.setattr(
+        sglang_model_runner_module,
+        "get_exec",
+        lambda: SimpleNamespace(
+            graph=SimpleNamespace(
+                cuda_graph_config=SimpleNamespace(
+                    prefill=SimpleNamespace(
+                        backend=engine_builder_module.CudaGraphBackend.BREAKABLE
+                    )
+                )
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        Qwen3ASRTemporalPrefillCudaGraphRunner,
+        "__init__",
+        lambda runner, model_runner: setattr(runner, "model_runner", model_runner),
+    )
+    monkeypatch.setattr(
+        engine_builder_module.current_platform, "is_cuda", lambda: False
+    )
+    monkeypatch.setattr(engine_builder_module.current_platform, "is_xpu", lambda: False)
+
+    sglang_runner = object.__new__(SGLModelRunner)
+    sglang_runner.prefill_graph_runner_class = None
+    sglang_runner.model_arch_override = "Qwen3ASRForConditionalGeneration"
+    original_logits_processor = torch.nn.Identity()
+    sglang_runner.model = SimpleNamespace(
+        language_model=SimpleNamespace(logits_processor=original_logits_processor)
+    )
+    builder = object.__new__(Qwen3ASREngineBuilder)
+    builder.enable_temporal_final_verification = True
+    builder.enable_temporal_prefill_cuda_graph = temporal_graph_enabled
+    builder.uses_torch_mps = lambda: False
+
+    builder.setup_model(
+        model_worker=SimpleNamespace(model_runner=sglang_runner),
+        checkpoint_dir="unused",
+        device="cpu",
+        gpu_id=0,
+        server_args=SimpleNamespace(),
+    )
+
+    assert isinstance(
+        sglang_runner.model.language_model.logits_processor,
+        Qwen3ASRTemporalLogitsProcessor,
+    )
+    if temporal_graph_enabled:
+        assert (
+            sglang_runner.prefill_graph_runner_class
+            is Qwen3ASRTemporalPrefillCudaGraphRunner
+        )
+    else:
+        assert sglang_runner.prefill_graph_runner_class is None
+    sglang_model_runner_module.install_prefill_runner_dispatch()
+    graph_runner = cuda_graph_setup.PrefillCudaGraphRunner(sglang_runner)
+    if temporal_graph_enabled:
+        assert isinstance(graph_runner, Qwen3ASRTemporalPrefillCudaGraphRunner)
+    else:
+        assert isinstance(graph_runner, NativePrefillRunner)
+
+
+def test_temporal_bcg_flag_requires_temporal_verification() -> None:
+    assert not Qwen3ASRFactoryArgs().enable_temporal_prefill_cuda_graph
+    assert Qwen3ASRFactoryArgs(
+        enable_temporal_final_verification=True,
+        enable_temporal_prefill_cuda_graph=True,
+    ).enable_temporal_prefill_cuda_graph
+
+    with pytest.raises(ValueError, match="requires temporal final verification"):
+        engine_builder_module.Qwen3ASREngineBuilder(
+            max_running_requests=1,
+            max_new_tokens=1,
+            enable_async_decode=False,
+            enable_plain_fallback=False,
+            async_decode_min_batch_size=None,
+            mem_fraction_static=None,
+            mm_embedding_cache_size_bytes=0,
+            enable_torch_compile=False,
+            torch_compile_max_bs=1,
+            mm_attention_backend=None,
+            request_build_max_workers=1,
+            request_build_max_pending=1,
+            prefill_coalesce_requests=1,
+            prefill_coalesce_wait_ms=0,
+            prefill_coalesce_when_idle=False,
+            prefill_coalesce_requires_pending_builds=False,
+            prefill_coalesce_after_builds_during_decode=None,
+            stream_emit_interval_s=0,
+            enable_temporal_prefill_cuda_graph=True,
+        )
 
 
 @pytest.mark.parametrize(

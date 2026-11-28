@@ -41,9 +41,14 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
     supports_speculative_async_decode: bool = False
 
     def __init__(
-        self, tp_worker: ModelWorker, output_processor: SGLangOutputProcessor
+        self,
+        tp_worker: ModelWorker,
+        output_processor: SGLangOutputProcessor,
+        *,
+        enable_temporal_prefill_cuda_graph: bool = False,
     ) -> None:
         super().__init__(tp_worker, output_processor)
+        self.enable_temporal_prefill_cuda_graph = enable_temporal_prefill_cuda_graph
         self.temporal_forward_context_stack: list[
             Qwen3ASRTemporalForwardContext | None
         ] = []
@@ -92,7 +97,10 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         self.temporal_forward_context_stack[-1] = temporal_context
         graph_runner = self.tp_worker.model_runner.prefill_cuda_graph_runner
         if isinstance(graph_runner, PrefillCudaGraphRunner):
-            install_temporal_prefill_graph_gate(graph_runner)
+            install_temporal_prefill_graph_gate(
+                graph_runner,
+                enable_temporal_cuda_graph=(self.enable_temporal_prefill_cuda_graph),
+            )
         else:
             pass
 
@@ -134,27 +142,52 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         else:
             pass
         logits_output = result.logits_output
-        if result.can_run_cuda_graph:
-            logger.error(
-                f"qwen3_asr_temporal_verification_failed "
-                f"request_id={requests[0].request_id} dispatch=graph "
-                f"logits_output_type={type(logits_output).__name__} "
-                "reason=admitted_prefill_used_cuda_graph"
-            )
-            raise RuntimeError(
-                "Qwen3-ASR admitted temporal prefill unexpectedly used a CUDA graph"
-            )
-        else:
-            pass
+        dispatch = "graph" if result.can_run_cuda_graph else "eager"
         if not isinstance(logits_output, Qwen3ASRTemporalLogitsProcessorOutput):
             logger.error(
                 f"qwen3_asr_temporal_verification_failed "
-                f"request_id={requests[0].request_id} dispatch=eager "
+                f"request_id={requests[0].request_id} dispatch={dispatch} "
                 f"logits_output_type={type(logits_output).__name__} "
                 "reason=missing_temporal_verification"
             )
             raise RuntimeError(
                 "Qwen3-ASR admitted temporal prefill did not return a verification"
+            )
+        else:
+            pass
+        graph_replay = logits_output.graph_replay
+        if result.can_run_cuda_graph:
+            if not self.enable_temporal_prefill_cuda_graph or graph_replay is None:
+                logger.error(
+                    f"qwen3_asr_temporal_verification_failed "
+                    f"request_id={requests[0].request_id} dispatch=graph "
+                    f"logits_output_type={type(logits_output).__name__} "
+                    "reason=missing_graph_replay_ownership"
+                )
+                raise RuntimeError(
+                    "Qwen3-ASR temporal graph replay lost its trusted metadata"
+                )
+            elif (
+                graph_replay.request_id != requests[0].request_id
+                or graph_replay.raw_num_tokens
+                != temporal_request.prompt_boundary
+                + len(temporal_request.candidate_token_ids)
+                or graph_replay.graph_bucket_size < graph_replay.raw_num_tokens
+            ):
+                raise RuntimeError(
+                    "Qwen3-ASR temporal graph replay does not match its request"
+                )
+            else:
+                pass
+        elif graph_replay is not None:
+            logger.error(
+                f"qwen3_asr_temporal_verification_failed "
+                f"request_id={requests[0].request_id} dispatch=eager "
+                f"logits_output_type={type(logits_output).__name__} "
+                "reason=unexpected_graph_replay_metadata"
+            )
+            raise RuntimeError(
+                "Qwen3-ASR eager temporal prefill received graph replay metadata"
             )
         else:
             pass
@@ -186,9 +219,16 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
             pass
         logits_output.temporal_verification = verification
         result.next_token_ids = pending_token_ids
+        graph_details = (
+            f" raw_num_tokens={graph_replay.raw_num_tokens}"
+            f" graph_bucket_size={graph_replay.graph_bucket_size}"
+            if graph_replay is not None
+            else ""
+        )
         logger.info(
             f"qwen3_asr_temporal_verified request_id={requests[0].request_id} "
-            f"dispatch=eager logits_output_type={type(logits_output).__name__} "
+            f"dispatch={dispatch}{graph_details} "
+            f"logits_output_type={type(logits_output).__name__} "
             f"accepted_candidate_tokens={len(verification.accepted_prefix)} "
             f"rejected_candidate_tokens="
             f"{len(verification.candidate_token_ids) - len(verification.accepted_prefix)}"
