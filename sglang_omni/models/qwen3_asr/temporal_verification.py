@@ -3,7 +3,7 @@
 
 from __future__ import annotations
 
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, fields, replace
 
 import torch
@@ -31,9 +31,16 @@ class Qwen3ASRTemporalForward:
     candidate_token_ids: tuple[int, ...]
 
 
-QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT: ContextVar[Qwen3ASRTemporalForward | None] = (
-    ContextVar("qwen3_asr_temporal_forward", default=None)
-)
+@dataclass(slots=True)
+class Qwen3ASRTemporalForwardContext:
+    temporal_forward: Qwen3ASRTemporalForward
+    owner_forward_batch_id: int
+    context_token: Token[Qwen3ASRTemporalForwardContext | None] | None = None
+
+
+QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT: ContextVar[
+    Qwen3ASRTemporalForwardContext | None
+] = ContextVar("qwen3_asr_temporal_forward", default=None)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -66,35 +73,82 @@ class Qwen3ASRTemporalBatchResult:
 
 def attach_temporal_forward_inputs(
     forward_batch: ForwardBatch, temporal_forward: Qwen3ASRTemporalForward
-) -> None:
+) -> Qwen3ASRTemporalForwardContext:
     if hasattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR):
         raise RuntimeError("Qwen3-ASR temporal forward state was already attached")
     elif QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.get() is not None:
         raise RuntimeError("Qwen3-ASR temporal forward context was already active")
     else:
         pass
-    setattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR, temporal_forward)
-    QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.set(temporal_forward)
+    temporal_context = Qwen3ASRTemporalForwardContext(
+        temporal_forward=temporal_forward,
+        owner_forward_batch_id=id(forward_batch),
+    )
+    context_token = QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.set(temporal_context)
+    temporal_context.context_token = context_token
+    try:
+        setattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR, temporal_context)
+    except BaseException:
+        QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.reset(context_token)
+        temporal_context.context_token = None
+        raise
+    return temporal_context
 
 
 def get_temporal_forward_inputs(
     forward_batch: ForwardBatch,
 ) -> Qwen3ASRTemporalForward | None:
-    temporal_forward = getattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR, None)
-    if isinstance(temporal_forward, Qwen3ASRTemporalForward):
-        return temporal_forward
+    temporal_context = getattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR, None)
+    active_context = QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.get()
+    if temporal_context is not None:
+        if not isinstance(temporal_context, Qwen3ASRTemporalForwardContext):
+            raise RuntimeError("Qwen3-ASR temporal forward ownership is invalid")
+        elif temporal_context.owner_forward_batch_id != id(forward_batch):
+            raise RuntimeError("Qwen3-ASR temporal forward belongs to another batch")
+        elif active_context is not temporal_context:
+            raise RuntimeError("Qwen3-ASR temporal forward context is not active")
+        else:
+            return temporal_context.temporal_forward
+    elif active_context is None:
+        return None
     else:
-        return QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.get()
+        temporal_forward = active_context.temporal_forward
+        if forward_batch.rids != [temporal_forward.request_id]:
+            raise RuntimeError("Qwen3-ASR temporal context belongs to another request")
+        else:
+            return temporal_forward
 
 
-def clear_temporal_forward_inputs(forward_batch: ForwardBatch | None) -> None:
-    if forward_batch is not None and hasattr(
-        forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR
-    ):
-        delattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR)
+def clear_temporal_forward_inputs(
+    forward_batch: ForwardBatch,
+    expected_context: Qwen3ASRTemporalForwardContext,
+) -> None:
+    if expected_context.owner_forward_batch_id != id(forward_batch):
+        raise RuntimeError("Qwen3-ASR cleanup does not own the temporal forward")
     else:
         pass
-    QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.set(None)
+    temporal_context = getattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR, None)
+    if temporal_context is None:
+        if expected_context.context_token is None:
+            return
+        else:
+            raise RuntimeError("Qwen3-ASR temporal forward context is missing")
+    elif not isinstance(temporal_context, Qwen3ASRTemporalForwardContext):
+        raise RuntimeError("Qwen3-ASR temporal forward ownership is invalid")
+    elif temporal_context is not expected_context:
+        raise RuntimeError("Qwen3-ASR cleanup does not own this temporal forward")
+    elif temporal_context.context_token is None:
+        if QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.get() is temporal_context:
+            raise RuntimeError("Qwen3-ASR active temporal forward has no reset token")
+        else:
+            delattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR)
+    elif QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.get() is not temporal_context:
+        raise RuntimeError("Qwen3-ASR cleanup does not own the active context")
+    else:
+        context_token = temporal_context.context_token
+        QWEN3_ASR_TEMPORAL_FORWARD_CONTEXT.reset(context_token)
+        temporal_context.context_token = None
+        delattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR)
 
 
 def verify_greedy_candidates(

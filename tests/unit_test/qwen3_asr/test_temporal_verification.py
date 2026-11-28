@@ -12,6 +12,7 @@ import pytest
 import sglang.srt.managers.schedule_batch as schedule_batch_module
 import sglang.srt.managers.scheduler_components.batch_result_processor as batch_result_processor_module
 import sglang.srt.model_executor.model_runner as native_model_runner_module
+import sglang.srt.model_executor.runner.eager_runner as eager_runner_module
 import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import (
@@ -24,7 +25,11 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.model_executor.cuda_graph_buffer_registry import CudaGraphBufferRegistry
+from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+    CudaGraphBufferRegistry,
+    GraphSlot,
+    PaddingPolicy,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
@@ -56,6 +61,7 @@ from sglang_omni.models.qwen3_asr.temporal_verification import (
     Qwen3ASRTemporalLogitsProcessorOutput,
     attach_temporal_forward_inputs,
     clear_temporal_forward_inputs,
+    get_temporal_forward_inputs,
     verify_greedy_candidates,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
@@ -310,7 +316,7 @@ def test_temporal_logits_processor_uses_multimodal_forward_batch_once(
     )
     temporal_processor = Qwen3ASRTemporalLogitsProcessor(native_processor)
     lm_head = RecordingLMHead()
-    attach_temporal_forward_inputs(
+    temporal_context = attach_temporal_forward_inputs(
         forward_batch,
         Qwen3ASRTemporalForward(
             request_id=request_id,
@@ -337,7 +343,7 @@ def test_temporal_logits_processor_uses_multimodal_forward_batch_once(
     assert lm_head.invocation_count == 1
     assert lm_head.selected_rows == [2, 3, 4]
 
-    clear_temporal_forward_inputs(forward_batch)
+    clear_temporal_forward_inputs(forward_batch, temporal_context)
     lm_head.invocation_count = 0
     ordinary_output = temporal_processor(
         input_ids=None,
@@ -349,6 +355,213 @@ def test_temporal_logits_processor_uses_multimodal_forward_batch_once(
     assert not isinstance(ordinary_output, Qwen3ASRTemporalLogitsProcessorOutput)
     assert lm_head.invocation_count == 1
     assert lm_head.selected_rows == [4]
+
+
+def test_temporal_context_rejects_duplicate_and_cross_request_ownership() -> None:
+    def make_batch(request_id: str) -> ForwardBatch:
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.tensor([10], dtype=torch.long),
+            req_pool_indices=torch.tensor([0], dtype=torch.long),
+            seq_lens=torch.tensor([1], dtype=torch.long),
+            out_cache_loc=torch.tensor([0], dtype=torch.long),
+            seq_lens_sum=1,
+        )
+        batch.rids = [request_id]
+        return batch
+
+    first_batch = make_batch("temporal-a")
+    other_batch = make_batch("temporal-b")
+    temporal_context = attach_temporal_forward_inputs(
+        first_batch,
+        Qwen3ASRTemporalForward(
+            request_id="temporal-a",
+            prompt_boundary=1,
+            candidate_token_ids=(20,),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="already attached"):
+        attach_temporal_forward_inputs(
+            first_batch,
+            Qwen3ASRTemporalForward(
+                request_id="temporal-a",
+                prompt_boundary=1,
+                candidate_token_ids=(21,),
+            ),
+        )
+    with pytest.raises(RuntimeError, match="already active"):
+        attach_temporal_forward_inputs(
+            other_batch,
+            Qwen3ASRTemporalForward(
+                request_id="temporal-b",
+                prompt_boundary=1,
+                candidate_token_ids=(22,),
+            ),
+        )
+    with pytest.raises(RuntimeError, match="another request"):
+        get_temporal_forward_inputs(other_batch)
+    with pytest.raises(RuntimeError, match="does not own"):
+        clear_temporal_forward_inputs(other_batch, temporal_context)
+
+    assert get_temporal_forward_inputs(first_batch) == temporal_context.temporal_forward
+    clear_temporal_forward_inputs(first_batch, temporal_context)
+    clear_temporal_forward_inputs(first_batch, temporal_context)
+    assert get_temporal_forward_inputs(first_batch) is None
+    assert not hasattr(first_batch, "qwen3_asr_temporal_forward")
+    assert get_temporal_forward_inputs(other_batch) is None
+
+
+@pytest.mark.parametrize("failure_point", ["preparation", "forward"])
+def test_temporal_prepare_and_forward_releases_context_after_failure(
+    failure_point: str,
+) -> None:
+    request_id = "temporal-failure"
+    candidate_token_ids = (20,)
+    temporal_request = Qwen3ASRTemporalRequest(
+        context=RealtimeTranscriptionContext(
+            request_id=request_id,
+            segment_id=1,
+            attempt=1,
+            is_final=True,
+            previous_hypothesis="word",
+            language="English",
+        ),
+        candidate_token_ids=candidate_token_ids,
+        prompt_boundary=1,
+        admitted=True,
+        attempted=True,
+    )
+    scheduler_request = SchedulerRequest(
+        request_id=request_id,
+        data=Qwen3ASRRequestData(temporal_request=temporal_request),
+    )
+    schedule_batch = SimpleNamespace(
+        reqs=[SimpleNamespace()],
+        input_ids=torch.tensor([10, 20], dtype=torch.long),
+        is_prefill_only=True,
+    )
+    forward_batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=1,
+        input_ids=schedule_batch.input_ids,
+        req_pool_indices=torch.tensor([0], dtype=torch.long),
+        seq_lens=torch.tensor([2], dtype=torch.long),
+        out_cache_loc=torch.arange(2, dtype=torch.long),
+        seq_lens_sum=2,
+    )
+    forward_batch.rids = [request_id]
+    forward_batch.positions = torch.arange(2, dtype=torch.long)
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"forced {failure_point} failure")
+
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(prefill_cuda_graph_runner=None),
+        forward_batch_generation=fail if failure_point == "forward" else None,
+    )
+    runner = object.__new__(Qwen3ASRTemporalModelRunner)
+    runner.tp_worker = worker
+    runner.retained_prefill_input_embeds = None
+    runner.retain_prefill_input_embeds = False
+    runner.temporal_forward_context_stack = []
+    if failure_point == "preparation":
+        runner.custom_prefill_forward = fail
+    else:
+        runner.custom_prefill_forward = lambda *_args: None
+
+    with pytest.raises(RuntimeError, match=f"forced {failure_point} failure"):
+        runner.prepare_and_forward(
+            forward_batch,
+            schedule_batch,
+            [scheduler_request],
+            is_prefill=True,
+        )
+
+    assert get_temporal_forward_inputs(forward_batch) is None
+    assert not hasattr(forward_batch, "qwen3_asr_temporal_forward")
+    assert runner.temporal_forward_context_stack == []
+
+
+def test_before_prefill_failure_preserves_another_requests_context() -> None:
+    def make_temporal_request(request_id: str) -> SchedulerRequest:
+        temporal_request = Qwen3ASRTemporalRequest(
+            context=RealtimeTranscriptionContext(
+                request_id=request_id,
+                segment_id=1,
+                attempt=1,
+                is_final=True,
+                previous_hypothesis="word",
+                language="English",
+            ),
+            candidate_token_ids=(20,),
+            prompt_boundary=1,
+            admitted=True,
+            attempted=True,
+        )
+        return SchedulerRequest(
+            request_id=request_id,
+            data=Qwen3ASRRequestData(temporal_request=temporal_request),
+        )
+
+    first_batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=1,
+        input_ids=torch.tensor([10, 20], dtype=torch.long),
+        req_pool_indices=torch.tensor([0], dtype=torch.long),
+        seq_lens=torch.tensor([2], dtype=torch.long),
+        out_cache_loc=torch.arange(2, dtype=torch.long),
+        seq_lens_sum=2,
+    )
+    first_batch.rids = ["temporal-a"]
+    first_context = attach_temporal_forward_inputs(
+        first_batch,
+        Qwen3ASRTemporalForward(
+            request_id="temporal-a",
+            prompt_boundary=1,
+            candidate_token_ids=(20,),
+        ),
+    )
+    second_batch = ForwardBatch(
+        forward_mode=ForwardMode.EXTEND,
+        batch_size=1,
+        input_ids=torch.tensor([11, 21], dtype=torch.long),
+        req_pool_indices=torch.tensor([1], dtype=torch.long),
+        seq_lens=torch.tensor([2], dtype=torch.long),
+        out_cache_loc=torch.arange(2, dtype=torch.long),
+        seq_lens_sum=2,
+    )
+    second_batch.rids = ["temporal-b"]
+    second_request = make_temporal_request("temporal-b")
+    schedule_batch = SimpleNamespace(
+        reqs=[SimpleNamespace()],
+        input_ids=second_batch.input_ids,
+        is_prefill_only=True,
+    )
+    runner = object.__new__(Qwen3ASRTemporalModelRunner)
+    runner.tp_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(prefill_cuda_graph_runner=None)
+    )
+    runner.retained_prefill_input_embeds = None
+    runner.retain_prefill_input_embeds = False
+    runner.temporal_forward_context_stack = []
+
+    with pytest.raises(RuntimeError, match="already active"):
+        runner.prepare_and_forward(
+            second_batch,
+            schedule_batch,
+            [second_request],
+            is_prefill=True,
+        )
+
+    assert runner.temporal_forward_context_stack == []
+    runner.cleanup_prefill(second_batch, schedule_batch, [second_request])
+    runner.cleanup_prefill(second_batch, schedule_batch, [second_request])
+    assert get_temporal_forward_inputs(first_batch) == first_context.temporal_forward
+    with pytest.raises(RuntimeError, match="another request"):
+        get_temporal_forward_inputs(second_batch)
+    clear_temporal_forward_inputs(first_batch, first_context)
 
 
 def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
@@ -388,11 +601,14 @@ def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
         check_native_graph_eligibility,
     )
     install_temporal_prefill_graph_gate(runner)
+    native_graph_check = runner.qwen3_asr_temporal_native_graph_check
+    install_temporal_prefill_graph_gate(runner)
 
     assert runner.can_run_graph(forward_batch)
+    assert runner.qwen3_asr_temporal_native_graph_check is native_graph_check
     assert native_graph_checks == [forward_batch]
 
-    attach_temporal_forward_inputs(
+    temporal_context = attach_temporal_forward_inputs(
         forward_batch,
         Qwen3ASRTemporalForward(
             request_id="final-3-1",
@@ -402,30 +618,43 @@ def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
     )
     assert not runner.can_run_graph(forward_batch)
     assert native_graph_checks == [forward_batch]
-    clear_temporal_forward_inputs(forward_batch)
+    clear_temporal_forward_inputs(forward_batch, temporal_context)
     assert runner.can_run_graph(forward_batch)
     assert native_graph_checks == [forward_batch, forward_batch]
 
 
+@pytest.mark.parametrize("no_copy", [False, True])
+@pytest.mark.parametrize("graph_enabled", [False, True])
 def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
     monkeypatch: pytest.MonkeyPatch,
+    no_copy: bool,
+    graph_enabled: bool,
 ) -> None:
     """An eager ForwardBatch copy must not turn an admitted request into plain prefill."""
     import sglang_omni.models.qwen3_asr.engine_builder as engine_builder
 
+    monkeypatch.setenv("SGLANG_EAGER_INPUT_NO_COPY", str(no_copy).lower())
     request_id = "final-3-1"
     candidate_token_ids = (20, 21)
     prompt_boundary = 3
     input_token_ids = torch.tensor([10, 11, 12, 20, 21], dtype=torch.long)
-    native_graph_checks: list[ForwardBatch] = []
-    graph_executions: list[ForwardBatch] = []
+    native_graph_checks: list[tuple[PrefillCudaGraphRunner, ForwardBatch]] = []
+    graph_executions: list[tuple[PrefillCudaGraphRunner, ForwardBatch]] = []
     eager_batches: list[ForwardBatch] = []
+    temporal_eager_batches: list[ForwardBatch] = []
+    eager_batch_copies: list[tuple[ForwardBatch, ForwardBatch]] = []
+    installed_processors: list[Qwen3ASRTemporalLogitsProcessor] = []
     published_next_token_ids: list[torch.Tensor | None] = []
 
-    def make_forward_batch(token_ids: torch.Tensor) -> ForwardBatch:
+    def make_forward_batch(
+        token_ids: torch.Tensor,
+        *,
+        request_id: str,
+        forward_mode: ForwardMode = ForwardMode.EXTEND,
+    ) -> ForwardBatch:
         token_count = len(token_ids)
         forward_batch = ForwardBatch(
-            forward_mode=ForwardMode.EXTEND,
+            forward_mode=forward_mode,
             batch_size=1,
             input_ids=token_ids,
             req_pool_indices=torch.tensor([0], dtype=torch.long),
@@ -435,10 +664,13 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
         )
         forward_batch.rids = [request_id]
         forward_batch.positions = torch.arange(token_count, dtype=torch.long)
+        forward_batch.seq_lens_cpu = torch.tensor([token_count], dtype=torch.long)
+        forward_batch.mrope_positions = torch.arange(token_count).expand(3, -1).clone()
         forward_batch.extend_seq_lens = torch.tensor([token_count], dtype=torch.int32)
         forward_batch.extend_seq_lens_cpu = [token_count]
         forward_batch.extend_prefix_lens_cpu = [0]
         forward_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        forward_batch.forward_metadata_ready = True
         forward_batch.input_embeds = torch.arange(
             token_count, dtype=torch.float32
         ).reshape(token_count, 1)
@@ -476,27 +708,32 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
 
     monkeypatch.setattr(native_processor, "_get_logits", run_lm_head)
     lm_head = RecordingLMHead()
-    graph_runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
 
     def native_can_run_graph(
         prefill_runner: PrefillCudaGraphRunner,
         forward_batch: ForwardBatch,
     ) -> bool:
-        assert prefill_runner is graph_runner
-        native_graph_checks.append(forward_batch)
-        return True
+        native_graph_checks.append((prefill_runner, forward_batch))
+        return graph_enabled
 
     monkeypatch.setattr(PrefillCudaGraphRunner, "can_run_graph", native_can_run_graph)
 
-    def execute_graph(forward_batch: ForwardBatch) -> LogitsProcessorOutput:
-        graph_executions.append(forward_batch)
-        return LogitsProcessorOutput(next_token_logits=torch.zeros((1, 32)))
+    def make_graph_runner() -> PrefillCudaGraphRunner:
+        graph_runner = object.__new__(PrefillCudaGraphRunner)
 
-    graph_runner.execute = execute_graph
+        def execute_graph(forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+            graph_executions.append((graph_runner, forward_batch))
+            return LogitsProcessorOutput(next_token_logits=torch.zeros((1, 32)))
+
+        graph_runner.execute = execute_graph
+        return graph_runner
+
+    graph_runner = make_graph_runner()
     sglang_runner = object.__new__(SGLModelRunner)
     sglang_runner.plain_decode_runner = None
     sglang_runner.model = SimpleNamespace(shared_experts_config=None)
     sglang_runner.device = "cpu"
+    sglang_runner.hisparse_coordinator = None
     sglang_runner.decode_cuda_graph_runner = None
     sglang_runner.prefill_cuda_graph_runner = graph_runner
     sglang_runner.device_timer = None
@@ -535,41 +772,134 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
         lambda *_arguments: nullcontext(),
     )
 
-    eager_runner = object.__new__(EagerRunner)
-    setattr(
-        eager_runner,
-        "_eager_registry",
-        CudaGraphBufferRegistry(
+    def register_token_slot(registry: CudaGraphBufferRegistry, name: str) -> None:
+        registry.register_slot(
+            GraphSlot(
+                name=name,
+                shape_fn=lambda _max_bs, max_tokens: (max_tokens,),
+                dtype=torch.long,
+                axis="tokens",
+                padding_policy=PaddingPolicy.ZERO,
+            )
+        )
+
+    registry = CudaGraphBufferRegistry(
+        device=torch.device("cpu"),
+        max_bs=1,
+        max_num_tokens=len(input_token_ids),
+    )
+    register_token_slot(registry, "input_ids")
+    register_token_slot(registry, "positions")
+    register_token_slot(registry, "out_cache_loc")
+    registry.register_slot(
+        GraphSlot(
+            name="req_pool_indices",
+            shape_fn=lambda max_bs, _max_tokens: (max_bs,),
+            dtype=torch.long,
+            axis="bs",
+            padding_policy=PaddingPolicy.ZERO,
+        )
+    )
+    registry.register_slot(
+        GraphSlot(
+            name="seq_lens",
+            shape_fn=lambda max_bs, _max_tokens: (max_bs,),
+            dtype=torch.long,
+            axis="bs",
+            padding_policy=PaddingPolicy.ZERO,
+        )
+    )
+    registry.register_slot(
+        GraphSlot(
+            name="seq_lens_cpu",
+            shape_fn=lambda max_bs, _max_tokens: (max_bs,),
+            dtype=torch.long,
+            axis="bs",
             device=torch.device("cpu"),
-            max_bs=1,
-            max_num_tokens=len(input_token_ids),
-        ),
+            padding_policy=PaddingPolicy.ZERO,
+        )
     )
-    temporal_processor = Qwen3ASRTemporalLogitsProcessor(native_processor)
-    hidden_states = torch.arange(len(input_token_ids), dtype=torch.float32).reshape(
-        len(input_token_ids), 1
+    registry.register_slot(
+        GraphSlot(
+            name="mrope_positions",
+            shape_fn=lambda _max_bs, max_tokens: (3, max_tokens),
+            dtype=torch.long,
+            axis="tokens",
+            padding_policy=PaddingPolicy.ZERO,
+            slice_fn=lambda buffer, count: buffer[:, :count],
+        )
     )
+    eager_runner = object.__new__(EagerRunner)
+    eager_runner.model_runner = sglang_runner
+    eager_runner.enable_pdmux = False
+    setattr(eager_runner, "_eager_registry", registry)
+    sglang_runner.eager_runner = eager_runner
+    sglang_runner.attn_backend = SimpleNamespace()
+    setattr(sglang_runner, "_pp_kwargs", lambda _pp_proxy_tensors: {})
 
-    class EagerExecution:
-        def execute(
-            self,
-            forward_batch: ForwardBatch,
-            pp_proxy_tensors: object | None = None,
-        ) -> LogitsProcessorOutput:
-            replay_batch = EagerRunner.load_batch(
-                eager_runner,
-                forward_batch,
-                pp_proxy_tensors=pp_proxy_tensors,
-            )
-            eager_batches.append(replay_batch)
-            return temporal_processor(
-                input_ids=None,
-                hidden_states=hidden_states,
-                lm_head=lm_head,
-                logits_metadata=replay_batch,
-            )
+    native_load_batch = EagerRunner.load_batch
 
-    sglang_runner.eager_runner = EagerExecution()
+    def record_load_batch(
+        runner: EagerRunner,
+        forward_batch: ForwardBatch,
+        pp_proxy_tensors: object | None = None,
+        **kwargs: object,
+    ) -> ForwardBatch:
+        copied_batch = native_load_batch(
+            runner,
+            forward_batch,
+            pp_proxy_tensors=pp_proxy_tensors,
+            **kwargs,
+        )
+        eager_batch_copies.append((forward_batch, copied_batch))
+        return copied_batch
+
+    monkeypatch.setattr(EagerRunner, "load_batch", record_load_batch)
+
+    def eager_model_forward(
+        _input_ids: torch.Tensor,
+        _positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        **_kwargs: object,
+    ) -> LogitsProcessorOutput:
+        eager_batches.append(forward_batch)
+        if get_temporal_forward_inputs(forward_batch) is not None:
+            temporal_eager_batches.append(forward_batch)
+        else:
+            pass
+        processor = sglang_runner.model.language_model.logits_processor
+        assert isinstance(processor, Qwen3ASRTemporalLogitsProcessor)
+        installed_processors.append(processor)
+        hidden_states = torch.arange(
+            len(forward_batch.input_ids), dtype=torch.float32
+        ).reshape(-1, 1)
+        return processor(
+            input_ids=None,
+            hidden_states=hidden_states,
+            lm_head=lm_head,
+            logits_metadata=forward_batch,
+        )
+
+    model = SimpleNamespace(
+        shared_experts_config=None,
+        language_model=SimpleNamespace(logits_processor=native_processor),
+        forward=eager_model_forward,
+    )
+    sglang_runner.model = model
+
+    monkeypatch.setattr(EagerRunner, "model_context", lambda _runner: nullcontext())
+    monkeypatch.setattr(eager_runner_module, "get_forward_context", lambda: None)
+    monkeypatch.setattr(
+        eager_runner_module,
+        "forward_context",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        eager_runner_module,
+        "device_timer_ctx",
+        lambda *_args, **_kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(eager_runner_module, "is_cp_active", lambda _batch: False)
 
     def native_forward(*, forward_batch: ForwardBatch) -> SGLangModelRunnerOutput:
         return forward_raw(forward_batch, pp_proxy_tensors=None)
@@ -580,11 +910,6 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
     monkeypatch.setattr(builder, "uses_torch_mps", lambda: False)
     monkeypatch.setattr(engine_builder.current_platform, "is_cuda", lambda: False)
     monkeypatch.setattr(engine_builder.current_platform, "is_xpu", lambda: False)
-    model = SimpleNamespace(
-        shared_experts_config=None,
-        language_model=SimpleNamespace(logits_processor=native_processor),
-    )
-    sglang_runner.model = model
     builder.setup_model(
         model_worker=SimpleNamespace(model_runner=sglang_runner),
         checkpoint_dir="unused",
@@ -594,11 +919,13 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
     )
 
     ordinary_before = forward_raw(
-        make_forward_batch(torch.tensor([10], dtype=torch.long)),
+        make_forward_batch(
+            torch.tensor([10], dtype=torch.long), request_id="ordinary-before"
+        ),
         pp_proxy_tensors=None,
     )
-    assert ordinary_before.can_run_graph
-    assert len(graph_executions) == 1
+    assert ordinary_before.can_run_graph is graph_enabled
+    assert len(graph_executions) == int(graph_enabled)
 
     temporal_request = Qwen3ASRTemporalRequest(
         context=RealtimeTranscriptionContext(
@@ -621,7 +948,7 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
         input_ids=input_token_ids,
         is_prefill_only=False,
     )
-    forward_batch = make_forward_batch(input_token_ids)
+    forward_batch = make_forward_batch(input_token_ids, request_id=request_id)
     model_worker = object.__new__(ModelWorker)
     model_worker.dllm_algorithm = None
     model_worker.model_runner = sglang_runner
@@ -632,22 +959,25 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
     temporal_runner.tp_worker = model_worker
     temporal_runner.retained_prefill_input_embeds = None
     temporal_runner.retain_prefill_input_embeds = False
+    temporal_runner.temporal_forward_context_stack = []
     temporal_runner.execution_bridge = SimpleNamespace(
         publish_next_tokens=lambda _batch, token_ids: published_next_token_ids.append(
             token_ids
         )
     )
     temporal_runner.output_processor = SimpleNamespace(
-        process=lambda _result, _scheduler_output: {
-            request_id: RequestOutput(
-                request_id=request_id,
+        process=lambda _result, current_scheduler_output: {
+            request.request_id: RequestOutput(
+                request_id=request.request_id,
                 data="must wait for temporal precommit",
                 extra={},
             )
+            for request in current_scheduler_output.requests
         }
     )
     scheduler_output = SchedulerOutput(requests=[scheduler_request], batch_data=None)
 
+    lm_head.invocation_count = 0
     batch_result = temporal_runner.prepare_and_forward(
         forward_batch,
         schedule_batch,
@@ -663,11 +993,49 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
     )
     assert lm_head.invocation_count == 1
     assert lm_head.selected_rows == [2, 3, 4]
-    assert len(eager_batches) == 1
-    assert eager_batches[0] is not forward_batch
-    assert eager_batches[0].input_ids is forward_batch.input_ids
-    assert len(graph_executions) == 1
-    assert get_temporal_forward_inputs(eager_batches[0]) is None
+    assert len(temporal_eager_batches) == 1
+    assert temporal_eager_batches[0] is not forward_batch
+    source_batch, copied_batch = next(
+        copy_pair for copy_pair in eager_batch_copies if copy_pair[0] is forward_batch
+    )
+    assert source_batch is forward_batch
+    assert copied_batch is temporal_eager_batches[0]
+    if no_copy:
+        assert copied_batch.input_ids is forward_batch.input_ids
+    else:
+        assert copied_batch.input_ids.data_ptr() != forward_batch.input_ids.data_ptr()
+    assert torch.equal(copied_batch.input_ids, input_token_ids)
+    assert torch.equal(temporal_eager_batches[0].input_ids, input_token_ids)
+    assert torch.equal(
+        temporal_eager_batches[0].positions,
+        torch.arange(len(input_token_ids), dtype=torch.long),
+    )
+    assert torch.equal(
+        temporal_eager_batches[0].mrope_positions,
+        torch.arange(len(input_token_ids)).expand(3, -1),
+    )
+    assert temporal_eager_batches[0].mrope_positions.shape == (3, len(input_token_ids))
+    assert temporal_eager_batches[0].rids == [request_id]
+    assert temporal_eager_batches[0].seq_lens.tolist() == [len(input_token_ids)]
+    assert temporal_eager_batches[0].seq_lens_cpu.tolist() == [len(input_token_ids)]
+    assert temporal_eager_batches[0].req_pool_indices.tolist() == [0]
+    assert temporal_eager_batches[0].out_cache_loc.tolist() == list(
+        range(len(input_token_ids))
+    )
+    assert eager_batch_copies
+    assert len(graph_executions) == int(graph_enabled)
+    assert isinstance(
+        sglang_runner.model.language_model.logits_processor,
+        Qwen3ASRTemporalLogitsProcessor,
+    )
+    assert all(
+        processor is sglang_runner.model.language_model.logits_processor
+        for processor in installed_processors
+    )
+    assert get_temporal_forward_inputs(temporal_eager_batches[0]) is None
+    assert get_temporal_forward_inputs(forward_batch) is None
+    assert not hasattr(forward_batch, "qwen3_asr_temporal_forward")
+    assert temporal_runner.temporal_forward_context_stack == []
 
     temporal_runner.post_prefill(
         batch_result,
@@ -700,13 +1068,143 @@ def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
     assert scheduler_result.native_result.next_token_ids is not None
     assert scheduler_result.native_result.next_token_ids.tolist() == [2]
 
+    graph_runner_a = graph_runner
+    from sglang_omni.models.qwen3_asr.temporal_prefill import (
+        install_temporal_prefill_graph_gate,
+    )
+
+    native_gate_a = graph_runner_a.qwen3_asr_temporal_native_graph_check
+    assert native_gate_a.__self__ is graph_runner_a
+    install_temporal_prefill_graph_gate(graph_runner_a)
+    assert graph_runner_a.qwen3_asr_temporal_native_graph_check is native_gate_a
+
     ordinary_after = forward_raw(
-        make_forward_batch(torch.tensor([11], dtype=torch.long)),
+        make_forward_batch(
+            torch.tensor([11], dtype=torch.long), request_id="ordinary-after-a"
+        ),
         pp_proxy_tensors=None,
     )
-    assert ordinary_after.can_run_graph
-    assert len(graph_executions) == 2
-    assert native_graph_checks[-1] is not forward_batch
+    assert ordinary_after.can_run_graph is graph_enabled
+    assert len(graph_executions) == 2 * int(graph_enabled)
+    assert len(native_graph_checks) == 2
+    assert native_graph_checks[-1][0] is graph_runner_a
+
+    graph_runner_b = make_graph_runner()
+    assert not hasattr(graph_runner_b, "qwen3_asr_temporal_native_graph_check")
+    sglang_runner.prefill_cuda_graph_runner = graph_runner_b
+    request_b_id = "final-3-2"
+    temporal_request_b = Qwen3ASRTemporalRequest(
+        context=RealtimeTranscriptionContext(
+            request_id=request_b_id,
+            segment_id=3,
+            attempt=2,
+            is_final=True,
+            previous_hypothesis="recognized words",
+            language="English",
+        ),
+        candidate_token_ids=candidate_token_ids,
+        prompt_boundary=prompt_boundary,
+        admitted=True,
+        attempted=True,
+    )
+    scheduler_request_b = SchedulerRequest(
+        request_id=request_b_id,
+        data=Qwen3ASRRequestData(temporal_request=temporal_request_b),
+    )
+    schedule_batch_b = SimpleNamespace(
+        reqs=[SimpleNamespace()],
+        input_ids=input_token_ids,
+        is_prefill_only=False,
+    )
+    forward_batch_b = make_forward_batch(input_token_ids, request_id=request_b_id)
+    scheduler_output_b = SchedulerOutput(
+        requests=[scheduler_request_b], batch_data=None
+    )
+    lm_head.invocation_count = 0
+    batch_result_b = temporal_runner.prepare_and_forward(
+        forward_batch_b,
+        schedule_batch_b,
+        [scheduler_request_b],
+        is_prefill=True,
+    )
+    assert not batch_result_b.can_run_cuda_graph
+    assert isinstance(
+        batch_result_b.logits_output, Qwen3ASRTemporalLogitsProcessorOutput
+    )
+    assert batch_result_b.logits_output.temporal_verification is not None
+    assert batch_result_b.logits_output.temporal_verification.request_id == request_b_id
+    assert batch_result_b.logits_output.temporal_verification.accepted_prefix == (
+        candidate_token_ids
+    )
+    assert lm_head.invocation_count == 1
+    assert lm_head.selected_rows == [2, 3, 4]
+    assert len(temporal_eager_batches) == 2
+    assert get_temporal_forward_inputs(forward_batch_b) is None
+    assert not hasattr(forward_batch_b, "qwen3_asr_temporal_forward")
+    assert temporal_runner.temporal_forward_context_stack == []
+    assert hasattr(graph_runner_b, "qwen3_asr_temporal_native_graph_check")
+    native_gate_b = graph_runner_b.qwen3_asr_temporal_native_graph_check
+    assert native_gate_b.__self__ is graph_runner_b
+    assert native_gate_b is not native_gate_a
+    assert len(graph_executions) == 2 * int(graph_enabled)
+    temporal_runner.post_prefill(
+        batch_result_b,
+        forward_batch_b,
+        schedule_batch_b,
+        [scheduler_request_b],
+    )
+    temporal_runner.publish_next_tokens(
+        batch_result_b,
+        forward_batch_b,
+        schedule_batch_b,
+        [scheduler_request_b],
+    )
+    finalized_output_b = temporal_runner.finalize(
+        batch_result_b,
+        forward_batch_b,
+        schedule_batch_b,
+        scheduler_output_b,
+    )
+    scheduler_result_b = Qwen3ASRTemporalScheduler.make_batch_result(finalized_output_b)
+    assert isinstance(scheduler_result_b, Qwen3ASRTemporalBatchResult)
+    assert scheduler_result_b.temporal_verification.request_id == request_b_id
+    assert scheduler_result_b.native_result.next_token_ids is not None
+    assert scheduler_result_b.native_result.next_token_ids.tolist() == [2]
+    assert published_next_token_ids == [None, None]
+
+    ordinary_after_b = forward_raw(
+        make_forward_batch(
+            torch.tensor([12], dtype=torch.long), request_id="ordinary-after-b"
+        ),
+        pp_proxy_tensors=None,
+    )
+    assert ordinary_after_b.can_run_graph is graph_enabled
+    assert len(graph_executions) == 3 * int(graph_enabled)
+    assert len(native_graph_checks) == 3
+    assert native_graph_checks[-1][0] is graph_runner_b
+
+    decode_graph_checks: list[ForwardBatch] = []
+
+    def decode_can_run_graph(forward_batch: ForwardBatch) -> bool:
+        decode_graph_checks.append(forward_batch)
+        return False
+
+    decode_graph_runner = SimpleNamespace(can_run_graph=decode_can_run_graph)
+    sglang_runner.decode_cuda_graph_runner = decode_graph_runner
+    decode_batch = make_forward_batch(
+        torch.tensor([2], dtype=torch.long),
+        request_id="ordinary-decode",
+        forward_mode=ForwardMode.DECODE,
+    )
+    decode_result = forward_raw(
+        decode_batch,
+        pp_proxy_tensors=None,
+    )
+    assert not decode_result.can_run_graph
+    assert sglang_runner.decode_cuda_graph_runner is decode_graph_runner
+    assert decode_graph_checks == [decode_batch]
+    assert get_temporal_forward_inputs(temporal_eager_batches[-1]) is None
+    assert len(graph_executions) == 3 * int(graph_enabled)
 
 
 def test_retracted_request_rebuilds_mrope_from_the_canonical_prompt() -> None:
