@@ -486,6 +486,16 @@ def test_temporal_graph_verifier_uses_only_real_prediction_rows(
         monkeypatch,
         target_token_by_row,
     )
+    forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+    native_processor_outputs: list[LogitsProcessorOutput] = []
+    native_forward = native_processor.forward
+
+    def record_native_output(*args: object, **kwargs: object) -> LogitsProcessorOutput:
+        output = native_forward(*args, **kwargs)
+        native_processor_outputs.append(output)
+        return output
+
+    monkeypatch.setattr(native_processor, "forward", record_native_output)
     temporal_processor = Qwen3ASRTemporalLogitsProcessor(native_processor)
     hidden_states = torch.arange(graph_bucket_size, dtype=torch.float32).unsqueeze(1)
 
@@ -503,6 +513,17 @@ def test_temporal_graph_verifier_uses_only_real_prediction_rows(
     assert temporal_output.pending_token_ids is not None
     assert temporal_output.pending_token_ids.tolist() == [pending_token_id]
     assert temporal_output.graph_replay is temporal_context.graph_replay
+    assert len(native_processor_outputs) == 1
+    assert native_processor_outputs[0].hidden_states is not None
+    assert temporal_output.hidden_states is not None
+    assert (
+        temporal_output.hidden_states.data_ptr()
+        != native_processor_outputs[0].hidden_states.data_ptr()
+    )
+    assert torch.equal(
+        temporal_output.hidden_states,
+        native_processor_outputs[0].hidden_states,
+    )
     assert lm_head.invocation_count == 1
     assert lm_head.selected_rows == [2, 3, 4]
 

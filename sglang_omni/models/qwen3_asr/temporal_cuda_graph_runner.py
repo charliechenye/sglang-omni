@@ -68,10 +68,12 @@ class Qwen3ASRTemporalPrefillCudaGraphRunner(PrefillCudaGraphRunner):
         )
         return static_forward_batch, shared_read_ends
 
-    def _trim_logits_output(
+    def _trim_logits_output(  # noqa: leading-underscore  # pinned SGLang trim override
         self, output: LogitsProcessorOutput
     ) -> LogitsProcessorOutput:
-        trimmed_output = super()._trim_logits_output(output)
+        trimmed_output = super()._trim_logits_output(  # noqa: leading-underscore  # pinned SGLang trim hook
+            output
+        )
         if not isinstance(output, Qwen3ASRTemporalLogitsProcessorOutput):
             return trimmed_output
         else:

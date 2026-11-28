@@ -419,6 +419,12 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
             field.name: getattr(temporal_output, field.name)
             for field in fields(LogitsProcessorOutput)
         }
+        for hidden_state_name in ("hidden_states", "last_hidden_states"):
+            hidden_state = native_values[hidden_state_name]
+            if hidden_state is not None:
+                native_values[hidden_state_name] = hidden_state.clone()
+            else:
+                pass
         native_values["next_token_logits"] = temporal_logits[
             pending_row_index : pending_row_index + 1
         ].clone()
