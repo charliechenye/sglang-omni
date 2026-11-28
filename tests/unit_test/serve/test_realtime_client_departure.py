@@ -30,6 +30,8 @@ class FakeVAD:
 
 
 class IdleStrategy:
+    supports_inflight_final_reuse: bool = False
+
     def create_state(self, *, model_name: str, language: str | None) -> None:
         return None
 

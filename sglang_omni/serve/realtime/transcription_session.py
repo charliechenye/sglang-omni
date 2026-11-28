@@ -68,6 +68,8 @@ _UNBOUNDED_BUFFER_S = 600.0
 
 
 class StreamingASRStrategy(Protocol):
+    supports_inflight_final_reuse: bool
+
     def create_state(self, *, model_name: str, language: str | None) -> object: ...
 
     def build_decode_request(
@@ -778,7 +780,7 @@ class RealtimeTranscriptionSession:
                 pass
         if not is_final and self.active_segment is not segment:
             if (
-                getattr(self.strategy, "supports_inflight_final_reuse", False)
+                self.strategy.supports_inflight_final_reuse
                 and result.finish_reason == "stop"
                 and self.pending_finals
             ):

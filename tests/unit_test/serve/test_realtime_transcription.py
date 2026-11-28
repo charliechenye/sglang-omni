@@ -71,6 +71,8 @@ def use_fake_speech_model(monkeypatch: pytest.MonkeyPatch) -> FakeSpeechModel:
 
 
 class FakeStrategy:
+    supports_inflight_final_reuse: bool = False
+
     def create_state(self, **settings: Any) -> object:
         return settings
 
@@ -107,37 +109,16 @@ class FakeClient:
 
 
 class BlockingClient(FakeClient):
-    def __init__(self) -> None:
-        super().__init__([])
-        self.started = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def completion(
-        self, _request: GenerateRequest, *, request_id: str
-    ) -> CompletionResult:
-        self.calls.append(request_id)
-        if len(self.calls) == 1:
-            self.started.set()
-            await self.release.wait()
-        return CompletionResult(
-            request_id=request_id,
-            text=f"text-{len(self.calls)}",
-            language="English",
-        )
-
-
-class BlockingResultClient(FakeClient):
     def __init__(
         self,
         *,
-        first_finish_reason: str = "stop",
-        first_text: str = "refresh-transcript",
-        final_text: str = "final-transcript",
+        outputs: list[str] | None = None,
+        finish_reasons: list[str] | None = None,
+        block_on_call: int = 1,
     ) -> None:
-        super().__init__([])
-        self.first_finish_reason: str = first_finish_reason
-        self.first_text: str = first_text
-        self.final_text: str = final_text
+        super().__init__(outputs or [])
+        self.finish_reasons = finish_reasons or []
+        self.block_on_call = block_on_call
         self.started: asyncio.Event = asyncio.Event()
         self.release: asyncio.Event = asyncio.Event()
 
@@ -145,38 +126,17 @@ class BlockingResultClient(FakeClient):
         self, _request: GenerateRequest, *, request_id: str
     ) -> CompletionResult:
         self.calls.append(request_id)
-        if len(self.calls) == 1:
+        call_number = len(self.calls)
+        text = self.outputs.pop(0) if self.outputs else f"text-{call_number}"
+        finish_reason = self.finish_reasons.pop(0) if self.finish_reasons else "stop"
+        if call_number == self.block_on_call:
             self.started.set()
             await self.release.wait()
-            text = self.first_text
-            finish_reason = self.first_finish_reason
-        else:
-            text = self.final_text
-            finish_reason = "stop"
         return CompletionResult(
             request_id=request_id,
             text=text,
             language="English",
             finish_reason=finish_reason,
-        )
-
-
-class BlockingSecondClient(FakeClient):
-    def __init__(self) -> None:
-        super().__init__([])
-        self.second_started = asyncio.Event()
-
-    async def completion(
-        self, _request: GenerateRequest, *, request_id: str
-    ) -> CompletionResult:
-        self.calls.append(request_id)
-        if len(self.calls) == 2:
-            self.second_started.set()
-            await asyncio.Event().wait()
-        return CompletionResult(
-            request_id=request_id,
-            text=f"text-{len(self.calls)}",
-            language="English",
         )
 
 
@@ -292,7 +252,7 @@ async def test_inflight_asr_refresh_is_reused_for_identical_final(
     strategy_type: type[FunASRStreamingStrategy] | type[Qwen3ASRStreamingStrategy],
 ) -> None:
     """A refresh still inflight at transcription.done supplies the final result."""
-    client = BlockingResultClient(first_text="authoritative-transcript")
+    client = BlockingClient(outputs=["authoritative-transcript"])
     session, websocket, _client = await make_session(
         monkeypatch,
         model_name=model_name,
@@ -321,21 +281,20 @@ async def test_inflight_asr_refresh_is_reused_for_identical_final(
     assert state.chunk_id == 1
     assert state.transcript == "authoritative-transcript"
     assert state.language == "English"
-    final_events = [
-        event
-        for event in websocket.events
-        if event["type"] == "transcription.segment" and event["is_final"]
+    segment_events = [
+        event for event in websocket.events if event["type"] == "transcription.segment"
     ]
-    assert [(event["segment_id"], event["text"]) for event in final_events] == [
-        (0, "authoritative-transcript")
-    ]
+    assert [
+        (event["segment_id"], event["text"], event["is_final"])
+        for event in segment_events
+    ] == [(0, "authoritative-transcript", True)]
     event_indexes = [event["event_index"] for event in websocket.events]
     committed_index = next(
         event["event_index"]
         for event in websocket.events
         if event["type"] == "input_audio_buffer.committed"
     )
-    assert committed_index < final_events[0]["event_index"]
+    assert committed_index < segment_events[0]["event_index"]
     assert event_indexes == sorted(event_indexes)
     assert websocket.events[-1]["type"] == "transcription.completed"
     assert websocket.events[-1]["text"] == "authoritative-transcript"
@@ -352,7 +311,7 @@ async def test_extended_audio_uses_a_separate_final_inference(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A final over extended audio does not consume a shorter refresh result."""
-    client = BlockingResultClient()
+    client = BlockingClient(outputs=["refresh-transcript", "final-transcript"])
     session, websocket, _client = await make_session(
         monkeypatch,
         strategy=Qwen3ASRStreamingStrategy(),
@@ -429,7 +388,10 @@ async def test_ineligible_refresh_keeps_the_final_inference_path(
 ) -> None:
     """Unsupported strategies and truncated refreshes keep the final request."""
     strategy = Qwen3ASRStreamingStrategy() if reuse_enabled else FakeStrategy()
-    client = BlockingResultClient(first_finish_reason=first_finish_reason)
+    client = BlockingClient(
+        outputs=["refresh-transcript", "final-transcript"],
+        finish_reasons=[first_finish_reason],
+    )
     session, websocket, _client = await make_session(
         monkeypatch,
         strategy=strategy,
@@ -524,13 +486,19 @@ async def test_teardown_aborts_inflight_decode(
     assert websocket.client_state == WebSocketState.DISCONNECTED
 
 
+@pytest.mark.parametrize(
+    "commit_before_clear",
+    [False, True],
+    ids=["refresh-inflight", "queued-final"],
+)
 @pytest.mark.asyncio
 async def test_clear_aborts_active_segment_and_session_remains_usable(
     monkeypatch: pytest.MonkeyPatch,
+    commit_before_clear: bool,
 ) -> None:
     vad = use_fake_speech_model(monkeypatch)
     websocket = RecordingWebSocket()
-    client = BlockingSecondClient()
+    client = BlockingClient(block_on_call=2)
     strategy = Qwen3ASRStreamingStrategy()
     session = RealtimeTranscriptionSession(
         websocket,  # type: ignore[arg-type]
@@ -555,16 +523,31 @@ async def test_clear_aborts_active_segment_and_session_remains_usable(
     cleared_state = session.active_segment.strategy_state
 
     await session.dispatch(audio_event(make_pcm(2.0)))
-    await client.second_started.wait()
+    await client.started.wait()
+    queued_final_waiter: asyncio.Future[None] | None = None
+    if commit_before_clear:
+        await session.dispatch({"type": "input_audio_buffer.commit"})
+        assert len(session.pending_finals) == 1
+        assert len(session.final_waiters) == 1
+        queued_final_waiter = session.pending_finals[0].done
+        assert websocket.events[-1]["type"] == "input_audio_buffer.committed"
+        assert vad.reset_calls == 1
+    else:
+        pass
     await session.dispatch({"type": "input_audio_buffer.clear"})
 
     assert client.aborted == [client.calls[1]]
     assert session.audio_buffer.is_empty()
     assert session.active_segment is None
-    assert vad.reset_calls == 1
+    assert vad.reset_calls == (2 if commit_before_clear else 1)
     assert not session.decode_worker_task.done()
     assert not session.pending_finals
     assert not session.final_waiters
+    if commit_before_clear:
+        assert queued_final_waiter is not None
+        assert queued_final_waiter.cancelled()
+    else:
+        pass
     assert websocket.events[-1]["type"] == "input_audio_buffer.cleared"
     assert not any(
         event["type"] == "transcription.segment"
@@ -663,6 +646,8 @@ async def test_vad_idle_silence_keeps_buffer_bounded(
 
 
 class ExplodingStrategy(FakeStrategy):
+    supports_inflight_final_reuse: bool = False
+
     def create_state(self, **settings: Any) -> object:
         raise RuntimeError("strategy exploded")
 
@@ -754,6 +739,8 @@ async def test_vad_settings_reject_negative_padding_and_zero_silence(
 
 
 class FailOnceStrategy(FakeStrategy):
+    supports_inflight_final_reuse: bool = False
+
     def __init__(self) -> None:
         self.failures_left = 1
 
