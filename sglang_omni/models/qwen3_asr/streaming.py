@@ -18,6 +18,8 @@ class Qwen3ASRStreamingState:
 
 
 class Qwen3ASRStreamingStrategy:
+    supports_inflight_final_reuse: bool = True
+
     def create_state(
         self, *, model_name: str, language: str | None
     ) -> Qwen3ASRStreamingState:

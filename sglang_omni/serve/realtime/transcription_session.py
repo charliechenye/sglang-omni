@@ -22,7 +22,7 @@ from sglang_omni.audio.vad import (
     VADConfig,
     offsets_to_ms,
 )
-from sglang_omni.client import Client, GenerateRequest
+from sglang_omni.client import Client, CompletionResult, GenerateRequest
 from sglang_omni.config import RealtimeTranscriptionConfig
 from sglang_omni.serve.realtime.audio_buffer import (
     PCM16_BYTES_PER_SAMPLE,
@@ -126,6 +126,7 @@ class FinalDecode:
     pcm: bytes
     audio: bytes
     done: asyncio.Future[None]
+    reused_result: CompletionResult | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -683,6 +684,13 @@ class RealtimeTranscriptionSession:
                             end_sample=final.end_sample,
                             is_final=True,
                         )
+                    elif final.reused_result is not None:
+                        await self.apply_completion(
+                            final.segment,
+                            final.reused_result,
+                            end_sample=final.end_sample,
+                            is_final=True,
+                        )
                     else:
                         await self.decode_and_emit(
                             final.segment,
@@ -761,9 +769,43 @@ class RealtimeTranscriptionSession:
             else:
                 pass
         if not is_final and self.active_segment is not segment:
+            if (
+                getattr(self.strategy, "supports_inflight_final_reuse", False)
+                and result.finish_reason == "stop"
+                and self.pending_finals
+            ):
+                final = self.pending_finals[0]
+                if (
+                    final.segment is segment
+                    and final.end_sample == end_sample
+                    and final.audio == audio
+                    and not final.done.done()
+                ):
+                    final.reused_result = result
+                    logger.info(
+                        f"qwen3_asr_inflight_final_reuse session_id={self.session_id} "
+                        f"segment_id={segment.segment_id} refresh_request_id={request_id} "
+                        f"end_sample={end_sample}"
+                    )
+                else:
+                    pass
+            else:
+                pass
             return
         else:
             pass
+        await self.apply_completion(
+            segment, result, end_sample=end_sample, is_final=is_final
+        )
+
+    async def apply_completion(
+        self,
+        segment: ActiveTranscriptionSegment,
+        result: CompletionResult,
+        *,
+        end_sample: int,
+        is_final: bool,
+    ) -> None:
         segment.language = result.language or segment.language
         text = self.strategy.update_hypothesis(
             generated_text=result.text,
