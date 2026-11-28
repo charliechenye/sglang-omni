@@ -3661,15 +3661,11 @@ class OmniScheduler(Generic[RequestDataT]):
                             rid,
                             terminal_error is None,
                         )
-                    except Exception as exc:
+                    except Exception:
                         logger.exception(
                             "OmniScheduler terminal metrics failed for request %s",
                             rid,
                         )
-                        if terminal_error is None:
-                            terminal_error = exc
-                        else:
-                            pass
                 else:
                     pass
                 # Note: (Jiaxin Deng) close the model-path interval before

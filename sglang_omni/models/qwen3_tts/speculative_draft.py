@@ -69,8 +69,11 @@ class P16DraftRuntime:
         else:
             pass
 
+        # P14/P15A first materialize the checkpoint in BF16, then fold the
+        # rounded parameters in FP32. Folding the original FP32 values changes
+        # the draft distribution and therefore the acceptance trajectory.
         weights = {
-            name: tensor.to(device=device, dtype=torch.float32)
+            name: tensor.to(device=device, dtype=torch.bfloat16).float()
             for name, tensor in checkpoint.weights.items()
         }
         hidden_scale = weights["hidden_scale"]

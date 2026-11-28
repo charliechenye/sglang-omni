@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import gc
 import hashlib
 import json
@@ -37,24 +38,25 @@ from sglang_omni.models.qwen3_tts.request_builders import (
     normalize_qwen3_tts_seed,
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
-    build_speculative_probability_candidates_selected,
+    build_speculative_probability_candidates,
+    uses_split_top_k,
 )
 from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
 from sglang_omni.models.qwen3_tts.speculative_draft import (
     P16_DRAFT_SHA256,
     load_p16_draft_checkpoint,
 )
-from sglang_omni.models.qwen3_tts.speculative_rng import derive_speculative_request_seed
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.types import SchedulerRequest
 from sglang_omni.utils.json import JsonValue
-from sglang_omni.utils.predictor_grouped_heads import grouped_lm_head_linear
+from sglang_omni.utils.predictor_grouped_heads import grouped_lm_head_warp_accumulate
 
 P12_MANIFEST_SHA256 = "87ae5928d52fe1675b43c24ea15d7e054df3e0b4810e1c3ca1b42a4a040957"
 P12_TEACHER_BASE = "caf13d4d4bd0eab7edb7186675fb7307a5a0ecdc"
 P12_TEACHER_MODE = "native_fused_fixed_prefix"
 P15_COHORT_SHA256 = "c823f32c837b4979c0e74e4b1f4c60b53f40089e9f2a7119be6b11bb8ce24725"
 P16_SCHEMA = "qtts-p16-integration-v1"
+P16_UPSTREAM_BASE_SHA = "a6e2fc6d98ab6abbed1c0ea40d0a7d6d038f3d74"
 P16_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 P16_GROUPS = 16
 P16_TALKER_HIDDEN_SIZE = 2048
@@ -611,8 +613,8 @@ def build_talker(
             dtype="bfloat16",
             server_args_overrides={
                 "tp_size": 1,
-                "max_running_requests": 2,
-                "max_queued_requests": 2,
+                "max_running_requests": 4,
+                "max_queued_requests": 4,
                 "disable_cuda_graph": False,
                 "disable_overlap_schedule": True,
                 "enable_torch_compile": False,
@@ -647,22 +649,19 @@ def create_request(
     seed: int,
     *,
     top_k: int = P16_MAX_TOP_K,
+    temperature: float = 0.9,
+    top_p: float = 1.0,
+    do_sample: bool = True,
 ) -> SchedulerRequest:
     request_data = Qwen3TTSSGLangRequestData(
         semantic_sampling_seed=seed,
         subtalker_sampling_seed=seed,
-        subtalker_dosample=True,
-        subtalker_temperature=0.9,
-        subtalker_top_p=1.0,
+        subtalker_dosample=do_sample,
+        subtalker_temperature=temperature,
+        subtalker_top_p=top_p,
         subtalker_top_k=top_k,
-        user_seed_provided=True,
     )
     return SchedulerRequest(request_id=request_id, data=request_data)
-
-
-def reset_predictor_cache(talker: Qwen3TTSTalker) -> None:
-    talker.predictor_k_cache.zero_()
-    talker.predictor_v_cache.zero_()
 
 
 def input_tensors(
@@ -691,7 +690,6 @@ def run_public_predictor(
     layer0_codes, talker_hidden, semantic_positions = input_tensors(
         frames, talker.predictor_device
     )
-    reset_predictor_cache(talker)
     codes, summed_embeddings = talker.code_predictor_forward(
         layer0_codes,
         talker_hidden,
@@ -710,7 +708,6 @@ def run_native_incremental(
     layer0_codes, talker_hidden, semantic_positions = input_tensors(
         frames, talker.predictor_device
     )
-    reset_predictor_cache(talker)
     codes, summed_embeddings = talker.code_predictor_forward_incremental(
         layer0_codes,
         talker_hidden,
@@ -718,6 +715,32 @@ def run_native_incremental(
     )
     torch.cuda.synchronize(talker.predictor_device)
     return codes.detach().cpu().clone(), summed_embeddings.detach().cpu().clone()
+
+
+def upstream_native_incremental_matches() -> bool:
+    """Check that the independent native replay method is unchanged from main."""
+    relative_path = "sglang_omni/models/qwen3_tts/sglang_model.py"
+    candidate_source = Path(relative_path).read_text(encoding="utf-8")
+    upstream_source = subprocess.check_output(
+        ["git", "show", f"{P16_UPSTREAM_BASE_SHA}:{relative_path}"], text=True
+    )
+
+    def method_source(source: str) -> str | None:
+        tree = ast.parse(source)
+        for class_node in (
+            node for node in tree.body if isinstance(node, ast.ClassDef)
+        ):
+            for node in class_node.body:
+                if (
+                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and node.name == "code_predictor_forward_incremental"
+                ):
+                    return ast.get_source_segment(source, node)
+                else:
+                    pass
+        return None
+
+    return method_source(candidate_source) == method_source(upstream_source)
 
 
 def build_compact_probabilities(
@@ -734,7 +757,7 @@ def build_compact_probabilities(
         active_rows = torch.ones((row_count,), device=device, dtype=torch.bool)
     else:
         pass
-    candidates = build_speculative_probability_candidates_selected(
+    candidates = build_speculative_probability_candidates(
         logits.contiguous(),
         temperatures,
         top_ks,
@@ -743,15 +766,14 @@ def build_compact_probabilities(
         max_top_k=P16_MAX_TOP_K,
         has_top_p=False,
         has_unbounded_top_k=False,
-        backend="split_top_k",
     )
     if candidates is None:
         raise RuntimeError("split Top-K probability builder rejected an audited shape")
     else:
         pass
-    probabilities, token_ids, backend = candidates
+    probabilities, token_ids = candidates
     require(
-        backend == "split_top_k",
+        uses_split_top_k(logits, P16_MAX_TOP_K, P16_CANDIDATE_WIDTH),
         "compact_probability",
         "validator did not execute split Top-K",
     )
@@ -886,14 +908,12 @@ def capture_frame(
     else:
         pass
     talker.prepare_decode_buffers([request])
-    expected_seed = derive_speculative_request_seed(
-        int(request_data.subtalker_sampling_seed), request.request_id
-    )
+    expected_seed = int(request_data.subtalker_sampling_seed)
     require(
         talker.sub_speculative_seed_tensor is not None
         and int(talker.sub_speculative_seed_tensor[0]) == expected_seed,
         "request_seed_staging",
-        "request-owned speculative seed was not staged from identity and user seed",
+        "request-owned speculative seed differs from the stable subtalker seed",
         context_for(frame, seed),
     )
     layer0_codes, talker_hidden, semantic_positions = input_tensors(
@@ -916,7 +936,6 @@ def capture_frame(
     layer0_codes, talker_hidden, semantic_positions = input_tensors(
         [frame], talker.predictor_device
     )
-    reset_predictor_cache(talker)
     output_codes, summed_embeddings = talker.code_predictor_forward(
         layer0_codes,
         talker_hidden,
@@ -972,8 +991,7 @@ def capture_frame(
     probability_counts = stats["probability_backend_execution_counts"]
     require(
         probability_counts["split_top_k"] > 0
-        and probability_counts["radix_compact"] == 0
-        and probability_counts["radix_compact_4bit"] == 0,
+        and sum(probability_counts.values()) == probability_counts["split_top_k"],
         "probability_backend",
         "P16 did not execute its configured split Top-K probability backend",
         context_for(frame, seed),
@@ -1006,7 +1024,6 @@ def audit_sequential_reference(
     talker.prepare_decode_buffers([request])
     device = talker.predictor_device
     layer0_codes, talker_hidden, semantic_positions = input_tensors([frame], device)
-    reset_predictor_cache(talker)
     require(
         torch.equal(tensor_field(opening, "layer0_codes"), layer0_codes.cpu())
         and torch.equal(tensor_field(opening, "talker_hidden"), talker_hidden.cpu())
@@ -1168,13 +1185,12 @@ def audit_sequential_reference(
                 [proposal_depth], device=device, dtype=torch.long
             )
             active_rows = torch.ones((1,), device=device, dtype=torch.bool)
-            proposal_logits = grouped_lm_head_linear(
+            proposal_logits = grouped_lm_head_warp_accumulate(
                 draft_hidden.contiguous(),
                 packed_head_weights,
                 None,
                 head_indices,
                 active_rows,
-                backend="warp_accumulate",
             )
             proposal_probabilities, proposal_ids = build_compact_probabilities(
                 proposal_logits
@@ -1252,7 +1268,7 @@ def audit_sequential_reference(
                 token_embeds=query_embedding,
                 batch_size=1,
                 cache_len=round_depth + 1 + query_index,
-            )[:, 0, :].contiguous()
+            )[:, 0:1, :].contiguous()
             native_logits, _ = talker.code_predictor.lm_head[target_depth](query_hidden)
             native_logits = native_logits.contiguous()
             p16_logits = talker.code_predictor_p16_target_logits(
@@ -1264,8 +1280,8 @@ def audit_sequential_reference(
                 "native_target_logits_exact",
                 round_context,
             )
-            query_hidden_rows.append(query_hidden[0].detach().cpu())
-            query_logits_rows.append(native_logits[0].detach().cpu())
+            query_hidden_rows.append(query_hidden[0, 0].detach().cpu())
+            query_logits_rows.append(native_logits[0, 0].detach().cpu())
         sequential_hidden = torch.stack(query_hidden_rows)
         sequential_logits = torch.stack(query_logits_rows)
         assert_tensor_equal(
@@ -1476,6 +1492,14 @@ def audit_sequential_reference(
             "carried_state_exact",
             round_context,
         )
+        used_uniforms = torch.cat(
+            (
+                uniforms[0, 0, :proposal_count],
+                uniforms[0, 1, :proposal_count],
+                uniforms[0, 2, :verify_width],
+                uniforms[0, 3, :verify_width],
+            )
+        )
         round_row: dict[str, JsonValue] = {
             "depth": round_depth,
             "verify_width": verify_width,
@@ -1487,6 +1511,7 @@ def audit_sequential_reference(
             "target_logits_sha256": hash_tensor(sequential_logits),
             "target_hidden_sha256": hash_tensor(sequential_hidden),
             "target_probability_sha256": hash_tensor(target_probabilities.cpu()),
+            "uniforms_sha256": hash_tensor(used_uniforms),
             "proposal_probability_sha256": hash_tensor(
                 tensor_field(captured_round, "proposal_probabilities")
             ),
@@ -1549,14 +1574,21 @@ def run_native_controls(
     first_frame = validation_frames[0]
     request_id = f"p16-control:{first_frame.uid}:{first_frame.ordinal}:{seed}"
     off_request = create_request(request_id, seed)
+    upstream_codes, upstream_embedding = run_native_incremental(
+        talker, [first_frame], [off_request]
+    )
     off_codes, off_embedding = run_public_predictor(
         talker, [first_frame], [off_request]
     )
     repeated_codes, repeated_embedding = run_public_predictor(
         talker, [first_frame], [off_request]
     )
-    default_off_exact = torch.equal(off_codes, repeated_codes) and torch.equal(
-        off_embedding, repeated_embedding
+    default_off_exact = (
+        upstream_native_incremental_matches()
+        and torch.equal(off_codes, upstream_codes)
+        and torch.equal(off_embedding, upstream_embedding)
+        and torch.equal(off_codes, repeated_codes)
+        and torch.equal(off_embedding, repeated_embedding)
     )
     off_no_draft_allocation = (
         talker.code_predictor_p16_draft is None
@@ -1564,7 +1596,6 @@ def run_native_controls(
         and talker.code_predictor_spec_requested_width == 0
         and talker.code_predictor_spec_effective_width == 0
         and talker.sub_speculative_seed_tensor is None
-        and talker.sub_speculative_round_index_tensor is None
         and talker.sub_speculative_uniforms_tensor is None
         and talker.sub_speculative_rng_pool_tensor is None
         and talker.code_predictor_spec_lm_head_weights is None
@@ -1574,7 +1605,9 @@ def run_native_controls(
         and not talker.code_predictor_spec_opening_graphs
     )
     require(
-        default_off_exact, "default_off_exact", "repeated native OFF output changed"
+        default_off_exact,
+        "default_off_exact",
+        "candidate OFF output differs from the source-identical upstream incremental native path",
     )
     require(
         off_no_draft_allocation,
@@ -1661,6 +1694,41 @@ def test_request_reset_and_reuse(
         totals,
     )
     audit_capture.release(first_audit)
+    independent_request = create_request(f"{request_id}:different-id", first_seed)
+    independent_codes, independent_embedding, independent_audit, _ = capture_frame(
+        talker, frame, independent_request, first_seed, audit_capture
+    )
+    independent_speculative_seed = int(talker.sub_speculative_seed_tensor[0])
+    independent_evidence = audit_sequential_reference(
+        talker,
+        frame,
+        independent_request,
+        first_seed,
+        independent_codes,
+        independent_embedding,
+        independent_audit,
+        totals,
+    )
+    audit_capture.release(independent_audit)
+    if first_audit.opening is None or independent_audit.opening is None:
+        raise RuntimeError("P16 request-ID audit did not capture its opening trace")
+    else:
+        pass
+    opening_fields = (
+        "opening_logits",
+        "opening_sampling_seeds",
+        "opening_sampling_positions",
+        "output_codes",
+        "pending_tokens",
+        "preceding_hidden",
+    )
+    same_opening_trace = all(
+        torch.equal(
+            tensor_field(first_audit.opening, field_name),
+            tensor_field(independent_audit.opening, field_name),
+        )
+        for field_name in opening_fields
+    )
     second_request = create_request(request_id, second_seed)
     second_codes, second_embedding, second_audit, _ = capture_frame(
         talker, frame, second_request, second_seed, audit_capture
@@ -1696,12 +1764,17 @@ def test_request_reset_and_reuse(
     require(
         torch.equal(first_codes, repeated_codes)
         and torch.equal(first_embedding, repeated_embedding)
+        and torch.equal(first_codes, independent_codes)
+        and torch.equal(first_embedding, independent_embedding)
+        and same_opening_trace
         and len(first_audit.rounds or []) == len(repeated_audit.rounds or [])
         and first_evidence["rounds"] == repeated_evidence["rounds"]
+        and first_evidence["rounds"] == independent_evidence["rounds"]
         and first_speculative_seed == repeated_speculative_seed
+        and first_speculative_seed == independent_speculative_seed
         and first_speculative_seed != second_speculative_seed,
         "request_reset_and_reuse",
-        "reusing one request identity after another seed changed its original trajectory",
+        "explicit seeds changed across request IDs or after request identity reuse",
         context_for(frame, first_seed),
     )
     return True
@@ -1809,12 +1882,13 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
         and talker.code_predictor_p16_draft is not None
         and talker.code_predictor_p16_draft_sha256 == P16_DRAFT_SHA256
         and talker.code_predictor_spec_effective_width == P16_VERIFY_WIDTH
-        and talker.code_predictor_spec_backend == "full_round_graph"
-        and talker.code_predictor_spec_opening_pair_graph_enabled,
+        and talker.code_predictor_spec_requested_width == P16_VERIFY_WIDTH,
         "checkpoint_weights_verified",
         "production builder did not load the pinned draft and graph configuration",
     )
-    native_target_flinear = talker.code_predictor_p16_target_f_linear_exact
+    # Retained receipt field for compatibility; target verification now calls
+    # the native LM-head module directly and does not select F.linear.
+    native_target_flinear = False
     require(
         talker.code_predictor_p16_static_fallback_reason is None,
         "p16_eligibility",
@@ -1887,39 +1961,61 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
         totals,
     )
     invalid_request_rejected = check_invalid_request(talker, first_frame, first_seed)
-    frame_pair = cohort[:2]
-    batch_requests = [
-        create_request(
-            f"p16-unsupported-batch:{frame.uid}:{frame.ordinal}:{index}",
-            seed_for(frame.uid, frame.ordinal, index),
+    unsupported_batch_exact = True
+    unsupported_fallback_frames = 0
+    for batch_size in (2, 4):
+        batch_frames = cohort[:batch_size]
+        batch_requests = [
+            create_request(
+                f"p16-unsupported-batch-{batch_size}:{frame.uid}:{frame.ordinal}:{index}",
+                seed_for(frame.uid, frame.ordinal, index),
+            )
+            for index, frame in enumerate(batch_frames)
+        ]
+        unsupported_batch_exact = (
+            audit_unsupported_native_fallback(
+                talker,
+                batch_frames,
+                batch_requests,
+                "unsupported_batch",
+                "unsupported_batch_native_exact",
+            )
+            and unsupported_batch_exact
         )
-        for index, frame in enumerate(frame_pair)
-    ]
-    batch_native_exact = audit_unsupported_native_fallback(
-        talker,
-        frame_pair,
-        batch_requests,
-        "unsupported_batch",
-        "unsupported_batch_native_exact",
+        unsupported_fallback_frames += len(batch_frames)
+
+    unsupported_sampling_exact = True
+    sampling_cases = (
+        ("greedy", {"do_sample": False}),
+        ("temperature", {"temperature": 0.8}),
+        ("top-k", {"top_k": 49}),
+        ("top-p", {"top_p": 0.95}),
     )
-    sampling_request = create_request(
-        f"p16-unsupported-sampling:{first_frame.uid}:{first_frame.ordinal}",
-        first_seed,
-        top_k=49,
-    )
-    sampling_native_exact = audit_unsupported_native_fallback(
-        talker,
-        [first_frame],
-        [sampling_request],
-        "unsupported_sampling",
-        "unsupported_sampling_native_exact",
-    )
+    for name, sampling_options in sampling_cases:
+        sampling_request = create_request(
+            f"p16-unsupported-{name}:{first_frame.uid}:{first_frame.ordinal}",
+            first_seed,
+            **sampling_options,
+        )
+        unsupported_sampling_exact = (
+            audit_unsupported_native_fallback(
+                talker,
+                [first_frame],
+                [sampling_request],
+                "unsupported_sampling",
+                "unsupported_sampling_native_exact",
+            )
+            and unsupported_sampling_exact
+        )
+        unsupported_fallback_frames += 1
+
+    frame_pair = cohort[:2]
     actual_stats = talker.predictor_speculative_stats()
     no_cuda_errors = (
         talker.code_predictor_spec_cuda_errors == 0
         and talker.code_predictor_spec_invalid_probability_rows == 0
-        and talker.code_predictor_spec_eager_round_count == 0
-        and talker.code_predictor_spec_native_fallback_count == len(frame_pair) + 1
+        and talker.code_predictor_spec_native_fallback_count
+        == unsupported_fallback_frames
         and talker.code_predictor_spec_full_round_graph_replay_count
         == talker.code_predictor_spec_round_count
     )
@@ -1943,8 +2039,8 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
     checks = {
         **off_checks,
         "bad_checkpoint_rejected": bad_checkpoint_rejected,
-        "unsupported_batch_native_exact": batch_native_exact,
-        "unsupported_sampling_native_exact": sampling_native_exact,
+        "unsupported_batch_native_exact": unsupported_batch_exact,
+        "unsupported_sampling_native_exact": unsupported_sampling_exact,
         "packed_hidden_exact": True,
         "native_target_logits_exact": True,
         "compact_probability_exact": True,
@@ -1955,7 +2051,8 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
         "graph_replays_no_fallback": (
             actual_stats["full_round_graph_replay_coverage"] == 1.0
             and actual_stats["opening_pair_graph_replay_coverage"] == 1.0
-            and talker.code_predictor_spec_native_fallback_count == len(frame_pair) + 1
+            and talker.code_predictor_spec_native_fallback_count
+            == unsupported_fallback_frames
         ),
         "request_reset_and_reuse": reuse_ok,
         "invalid_request_rejected": invalid_request_rejected,

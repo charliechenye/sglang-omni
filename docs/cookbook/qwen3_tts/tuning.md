@@ -28,6 +28,11 @@ changed. The checkpoint loader verifies the pinned SHA256, manifest, recipe,
 tensor names, shapes, dtypes, normalization scales, and finite values. The
 server does not download the draft automatically.
 
+The standalone P15A benchmark used radix compact probability construction;
+production P16 intentionally uses split Top-K. P15A's latency result is not an
+inherited P16 performance claim. Measure this production path on H200 before
+using it for performance decisions.
+
 Run the in-process validator against the local model, P12 validation artifacts,
 and a passing full P15A result. A four-frame smoke validates the integration
 entry point; the complete cohort is 128 frames by four seeds:

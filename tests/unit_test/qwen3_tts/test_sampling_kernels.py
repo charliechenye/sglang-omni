@@ -27,7 +27,6 @@ from sglang_omni.models.qwen3_tts.predictor_kernels import (
 )
 from sglang_omni.models.qwen3_tts.sampling_kernels import (
     build_speculative_probability_candidates,
-    build_speculative_probability_candidates_radix,
     sample_codes_and_gather_codec_embedding,
     sample_from_logits_with_seed_top_k_top_p,
     sample_from_sorted_logprobs_with_seed_small_k,
@@ -144,68 +143,6 @@ def test_speculative_probabilities_preserve_native_tie_order_for_top_p() -> None
         actual_probabilities, actual_ids, logits.shape[-1]
     )
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
-
-
-@pytest.mark.parametrize("max_top_k", [50, 128])
-def test_speculative_radix_candidates_match_native_split_top_k(
-    max_top_k: int,
-) -> None:
-    if torch.cuda.get_device_capability() != (9, 0):
-        pytest.skip("the production split Top-K path is enabled on SM90")
-    else:
-        pass
-    row_count = 4
-    logits = torch.full((row_count, 2048), -20.0, device="cuda", dtype=torch.bfloat16)
-    ranked_scores = (
-        15.0 - torch.arange(max_top_k, device="cuda", dtype=torch.float32) * 0.25
-    ).to(torch.bfloat16)
-    logits[:, :max_top_k] = ranked_scores
-    temperatures = torch.tensor([0.7, 0.9, 1.1, 1.4], device="cuda")
-    top_ks = torch.tensor([max_top_k, 32, max_top_k - 1, 8], device="cuda")
-    top_ps = torch.tensor([0.65, 0.83, 1.0, 0.0], device="cuda")
-    active_rows = torch.tensor([True, True, True, False], device="cuda")
-    native_candidates = build_speculative_probability_candidates(
-        logits.contiguous(),
-        temperatures,
-        top_ks,
-        top_ps,
-        active_rows,
-        max_top_k=max_top_k,
-        has_top_p=True,
-        has_unbounded_top_k=False,
-    )
-    radix_candidates = build_speculative_probability_candidates_radix(
-        logits.contiguous(),
-        temperatures,
-        top_ks,
-        top_ps,
-        active_rows,
-        max_top_k=max_top_k,
-        has_top_p=True,
-        has_unbounded_top_k=False,
-    )
-    assert native_candidates is not None
-    assert radix_candidates is not None
-    native_probabilities = compact_probabilities_to_dense(
-        *native_candidates, vocab_size=logits.shape[-1]
-    )
-    radix_probabilities = compact_probabilities_to_dense(
-        *radix_candidates, vocab_size=logits.shape[-1]
-    )
-    assert torch.equal(
-        native_probabilities > 0,
-        radix_probabilities > 0,
-    )
-    for probabilities in (native_probabilities, radix_probabilities):
-        torch.testing.assert_close(
-            probabilities.sum(dim=-1),
-            active_rows.float(),
-            atol=1e-6,
-            rtol=0.0,
-        )
-    torch.testing.assert_close(
-        radix_probabilities, native_probabilities, atol=3e-5, rtol=3e-4
-    )
 
 
 @pytest.mark.parametrize("batch_size,num_cols", [(1, 1), (3, 2), (7, 30), (16, 64)])
@@ -1074,7 +1011,6 @@ def test_talker_precompile_leaves_the_first_prefill_samples_nothing_to_compile()
     runner.model = talker
     seeded_request = SimpleNamespace(
         data=SimpleNamespace(
-            user_seed_provided=True,
             req=SimpleNamespace(sampling_params=SimpleNamespace(sampling_seed=7)),
         )
     )

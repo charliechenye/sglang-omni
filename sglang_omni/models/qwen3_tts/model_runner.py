@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 from types import ModuleType
 from typing import TYPE_CHECKING, TypedDict
 
@@ -15,6 +16,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     attach_omni_prefill_inputs,
 )
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
+from sglang_omni.models.qwen3_tts.speculative_execution import PredictorSpeculativeStats
 from sglang_omni.models.qwen3_tts.speculative_telemetry import P16FrameTelemetry
 from sglang_omni.scheduling.types import (
     RequestOutput,
@@ -32,7 +34,6 @@ if TYPE_CHECKING:
     from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSSGLangRequestData
     from sglang_omni.models.qwen3_tts.sglang_model import (
         PredictorGraphStats,
-        PredictorSpeculativeStats,
         Qwen3TTSTalker,
     )
     from sglang_omni.scheduling.sglang_backend.output_processor import (
@@ -43,6 +44,7 @@ else:
 
 # note (ratish): official qwen-tts generates the talker with min_new_tokens=2; an EOS on the first frame ended a request with no audio.
 QWEN3_TTS_MIN_NEW_FRAMES = 2
+logger = logging.getLogger(__name__)
 
 
 class Qwen3TTSModelInfo(TypedDict):
@@ -222,8 +224,9 @@ class Qwen3TTSModelRunner(ModelRunner):
         """Install the staged semantic seeds when a request in the batch carries a
         seed, or deterministic inference has already seeded every row."""
         sampling_info = forward_batch.sampling_info
-        if sampling_info.sampling_seed is None and not any(
-            scheduled_request.data.user_seed_provided for scheduled_request in requests
+        if sampling_info.sampling_seed is None and all(
+            scheduled_request.data.req.sampling_params.sampling_seed is None
+            for scheduled_request in requests
         ):
             return
         else:
@@ -393,12 +396,16 @@ class Qwen3TTSModelRunner(ModelRunner):
             telemetry = self.model.code_predictor_p16_telemetry
             if telemetry is not None:
                 if frame_telemetry is None:
-                    raise RuntimeError(
-                        "Qwen3-TTS emitted a frame without P16 telemetry attribution"
+                    logger.error(
+                        f"Qwen3-TTS frame {sched_req.request_id} has no P16 telemetry attribution"
                     )
                 else:
-                    pass
-                telemetry.record_frame(sched_req.request_id, frame_telemetry)
+                    try:
+                        telemetry.record_frame(sched_req.request_id, frame_telemetry)
+                    except Exception:
+                        logger.exception(
+                            f"Failed to record P16 frame telemetry for request {sched_req.request_id}"
+                        )
             else:
                 pass
             code_chunk = codes_snap[row_idx]
@@ -423,7 +430,12 @@ class Qwen3TTSModelRunner(ModelRunner):
         if telemetry is None:
             return
         elif succeeded and finish_reason not in ("abort", "error"):
-            telemetry.complete_request(request_id)
+            try:
+                telemetry.complete_request(request_id)
+            except Exception:
+                logger.exception(
+                    f"Failed to complete P16 telemetry for request {request_id}"
+                )
         else:
             telemetry.discard_request(request_id)
 

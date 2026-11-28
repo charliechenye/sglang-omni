@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Protocol, TypeAlias
+from typing import Literal, TypeAlias
 
 import torch
 
@@ -17,15 +17,8 @@ PredictorGraphSignature: TypeAlias = tuple[
     Literal["argmax", "sampled"], int, bool, bool, bool
 ]
 PredictorSpeculativeRoundGraphKey: TypeAlias = tuple[
-    int, int, int, PredictorGraphSignature, str, str, str, str
+    int, int, int, PredictorGraphSignature
 ]
-
-
-class PredictorSpeculativeRoundGraphHandle(Protocol):
-    proposal_probability_backend: str | None
-    target_probability_backend: str
-
-    def replay(self) -> None: ...
 
 
 def compact_candidate_view(
@@ -84,7 +77,6 @@ class PredictorSpeculativeRoundWorkspace:
     acceptance_outputs: SpeculativeAcceptanceBatch
     verifier_inputs: SpeculativeVerifierInputs
     split_candidate_keys: torch.Tensor | None
-    radix_candidate_keys: torch.Tensor | None
 
 
 class PredictorSpeculativeWorkspace:
@@ -103,19 +95,20 @@ class PredictorSpeculativeWorkspace:
         split_top_k_chunks: int,
         *,
         seed_rows: torch.Tensor,
-        round_index: torch.Tensor,
         uniforms: torch.Tensor | None,
         rng_pool: torch.Tensor | None,
         metadata_device: torch.Tensor,
         metadata_host: torch.Tensor,
         verifier_input_buffers: dict[int, SpeculativeVerifierInputs],
     ) -> None:
-        if candidate_width <= 0 or split_top_k_chunks <= 0:
+        if max_batch_size != 1:
+            raise ValueError("P16 speculative workspace supports batch size one")
+        elif candidate_width <= 0 or split_top_k_chunks <= 0:
             raise ValueError("workspace candidate dimensions must be positive")
         else:
             pass
-        if not 1 <= max_verify_width <= 8:
-            raise ValueError("workspace verification width must be in [1, 8]")
+        if not 1 <= max_verify_width <= 4:
+            raise ValueError("workspace verification width must be in [1, 4]")
         else:
             pass
         self.max_batch_size = max_batch_size
@@ -127,7 +120,6 @@ class PredictorSpeculativeWorkspace:
         self.max_top_k = max_top_k
         self.candidate_width = candidate_width
         self.seed_rows = seed_rows
-        self.round_index = round_index
         self.uniforms = (
             torch.empty(
                 (max_batch_size, 4, max_verify_width),
@@ -151,14 +143,6 @@ class PredictorSpeculativeWorkspace:
         )
         self.active_rows = torch.empty(max_batch_size, device=device, dtype=torch.bool)
         self.rounds: dict[int, PredictorSpeculativeRoundWorkspace] = {}
-        self.full_round_graph_lookup_ready = False
-        self.full_round_graph_entries: dict[
-            tuple[int, int],
-            tuple[
-                PredictorSpeculativeRoundGraphKey,
-                PredictorSpeculativeRoundGraphHandle | None,
-            ],
-        ] = {}
         for verify_width in range(1, max_verify_width + 1):
             proposal_width = verify_width - 1
             proposal_row_count = max_batch_size * proposal_width
@@ -250,17 +234,10 @@ class PredictorSpeculativeWorkspace:
             bonus_rows = torch.empty_like(rejected_rows)
             invalid_rows = torch.empty_like(rejected_rows)
             split_candidate_keys = None
-            radix_candidate_keys = None
             if max_top_k > 32:
                 split_candidate_keys = torch.empty(
                     proposal_row_count + target_row_count,
                     split_top_k_chunks * candidate_width,
-                    device=device,
-                    dtype=torch.int64,
-                )
-                radix_candidate_keys = torch.empty(
-                    proposal_row_count + target_row_count,
-                    candidate_width,
                     device=device,
                     dtype=torch.int64,
                 )
@@ -298,14 +275,12 @@ class PredictorSpeculativeWorkspace:
                 ),
                 verifier_inputs=verifier_input_buffers[verify_width],
                 split_candidate_keys=split_candidate_keys,
-                radix_candidate_keys=radix_candidate_keys,
             )
 
     @property
     def tensor_storage(self) -> list[torch.Tensor]:
         tensors = [
             self.seed_rows,
-            self.round_index,
             self.metadata_host,
             self.committed_depths,
             self.logical_kv_lengths,
@@ -359,10 +334,6 @@ class PredictorSpeculativeWorkspace:
             )
             if round_workspace.split_candidate_keys is not None:
                 tensors.append(round_workspace.split_candidate_keys)
-            else:
-                pass
-            if round_workspace.radix_candidate_keys is not None:
-                tensors.append(round_workspace.radix_candidate_keys)
             else:
                 pass
         return tensors

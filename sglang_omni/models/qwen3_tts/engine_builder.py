@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from types import FunctionType
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 import numpy.typing as npt
@@ -62,7 +62,6 @@ from sglang_omni.scheduling.generation_batch_policy import (
 )
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import StreamOutputBuilder
-from sglang_omni.utils.predictor_speculation import speculative_resources_requested
 from sglang_omni.vendor.sglang.server_args import override_server_args
 
 if current_platform.is_npu():
@@ -90,6 +89,7 @@ logger = logging.getLogger(__name__)
 P16_ENABLE_ENV = "SGLANG_OMNI_QTTS_P16_ENABLE"
 P16_DRAFT_PATH_ENV = "SGLANG_OMNI_QTTS_P16_DRAFT_PATH"
 P16_DRAFT_SHA256_ENV = "SGLANG_OMNI_QTTS_P16_DRAFT_SHA256"
+P16_TELEMETRY_PATH_ENV = "SGLANG_OMNI_QTTS_P16_TELEMETRY_PATH"
 P16_MODEL_REVISION = "0c0e3051f131929182e2c023b9537f8b1c68adfe"
 P16_TALKER_HIDDEN_SIZE = 2048
 P16_PREDICTOR_HIDDEN_SIZE = 1024
@@ -284,23 +284,6 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         attn_implementation: str | None = None,
         prefill_coalesce_requests: int = 0,
         prefill_coalesce_wait_ms: float = 60.0,
-        code_predictor_spec_verify_size: int = 0,
-        code_predictor_spec_backend: Literal[
-            "cuda_graph", "eager", "full_round_graph"
-        ] = "cuda_graph",
-        code_predictor_spec_probability_backend: Literal[
-            "split_top_k", "radix_compact", "radix_compact_4bit"
-        ] = "split_top_k",
-        code_predictor_spec_lm_head_backend: Literal[
-            "grouped_triton", "warp_gemv", "warp_accumulate"
-        ] = "grouped_triton",
-        code_predictor_spec_rng_backend: Literal[
-            "per_round", "frame_pool"
-        ] = "per_round",
-        code_predictor_spec_acceptance_backend: Literal[
-            "compact", "dense_indexed"
-        ] = "compact",
-        code_predictor_spec_opening_pair_graph: bool = False,
         reference_encoder_cuda_graph_bucket_frames: Sequence[int] = (
             DEFAULT_QWEN3_TTS_REFERENCE_ENCODER_BUCKET_FRAMES
         ),
@@ -308,20 +291,6 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             qwen3_stages.DEFAULT_LEADING_SILENCE_MASK_FRAMES
         ),
     ) -> None:
-        speculative_resources_requested(code_predictor_spec_verify_size)
-        self.code_predictor_spec_verify_size = code_predictor_spec_verify_size
-        self.code_predictor_spec_backend = code_predictor_spec_backend
-        self.code_predictor_spec_probability_backend = (
-            code_predictor_spec_probability_backend
-        )
-        self.code_predictor_spec_lm_head_backend = code_predictor_spec_lm_head_backend
-        self.code_predictor_spec_rng_backend = code_predictor_spec_rng_backend
-        self.code_predictor_spec_acceptance_backend = (
-            code_predictor_spec_acceptance_backend
-        )
-        self.code_predictor_spec_opening_pair_graph = (
-            code_predictor_spec_opening_pair_graph
-        )
         self.attn_implementation = attn_implementation
         self.prefill_coalesce_requests = prefill_coalesce_requests
         self.prefill_coalesce_wait_ms = prefill_coalesce_wait_ms
@@ -461,7 +430,7 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             pass
         p16_enabled = p16_enable_value == "1"
         resolved_checkpoint_path = Path(checkpoint_dir).resolve()
-        telemetry_path = os.environ.get("SGLANG_OMNI_QTTS_P16_TELEMETRY_PATH")
+        telemetry_path = os.environ.get(P16_TELEMETRY_PATH_ENV)
         p16_static_fallback_reason: str | None = None
         if p16_enabled or telemetry_path is not None:
             p16_static_fallback_reason = p16_model_fallback_reason(
@@ -505,12 +474,24 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
         model.code_predictor_p16_static_fallback_reason = p16_static_fallback_reason
         draft_loaded = False
         loaded_draft_sha256: str | None = None
-        if p16_enabled:
+        p16_fallback_reason = p16_static_fallback_reason
+        if p16_enabled and p16_fallback_reason is None:
+            p16_model_config = load_qwen3_tts_checkpoint_config(checkpoint_dir)
+            if (
+                p16_model_config.get("tts_model_type") != "custom_voice"
+                or p16_model_config.get("tts_model_size") != "1b7"
+            ):
+                p16_fallback_reason = "unsupported-model"
+            else:
+                pass
+        else:
+            pass
+        if p16_enabled and p16_fallback_reason is None:
             draft_path = os.environ.get(P16_DRAFT_PATH_ENV)
             draft_sha256 = os.environ.get(P16_DRAFT_SHA256_ENV)
             if not draft_path or not draft_sha256:
                 raise ValueError(
-                    f"{P16_DRAFT_PATH_ENV} and {P16_DRAFT_SHA256_ENV} are required when P16 is enabled"
+                    f"{P16_DRAFT_PATH_ENV} and {P16_DRAFT_SHA256_ENV} are required when P16 is eligible"
                 )
             else:
                 pass
@@ -518,65 +499,44 @@ class Qwen3TtsEngineBuilder(TtsEngineBuilder[Qwen3TTSSGLangRequestData]):
             draft_loaded = True
             loaded_draft_sha256 = draft_checkpoint.sha256
             model.code_predictor_p16_draft_sha256 = draft_checkpoint.sha256
-            p16_model_config = load_qwen3_tts_checkpoint_config(checkpoint_dir)
-            p16_fallback_reason = p16_static_fallback_reason
-            if p16_fallback_reason is None and (
-                p16_model_config.get("tts_model_type") != "custom_voice"
-                or p16_model_config.get("tts_model_size") != "1b7"
-            ):
-                p16_fallback_reason = "unsupported-model"
+            projected_tables = model.predictor_projected_embeddings
+            if projected_tables is None:
+                raise RuntimeError("P16 requires projected codec embedding tables")
             else:
                 pass
-            if p16_fallback_reason is None:
-                model.validate_p16_native_target_projection()
-                projected_tables = model.predictor_projected_embeddings
-                if projected_tables is None:
-                    raise RuntimeError("P16 requires projected codec embedding tables")
-                else:
-                    pass
-                model.code_predictor_p16_draft = P16DraftRuntime.create(
-                    draft_checkpoint,
-                    projected_tables,
-                    model.predictor_device,
+            model.code_predictor_p16_draft = P16DraftRuntime.create(
+                draft_checkpoint,
+                projected_tables,
+                model.predictor_device,
+            )
+            model.configure_code_predictor_p16(True)
+            model.code_predictor_p16_enabled = (
+                model.code_predictor_spec_effective_width == 4
+                and model.code_predictor_spec_fallback_reason is None
+            )
+            if not model.code_predictor_p16_enabled:
+                model.code_predictor_p16_static_fallback_reason = (
+                    model.code_predictor_spec_fallback_reason
+                    or "unsupported-predictor-capability"
                 )
-                model.code_predictor_p16_enabled = True
-                model.configure_code_predictor_speculation(
-                    4,
-                    backend="full_round_graph",
-                    probability_backend="split_top_k",
-                    lm_head_backend="warp_accumulate",
-                    rng_backend="frame_pool",
-                    acceptance_backend="compact",
-                    opening_pair_graph=True,
-                )
-                model.code_predictor_p16_enabled = (
-                    model.code_predictor_spec_effective_width == 4
-                    and model.code_predictor_spec_fallback_reason is None
-                )
-                if not model.code_predictor_p16_enabled:
-                    model.code_predictor_p16_static_fallback_reason = (
-                        model.code_predictor_spec_fallback_reason
-                        or "unsupported-predictor-capability"
-                    )
-                else:
-                    pass
             else:
-                model.code_predictor_p16_draft = None
-                model.code_predictor_p16_enabled = False
-                model.configure_code_predictor_speculation(0)
-                model.code_predictor_spec_fallback_reason = p16_fallback_reason
-                logger.warning(
-                    f"P16 enabled but this Qwen3-TTS worker will use native Predictor decoding: {p16_fallback_reason}"
-                )
+                pass
         else:
             model.code_predictor_p16_draft = None
             model.code_predictor_p16_enabled = False
             model.code_predictor_p16_draft_sha256 = None
-            model.configure_code_predictor_speculation(0)
+            model.configure_code_predictor_p16(False)
+            model.code_predictor_spec_fallback_reason = p16_fallback_reason
+            if p16_enabled:
+                logger.warning(
+                    f"P16 enabled but this Qwen3-TTS worker will use native Predictor decoding: {p16_fallback_reason}"
+                )
+            else:
+                pass
         if telemetry_path is not None:
             model.code_predictor_p16_telemetry = P16WorkerTelemetry(
                 telemetry_path,
-                enabled=p16_enabled,
+                enabled=model.code_predictor_p16_enabled,
                 draft_sha256=loaded_draft_sha256,
                 draft_loaded=draft_loaded,
             )

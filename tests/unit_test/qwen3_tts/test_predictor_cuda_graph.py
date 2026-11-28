@@ -140,11 +140,9 @@ def initialize_native_speculation_state(
     talker.code_predictor_spec_workspace_allocation_count = 0
 
     talker.sub_speculative_seed_tensor = None
-    talker.sub_speculative_round_index_tensor = None
     talker.sub_speculative_uniforms_tensor = None
     talker.sub_speculative_rng_pool_tensor = None
 
-    talker.sub_user_seed_rows = ()
     talker.sub_request_ids = ()
     talker.sub_sample_rows = ()
 
@@ -295,7 +293,6 @@ def make_request(
         request_id=None,
         data=SimpleNamespace(
             decode_prep_epoch=None,
-            user_seed_provided=False,
             semantic_sampling_seed=semantic_seed,
             subtalker_dosample=dosample,
             subtalker_temperature=temperature,
@@ -1160,24 +1157,8 @@ def test_a_declared_disable_also_drops_the_reference_encoder_buckets(
         device = torch.device("cpu")
         tts_model_type = "base"
 
-        def configure_code_predictor_speculation(
-            self,
-            requested_width: int,
-            *,
-            backend: str,
-            probability_backend: str,
-            lm_head_backend: str,
-            rng_backend: str,
-            acceptance_backend: str,
-            opening_pair_graph: bool,
-        ) -> None:
-            assert requested_width == 0
-            assert backend == "cuda_graph"
-            assert probability_backend == "split_top_k"
-            assert lm_head_backend == "grouped_triton"
-            assert rng_backend == "per_round"
-            assert acceptance_backend == "compact"
-            assert opening_pair_graph is False
+        def configure_code_predictor_p16(self, enabled: bool) -> None:
+            assert enabled is False
 
         def load_speech_tokenizer(self, tokenizer) -> None:
             del tokenizer

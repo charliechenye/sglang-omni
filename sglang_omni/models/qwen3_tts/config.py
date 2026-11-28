@@ -7,9 +7,7 @@ import base64
 import json
 import re
 from pathlib import Path
-from typing import ClassVar, Literal, TypedDict
-
-from pydantic import field_validator
+from typing import ClassVar, TypedDict
 
 from sglang_omni.config import (
     CustomVoiceConfig,
@@ -54,17 +52,6 @@ class Qwen3TTSStageFactoryKwargs(TypedDict, total=False):
     max_in_flight: int | None
     codec_state_slots: int | None
     shares_engine_speech_tokenizer: bool
-    code_predictor_spec_verify_size: int
-    code_predictor_spec_backend: Literal["cuda_graph", "eager", "full_round_graph"]
-    code_predictor_spec_probability_backend: Literal[
-        "split_top_k", "radix_compact", "radix_compact_4bit"
-    ]
-    code_predictor_spec_lm_head_backend: Literal[
-        "grouped_triton", "warp_gemv", "warp_accumulate"
-    ]
-    code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"]
-    code_predictor_spec_acceptance_backend: Literal["compact", "dense_indexed"]
-    code_predictor_spec_opening_pair_graph: bool
 
 
 class Qwen3TTSPipelineConfig(PipelineConfig):
@@ -88,37 +75,11 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
             "max_queued_requests": QWEN3_TTS_MAX_QUEUED_REQUESTS,
         }
 
-    @field_validator("code_predictor_spec_verify_size")
-    @classmethod
-    def validate_code_predictor_spec_verify_size(cls, value: int) -> int:
-        if isinstance(value, bool) or value not in range(0, 9) or value == 1:
-            raise ValueError(
-                "code_predictor_spec_verify_size must be 0 or an integer in [2, 8]"
-            )
-        else:
-            pass
-        return value
-
     model_path: str
     # note (0xtoward): Keep deterministic inference opt-in because it serializes
     # preprocessing and vocoder decoding and disables the vocoder CUDA graphs,
     # reducing throughput.
     enable_deterministic_inference: bool = False
-    code_predictor_spec_verify_size: int = 0
-    code_predictor_spec_backend: Literal["cuda_graph", "eager", "full_round_graph"] = (
-        "cuda_graph"
-    )
-    code_predictor_spec_probability_backend: Literal[
-        "split_top_k", "radix_compact", "radix_compact_4bit"
-    ] = "split_top_k"
-    code_predictor_spec_lm_head_backend: Literal[
-        "grouped_triton", "warp_gemv", "warp_accumulate"
-    ] = "grouped_triton"
-    code_predictor_spec_rng_backend: Literal["per_round", "frame_pool"] = "per_round"
-    code_predictor_spec_acceptance_backend: Literal["compact", "dense_indexed"] = (
-        "compact"
-    )
-    code_predictor_spec_opening_pair_graph: bool = False
     stages: list[StageConfig] = [
         StageConfig(
             name="preprocessing",
@@ -158,28 +119,6 @@ class Qwen3TTSPipelineConfig(PipelineConfig):
 
     def stage_factory_kwargs(self, stage_name: str) -> Qwen3TTSStageFactoryKwargs:
         kwargs: Qwen3TTSStageFactoryKwargs = {}
-        if stage_name == "tts_engine":
-            kwargs["code_predictor_spec_verify_size"] = (
-                self.code_predictor_spec_verify_size
-            )
-            kwargs["code_predictor_spec_backend"] = self.code_predictor_spec_backend
-            kwargs["code_predictor_spec_probability_backend"] = (
-                self.code_predictor_spec_probability_backend
-            )
-            kwargs["code_predictor_spec_lm_head_backend"] = (
-                self.code_predictor_spec_lm_head_backend
-            )
-            kwargs["code_predictor_spec_rng_backend"] = (
-                self.code_predictor_spec_rng_backend
-            )
-            kwargs["code_predictor_spec_acceptance_backend"] = (
-                self.code_predictor_spec_acceptance_backend
-            )
-            kwargs["code_predictor_spec_opening_pair_graph"] = (
-                self.code_predictor_spec_opening_pair_graph
-            )
-        else:
-            pass
         # Note (Jiaxin Deng): outside the engine process the preprocessing stage
         # loads its own prompt frontend and ships prepared tensors in the payload.
         if stage_name == "preprocessing" and self.preprocessing_in_own_process():

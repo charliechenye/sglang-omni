@@ -132,59 +132,6 @@ def derive_qwen3_tts_sampling_seeds(seed: int) -> tuple[int, int]:
     )
 
 
-SpeculativeDrawPurpose = Literal["proposal", "acceptance", "correction", "bonus"]
-
-
-def derive_qwen3_tts_speculative_draw_seed(
-    request_seed: int,
-    request_id: str,
-    semantic_position: int,
-    residual_quantization_depth: int,
-    round_index: int,
-    draw_purpose: SpeculativeDrawPurpose,
-    draw_index: int = 0,
-) -> int:
-    """Derive a row-order-independent seed for one speculative random draw."""
-    if not request_id:
-        raise ValueError("speculative random draws require a request ID")
-    else:
-        pass
-    if any(
-        isinstance(value, bool) or not isinstance(value, int)
-        for value in (
-            request_seed,
-            semantic_position,
-            residual_quantization_depth,
-            round_index,
-            draw_index,
-        )
-    ):
-        raise ValueError("speculative random draw coordinates must be integers")
-    else:
-        pass
-    if (
-        semantic_position < 0
-        or residual_quantization_depth < 1
-        or round_index < 0
-        or draw_index < 0
-    ):
-        raise ValueError("speculative random draw coordinates are out of range")
-    else:
-        pass
-    if draw_purpose not in ("proposal", "acceptance", "correction", "bonus"):
-        raise ValueError("unsupported speculative draw purpose")
-    else:
-        pass
-    label = (
-        f"{len(request_id)}:{request_id}:{semantic_position}:"
-        f"{residual_quantization_depth}:"
-        f"{round_index}:{draw_purpose}:{draw_index}"
-    )
-    return derive_sampling_seed(
-        "qwen3-tts-speculative", normalize_qwen3_tts_seed(request_seed), label
-    )
-
-
 @dataclass(frozen=True)
 class SubtalkerSampling:
     do_sample: bool
@@ -227,7 +174,6 @@ class Qwen3TTSSGLangRequestData(SGLangARRequestData):
     subtalker_top_p: float = 1.0
     subtalker_top_k: int = 50
     subtalker_sampling_seed: int = field(default_factory=new_qwen3_tts_sampling_seed)
-    user_seed_provided: bool = False
     engine_start_s: float = 0.0
     decode_prep_epoch: int | None = None
 
@@ -2044,7 +1990,6 @@ def build_sglang_qwen3_tts_request(
         subtalker_top_p=subtalker.top_p,
         subtalker_top_k=subtalker.top_k,
         subtalker_sampling_seed=subtalker_sampling_seed,
-        user_seed_provided=state.seed is not None,
         stream_codec_output=state.stream_codec_output,
         suppress_bootstrap_silence=state.suppress_bootstrap_silence,
         # note (luojiaxuan): only x-vector-only clones start cold; an ICL clone's
