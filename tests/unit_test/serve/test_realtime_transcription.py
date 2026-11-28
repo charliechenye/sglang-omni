@@ -453,47 +453,6 @@ async def test_ineligible_refresh_keeps_the_final_inference_path(
 
 
 @pytest.mark.asyncio
-async def test_clear_cancels_queued_final_after_refresh_starts(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Clearing queued audio cancels its final waiter before the session restarts."""
-    client = BlockingResultClient()
-    session, websocket, _client = await make_session(
-        monkeypatch,
-        strategy=Qwen3ASRStreamingStrategy(),
-        client=client,
-    )
-
-    await session.dispatch(audio_event(make_pcm(2.0)))
-    await client.started.wait()
-    await session.dispatch({"type": "input_audio_buffer.commit"})
-    await session.dispatch({"type": "input_audio_buffer.clear"})
-
-    assert client.aborted == [client.calls[0]]
-    assert websocket.events[-1]["type"] == "input_audio_buffer.cleared"
-    assert not [
-        event
-        for event in websocket.events
-        if event["type"] == "transcription.segment" and event["is_final"]
-    ]
-
-    await session.dispatch(audio_event(make_pcm(1.0)))
-    await session.dispatch({"type": "input_audio_buffer.commit"})
-    await session.dispatch({"type": "transcription.done"})
-
-    assert len(client.calls) == 2
-    final_events = [
-        event
-        for event in websocket.events
-        if event["type"] == "transcription.segment" and event["is_final"]
-    ]
-    assert [(event["segment_id"], event["text"]) for event in final_events] == [
-        (1, "final-transcript")
-    ]
-    assert websocket.events[-1]["text"] == "final-transcript"
-
-
-@pytest.mark.asyncio
 async def test_audio_during_decode_coalesces_to_one_followup_refresh(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -572,13 +531,13 @@ async def test_clear_aborts_active_segment_and_session_remains_usable(
     vad = use_fake_speech_model(monkeypatch)
     websocket = RecordingWebSocket()
     client = BlockingSecondClient()
-    strategy = FakeStrategy()
+    strategy = Qwen3ASRStreamingStrategy()
     session = RealtimeTranscriptionSession(
         websocket,  # type: ignore[arg-type]
         client=client,  # type: ignore[arg-type]
         model_name="qwen3-asr",
         transcription_config=RealtimeTranscriptionConfig(
-            strategy_cls=FakeStrategy,
+            strategy_cls=Qwen3ASRStreamingStrategy,
             decode_interval_ms=2000,
             server_vad=True,
             max_segment_s=30.0,

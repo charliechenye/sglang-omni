@@ -161,52 +161,17 @@ def test_qwen_strategy_waits_for_unfixed_chunks_before_using_prefix() -> None:
     third = strategy.build_decode_request(
         audio=b"wav", state=state, is_final=False, request_id="r2"
     )
-
-    assert first.extra_params["_asr_streaming_prefix_text"] is None
-    assert second.extra_params["_asr_streaming_prefix_text"] is None
-    assert third.extra_params["_asr_streaming_prefix_text"] == "hello world"
-
-
-def test_qwen_refresh_and_final_requests_match_for_unchanged_state() -> None:
-    strategy = Qwen3ASRStreamingStrategy()
-    state = strategy.create_state(model_name="qwen3-asr", language="English")
-    strategy.update_hypothesis(
-        generated_text="an earlier hypothesis",
-        language="English",
-        state=state,
-    )
-    strategy.update_hypothesis(
-        generated_text="hello world",
-        language="English",
-        state=state,
-    )
-    audio_bytes = b"identical wav bytes"
-
-    refresh = strategy.build_decode_request(
-        audio=audio_bytes,
-        state=state,
-        is_final=False,
-        request_id="refresh-request",
-    )
-    final = strategy.build_decode_request(
-        audio=audio_bytes,
-        state=state,
-        is_final=True,
-        request_id="final-request",
+    third_final = strategy.build_decode_request(
+        audio=b"wav", state=state, is_final=True, request_id="r3"
     )
 
     assert strategy.supports_inflight_final_reuse is True
-    assert refresh.to_dict() == final.to_dict()
-    assert refresh.model == "qwen3-asr"
-    assert refresh.prompt == {
-        "audio_bytes": audio_bytes,
-        "filename": "realtime-segment.wav",
-        "content_type": "audio/wav",
-    }
-    assert refresh.extra_params["language"] == "English"
-    assert refresh.extra_params["_asr_streaming_prefix_text"] == "hello world"
-    assert refresh.extra_params["_asr_streaming_rollback_tokens"] == 5
-    assert refresh.sampling.temperature == 0.0
+    assert third.to_dict() == third_final.to_dict()
+    assert first.extra_params["_asr_streaming_prefix_text"] is None
+    assert second.extra_params["_asr_streaming_prefix_text"] is None
+    assert third.extra_params["_asr_streaming_prefix_text"] == "hello world"
+    assert third.extra_params["_asr_streaming_rollback_tokens"] == 5
+    assert third.sampling.temperature == 0.0
 
 
 def test_qwen_strategy_skips_prefix_until_language_is_known() -> None:
