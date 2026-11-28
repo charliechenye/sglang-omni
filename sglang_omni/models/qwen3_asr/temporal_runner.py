@@ -1,26 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in model runner hooks for Qwen3-ASR temporal verification."""
+"""Model runner hooks for Qwen3-ASR temporal verification."""
 
 from __future__ import annotations
-
-import logging
 
 import torch
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
-    PrefillCudaGraphRunner,
-)
 
 from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.models.qwen3_asr.engine_builder import Qwen3ASRModelRunner
 from sglang_omni.models.qwen3_asr.request_builders import Qwen3ASRRequestData
-from sglang_omni.models.qwen3_asr.temporal_prefill import (
-    install_temporal_prefill_graph_gate,
-)
 from sglang_omni.models.qwen3_asr.temporal_verification import (
-    Qwen3ASRTemporalForward,
     Qwen3ASRTemporalForwardContext,
     Qwen3ASRTemporalLogitsProcessorOutput,
     Qwen3ASRTemporalRunnerOutput,
@@ -34,8 +25,6 @@ from sglang_omni.scheduling.types import (
     SchedulerRequest,
 )
 
-logger = logging.getLogger(__name__)
-
 
 class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
     supports_speculative_async_decode: bool = False
@@ -44,14 +33,9 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         self,
         tp_worker: ModelWorker,
         output_processor: SGLangOutputProcessor,
-        *,
-        enable_temporal_prefill_cuda_graph: bool = False,
     ) -> None:
         super().__init__(tp_worker, output_processor)
-        self.enable_temporal_prefill_cuda_graph = enable_temporal_prefill_cuda_graph
-        self.temporal_forward_context_stack: list[
-            Qwen3ASRTemporalForwardContext | None
-        ] = []
+        self.temporal_context: Qwen3ASRTemporalForwardContext | None = None
 
     def before_prefill(
         self,
@@ -59,50 +43,32 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
-        self.temporal_forward_context_stack.append(None)
         if not requests or not isinstance(requests[0].data, Qwen3ASRRequestData):
             return
         else:
             pass
-        request_data = requests[0].data
-        temporal_request = request_data.temporal_request
-        if temporal_request is None:
-            return
-        else:
-            pass
-        if not temporal_request.admitted:
+        temporal = requests[0].data.temporal_request
+        if temporal is None or not temporal.admitted:
             return
         elif (
             forward_batch is None or len(requests) != 1 or len(schedule_batch.reqs) != 1
         ):
-            raise RuntimeError("Qwen3-ASR temporal forward lost its isolated row")
+            raise RuntimeError("Qwen3-ASR temporal prefill must contain one request")
+        elif self.temporal_context is not None:
+            raise RuntimeError("Qwen3-ASR temporal forward is already active")
         else:
             pass
-        if temporal_request.prompt_boundary + len(
-            temporal_request.candidate_token_ids
-        ) != len(schedule_batch.input_ids):
-            raise RuntimeError(
-                "Qwen3-ASR temporal input boundary changed before forward"
-            )
+        if len(schedule_batch.input_ids) != temporal.prompt_boundary + len(
+            temporal.candidate_token_ids
+        ):
+            raise RuntimeError("Qwen3-ASR temporal prefill boundary changed")
         else:
             pass
-        temporal_context = attach_temporal_forward_inputs(
-            forward_batch,
-            Qwen3ASRTemporalForward(
-                request_id=requests[0].request_id,
-                prompt_boundary=temporal_request.prompt_boundary,
-                candidate_token_ids=temporal_request.candidate_token_ids,
-            ),
+        self.temporal_context = attach_temporal_forward_inputs(
+            requests[0].request_id,
+            temporal.prompt_boundary,
+            temporal.candidate_token_ids,
         )
-        self.temporal_forward_context_stack[-1] = temporal_context
-        graph_runner = self.tp_worker.model_runner.prefill_cuda_graph_runner
-        if isinstance(graph_runner, PrefillCudaGraphRunner):
-            install_temporal_prefill_graph_gate(
-                graph_runner,
-                enable_temporal_cuda_graph=(self.enable_temporal_prefill_cuda_graph),
-            )
-        else:
-            pass
 
     def cleanup_prefill(
         self,
@@ -110,20 +76,13 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
-        del schedule_batch, requests
-        if not self.temporal_forward_context_stack:
-            return
+        del forward_batch, schedule_batch, requests
+        context = self.temporal_context
+        if context is not None:
+            clear_temporal_forward_inputs(context)
+            self.temporal_context = None
         else:
             pass
-        temporal_context = self.temporal_forward_context_stack[-1]
-        if temporal_context is not None:
-            if forward_batch is None:
-                raise RuntimeError("Qwen3-ASR cleanup lost its owning forward batch")
-            else:
-                clear_temporal_forward_inputs(forward_batch, temporal_context)
-        else:
-            pass
-        self.temporal_forward_context_stack.pop()
 
     def post_prefill(
         self,
@@ -136,103 +95,30 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
             return
         else:
             pass
-        temporal_request = requests[0].data.temporal_request
-        if temporal_request is None or not temporal_request.admitted:
+        temporal = requests[0].data.temporal_request
+        if temporal is None or not temporal.admitted:
             return
+        elif not isinstance(
+            result.logits_output, Qwen3ASRTemporalLogitsProcessorOutput
+        ):
+            raise RuntimeError("Qwen3-ASR temporal prefill returned no verification")
         else:
             pass
         logits_output = result.logits_output
-        dispatch = "graph" if result.can_run_cuda_graph else "eager"
-        if not isinstance(logits_output, Qwen3ASRTemporalLogitsProcessorOutput):
-            logger.error(
-                f"qwen3_asr_temporal_verification_failed "
-                f"request_id={requests[0].request_id} dispatch={dispatch} "
-                f"logits_output_type={type(logits_output).__name__} "
-                "reason=missing_temporal_verification"
-            )
-            raise RuntimeError(
-                "Qwen3-ASR admitted temporal prefill did not return a verification"
-            )
-        else:
-            pass
-        graph_replay = logits_output.graph_replay
-        if result.can_run_cuda_graph:
-            if not self.enable_temporal_prefill_cuda_graph or graph_replay is None:
-                logger.error(
-                    f"qwen3_asr_temporal_verification_failed "
-                    f"request_id={requests[0].request_id} dispatch=graph "
-                    f"logits_output_type={type(logits_output).__name__} "
-                    "reason=missing_graph_replay_ownership"
-                )
-                raise RuntimeError(
-                    "Qwen3-ASR temporal graph replay lost its trusted metadata"
-                )
-            elif (
-                graph_replay.request_id != requests[0].request_id
-                or graph_replay.raw_num_tokens
-                != temporal_request.prompt_boundary
-                + len(temporal_request.candidate_token_ids)
-                or graph_replay.graph_bucket_size < graph_replay.raw_num_tokens
-            ):
-                raise RuntimeError(
-                    "Qwen3-ASR temporal graph replay does not match its request"
-                )
-            else:
-                pass
-        elif graph_replay is not None:
-            logger.error(
-                f"qwen3_asr_temporal_verification_failed "
-                f"request_id={requests[0].request_id} dispatch=eager "
-                f"logits_output_type={type(logits_output).__name__} "
-                "reason=unexpected_graph_replay_metadata"
-            )
-            raise RuntimeError(
-                "Qwen3-ASR eager temporal prefill received graph replay metadata"
-            )
-        else:
-            pass
         verification = logits_output.temporal_verification
         pending_token_ids = logits_output.pending_token_ids
         if (
             verification is None
+            or verification.request_id != requests[0].request_id
             or pending_token_ids is None
             or pending_token_ids.numel() != 1
-            or len(schedule_batch.reqs) != 1
-            or len(schedule_batch.input_ids)
-            != temporal_request.prompt_boundary
-            + len(temporal_request.candidate_token_ids)
         ):
-            raise RuntimeError(
-                "Qwen3-ASR temporal target rows differ from the admitted prefill"
-            )
-        elif requests[0].request_id != temporal_request.context.request_id:
-            raise RuntimeError("Qwen3-ASR temporal result lost request ownership")
+            raise RuntimeError("Qwen3-ASR temporal verification lost request ownership")
+        elif result.can_run_cuda_graph != (logits_output.graph_bucket_size is not None):
+            raise RuntimeError("Qwen3-ASR temporal graph metadata was lost")
         else:
             pass
-        if (
-            verification.request_id != requests[0].request_id
-            or verification.prompt_boundary != temporal_request.prompt_boundary
-            or verification.candidate_token_ids != temporal_request.candidate_token_ids
-        ):
-            raise RuntimeError("Qwen3-ASR temporal result lost request ownership")
-        else:
-            pass
-        logits_output.temporal_verification = verification
         result.next_token_ids = pending_token_ids
-        graph_details = (
-            f" raw_num_tokens={graph_replay.raw_num_tokens}"
-            f" graph_bucket_size={graph_replay.graph_bucket_size}"
-            if graph_replay is not None
-            else ""
-        )
-        logger.info(
-            f"qwen3_asr_temporal_verified request_id={requests[0].request_id} "
-            f"dispatch={dispatch}{graph_details} "
-            f"logits_output_type={type(logits_output).__name__} "
-            f"accepted_candidate_tokens={len(verification.accepted_prefix)} "
-            f"rejected_candidate_tokens="
-            f"{len(verification.candidate_token_ids) - len(verification.accepted_prefix)}"
-        )
 
     def next_input_token_ids(
         self,

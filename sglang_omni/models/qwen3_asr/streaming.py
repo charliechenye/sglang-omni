@@ -74,8 +74,6 @@ class Qwen3ASRStreamingStrategy:
         if self.enable_temporal_final_verification and is_final and use_prefix:
             request.internal_realtime_context = RealtimeTranscriptionContext(
                 request_id=request_id,
-                segment_id=-1,
-                attempt=-1,
                 is_final=True,
                 previous_hypothesis=qwen_state.transcript,
                 language=qwen_state.language,

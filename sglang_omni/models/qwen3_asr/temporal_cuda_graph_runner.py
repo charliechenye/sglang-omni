@@ -13,8 +13,6 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
 )
 
 from sglang_omni.models.qwen3_asr.temporal_verification import (
-    QWEN3_ASR_TEMPORAL_FORWARD_ATTR,
-    Qwen3ASRTemporalGraphReplay,
     Qwen3ASRTemporalLogitsProcessorOutput,
     get_temporal_forward_context,
 )
@@ -29,20 +27,17 @@ class Qwen3ASRTemporalPrefillCudaGraphRunner(PrefillCudaGraphRunner):
             return super().load_batch(forward_batch, **kwargs)
         else:
             pass
-        temporal_forward = temporal_context.temporal_forward
+        expected_raw_tokens = temporal_context.prompt_boundary + len(
+            temporal_context.candidate_token_ids
+        )
         raw_num_tokens = len(forward_batch.input_ids)
         if (
-            getattr(forward_batch, QWEN3_ASR_TEMPORAL_FORWARD_ATTR, None)
-            is not temporal_context
-            or temporal_context.owner_forward_batch_id != id(forward_batch)
-            or forward_batch.rids != [temporal_forward.request_id]
+            forward_batch.rids != [temporal_context.request_id]
             or forward_batch.batch_size != 1
-            or raw_num_tokens
-            != temporal_forward.prompt_boundary
-            + len(temporal_forward.candidate_token_ids)
+            or raw_num_tokens != expected_raw_tokens
             or forward_batch.extend_seq_lens_cpu != [raw_num_tokens]
             or forward_batch.extend_prefix_lens_cpu != [0]
-            or temporal_context.graph_replay is not None
+            or temporal_context.graph_bucket_size is not None
         ):
             raise RuntimeError(
                 "Qwen3-ASR temporal graph replay lost its owning raw request"
@@ -61,11 +56,7 @@ class Qwen3ASRTemporalPrefillCudaGraphRunner(PrefillCudaGraphRunner):
         else:
             pass
         static_forward_batch.rids = list(forward_batch.rids)
-        temporal_context.graph_replay = Qwen3ASRTemporalGraphReplay(
-            request_id=temporal_forward.request_id,
-            raw_num_tokens=self.raw_num_tokens,
-            graph_bucket_size=len(static_forward_batch.input_ids),
-        )
+        temporal_context.graph_bucket_size = len(static_forward_batch.input_ids)
         return static_forward_batch, shared_read_ends
 
     def _trim_logits_output(  # noqa: leading-underscore  # pinned SGLang trim override
@@ -85,7 +76,7 @@ class Qwen3ASRTemporalPrefillCudaGraphRunner(PrefillCudaGraphRunner):
             },
             temporal_verification=output.temporal_verification,
             pending_token_ids=output.pending_token_ids,
-            graph_replay=output.graph_replay,
+            graph_bucket_size=output.graph_bucket_size,
         )
 
 

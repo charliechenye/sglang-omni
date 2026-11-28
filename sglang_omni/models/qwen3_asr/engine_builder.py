@@ -10,7 +10,10 @@ from typing import Callable
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
 from sglang.srt.managers.mm_utils import init_mm_embedding_cache
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator import (
+    BaseTokenToKVPoolAllocator,
+    TokenToKVPoolAllocator,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
@@ -113,18 +116,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         enable_encoder_cuda_graph: bool = True,
         max_audio_clip_s: float | None = None,
         enable_temporal_final_verification: bool = False,
-        enable_temporal_prefill_cuda_graph: bool = False,
     ) -> None:
-        if (
-            enable_temporal_prefill_cuda_graph
-            and not enable_temporal_final_verification
-        ):
-            raise ValueError(
-                "Qwen3-ASR temporal prefill CUDA Graph requires "
-                "temporal final verification"
-            )
-        else:
-            pass
         if pre_lm_max_batch_size < 1:
             raise ValueError(
                 f"pre_lm_max_batch_size must be >= 1, got {pre_lm_max_batch_size}"
@@ -172,7 +164,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         self.enable_encoder_cuda_graph = enable_encoder_cuda_graph
         self.max_audio_clip_s = max_audio_clip_s
         self.enable_temporal_final_verification = enable_temporal_final_verification
-        self.enable_temporal_prefill_cuda_graph = enable_temporal_prefill_cuda_graph
         self.tokenizer: PreTrainedTokenizerBase | None = None
         self.feature_extractor: WhisperFeatureExtractor | None = None
         self.context_length = 0
@@ -246,10 +237,15 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         }
         if current_platform.is_cuda():
             # note (Zhuofeng Li): full capture removes per-layer attention dispatch.
-            defaults["cuda_graph_backend_prefill"] = CudaGraphBackend.FULL
-            defaults["cuda_graph_config"] = {
-                "prefill": {"full_prefill_max_req": QWEN3_ASR_FULL_PREFILL_MAX_REQUESTS}
-            }
+            if self.enable_temporal_final_verification:
+                defaults["cuda_graph_backend_prefill"] = CudaGraphBackend.BREAKABLE
+            else:
+                defaults["cuda_graph_backend_prefill"] = CudaGraphBackend.FULL
+                defaults["cuda_graph_config"] = {
+                    "prefill": {
+                        "full_prefill_max_req": QWEN3_ASR_FULL_PREFILL_MAX_REQUESTS
+                    }
+                }
         else:
             pass
         # ROCm 7.2's AITER batch-prefill specialization is inaccurate for the
@@ -298,9 +294,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
             return Qwen3ASRTemporalModelRunner(
                 model_worker,
                 output_proc,
-                enable_temporal_prefill_cuda_graph=(
-                    self.enable_temporal_prefill_cuda_graph
-                ),
             )
         else:
             return Qwen3ASRModelRunner(model_worker, output_proc)
@@ -326,7 +319,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
             )
         else:
             pass
-        if self.enable_temporal_prefill_cuda_graph:
+        if self.enable_temporal_final_verification:
             from sglang_omni.models.qwen3_asr.temporal_cuda_graph_runner import (
                 Qwen3ASRTemporalPrefillCudaGraphRunner,
             )
@@ -380,7 +373,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
 
         cfg = resolved_view(server_args)
         if (
-            self.enable_temporal_prefill_cuda_graph
+            self.enable_temporal_final_verification
             and cfg.cuda_graph_config.prefill.backend
             not in (
                 CudaGraphBackend.DISABLED,
@@ -388,7 +381,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
             )
         ):
             raise ValueError(
-                "Qwen3-ASR temporal prefill CUDA Graph requires a disabled or "
+                "Qwen3-ASR temporal final verification requires a disabled or "
                 "Breakable prefill graph backend"
             )
         else:
@@ -434,16 +427,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
                 raise ValueError(
                     "Qwen3-ASR temporal final verification requires "
                     "enable_torch_compile=false"
-                )
-            elif getattr(server_args, "speculative_algorithm", None) not in (
-                None,
-                "",
-                "NONE",
-                "none",
-            ):
-                raise ValueError(
-                    "Qwen3-ASR temporal final verification cannot be combined "
-                    "with SGLang speculative decoding"
                 )
             else:
                 pass
@@ -503,14 +486,15 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
 
     def adjust_overrides(self, overrides: dict[str, object]) -> None:
         algorithm = overrides.get("speculative_algorithm")
-        if self.enable_temporal_final_verification and algorithm is not None:
-            raise ValueError(
-                "Qwen3-ASR temporal final verification cannot be combined with "
-                "SGLang speculative decoding"
-            )
-        else:
-            pass
-        if algorithm is None:
+        if self.enable_temporal_final_verification:
+            if algorithm not in (None, "", "NONE", "none"):
+                raise ValueError(
+                    "Qwen3-ASR temporal final verification cannot be combined "
+                    "with SGLang speculative decoding"
+                )
+            else:
+                pass
+        elif algorithm is None:
             pass
         elif algorithm != "DFLASH":
             raise ValueError(
@@ -558,7 +542,7 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         else:
             pass
 
-        if current_platform.is_cuda():
+        if current_platform.is_cuda() and not self.enable_temporal_final_verification:
             graph_config = overrides.get("cuda_graph_config", {})
             prefill_config = graph_config.get("prefill", {})
             overrides["cuda_graph_config"] = {
@@ -723,6 +707,27 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
                 request_builder=request_builder,
                 result_adapter=result_adapter,
                 extra_scheduler_kwargs=extra_scheduler_kwargs,
+            )
+        else:
+            pass
+
+        from sglang.srt.runtime_context import get_schedule
+
+        if get_schedule().page_size != 1:
+            raise ValueError(
+                "Qwen3-ASR temporal final verification requires page_size=1"
+            )
+        elif not isinstance(token_to_kv_pool_allocator, TokenToKVPoolAllocator):
+            raise ValueError(
+                "Qwen3-ASR temporal final verification requires the native "
+                "token-to-KV allocator"
+            )
+        elif (
+            model_worker.model_runner.is_hybrid_swa
+            or model_worker.model_runner.is_hybrid_ssm_cache
+        ):
+            raise ValueError(
+                "Qwen3-ASR temporal final verification does not support hybrid KV"
             )
         else:
             pass
