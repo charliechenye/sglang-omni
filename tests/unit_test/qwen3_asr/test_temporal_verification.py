@@ -873,7 +873,9 @@ def test_temporal_bcg_gate_falls_back_when_graph_is_unavailable(
         assert native_graph_checks == []
     clear_temporal_forward_inputs(forward_batch, temporal_context)
     assert runner.can_run_graph(forward_batch)
-    assert native_graph_checks == [forward_batch]
+    assert native_graph_checks == (
+        [forward_batch, forward_batch] if supported_runner else [forward_batch]
+    )
 
 
 def test_temporal_bcg_replay_survives_native_trim_and_runner_finalization(
