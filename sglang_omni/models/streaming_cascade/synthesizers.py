@@ -163,53 +163,47 @@ class PreparedSpeech:
 
     request_body: dict[str, object]
     sample_iterator: AsyncIterator[np.ndarray]
-    samples: asyncio.Queue[np.ndarray] = field(
+    samples: asyncio.Queue[np.ndarray | httpx.HTTPError | ValueError | None] = field(
         default_factory=lambda: asyncio.Queue(maxsize=1)
     )
-    task: asyncio.Task[httpx.HTTPError | ValueError | None] = field(init=False)
+    samples_ready: asyncio.Event = field(default_factory=asyncio.Event)
+    task: asyncio.Task[None] = field(init=False)
     is_authorized: bool = False
 
     def __post_init__(self) -> None:
         self.task = asyncio.create_task(self.produce())
 
-    async def produce(self) -> httpx.HTTPError | ValueError | None:
+    async def produce(self) -> None:
         try:
             async with aclosing(self.sample_iterator):
                 async for samples in self.sample_iterator:
                     if samples.size:
                         await self.samples.put(samples)
+                        self.samples_ready.set()
                     else:
                         pass
         except (httpx.HTTPError, ValueError) as error:
-            return error
-        return None
+            await self.samples.put(error)
+        else:
+            await self.samples.put(None)
+        finally:
+            self.samples_ready.set()
 
     async def next_sample(
         self,
     ) -> np.ndarray | httpx.HTTPError | ValueError | None:
-        sample_task = asyncio.create_task(self.samples.get())
-        try:
-            await asyncio.wait(
-                {sample_task, self.task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if self.task.done():
-                result = self.task.result()
-                if result is not None:
-                    return result
-                elif sample_task.done():
-                    return sample_task.result()
-                elif not self.samples.empty():
-                    return self.samples.get_nowait()
-                else:
-                    return None
-            else:
-                return sample_task.result()
-        finally:
-            if not sample_task.done():
-                sample_task.cancel()
-                await asyncio.wait({sample_task})
+        while self.samples.empty():
+            self.samples_ready.clear()
+            if self.samples.empty() and not self.task.done():
+                await self.samples_ready.wait()
             else:
                 pass
+            if self.samples.empty() and self.task.done():
+                self.task.result()
+                return None
+            else:
+                pass
+        return self.samples.get_nowait()
 
     async def samples_after(
         self, first_sample: np.ndarray
