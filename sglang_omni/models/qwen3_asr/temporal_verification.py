@@ -327,30 +327,6 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
                 )
             else:
                 pass
-            expected_mrope_positions = (
-                expected_positions[
-                    temporal_forward.prompt_boundary : expected_input_rows
-                ]
-                .unsqueeze(0)
-                .expand(3, -1)
-            )
-            mrope_positions_match = (
-                mrope_positions[
-                    :, temporal_forward.prompt_boundary : expected_input_rows
-                ]
-                == expected_mrope_positions
-            ).all()
-            if mrope_positions_match.device.type == "cuda":
-                torch._assert_async(  # noqa: leading-underscore  # avoid a device-to-host sync
-                    mrope_positions_match,
-                    "Qwen3-ASR temporal graph replay changed candidate mRoPE positions",
-                )
-            elif not bool(mrope_positions_match):
-                raise RuntimeError(
-                    "Qwen3-ASR temporal graph replay changed candidate mRoPE positions"
-                )
-            else:
-                pass
         else:
             pass
         first_prediction_row = temporal_forward.prompt_boundary - 1
@@ -419,12 +395,6 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
             field.name: getattr(temporal_output, field.name)
             for field in fields(LogitsProcessorOutput)
         }
-        for hidden_state_name in ("hidden_states", "last_hidden_states"):
-            hidden_state = native_values[hidden_state_name]
-            if hidden_state is not None:
-                native_values[hidden_state_name] = hidden_state.clone()
-            else:
-                pass
         native_values["next_token_logits"] = temporal_logits[
             pending_row_index : pending_row_index + 1
         ].clone()

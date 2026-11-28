@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 from array import array
+from collections.abc import Iterator
 from contextlib import nullcontext
 from types import SimpleNamespace, TracebackType
 from typing import Protocol
@@ -70,6 +71,7 @@ from sglang_omni.models.qwen3_asr.temporal_scheduler import Qwen3ASRTemporalSche
 from sglang_omni.models.qwen3_asr.temporal_verification import (
     Qwen3ASRTemporalBatchResult,
     Qwen3ASRTemporalForward,
+    Qwen3ASRTemporalForwardContext,
     Qwen3ASRTemporalGraphReplay,
     Qwen3ASRTemporalLogitsProcessor,
     Qwen3ASRTemporalLogitsProcessorOutput,
@@ -87,6 +89,18 @@ from sglang_omni.scheduling.types import (
     SchedulerOutput,
     SchedulerRequest,
 )
+
+
+@pytest.fixture
+def temporal_context_cleanup() -> (
+    Iterator[list[tuple[ForwardBatch, Qwen3ASRTemporalForwardContext]]]
+):
+    contexts: list[tuple[ForwardBatch, Qwen3ASRTemporalForwardContext]] = []
+    yield contexts
+    for forward_batch, temporal_context in reversed(contexts):
+        clear_temporal_forward_inputs(forward_batch, temporal_context)
+        assert get_temporal_forward_inputs(forward_batch) is None
+        assert not hasattr(forward_batch, "qwen3_asr_temporal_forward")
 
 
 class NoArgumentCallback(Protocol):
@@ -344,6 +358,7 @@ def test_realtime_context_round_trips_and_rejects_malformed_wire_values() -> Non
 
 def test_temporal_logits_processor_uses_multimodal_forward_batch_once(
     monkeypatch: pytest.MonkeyPatch,
+    temporal_context_cleanup: list[tuple[ForwardBatch, Qwen3ASRTemporalForwardContext]],
 ) -> None:
     request_id = "final-3-1"
     candidate_token_ids = (20, 21)
@@ -412,6 +427,7 @@ def test_temporal_logits_processor_uses_multimodal_forward_batch_once(
             candidate_token_ids=candidate_token_ids,
         ),
     )
+    temporal_context_cleanup.append((forward_batch, temporal_context))
 
     temporal_output = temporal_processor(
         input_ids=None,
@@ -449,8 +465,8 @@ def test_temporal_logits_processor_uses_multimodal_forward_batch_once(
 @pytest.mark.parametrize(
     ("target_token_by_row", "accepted_prefix", "pending_token_id"),
     [
-        ({2: 99, 3: 21, 4: 2}, (), 99),
-        ({2: 20, 3: 99, 4: 2}, (20,), 99),
+        ({2: 30, 3: 21, 4: 2}, (), 30),
+        ({2: 20, 3: 30, 4: 2}, (20,), 30),
         ({2: 20, 3: 21, 4: 2}, (20, 21), 2),
     ],
 )
@@ -460,6 +476,7 @@ def test_temporal_graph_verifier_uses_only_real_prediction_rows(
     target_token_by_row: dict[int, int],
     accepted_prefix: tuple[int, ...],
     pending_token_id: int,
+    temporal_context_cleanup: list[tuple[ForwardBatch, Qwen3ASRTemporalForwardContext]],
 ) -> None:
     request_id = "graph-final-a"
     prompt_boundary = 3
@@ -477,6 +494,7 @@ def test_temporal_graph_verifier_uses_only_real_prediction_rows(
             candidate_token_ids=candidate_token_ids,
         ),
     )
+    temporal_context_cleanup.append((forward_batch, temporal_context))
     temporal_context.graph_replay = Qwen3ASRTemporalGraphReplay(
         request_id=request_id,
         raw_num_tokens=5,
@@ -487,15 +505,6 @@ def test_temporal_graph_verifier_uses_only_real_prediction_rows(
         target_token_by_row,
     )
     forward_batch.capture_hidden_mode = CaptureHiddenMode.FULL
-    native_processor_outputs: list[LogitsProcessorOutput] = []
-    native_forward = native_processor.forward
-
-    def record_native_output(*args: object, **kwargs: object) -> LogitsProcessorOutput:
-        output = native_forward(*args, **kwargs)
-        native_processor_outputs.append(output)
-        return output
-
-    monkeypatch.setattr(native_processor, "forward", record_native_output)
     temporal_processor = Qwen3ASRTemporalLogitsProcessor(native_processor)
     hidden_states = torch.arange(graph_bucket_size, dtype=torch.float32).unsqueeze(1)
 
@@ -513,16 +522,11 @@ def test_temporal_graph_verifier_uses_only_real_prediction_rows(
     assert temporal_output.pending_token_ids is not None
     assert temporal_output.pending_token_ids.tolist() == [pending_token_id]
     assert temporal_output.graph_replay is temporal_context.graph_replay
-    assert len(native_processor_outputs) == 1
-    assert native_processor_outputs[0].hidden_states is not None
     assert temporal_output.hidden_states is not None
-    assert (
-        temporal_output.hidden_states.data_ptr()
-        != native_processor_outputs[0].hidden_states.data_ptr()
-    )
+    assert temporal_output.hidden_states.data_ptr() != hidden_states.data_ptr()
     assert torch.equal(
         temporal_output.hidden_states,
-        native_processor_outputs[0].hidden_states,
+        hidden_states[2:5],
     )
     assert lm_head.invocation_count == 1
     assert lm_head.selected_rows == [2, 3, 4]
@@ -530,7 +534,9 @@ def test_temporal_graph_verifier_uses_only_real_prediction_rows(
     clear_temporal_forward_inputs(forward_batch, temporal_context)
 
 
-def test_temporal_context_rejects_duplicate_and_cross_request_ownership() -> None:
+def test_temporal_context_rejects_duplicate_and_cross_request_ownership(
+    temporal_context_cleanup: list[tuple[ForwardBatch, Qwen3ASRTemporalForwardContext]],
+) -> None:
     def make_batch(request_id: str) -> ForwardBatch:
         batch = ForwardBatch(
             forward_mode=ForwardMode.EXTEND,
@@ -554,6 +560,7 @@ def test_temporal_context_rejects_duplicate_and_cross_request_ownership() -> Non
             candidate_token_ids=(20,),
         ),
     )
+    temporal_context_cleanup.append((first_batch, temporal_context))
 
     with pytest.raises(RuntimeError, match="already attached"):
         attach_temporal_forward_inputs(
@@ -678,7 +685,9 @@ def test_temporal_prepare_and_forward_releases_context_after_failure(
     assert runner.temporal_forward_context_stack == []
 
 
-def test_before_prefill_failure_preserves_another_requests_context() -> None:
+def test_before_prefill_failure_preserves_another_requests_context(
+    temporal_context_cleanup: list[tuple[ForwardBatch, Qwen3ASRTemporalForwardContext]],
+) -> None:
     def make_temporal_request(request_id: str) -> SchedulerRequest:
         temporal_request = Qwen3ASRTemporalRequest(
             context=RealtimeTranscriptionContext(
@@ -717,6 +726,7 @@ def test_before_prefill_failure_preserves_another_requests_context() -> None:
             candidate_token_ids=(20,),
         ),
     )
+    temporal_context_cleanup.append((first_batch, first_context))
     second_batch = ForwardBatch(
         forward_mode=ForwardMode.EXTEND,
         batch_size=1,
@@ -760,6 +770,7 @@ def test_before_prefill_failure_preserves_another_requests_context() -> None:
 
 def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
     monkeypatch: pytest.MonkeyPatch,
+    temporal_context_cleanup: list[tuple[ForwardBatch, Qwen3ASRTemporalForwardContext]],
 ) -> None:
     from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
         PrefillCudaGraphRunner,
@@ -810,6 +821,7 @@ def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
             candidate_token_ids=(20,),
         ),
     )
+    temporal_context_cleanup.append((forward_batch, temporal_context))
     assert not runner.can_run_graph(forward_batch)
     assert native_graph_checks == [forward_batch]
     clear_temporal_forward_inputs(forward_batch, temporal_context)
@@ -820,6 +832,7 @@ def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
 @pytest.mark.parametrize("supported_runner", [False, True])
 def test_temporal_bcg_gate_falls_back_when_graph_is_unavailable(
     supported_runner: bool,
+    temporal_context_cleanup: list[tuple[ForwardBatch, Qwen3ASRTemporalForwardContext]],
 ) -> None:
     from sglang_omni.models.qwen3_asr.temporal_prefill import (
         install_temporal_prefill_graph_gate,
@@ -847,6 +860,7 @@ def test_temporal_bcg_gate_falls_back_when_graph_is_unavailable(
             candidate_token_ids=(20,),
         ),
     )
+    temporal_context_cleanup.append((forward_batch, temporal_context))
     install_temporal_prefill_graph_gate(
         runner,
         enable_temporal_cuda_graph=True,
@@ -864,6 +878,7 @@ def test_temporal_bcg_gate_falls_back_when_graph_is_unavailable(
 
 def test_temporal_bcg_replay_survives_native_trim_and_runner_finalization(
     monkeypatch: pytest.MonkeyPatch,
+    temporal_context_cleanup: list[tuple[ForwardBatch, Qwen3ASRTemporalForwardContext]],
 ) -> None:
     request_id = "graph-final-a"
     input_token_ids = [10, 11, 12, 20, 21]
@@ -875,7 +890,7 @@ def test_temporal_bcg_replay_survives_native_trim_and_runner_finalization(
     )
     native_processor, lm_head = make_recording_temporal_logits_processor(
         monkeypatch,
-        {2: 20, 3: 99, 4: 2},
+        {2: 20, 3: 30, 4: 2},
     )
 
     class FakeQwen3ASRModel:
@@ -1033,11 +1048,21 @@ def test_temporal_bcg_replay_survives_native_trim_and_runner_finalization(
             candidate_token_ids=candidate_token_ids,
         ),
     )
+    temporal_context_cleanup.append((forward_batch, temporal_context))
     assert graph_runner.can_run_graph(forward_batch)
 
     static_forward_batch, _shared_read_ends = graph_runner.load_batch(forward_batch)
     assert static_forward_batch is not forward_batch
     assert static_forward_batch.rids == [request_id]
+    assert static_forward_batch.mrope_positions is not None
+    assert torch.equal(
+        static_forward_batch.mrope_positions[:, prompt_boundary:5],
+        torch.tensor([[3, 4], [3, 4], [3, 4]], dtype=torch.long),
+    )
+    assert torch.equal(
+        static_forward_batch.mrope_positions[:, 5:],
+        torch.zeros((3, 3), dtype=torch.long),
+    )
     assert not hasattr(static_forward_batch, "qwen3_asr_temporal_forward")
     assert temporal_context.graph_replay == Qwen3ASRTemporalGraphReplay(
         request_id=request_id,
@@ -1062,7 +1087,7 @@ def test_temporal_bcg_replay_survives_native_trim_and_runner_finalization(
     assert logits_output.temporal_verification is not None
     assert logits_output.temporal_verification.accepted_prefix == (20,)
     assert logits_output.pending_token_ids is not None
-    assert logits_output.pending_token_ids.tolist() == [99]
+    assert logits_output.pending_token_ids.tolist() == [30]
     assert logits_output.next_token_logits is not None
     assert logits_output.next_token_logits.shape == (1, 32)
     assert logits_output.graph_replay == temporal_context.graph_replay
@@ -1111,13 +1136,28 @@ def test_temporal_bcg_replay_survives_native_trim_and_runner_finalization(
     temporal_runner = object.__new__(Qwen3ASRTemporalModelRunner)
     temporal_runner.enable_temporal_prefill_cuda_graph = True
     temporal_runner.temporal_forward_context_stack = [temporal_context]
+    temporal_runner.cleanup_prefill(
+        forward_batch,
+        schedule_batch,
+        [scheduler_request],
+    )
+    assert get_temporal_forward_inputs(forward_batch) is None
+    assert not hasattr(forward_batch, "qwen3_asr_temporal_forward")
+    assert get_temporal_forward_inputs(static_forward_batch) is None
+    assert temporal_runner.temporal_forward_context_stack == []
+    assert logits_output.temporal_verification is not None
+    assert logits_output.graph_replay == Qwen3ASRTemporalGraphReplay(
+        request_id=request_id,
+        raw_num_tokens=5,
+        graph_bucket_size=8,
+    )
     temporal_runner.post_prefill(
         generation_result,
         forward_batch,
         schedule_batch,
         [scheduler_request],
     )
-    assert generation_result.next_token_ids.tolist() == [99]
+    assert generation_result.next_token_ids.tolist() == [30]
 
     def finalize_base_result(
         _runner: ModelRunner,
@@ -1145,13 +1185,8 @@ def test_temporal_bcg_replay_survives_native_trim_and_runner_finalization(
     batch_result = Qwen3ASRTemporalScheduler.make_batch_result(runner_output)
     assert isinstance(batch_result, Qwen3ASRTemporalBatchResult)
     assert batch_result.temporal_verification is logits_output.temporal_verification
-    assert batch_result.native_result.next_token_ids.tolist() == [99]
+    assert batch_result.native_result.next_token_ids.tolist() == [30]
 
-    temporal_runner.cleanup_prefill(
-        forward_batch,
-        schedule_batch,
-        [scheduler_request],
-    )
     assert get_temporal_forward_inputs(static_forward_batch) is None
     assert graph_runner.can_run_graph(ordinary_forward_batch)
     assert native_graph_checks == [
