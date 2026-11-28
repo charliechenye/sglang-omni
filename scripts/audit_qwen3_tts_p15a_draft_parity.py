@@ -37,6 +37,46 @@ def parse_arguments() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def expected_mlp_conditioning_depths() -> tuple[int, ...]:
+    return tuple(range(1, p16.P16_GROUPS - 1))
+
+
+def expected_runtime_proposal_depths() -> tuple[int, ...]:
+    return tuple(
+        depth
+        for depth in expected_mlp_conditioning_depths()
+        if min(p16.P16_VERIFY_WIDTH, p16.P16_GROUPS - 1 - depth) > 1
+    )
+
+
+def proposal_depth_coverage(observed_depths: set[int]) -> dict[str, list[int]]:
+    expected_depths = set(expected_runtime_proposal_depths())
+    actual_depths = set(observed_depths)
+    return {
+        "expected_proposal_depths": sorted(expected_depths),
+        "observed_proposal_depths": sorted(actual_depths),
+        "missing_proposal_depths": sorted(expected_depths - actual_depths),
+        "unexpected_proposal_depths": sorted(actual_depths - expected_depths),
+    }
+
+
+def audit_w1_tail_round(
+    verify_width: int,
+    proposal_count: int,
+    committed_token_count: int,
+) -> bool:
+    if verify_width == 1:
+        if proposal_count != 0 or committed_token_count != 1:
+            raise RuntimeError(
+                "W1 tail must have zero draft proposals and one committed target token"
+            )
+        else:
+            pass
+        return True
+    else:
+        return False
+
+
 def main() -> int:
     arguments = parse_arguments()
     if arguments.out.exists() or not arguments.out.is_absolute():
@@ -153,11 +193,24 @@ def main() -> int:
         totals = {
             "mlp_steps": 0,
             "mlp_exact": 0,
+            "mlp_elements": 0,
+            "mlp_equal_elements": 0,
+            "standalone_mlp_steps": 0,
+            "standalone_mlp_exact": 0,
+            "standalone_mlp_elements": 0,
+            "standalone_mlp_equal_elements": 0,
+            "standalone_mlp_max_abs": 0.0,
+            "standalone_depths": set(),
             "draft_logits": 0,
             "draft_logits_exact": 0,
             "candidate_probability_exact": 0,
+            "candidate_probability_elements": 0,
+            "candidate_probability_token_id_elements": 0,
             "proposal_chain_max_width": 0,
-            "depths": set(),
+            "proposal_depths": set(),
+            "w1_tail_rounds": 0,
+            "w1_tail_proposals": 0,
+            "w1_tail_committed_tokens": 0,
             "mlp_max_abs": 0.0,
             "draft_logits_max_abs": 0.0,
             "candidate_split_vs_p15a_radix_same_logits": [],
@@ -178,13 +231,52 @@ def main() -> int:
                     raise RuntimeError("P16 proposal trace has no opening context")
                 else:
                     pass
-                round_start = (
+                opening_hidden = (
                     p16.tensor_field(captured.opening, "preceding_hidden")
                     .to(device=device, dtype=torch.bfloat16)
                     .contiguous()
                 )
+                opening_codes = p16.tensor_field(captured.opening, "output_codes")
+                opening_pending = (
+                    opening_codes[0, 1].to(device=device, dtype=torch.long).reshape(1)
+                )
+                for standalone_depth in expected_mlp_conditioning_depths():
+                    depth_tensor = torch.tensor(
+                        [standalone_depth], device=device, dtype=torch.long
+                    )
+                    candidate_hidden = production_draft.step(
+                        opening_hidden,
+                        opening_pending,
+                        standalone_depth,
+                    ).clone()
+                    reference_hidden = reference_draft(
+                        opening_hidden.contiguous(),
+                        opening_pending.contiguous(),
+                        depth_tensor,
+                    ).clone()
+                    hidden_difference = (
+                        candidate_hidden.float() - reference_hidden.float()
+                    ).abs()
+                    totals["standalone_depths"].add(standalone_depth)
+                    totals["standalone_mlp_steps"] += 1
+                    totals["standalone_mlp_exact"] += int(
+                        torch.equal(candidate_hidden, reference_hidden)
+                    )
+                    totals["standalone_mlp_elements"] += candidate_hidden.numel()
+                    totals["standalone_mlp_equal_elements"] += int(
+                        torch.count_nonzero(candidate_hidden == reference_hidden)
+                    )
+                    totals["standalone_mlp_max_abs"] = max(
+                        totals["standalone_mlp_max_abs"],
+                        float(hidden_difference.max()),
+                    )
+                else:
+                    pass
+                round_start = opening_hidden
                 for record in captured.rounds:
                     depth = p16.integer_field(record, "round_depth")
+                    verify_width = p16.integer_field(record, "verify_width")
+                    proposal_count = p16.integer_field(record, "proposal_count")
                     proposal_tokens = p16.tensor_field(record, "proposal_tokens").to(
                         device=device, dtype=torch.long
                     )
@@ -195,12 +287,29 @@ def main() -> int:
                         device=device, dtype=torch.long
                     )
                     width = int(proposal_tokens.shape[1])
+                    if width != proposal_count or proposal_count != verify_width - 1:
+                        raise RuntimeError(
+                            "actual proposal width differs from the fixed K3 round contract"
+                        )
+                    else:
+                        pass
+                    committed_token_count = int(
+                        p16.tensor_field(record, "committed_token_counts")[0]
+                    )
+                    if audit_w1_tail_round(
+                        verify_width, proposal_count, committed_token_count
+                    ):
+                        totals["w1_tail_rounds"] += 1
+                        totals["w1_tail_proposals"] += proposal_count
+                        totals["w1_tail_committed_tokens"] += committed_token_count
+                    else:
+                        pass
                     totals["proposal_chain_max_width"] = max(
                         totals["proposal_chain_max_width"], width
                     )
                     for proposal_index in range(width):
                         proposal_depth = depth + proposal_index
-                        totals["depths"].add(proposal_depth)
+                        totals["proposal_depths"].add(proposal_depth)
                         token = (
                             pending
                             if proposal_index == 0
@@ -229,6 +338,10 @@ def main() -> int:
                         )
                         totals["mlp_max_abs"] = max(
                             totals["mlp_max_abs"], float(hidden_difference.max())
+                        )
+                        totals["mlp_elements"] += candidate_hidden.numel()
+                        totals["mlp_equal_elements"] += int(
+                            torch.count_nonzero(candidate_hidden == reference_hidden)
                         )
                         head_index = torch.tensor(
                             [proposal_depth], device=device, dtype=torch.long
@@ -278,13 +391,21 @@ def main() -> int:
                         captured_ids = p16.tensor_field(record, "proposal_token_ids")[
                             proposal_index : proposal_index + 1
                         ].to(device=device)
-                        if not torch.equal(candidate_split, captured_probabilities):
+                        if not torch.equal(
+                            candidate_split, captured_probabilities
+                        ) or not torch.equal(candidate_split_ids, captured_ids):
                             raise RuntimeError(
-                                "split probability replay differs from the captured production proposal"
+                                "split probability replay or token IDs differ from the captured production proposal"
                             )
                         else:
                             pass
                         totals["candidate_probability_exact"] += 1
+                        totals[
+                            "candidate_probability_elements"
+                        ] += candidate_split.numel()
+                        totals[
+                            "candidate_probability_token_id_elements"
+                        ] += candidate_split_ids.numel()
                         candidate_radix, candidate_radix_ids = reference_head.compact(
                             candidate_logits.contiguous()
                         )
@@ -333,12 +454,29 @@ def main() -> int:
                 pass
         else:
             pass
-        if set(totals["depths"]) != set(range(1, 15)):
+        if set(totals["standalone_depths"]) != set(expected_mlp_conditioning_depths()):
             raise RuntimeError(
-                f"P12 cohort did not cover every proposal depth: {sorted(totals['depths'])}"
+                "standalone MLP replay did not cover conditioning depths "
+                f"1-14: {sorted(totals['standalone_depths'])}"
             )
         elif totals["proposal_chain_max_width"] < 2:
             raise RuntimeError("P12 cohort did not exercise chained draft proposals")
+        elif totals["w1_tail_rounds"] == 0:
+            raise RuntimeError("P12 cohort did not exercise the W1 target-only tail")
+        elif (
+            totals["w1_tail_proposals"] != 0
+            or totals["w1_tail_committed_tokens"] != totals["w1_tail_rounds"]
+        ):
+            raise RuntimeError("W1 target-only rounds violated their commit contract")
+        else:
+            pass
+
+        proposal_coverage = proposal_depth_coverage(totals["proposal_depths"])
+        if proposal_coverage["unexpected_proposal_depths"]:
+            raise RuntimeError(
+                "actual K3 proposals included illegal depths: "
+                f"{proposal_coverage['unexpected_proposal_depths']}"
+            )
         else:
             pass
 
@@ -357,12 +495,30 @@ def main() -> int:
             "draft_sha256": p16.P16_DRAFT_SHA256,
             "cohort_sha256": cohort_sha,
             "cohort_identity": cohort_identity,
-            "proposal_depths": sorted(totals["depths"]),
+            "standalone_mlp": {
+                "expected_conditioning_depths": list(
+                    expected_mlp_conditioning_depths()
+                ),
+                "observed_conditioning_depths": sorted(totals["standalone_depths"]),
+                "steps": totals["standalone_mlp_steps"],
+                "exact_steps": totals["standalone_mlp_exact"],
+                "elements": totals["standalone_mlp_elements"],
+                "exact_elements": totals["standalone_mlp_equal_elements"],
+                "max_abs": totals["standalone_mlp_max_abs"],
+            },
+            "runtime_proposal_coverage": proposal_coverage,
             "proposal_chain_max_width": totals["proposal_chain_max_width"],
+            "w1_tail": {
+                "rounds": totals["w1_tail_rounds"],
+                "draft_proposals": totals["w1_tail_proposals"],
+                "committed_target_tokens": totals["w1_tail_committed_tokens"],
+            },
             "transformed_weights": transform_metrics,
             "mlp": {
                 "steps": totals["mlp_steps"],
                 "exact_steps": totals["mlp_exact"],
+                "elements": totals["mlp_elements"],
+                "exact_elements": totals["mlp_equal_elements"],
                 "max_abs": totals["mlp_max_abs"],
             },
             "draft_logits": {
@@ -374,6 +530,12 @@ def main() -> int:
                 "production_builder": "split_top_k",
                 "p15a_builder": "radix_compact",
                 "candidate_split_replayed_rows": totals["candidate_probability_exact"],
+                "candidate_split_probability_elements": totals[
+                    "candidate_probability_elements"
+                ],
+                "candidate_split_token_id_elements": totals[
+                    "candidate_probability_token_id_elements"
+                ],
                 "split_vs_p15a_radix_same_logits": summarize_deltas(
                     totals["candidate_split_vs_p15a_radix_same_logits"]
                 ),

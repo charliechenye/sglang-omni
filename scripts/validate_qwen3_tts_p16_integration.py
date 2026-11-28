@@ -57,6 +57,7 @@ P12_TEACHER_MODE = "native_fused_fixed_prefix"
 P15_COHORT_SHA256 = "c823f32c837b4979c0e74e4b1f4c60b53f40089e9f2a7119be6b11bb8ce24725"
 P16_SCHEMA = "qtts-p16-integration-v1"
 P16_UPSTREAM_BASE_SHA = "a6e2fc6d98ab6abbed1c0ea40d0a7d6d038f3d74"
+P16_NATIVE_REFERENCE_ROOT_ENV = "SGLANG_OMNI_QTTS_P16_REFERENCE_ROOT"
 P16_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 P16_GROUPS = 16
 P16_TALKER_HIDDEN_SIZE = 2048
@@ -1686,6 +1687,7 @@ def run_upstream_native_reference(
         "SGLANG_OMNI_QTTS_P16_DRAFT_PATH",
         "SGLANG_OMNI_QTTS_P16_DRAFT_SHA256",
         "SGLANG_OMNI_QTTS_P16_TELEMETRY_PATH",
+        P16_NATIVE_REFERENCE_ROOT_ENV,
         "PYTHONPATH",
     ):
         environment.pop(name, None)
@@ -1714,13 +1716,11 @@ def run_upstream_native_reference(
             capture_output=True,
             text=True,
         )
-        helper_path = checkout / "scripts/qwen3_tts_p16_native_reference.py"
-        helper_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(helper_source, helper_path)
+        environment[P16_NATIVE_REFERENCE_ROOT_ENV] = str(checkout)
         result = subprocess.run(
             [
                 sys.executable,
-                str(helper_path),
+                str(helper_source),
                 "--model",
                 str(model_path),
                 "--inputs",
@@ -1775,6 +1775,14 @@ def validate_native_reference(
         "default_off_reference_identity",
         "upstream reference metadata does not match the pinned validation identity",
     )
+    require(
+        reference_metadata.get("model_source_path_relative")
+        == "sglang_omni/models/qwen3_tts/sglang_model.py"
+        and isinstance(reference_metadata.get("model_source_path"), str)
+        and Path(reference_metadata["model_source_path"]).is_absolute(),
+        "default_off_reference_import",
+        "upstream reference did not record the pinned Talker source path",
+    )
     graph_evidence = require_mapping(
         reference_metadata.get("native_graph"), "upstream native graph evidence"
     )
@@ -1792,6 +1800,14 @@ def validate_native_reference(
         and isinstance(reference_feedback, torch.Tensor),
         "default_off_reference_outputs",
         "upstream reference did not save output code and feedback tensors",
+    )
+    require(
+        reference_codes.shape == candidate_codes.shape
+        and reference_feedback.shape == candidate_feedback.shape
+        and reference_codes.dtype is candidate_codes.dtype
+        and reference_feedback.dtype is candidate_feedback.dtype,
+        "default_off_reference_outputs",
+        "upstream reference output shapes or dtypes differ from candidate outputs",
     )
     records = reference_metadata.get("records")
     require(
@@ -1817,6 +1833,8 @@ def validate_native_reference(
     return exact, {
         "upstream_commit": P16_UPSTREAM_BASE_SHA,
         "model_revision": P16_MODEL_REVISION,
+        "model_source_path": reference_metadata["model_source_path"],
+        "model_source_path_relative": reference_metadata["model_source_path_relative"],
         "cohort_sha256": input_identity["cohort_sha256"],
         "sampling": input_identity["sampling"],
         "graph_configuration": input_identity["graph_configuration"],
@@ -2139,7 +2157,6 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
     }
     with tempfile.TemporaryDirectory(prefix="qtts-p16-native-inputs-") as directory:
         reference_inputs_path = Path(directory) / "native-inputs.pt"
-        reference_outputs_path = Path(directory) / "native-reference.pt"
         torch.save(input_artifact, reference_inputs_path)
         off_scheduler, off_talker = build_talker(
             model_path,
@@ -2159,10 +2176,15 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
         native_reference = run_upstream_native_reference(
             model_path,
             reference_inputs_path,
-            reference_outputs_path,
+            native_reference_path,
         )
+        native_reference_artifact = {
+            **native_reference,
+            "inputs": samples,
+        }
+        write_torch_atomic(native_reference_path, native_reference_artifact)
         default_off_exact, reference_metadata = validate_native_reference(
-            native_reference,
+            native_reference_artifact,
             input_identity=reference_identity,
             candidate_codes=candidate_off_codes,
             candidate_feedback=candidate_off_feedback,
@@ -2178,11 +2200,6 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
             "default_off_candidate_graph",
             f"candidate OFF native controls failed: {off_checks}",
         )
-        native_reference_artifact = {
-            **native_reference,
-            "inputs": samples,
-        }
-        write_torch_atomic(native_reference_path, native_reference_artifact)
         reference_metadata["artifact_sha256"] = sha256_file(native_reference_path)
         reference_metadata["input_records"] = [
             {
@@ -2419,6 +2436,10 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
             "audited_rounds": totals.rounds,
             "committed_kv_exact_rounds": totals.valid_kv_rounds,
             "predictor_graph_diagnostics": actual_stats,
+            "graph_memory_budget_semantics": (
+                "The 512 MiB limit is a post-capture reserved-memory growth guard; "
+                "it does not preallocate or reserve that memory before capture."
+            ),
             "rejections": totals.rejections,
             "bonuses": totals.bonuses,
             "w1_tail_rounds": totals.width_one_rounds,

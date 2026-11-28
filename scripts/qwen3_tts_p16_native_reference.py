@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import os
 import subprocess
 import sys
@@ -13,16 +14,27 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TypedDict
 
-REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
-if str(REPOSITORY_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPOSITORY_ROOT))
+P16_REFERENCE_ROOT_ENV = "SGLANG_OMNI_QTTS_P16_REFERENCE_ROOT"
+P16_UPSTREAM_BASE_SHA = "a6e2fc6d98ab6abbed1c0ea40d0a7d6d038f3d74"
+NATIVE_TALKER_SOURCE_RELATIVE_PATH = "sglang_omni/models/qwen3_tts/sglang_model.py"
+reference_root = os.environ.get(P16_REFERENCE_ROOT_ENV)
+REPOSITORY_ROOT = (
+    Path(reference_root).resolve()
+    if reference_root is not None
+    else Path(__file__).resolve().parents[1]
+)
+if str(REPOSITORY_ROOT) in sys.path:
+    sys.path.remove(str(REPOSITORY_ROOT))
 else:
     pass
+sys.path.insert(0, str(REPOSITORY_ROOT))
 
 import torch
 
 from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSSGLangRequestData
+from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
+from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 from sglang_omni.scheduling.types import SchedulerRequest
 
 
@@ -44,6 +56,34 @@ class NativeReferenceRecord(TypedDict):
     feedback_sha256: str
 
 
+def native_reference_talker(
+    scheduler: OmniScheduler[Qwen3TTSSGLangRequestData],
+) -> Qwen3TTSTalker:
+    model_runner = scheduler.model_runner
+    if model_runner is None:
+        raise RuntimeError("native reference scheduler has no model runner")
+    else:
+        pass
+    talker = model_runner.model
+    if not isinstance(talker, Qwen3TTSTalker):
+        raise RuntimeError("native reference scheduler model is not a Qwen3-TTS Talker")
+    else:
+        pass
+    return talker
+
+
+def native_talker_source_path(talker: Qwen3TTSTalker) -> Path:
+    source_path = Path(inspect.getfile(type(talker))).resolve(strict=True)
+    expected_source_path = REPOSITORY_ROOT / NATIVE_TALKER_SOURCE_RELATIVE_PATH
+    if source_path != expected_source_path:
+        raise RuntimeError(
+            f"native reference imported its Talker from {source_path}, expected {expected_source_path}"
+        )
+    else:
+        pass
+    return source_path
+
+
 class NativeReferenceInputIdentity(TypedDict):
     upstream_commit: str
     model_revision: str
@@ -58,6 +98,30 @@ def tensor_sha256(tensor: torch.Tensor) -> str:
     digest = hashlib.sha256(str((str(value.dtype), tuple(value.shape))).encode())
     digest.update(value.view(torch.uint8).numpy().tobytes())
     return digest.hexdigest()
+
+
+def native_reference_output_rows(
+    sample: NativeReferenceSample,
+    codes: torch.Tensor,
+    feedback: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, NativeReferenceRecord]:
+    if codes.ndim == 0 or codes.shape[0] != 1:
+        raise ValueError("native reference code output must contain one batch row")
+    elif feedback.ndim == 0 or feedback.shape[0] != 1:
+        raise ValueError("native reference feedback output must contain one batch row")
+    else:
+        pass
+    codes_row = codes.detach().cpu()[0].contiguous().clone()
+    feedback_row = feedback.detach().cpu()[0].contiguous().clone()
+    record: NativeReferenceRecord = {
+        "request_id": sample["request_id"],
+        "uid": sample["uid"],
+        "ordinal": sample["ordinal"],
+        "seed": sample["seed"],
+        "codes_sha256": tensor_sha256(codes_row),
+        "feedback_sha256": tensor_sha256(feedback_row),
+    }
+    return codes_row, feedback_row, record
 
 
 def validate_model_identity(model_path: Path, identity: Mapping[str, object]) -> None:
@@ -97,7 +161,7 @@ def validate_model_identity(model_path: Path, identity: Mapping[str, object]) ->
 
 
 def validate_reference_identity(identity: Mapping[str, object]) -> None:
-    if identity.get("upstream_commit") != "a6e2fc6d98ab6abbed1c0ea40d0a7d6d038f3d74":
+    if identity.get("upstream_commit") != P16_UPSTREAM_BASE_SHA:
         raise RuntimeError("native reference input has the wrong upstream commit")
     elif identity.get("sampling") != {
         "do_sample": True,
@@ -231,11 +295,8 @@ def main() -> int:
             "enable_torch_compile": False,
         },
     )
-    talker = builder.talker_model
-    if talker is None:
-        raise RuntimeError("upstream builder did not retain its Talker")
-    else:
-        pass
+    talker = native_reference_talker(scheduler)
+    talker_source_path = native_talker_source_path(talker)
 
     code_outputs: list[torch.Tensor] = []
     feedback_outputs: list[torch.Tensor] = []
@@ -270,20 +331,12 @@ def main() -> int:
                 semantic_positions=semantic_positions,
             )
             torch.cuda.synchronize(device)
-            codes_cpu = codes.detach().cpu().clone()
-            feedback_cpu = feedback.detach().cpu().clone()
-            code_outputs.append(codes_cpu[0])
-            feedback_outputs.append(feedback_cpu[0])
-            records.append(
-                {
-                    "request_id": sample["request_id"],
-                    "uid": sample["uid"],
-                    "ordinal": int(sample["ordinal"]),
-                    "seed": int(sample["seed"]),
-                    "codes_sha256": tensor_sha256(codes_cpu),
-                    "feedback_sha256": tensor_sha256(feedback_cpu),
-                }
+            code_row, feedback_row, record = native_reference_output_rows(
+                sample, codes, feedback
             )
+            code_outputs.append(code_row)
+            feedback_outputs.append(feedback_row)
+            records.append(record)
         else:
             pass
         graph_stats_after = talker.predictor_graph_stats()
@@ -303,6 +356,10 @@ def main() -> int:
             "metadata": {
                 "upstream_commit": actual_commit,
                 "model_revision": arguments.model_revision,
+                "model_source_path": str(talker_source_path),
+                "model_source_path_relative": talker_source_path.relative_to(
+                    REPOSITORY_ROOT
+                ).as_posix(),
                 "cohort_sha256": identity["cohort_sha256"],
                 "sampling": identity["sampling"],
                 "graph_configuration": {
