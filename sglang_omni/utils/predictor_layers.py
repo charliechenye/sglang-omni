@@ -190,6 +190,8 @@ if HAS_TRITON:
         PARTIALS,
         SUM_SQ_PARTIALS,
         COUNTERS,
+        CACHE_SIZE: tl.constexpr,
+        ROPE_POSITION_COUNT: tl.constexpr,
         T: tl.constexpr,
         K: tl.constexpr,
         HEAD_DIM: tl.constexpr,
@@ -275,8 +277,11 @@ if HAS_TRITON:
             rstd = libdevice.rsqrt(sum_sq / K + norm_eps)
             lo = (acc_lo * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
             hi = (acc_hi * rstd[:, None]).to(tl.bfloat16).to(tl.float32)
-            pos = tl.load(POS + rm, mask=row_mask, other=0)
-            cache_rows = rm // T * cache_stride_row + pos * cache_stride_slot
+            pos = tl.load(POS + rm, mask=row_mask, other=-1)
+            position_limit: tl.constexpr = min(CACHE_SIZE, ROPE_POSITION_COUNT)
+            position_valid = (pos >= 0) & (pos < position_limit)
+            safe_pos = tl.minimum(tl.maximum(pos, 0), position_limit - 1)
+            cache_rows = rm // T * cache_stride_row + safe_pos * cache_stride_slot
             if head < NUM_Q_HEADS + NUM_KV_HEADS:
                 if head < NUM_Q_HEADS:
                     w_lo = tl.load(QN_W + rh).to(tl.float32)
@@ -290,8 +295,16 @@ if HAS_TRITON:
                 hi = (hi * head_rstd[:, None] * w_hi[None, :]).to(tl.bfloat16)
                 lo = lo.to(tl.float32)
                 hi = hi.to(tl.float32)
-                cos = tl.load(COS_SIN + pos[:, None] * HEAD_DIM + rh[None, :])
-                sin = tl.load(COS_SIN + pos[:, None] * HEAD_DIM + HALF + rh[None, :])
+                cos = tl.load(
+                    COS_SIN + safe_pos[:, None] * HEAD_DIM + rh[None, :],
+                    mask=(row_mask & position_valid)[:, None],
+                    other=0.0,
+                )
+                sin = tl.load(
+                    COS_SIN + safe_pos[:, None] * HEAD_DIM + HALF + rh[None, :],
+                    mask=(row_mask & position_valid)[:, None],
+                    other=0.0,
+                )
                 out_lo = (lo * cos - hi * sin).to(tl.bfloat16)
                 out_hi = (lo * sin + hi * cos).to(tl.bfloat16)
                 if head < NUM_Q_HEADS:
@@ -299,24 +312,24 @@ if HAS_TRITON:
                     tl.store(
                         Q_OUT + q_rows[:, None] + lo_cols[None, :],
                         out_lo,
-                        mask=row_mask[:, None],
+                        mask=(row_mask & position_valid)[:, None],
                     )
                     tl.store(
                         Q_OUT + q_rows[:, None] + hi_cols[None, :],
                         out_hi,
-                        mask=row_mask[:, None],
+                        mask=(row_mask & position_valid)[:, None],
                     )
                 else:
                     slots = cache_rows + (head - NUM_Q_HEADS) * cache_stride_head
                     tl.store(
                         K_CACHE + slots[:, None] + rh[None, :],
                         out_lo,
-                        mask=row_mask[:, None],
+                        mask=(row_mask & position_valid)[:, None],
                     )
                     tl.store(
                         K_CACHE + slots[:, None] + HALF + rh[None, :],
                         out_hi,
-                        mask=row_mask[:, None],
+                        mask=(row_mask & position_valid)[:, None],
                     )
             else:
                 v_head = head - NUM_Q_HEADS - NUM_KV_HEADS
@@ -324,12 +337,12 @@ if HAS_TRITON:
                 tl.store(
                     V_CACHE + slots[:, None] + rh[None, :],
                     lo.to(tl.bfloat16),
-                    mask=row_mask[:, None],
+                    mask=(row_mask & position_valid)[:, None],
                 )
                 tl.store(
                     V_CACHE + slots[:, None] + HALF + rh[None, :],
                     hi.to(tl.bfloat16),
-                    mask=row_mask[:, None],
+                    mask=(row_mask & position_valid)[:, None],
                 )
         else:
             pass
@@ -343,7 +356,9 @@ if HAS_TRITON:
         cache_stride_slot,
         cache_stride_head,
         OUT,
+        POSITIONS,
         end,
+        cache_size: tl.constexpr,
         scale,
         T: tl.constexpr,
         HEAD_DIM: tl.constexpr,
@@ -353,10 +368,11 @@ if HAS_TRITON:
         BLOCK_Q: tl.constexpr,
         BLOCK_S: tl.constexpr,
         USE_GDC: tl.constexpr,
+        USE_ROW_POSITIONS: tl.constexpr,
     ):
-        """One program per row group and kv head: the group's T tokens by the kv head's
-        q heads as the rows of one MMA tile against its cache slots, the token t seeing
-        the slots below end - T + t + 1; scores and softmax in fp32, the unnormalized
+        """One program per row group and KV head: T tokens by a KV head's
+        query heads are rows of one MMA tile, each query seeing only slots through its
+        absolute position; scores and softmax in FP32, the unnormalized
         weights rounded to bf16 for the product with the values, then divided by their
         fp32 sum; Q's rows Q_ROW_STRIDE elements apart, OUT's rows packed."""
         row_group = tl.program_id(0)
@@ -371,6 +387,18 @@ if HAS_TRITON:
         rd = tl.arange(0, HEAD_DIM)
         token = rq // GROUP
         is_query = rq < T * GROUP
+        if USE_ROW_POSITIONS:
+            query_positions = tl.load(
+                POSITIONS + row_group * T + token,
+                mask=is_query,
+                other=-1,
+            )
+        else:
+            query_positions = end - T + token
+        position_valid = (
+            is_query & (query_positions >= 0) & (query_positions < cache_size)
+        )
+        max_position = tl.max(tl.where(position_valid, query_positions, -1), 0)
         q_offsets = (
             (row_group * T + token)[:, None] * Q_ROW_STRIDE
             + (kv_head * GROUP + rq % GROUP)[:, None] * HEAD_DIM
@@ -387,14 +415,28 @@ if HAS_TRITON:
             + rs[:, None] * cache_stride_slot
             + rd[None, :]
         )
-        q = tl.load(Q + q_offsets, mask=is_query[:, None], other=0.0)
-        k = tl.load(K_CACHE + cache_offsets, mask=(rs < end)[:, None], other=0.0)
-        v = tl.load(V_CACHE + cache_offsets, mask=(rs < end)[:, None], other=0.0)
+        q = tl.load(Q + q_offsets, mask=position_valid[:, None], other=0.0)
+        k = tl.load(
+            K_CACHE + cache_offsets,
+            mask=((rs <= max_position) & (rs < cache_size))[:, None],
+            other=0.0,
+        )
+        v = tl.load(
+            V_CACHE + cache_offsets,
+            mask=((rs <= max_position) & (rs < cache_size))[:, None],
+            other=0.0,
+        )
         scores = tl.dot(q, tl.trans(k)) * scale
-        visible = rs[None, :] < end - T + token[:, None] + 1
+        visible = (rs[None, :] <= query_positions[:, None]) & (rs[None, :] < cache_size)
+        visible = visible & position_valid[:, None]
         scores = tl.where(visible, scores, float("-inf"))
-        weights = libdevice.exp(scores - tl.max(scores, 1)[:, None])
-        attended = tl.dot(weights.to(tl.bfloat16), v) / tl.sum(weights, 1)[:, None]
+        max_scores = tl.max(scores, 1)
+        max_scores = tl.where(position_valid, max_scores, 0.0)
+        weights = tl.where(visible, libdevice.exp(scores - max_scores[:, None]), 0.0)
+        weight_sums = tl.sum(weights, 1)
+        attended = (
+            tl.dot(weights.to(tl.bfloat16), v) / tl.maximum(weight_sums, 1.0)[:, None]
+        )
         tl.store(OUT + out_offsets, attended.to(tl.bfloat16), mask=is_query[:, None])
         # note (ratish): released after the store, so o_proj's waiting programs do not hold
         # the SM slots the attention's later waves need.
@@ -673,6 +715,69 @@ def split_count(output_tiles: int, k_blocks: int, sm_count: int) -> int:
     return min(candidates, key=lambda split: abs(output_tiles * split - sm_count))
 
 
+def fused_predictor_scratch_rows(max_batch_size: int, max_tokens_per_row: int) -> int:
+    """Rows needed for an opt-in packed width, capped by the fused kernel limit."""
+    if (
+        isinstance(max_batch_size, bool)
+        or not isinstance(max_batch_size, int)
+        or max_batch_size <= 0
+    ):
+        raise ValueError("max_batch_size must be a positive integer")
+    else:
+        pass
+    if (
+        isinstance(max_tokens_per_row, bool)
+        or not isinstance(max_tokens_per_row, int)
+        or not 2 <= max_tokens_per_row <= 8
+    ):
+        raise ValueError("max_tokens_per_row must be an integer in [2, 8]")
+    else:
+        pass
+    return min(max_batch_size * max_tokens_per_row, MAX_FUSED_ROWS)
+
+
+def resolve_fused_predictor_width(
+    requested_width: int,
+    graph_batch_size: int,
+    max_rows: int,
+    query_heads: int,
+    kv_heads: int,
+) -> int:
+    """Reduce width for padded graph rows, scratch capacity, and attention tiles."""
+    if (
+        isinstance(requested_width, bool)
+        or not isinstance(requested_width, int)
+        or requested_width < 1
+        or requested_width > 8
+    ):
+        raise ValueError("requested_width must be in [1, 8]")
+    else:
+        pass
+    if any(
+        isinstance(value, bool) or not isinstance(value, int)
+        for value in (graph_batch_size, max_rows, query_heads, kv_heads)
+    ):
+        raise ValueError("packed capacity dimensions must be integers")
+    else:
+        pass
+    if graph_batch_size <= 0 or max_rows <= 0:
+        return 0
+    else:
+        pass
+    if query_heads <= 0 or kv_heads <= 0 or query_heads % kv_heads != 0:
+        return 0
+    else:
+        pass
+    width_from_scratch = max_rows // graph_batch_size
+    width_from_tile = ATTENTION_ROWS // (query_heads // kv_heads)
+    effective_width = min(requested_width, width_from_scratch, width_from_tile)
+    if effective_width < 1:
+        return 0
+    else:
+        pass
+    return effective_width
+
+
 def resolve_predictor_layer_shape(
     code_predictor: torch.nn.Module, predictor_len: int, device: torch.device
 ) -> PredictorLayerShape | None:
@@ -804,6 +909,10 @@ def attention_inputs(
     into the caches at each row's position. x is (rows, hidden) with unit column stride;
     the caches are (rows // tokens_per_row, slots, kv heads, head dim)."""
     rows = x.shape[0]
+    if k_cache.shape[1] <= 0 or attention.rotary_emb.cos_sin_cache.shape[0] <= 0:
+        raise ValueError("Predictor KV and RoPE position capacities must be positive")
+    else:
+        pass
     block_m = block_rows(rows)
     heads = shape.num_q_heads + 2 * shape.num_kv_heads
     use_gdc = is_arch_support_pdl()
@@ -832,6 +941,8 @@ def attention_inputs(
                 partials,
                 sum_sq_partials,
                 counters,
+                CACHE_SIZE=k_cache.shape[1],
+                ROPE_POSITION_COUNT=attention.rotary_emb.cos_sin_cache.shape[0],
                 T=tokens_per_row,
                 K=shape.hidden_size,
                 HEAD_DIM=shape.head_dim,
@@ -859,14 +970,45 @@ def decode_attention(
     tokens_per_row: int,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
-    end: int,
+    end: int | None = None,
+    positions: torch.Tensor | None = None,
     attention_output: torch.Tensor,
 ) -> None:
     """attention_output = softmax(q k^T / sqrt(head dim)) v over each row's slots up to
     its position, causal within a row group. q and attention_output are (rows, q heads *
     head dim), q with unit column stride and attention_output contiguous; the caches are
     (rows // tokens_per_row, slots, kv heads, head dim)."""
+    if (end is None) == (positions is None):
+        raise ValueError("provide exactly one of end or positions")
+    else:
+        pass
     num_kv_heads, head_dim = k_cache.shape[2:]
+    if q.ndim != 2 or q.shape[1] % head_dim != 0:
+        raise ValueError("q must have shape [rows, query_heads * head_dim]")
+    else:
+        pass
+    query_heads = q.shape[1] // head_dim
+    if query_heads % num_kv_heads != 0:
+        raise ValueError("query heads must be divisible by KV heads")
+    else:
+        pass
+    if tokens_per_row <= 0 or q.shape[0] % tokens_per_row != 0:
+        raise ValueError("query rows must form complete packed rows")
+    else:
+        pass
+    if tokens_per_row * (query_heads // num_kv_heads) > ATTENTION_ROWS:
+        raise ValueError("packed query rows exceed the fused attention tile capacity")
+    else:
+        pass
+    position_tensor = q if positions is None else positions.reshape(-1)
+    if positions is not None and positions.numel() != q.shape[0]:
+        raise ValueError("positions must contain one absolute position per query")
+    else:
+        pass
+    if end is not None and not 0 <= end <= k_cache.shape[1]:
+        raise ValueError("attention end must fit inside the KV cache")
+    else:
+        pass
     use_gdc = is_arch_support_pdl()
     decode_attention_kernel[(q.shape[0] // tokens_per_row, num_kv_heads)](
         q,
@@ -876,7 +1018,9 @@ def decode_attention(
         k_cache.stride(1),
         k_cache.stride(2),
         attention_output,
-        end,
+        position_tensor,
+        0 if end is None else end,
+        k_cache.shape[1],
         head_dim**-0.5,
         T=tokens_per_row,
         HEAD_DIM=head_dim,
@@ -886,6 +1030,7 @@ def decode_attention(
         BLOCK_Q=ATTENTION_ROWS,
         BLOCK_S=triton.next_power_of_2(k_cache.shape[1]),
         USE_GDC=use_gdc,
+        USE_ROW_POSITIONS=positions is not None,
         num_warps=NUM_WARPS,
         launch_pdl=use_gdc,
     )
@@ -1111,13 +1256,127 @@ class FusedPredictorLayers:
         k_cache: torch.Tensor,
         v_cache: torch.Tensor,
     ) -> torch.Tensor:
-        """token_embeds (batch, tokens, hidden) at slots cache_len onward; the caches are
-        (layer, row, slot, kv head, head dim), the slot being the position. Returns the
-        final norm of the residual stream as (batch, tokens, hidden)."""
+        """Run consecutive tokens at one scalar cache end, preserving native fast path.
+
+        The caches are (layer, row, slot, kv head, head dim), with the scalar
+        ``cache_len`` as the first slot. Returns final-normalized residuals as
+        (batch, tokens, hidden).
+        """
+        if token_embeds.ndim != 3 or token_embeds.shape[0] != batch_size:
+            raise ValueError(
+                "Predictor embeddings must have shape [batch, tokens, hidden]"
+            )
+        else:
+            pass
+        num_tokens = token_embeds.shape[1]
+        if token_embeds.shape[2] != self.shape.hidden_size:
+            raise ValueError(
+                "Predictor embedding hidden size does not match fused layer weights"
+            )
+        else:
+            pass
+        if positions.ndim != 1 or positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "Predictor positions must be a one-dimensional integer tensor"
+            )
+        else:
+            pass
+        if cache_len < 0 or cache_len + num_tokens > k_cache.shape[2]:
+            raise ValueError("Predictor scalar KV range is outside the cache")
+        else:
+            pass
+        return self.forward_with_attention_bounds(
+            layers=layers,
+            final_norm=final_norm,
+            token_embeds=token_embeds,
+            batch_size=batch_size,
+            positions=positions,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_end=cache_len + num_tokens,
+        )
+
+    def forward_packed(
+        self,
+        *,
+        layers: torch.nn.ModuleList,
+        final_norm: torch.nn.Module,
+        token_embeds: torch.Tensor,
+        batch_size: int,
+        positions: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run packed tokens at row-specific absolute positions; -1 pads a row.
+
+        The caches are (layer, row, slot, kv head, head dim), indexed by those
+        positions. Returns final-normalized residuals as (batch, tokens, hidden).
+        """
+        if token_embeds.ndim != 3 or token_embeds.shape[0] != batch_size:
+            raise ValueError(
+                "packed Predictor embeddings must have shape [batch, tokens, hidden]"
+            )
+        else:
+            pass
+        if token_embeds.shape[2] != self.shape.hidden_size:
+            raise ValueError(
+                "packed Predictor hidden size does not match fused layer weights"
+            )
+        else:
+            pass
+        if positions.ndim != 1 or positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError(
+                "packed Predictor positions must be a one-dimensional integer tensor"
+            )
+        else:
+            pass
+        return self.forward_with_attention_bounds(
+            layers=layers,
+            final_norm=final_norm,
+            token_embeds=token_embeds,
+            batch_size=batch_size,
+            positions=positions,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            cache_end=None,
+        )
+
+    def forward_with_attention_bounds(
+        self,
+        *,
+        layers: torch.nn.ModuleList,
+        final_norm: torch.nn.Module,
+        token_embeds: torch.Tensor,
+        batch_size: int,
+        positions: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        cache_end: int | None,
+    ) -> torch.Tensor:
+        """Run the shared fused stack with scalar or row-specific attention bounds."""
         shape = self.shape
         num_tokens, hidden_size = token_embeds.shape[1:]
         rows = batch_size * num_tokens
-        end = cache_len + num_tokens
+        if rows > self.max_rows:
+            raise ValueError(
+                "packed Predictor has "
+                f"{rows} rows, but scratch capacity is {self.max_rows}"
+            )
+        else:
+            pass
+        if num_tokens * (shape.num_q_heads // shape.num_kv_heads) > ATTENTION_ROWS:
+            raise ValueError(
+                "packed Predictor width exceeds the fused attention tile capacity"
+            )
+        else:
+            pass
+        if positions.ndim != 1 or positions.numel() != rows:
+            raise ValueError("positions must contain one entry per packed query")
+        elif positions.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Predictor positions must use an integer dtype")
+        else:
+            pass
+        positions = positions.reshape(-1).contiguous()
         hidden = token_embeds.reshape(rows, hidden_size)
         residual = self.residual[:rows]
         q_out = self.q[:rows]
@@ -1142,14 +1401,25 @@ class FusedPredictorLayers:
                 shape=shape,
                 fitted_stages=self.fitted_stages,
             )
-            decode_attention(
-                q=q_out,
-                tokens_per_row=num_tokens,
-                k_cache=layer_k_cache,
-                v_cache=layer_v_cache,
-                end=end,
-                attention_output=attention_output,
-            )
+            if cache_end is None:
+                decode_attention(
+                    q=q_out,
+                    tokens_per_row=num_tokens,
+                    k_cache=layer_k_cache,
+                    v_cache=layer_v_cache,
+                    positions=positions,
+                    attention_output=attention_output,
+                )
+            else:
+                decode_attention(
+                    q=q_out,
+                    tokens_per_row=num_tokens,
+                    k_cache=layer_k_cache,
+                    v_cache=layer_v_cache,
+                    end=cache_end,
+                    attention_output=attention_output,
+                )
+
             o_proj_add(
                 attention_output=attention_output.view(
                     batch_size, num_tokens, shape.num_q_heads, shape.head_dim
@@ -1191,15 +1461,15 @@ def resolve_fused_predictor_layers(
     max_batch_size: int,
     device: torch.device,
     dtype: torch.dtype,
+    *,
+    max_tokens_per_row: int = 2,
 ) -> FusedPredictorLayers | None:
-    """The fused layers for this predictor, or None where it keeps the plain path. The
-    opening pair runs as one pass of two rows per request; the layers cover passes of
-    up to MAX_FUSED_ROWS rows."""
+    """Return fused layers, defaulting to opening-pair capacity and allowing opt-in packed width."""
     shape = resolve_predictor_layer_shape(code_predictor, predictor_len, device)
     # note (ratish): deterministic inference promises the same bits at every batch size,
     # and a pass above MAX_FUSED_ROWS runs plain.
     if shape is None or get_exec().deterministic.enable_deterministic_inference:
         return None
     else:
-        max_rows = min(2 * max_batch_size, MAX_FUSED_ROWS)
+        max_rows = fused_predictor_scratch_rows(max_batch_size, max_tokens_per_row)
         return FusedPredictorLayers(shape, max_rows, device, dtype)

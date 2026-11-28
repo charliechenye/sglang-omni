@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Literal
+
 import torch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
@@ -89,6 +91,174 @@ if has_triton_runtime():
         h = rotl32(h, 13)
         h = (h * 5 + 0xE6546B64) & 0xFFFFFFFF
         return h
+
+    @triton.jit
+    def speculative_uniform_hash(
+        seed,
+        position,
+        columns,
+        salt: tl.constexpr,
+    ):
+        mixed_seed = seed ^ tl.cast(salt, tl.uint64)
+        hash_value: tl.uint32 = 0
+        hash_value = murmur3_mix(hash_value, (mixed_seed & 0xFFFFFFFF).to(tl.uint32))
+        hash_value = murmur3_mix(
+            hash_value, ((mixed_seed >> 32) & 0xFFFFFFFF).to(tl.uint32)
+        )
+        hash_value = murmur3_mix(hash_value, position.to(tl.uint32))
+        hash_value = murmur3_mix(hash_value, columns.to(tl.uint32))
+        return fmix32(hash_value ^ 16)
+
+    @triton.jit
+    def speculative_uniforms_four_purpose_kernel(
+        seeds,
+        semantic_positions,
+        round_index,
+        output,
+        OUTPUT_STRIDE_ROW: tl.constexpr,
+        OUTPUT_STRIDE_PURPOSE: tl.constexpr,
+        OUTPUT_STRIDE_COLUMN: tl.constexpr,
+        NUM_CODE_GROUPS: tl.constexpr,
+        PROPOSAL_WIDTH: tl.constexpr,
+        VERIFY_WIDTH: tl.constexpr,
+        MAX_COLUMNS: tl.constexpr,
+        BLOCK_COLUMNS: tl.constexpr,
+        PROPOSAL_SALT: tl.constexpr,
+        ACCEPTANCE_SALT: tl.constexpr,
+        CORRECTION_SALT: tl.constexpr,
+        BONUS_SALT: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        columns = tl.arange(0, BLOCK_COLUMNS)
+        seed = tl.load(seeds + row).to(tl.uint64)
+        semantic_position = tl.load(semantic_positions + row).to(tl.uint64)
+        current_round = tl.load(round_index).to(tl.uint64)
+        position = semantic_position * (2 * NUM_CODE_GROUPS) + current_round
+
+        proposal_hash = speculative_uniform_hash(seed, position, columns, PROPOSAL_SALT)
+        acceptance_hash = speculative_uniform_hash(
+            seed, position, columns, ACCEPTANCE_SALT
+        )
+        correction_hash = speculative_uniform_hash(
+            seed, position, columns, CORRECTION_SALT
+        )
+        bonus_hash = speculative_uniform_hash(seed, position, columns, BONUS_SALT)
+        proposal_uniforms = tl.minimum(
+            ((proposal_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        acceptance_uniforms = tl.minimum(
+            ((acceptance_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        correction_uniforms = tl.minimum(
+            ((correction_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        bonus_uniforms = tl.minimum(
+            ((bonus_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        output_base = output + row * OUTPUT_STRIDE_ROW
+        tl.store(
+            output_base + columns * OUTPUT_STRIDE_COLUMN,
+            tl.where(columns < PROPOSAL_WIDTH, proposal_uniforms, 0.0),
+            mask=columns < MAX_COLUMNS,
+        )
+        tl.store(
+            output_base + OUTPUT_STRIDE_PURPOSE + columns * OUTPUT_STRIDE_COLUMN,
+            tl.where(columns < PROPOSAL_WIDTH, acceptance_uniforms, 0.0),
+            mask=columns < MAX_COLUMNS,
+        )
+        tl.store(
+            output_base + 2 * OUTPUT_STRIDE_PURPOSE + columns * OUTPUT_STRIDE_COLUMN,
+            tl.where(columns < VERIFY_WIDTH, correction_uniforms, 0.0),
+            mask=columns < MAX_COLUMNS,
+        )
+        tl.store(
+            output_base + 3 * OUTPUT_STRIDE_PURPOSE + columns * OUTPUT_STRIDE_COLUMN,
+            tl.where(columns < VERIFY_WIDTH, bonus_uniforms, 0.0),
+            mask=columns < MAX_COLUMNS,
+        )
+
+    @triton.jit
+    def speculative_uniforms_frame_pool_kernel(
+        seeds,
+        semantic_positions,
+        output,
+        OUTPUT_STRIDE_ROW: tl.constexpr,
+        OUTPUT_STRIDE_PURPOSE: tl.constexpr,
+        OUTPUT_STRIDE_ROUND: tl.constexpr,
+        OUTPUT_STRIDE_COLUMN: tl.constexpr,
+        NUM_CODE_GROUPS: tl.constexpr,
+        MAX_COLUMNS: tl.constexpr,
+        BLOCK_COLUMNS: tl.constexpr,
+        PROPOSAL_SALT: tl.constexpr,
+        ACCEPTANCE_SALT: tl.constexpr,
+        CORRECTION_SALT: tl.constexpr,
+        BONUS_SALT: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        round_index = tl.program_id(1).to(tl.uint64)
+        columns = tl.arange(0, BLOCK_COLUMNS)
+        seed = tl.load(seeds + row).to(tl.uint64)
+        semantic_position = tl.load(semantic_positions + row).to(tl.uint64)
+        position = semantic_position * (2 * NUM_CODE_GROUPS) + round_index
+        proposal_hash = speculative_uniform_hash(seed, position, columns, PROPOSAL_SALT)
+        acceptance_hash = speculative_uniform_hash(
+            seed, position, columns, ACCEPTANCE_SALT
+        )
+        correction_hash = speculative_uniform_hash(
+            seed, position, columns, CORRECTION_SALT
+        )
+        bonus_hash = speculative_uniform_hash(seed, position, columns, BONUS_SALT)
+        proposal_uniforms = tl.minimum(
+            ((proposal_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        acceptance_uniforms = tl.minimum(
+            ((acceptance_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        correction_uniforms = tl.minimum(
+            ((correction_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        bonus_uniforms = tl.minimum(
+            ((bonus_hash.to(tl.float64) + 0.5) / 4294967296.0).to(tl.float32),
+            0.9999999403953552,
+        )
+        output_base = output + row * OUTPUT_STRIDE_ROW
+        round_offset = round_index.to(tl.int32) * OUTPUT_STRIDE_ROUND
+        tl.store(
+            output_base + round_offset + columns * OUTPUT_STRIDE_COLUMN,
+            proposal_uniforms,
+            mask=columns < MAX_COLUMNS - 1,
+        )
+        tl.store(
+            output_base
+            + OUTPUT_STRIDE_PURPOSE
+            + round_offset
+            + columns * OUTPUT_STRIDE_COLUMN,
+            acceptance_uniforms,
+            mask=columns < MAX_COLUMNS - 1,
+        )
+        tl.store(
+            output_base
+            + 2 * OUTPUT_STRIDE_PURPOSE
+            + round_offset
+            + columns * OUTPUT_STRIDE_COLUMN,
+            correction_uniforms,
+            mask=columns < MAX_COLUMNS,
+        )
+        tl.store(
+            output_base
+            + 3 * OUTPUT_STRIDE_PURPOSE
+            + round_offset
+            + columns * OUTPUT_STRIDE_COLUMN,
+            bonus_uniforms,
+            mask=columns < MAX_COLUMNS,
+        )
 
     @triton.jit
     def gumbel_from_hash(h: tl.uint32):
@@ -553,6 +723,208 @@ if has_triton_runtime():
         tl.store(out + row, token)
 
     @triton.jit
+    def speculative_top_k_top_p_probability_kernel(
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        active_rows,
+        probability_output,
+        token_id_output,
+        logits_stride_b: tl.constexpr,
+        max_top_k: tl.constexpr,
+        block_k: tl.constexpr,
+        has_top_p: tl.constexpr,
+        vocab_size: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        ranks = tl.arange(0, block_k)
+        if tl.load(active_rows + row):
+            vocab_offsets = tl.arange(0, vocab_size)
+            scores, ordered_score_bits, packed = pack_scaled_scores(
+                logits, temperatures, row, logits_stride_b, vocab_offsets
+            )
+            top_packed = tl.topk(packed, k=block_k)
+            sorted_scores, sorted_token_ids = unpack_top_keys(top_packed, block_k)
+
+            if max_top_k <= 32:
+                all_ones_vocab = tl.full(vocab_offsets.shape, 0xFFFFFFFF, tl.uint32)
+                all_ones_rank = tl.full(ranks.shape, 0xFFFFFFFF, tl.uint32)
+                threshold_ordered_score_bits = tl.max(
+                    tl.where(
+                        ranks == max_top_k - 1,
+                        (top_packed >> 32).to(tl.uint32),
+                        0,
+                    ),
+                    axis=0,
+                )
+                greater_than_threshold = (
+                    ordered_score_bits > threshold_ordered_score_bits
+                )
+                equal_to_threshold = ordered_score_bits == threshold_ordered_score_bits
+                gather_order_keys = (
+                    tl.where(
+                        greater_than_threshold,
+                        0,
+                        tl.where(equal_to_threshold, 1, all_ones_vocab),
+                    ).to(tl.uint64)
+                    << 32
+                ) | vocab_offsets.to(tl.uint64)
+                all_ones_key = (all_ones_vocab.to(tl.uint64) << 32) | all_ones_vocab.to(
+                    tl.uint64
+                )
+                gathered_complement = tl.topk(
+                    all_ones_key - gather_order_keys,
+                    k=32,
+                )
+                gather_source_ids = (
+                    all_ones_rank
+                    - (gathered_complement & all_ones_rank.to(tl.uint64)).to(tl.uint32)
+                ).to(tl.int32)
+                sorted_scores = tl.gather(scores, gather_source_ids, axis=0)
+                sorted_token_ids = gather_source_ids.to(tl.uint32)
+                sorted_scores, sorted_token_ids = bitonic_sort_selected_32_desc(
+                    sorted_scores, sorted_token_ids, max_top_k
+                )
+            else:
+                pass
+
+            top_k = tl.load(top_ks + row)
+            keep = ranks < tl.minimum(top_k, max_top_k)
+            masked_scores = tl.where(keep, sorted_scores, -float("inf"))
+            max_score = tl.max(masked_scores, axis=0)
+            probabilities = tl.exp(masked_scores - max_score)
+            probabilities = probabilities / tl.sum(probabilities, axis=0)
+            if has_top_p:
+                top_p = tl.load(top_ps + row).to(tl.float32)
+                active_top_p = (top_p > 0.0) & (top_p < 1.0)
+                cumulative = tl.cumsum(probabilities, axis=0)
+                remove = (cumulative - probabilities >= top_p) & active_top_p
+                keep = keep & ~(remove & (ranks != 0))
+            else:
+                pass
+            probabilities = tl.where(keep, probabilities, 0.0)
+            probabilities = probabilities / tl.sum(probabilities, axis=0)
+            tl.store(probability_output + row * block_k + ranks, probabilities)
+            tl.store(
+                token_id_output + row * block_k + ranks,
+                sorted_token_ids.to(tl.int32),
+            )
+        else:
+            tl.store(probability_output + row * block_k + ranks, 0.0)
+            tl.store(token_id_output + row * block_k + ranks, 0)
+
+    @triton.jit
+    def speculative_radix_top_k_top_p_probability_kernel(
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        active_rows,
+        compacted_keys,
+        probability_output,
+        token_id_output,
+        logits_stride_b: tl.constexpr,
+        max_top_k: tl.constexpr,
+        block_k: tl.constexpr,
+        has_top_p: tl.constexpr,
+        radix_bits: tl.constexpr,
+        radix_bin_count: tl.constexpr,
+        radix_pass_count: tl.constexpr,
+        vocab_size: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        ranks = tl.arange(0, block_k)
+        tl.store(compacted_keys + row * block_k + ranks, 0)
+        tl.debug_barrier()
+        if tl.load(active_rows + row):
+            vocab_offsets = tl.arange(0, vocab_size)
+            _, _, packed = pack_scaled_scores(
+                logits, temperatures, row, logits_stride_b, vocab_offsets
+            )
+            prefix = tl.full((), 0, tl.uint64)
+            prefix_mask = tl.full((), 0, tl.uint64)
+            remaining_rank = tl.full((), max_top_k, tl.int32)
+            higher_count = tl.full((), 0, tl.int32)
+            selection_complete = False
+            radix_bins = tl.arange(0, radix_bin_count)
+            radix_mask: tl.constexpr = radix_bin_count - 1
+            for radix_pass in tl.static_range(0, radix_pass_count):
+                if not selection_complete:
+                    shift = 64 - radix_bits - radix_pass * radix_bits
+                    digits = ((packed >> shift) & radix_mask).to(tl.int32)
+                    matches_prefix = (packed & prefix_mask) == prefix
+                    histogram = tl.histogram(
+                        digits, num_bins=radix_bin_count, mask=matches_prefix
+                    )
+                    descending_bins = tl.gather(
+                        histogram, radix_mask - radix_bins, axis=0
+                    )
+                    descending_rank = tl.cumsum(descending_bins, axis=0)
+                    selected_rank = tl.min(
+                        tl.where(
+                            descending_rank >= remaining_rank,
+                            radix_bins,
+                            radix_bin_count,
+                        ),
+                        axis=0,
+                    )
+                    selected_digit = radix_mask - selected_rank
+                    higher_in_prefix = tl.sum(
+                        tl.where(radix_bins > selected_digit, histogram, 0), axis=0
+                    )
+                    selected_group_count = tl.sum(
+                        tl.where(radix_bins == selected_digit, histogram, 0), axis=0
+                    )
+                    higher_count += higher_in_prefix
+                    remaining_rank -= higher_in_prefix
+                    prefix = prefix | (selected_digit.to(tl.uint64) << shift)
+                    prefix_mask = prefix_mask | (
+                        tl.full((), radix_mask, tl.uint64) << shift
+                    )
+                    selection_complete = higher_count + selected_group_count <= block_k
+                else:
+                    pass
+
+            selected_mask = packed >= prefix
+            compacted_ranks = tl.cumsum(selected_mask.to(tl.int32), axis=0) - 1
+            tl.store(
+                compacted_keys + row * block_k + compacted_ranks,
+                packed.to(tl.int64, bitcast=True),
+                mask=selected_mask,
+            )
+            tl.debug_barrier()
+            compacted = tl.load(compacted_keys + row * block_k + ranks).to(
+                tl.uint64, bitcast=True
+            )
+            top_packed = tl.topk(compacted, k=block_k)
+            sorted_scores, sorted_token_ids = unpack_top_keys(top_packed, block_k)
+            top_k = tl.load(top_ks + row)
+            keep = ranks < tl.minimum(top_k, max_top_k)
+            masked_scores = tl.where(keep, sorted_scores, -float("inf"))
+            max_score = tl.max(masked_scores, axis=0)
+            probabilities = tl.exp(masked_scores - max_score)
+            probabilities = probabilities / tl.sum(probabilities, axis=0)
+            if has_top_p:
+                top_p = tl.load(top_ps + row).to(tl.float32)
+                active_top_p = (top_p > 0.0) & (top_p < 1.0)
+                cumulative = tl.cumsum(probabilities, axis=0)
+                remove = (cumulative - probabilities >= top_p) & active_top_p
+                keep = keep & ~(remove & (ranks != 0))
+            else:
+                pass
+            probabilities = tl.where(keep, probabilities, 0.0)
+            probabilities = probabilities / tl.sum(probabilities, axis=0)
+            tl.store(probability_output + row * block_k + ranks, probabilities)
+            tl.store(
+                token_id_output + row * block_k + ranks,
+                sorted_token_ids.to(tl.int32),
+            )
+        else:
+            tl.store(probability_output + row * block_k + ranks, 0.0)
+            tl.store(token_id_output + row * block_k + ranks, 0)
+
+    @triton.jit
     def seeded_top_k_chunk_kernel(
         logits,
         temperatures,
@@ -677,13 +1049,88 @@ if has_triton_runtime():
         else:
             pass
 
+    @triton.jit
+    def seeded_top_k_merge_probability_kernel(
+        chunk_keys,
+        top_ks,
+        top_ps,
+        active_rows,
+        probability_output,
+        token_id_output,
+        num_candidates: tl.constexpr,
+        block_k: tl.constexpr,
+        log2_num_candidates: tl.constexpr,
+        log2_block_k: tl.constexpr,
+        max_top_k: tl.constexpr,
+        has_top_p: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        ranks = tl.arange(0, block_k)
+        if tl.load(active_rows + row):
+            candidates = tl.load(
+                chunk_keys + row * num_candidates + tl.arange(0, num_candidates)
+            ).to(tl.uint64)
+            candidates = tl.reshape(candidates, [2] * log2_num_candidates)
+            for log2_covered_keys in tl.static_range(
+                log2_block_k + 1, log2_num_candidates + 1
+            ):
+                candidates = tl.max(
+                    candidates, axis=log2_num_candidates - log2_covered_keys
+                )
+                if log2_covered_keys < log2_num_candidates:
+                    candidates = bitonic_merge_runs(
+                        candidates,
+                        log2_num_candidates - log2_covered_keys + log2_block_k,
+                        log2_block_k,
+                        bitonic_index_bit(
+                            log2_num_candidates - log2_covered_keys + log2_block_k,
+                            log2_block_k,
+                        ),
+                    )
+                else:
+                    candidates = bitonic_merge_runs(
+                        candidates, log2_block_k, log2_block_k, 1
+                    )
+            sorted_scores, sorted_token_ids = unpack_top_keys(
+                tl.reshape(candidates, [block_k]), block_k
+            )
+            top_k = tl.load(top_ks + row)
+            keep = ranks < tl.minimum(top_k, max_top_k)
+            masked_scores = tl.where(keep, sorted_scores, -float("inf"))
+            max_score = tl.max(masked_scores, axis=0)
+            probabilities = tl.exp(masked_scores - max_score)
+            probabilities = probabilities / tl.sum(probabilities, axis=0)
+            if has_top_p:
+                top_p = tl.load(top_ps + row).to(tl.float32)
+                active_top_p = (top_p > 0.0) & (top_p < 1.0)
+                cumulative = tl.cumsum(probabilities, axis=0)
+                remove = (cumulative - probabilities >= top_p) & active_top_p
+                keep = keep & ~(remove & (ranks != 0))
+            else:
+                pass
+            probabilities = tl.where(keep, probabilities, 0.0)
+            probabilities = probabilities / tl.sum(probabilities, axis=0)
+            tl.store(probability_output + row * block_k + ranks, probabilities)
+            tl.store(
+                token_id_output + row * block_k + ranks,
+                sorted_token_ids.to(tl.int32),
+            )
+        else:
+            tl.store(probability_output + row * block_k + ranks, 0.0)
+            tl.store(token_id_output + row * block_k + ranks, 0)
+
 else:
     seeded_gumbel_sample_sorted_kernel = None
+    speculative_uniforms_four_purpose_kernel = None
+    speculative_uniforms_frame_pool_kernel = None
     bitonic_compare_selected_32_desc = None
     bitonic_sort_selected_32_desc = None
     seeded_top_k_top_p_sample_kernel = None
     seeded_top_k_chunk_kernel = None
     seeded_top_k_merge_sample_kernel = None
+    seeded_top_k_merge_probability_kernel = None
+    speculative_top_k_top_p_probability_kernel = None
+    speculative_radix_top_k_top_p_probability_kernel = None
 
 
 def next_power_of_2(value: int) -> int:
@@ -1157,3 +1604,332 @@ def sample_from_logits_with_seed_top_k_top_p(
             num_warps=8,
         )
     return out
+
+
+def build_speculative_probability_candidates(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    active_rows: torch.Tensor,
+    *,
+    max_top_k: int,
+    has_top_p: bool,
+    has_unbounded_top_k: bool,
+    probability_output: torch.Tensor | None = None,
+    token_id_output: torch.Tensor | None = None,
+    split_candidate_keys: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Build native-ordered compact probabilities for bounded CUDA sampler rows."""
+    block_k = fused_raw_logit_block_k(max_top_k)
+    if (
+        speculative_top_k_top_p_probability_kernel is None
+        or not _TRITON_GATHER_SUPPORTED
+        or block_k is None
+        or has_unbounded_top_k
+        or not logits.is_cuda
+        or logits.ndim != 2
+        or logits.shape[1] != FUSED_SAMPLER_VOCAB_SIZE
+        or logits.dtype is not torch.bfloat16
+        or not logits.is_contiguous()
+    ):
+        return None
+    else:
+        pass
+    row_count = int(logits.shape[0])
+    row_tensors = (temperatures, top_ks, top_ps, active_rows)
+    if any(
+        tensor.device != logits.device
+        or tensor.ndim != 1
+        or tensor.shape[0] != row_count
+        or not tensor.is_contiguous()
+        for tensor in row_tensors
+    ):
+        return None
+    else:
+        pass
+    if (
+        temperatures.dtype is not torch.float32
+        or top_ks.dtype is not torch.long
+        or top_ps.dtype is not torch.float32
+        or active_rows.dtype is not torch.bool
+    ):
+        return None
+    else:
+        pass
+    if (probability_output is None) != (token_id_output is None):
+        raise ValueError("probability and token-ID outputs must be supplied together")
+    elif probability_output is None:
+        probabilities = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.float32
+        )
+        token_ids = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.int32
+        )
+    elif (
+        probability_output.shape != (row_count, block_k)
+        or token_id_output.shape != (row_count, block_k)
+        or probability_output.device != logits.device
+        or token_id_output.device != logits.device
+        or probability_output.dtype is not torch.float32
+        or token_id_output.dtype is not torch.int32
+        or not probability_output.is_contiguous()
+        or not token_id_output.is_contiguous()
+    ):
+        raise ValueError("persistent probability outputs do not match the builder")
+    else:
+        probabilities = probability_output
+        token_ids = token_id_output
+    if row_count == 0:
+        return probabilities, token_ids
+    else:
+        pass
+    if uses_split_top_k(logits, max_top_k, block_k):
+        if (
+            seeded_top_k_chunk_kernel is None
+            or seeded_top_k_merge_probability_kernel is None
+        ):
+            return None
+        else:
+            pass
+        num_candidates = TOP_K_CHUNKS * block_k
+        if split_candidate_keys is None:
+            chunk_keys = torch.empty(
+                (row_count, num_candidates), device=logits.device, dtype=torch.int64
+            )
+        elif (
+            split_candidate_keys.shape != (row_count, num_candidates)
+            or split_candidate_keys.device != logits.device
+            or split_candidate_keys.dtype is not torch.int64
+            or not split_candidate_keys.is_contiguous()
+        ):
+            raise ValueError(
+                "persistent split Top-K scratch does not match the builder"
+            )
+        else:
+            chunk_keys = split_candidate_keys
+        seeded_top_k_chunk_kernel[(row_count, TOP_K_CHUNKS)](
+            logits,
+            temperatures,
+            chunk_keys,
+            logits.stride(0),
+            FUSED_SAMPLER_VOCAB_SIZE // TOP_K_CHUNKS,
+            int(block_k),
+            num_warps=TOP_K_CHUNK_WARPS,
+        )
+        seeded_top_k_merge_probability_kernel[(row_count,)](
+            chunk_keys,
+            top_ks,
+            top_ps,
+            active_rows,
+            probabilities,
+            token_ids,
+            num_candidates,
+            int(block_k),
+            num_candidates.bit_length() - 1,
+            int(block_k).bit_length() - 1,
+            int(max_top_k),
+            bool(has_top_p),
+            num_warps=max(block_k // TOP_K_MERGE_KEYS_PER_WARP, 1),
+        )
+        return probabilities, token_ids
+    else:
+        pass
+    speculative_top_k_top_p_probability_kernel[(row_count,)](
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        active_rows,
+        probabilities,
+        token_ids,
+        logits.stride(0),
+        int(max_top_k),
+        int(block_k),
+        bool(has_top_p),
+        vocab_size=int(logits.shape[1]),
+        num_warps=8,
+    )
+    return probabilities, token_ids
+
+
+def build_speculative_probability_candidates_radix(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    active_rows: torch.Tensor,
+    *,
+    max_top_k: int,
+    has_top_p: bool,
+    has_unbounded_top_k: bool,
+    probability_output: torch.Tensor | None = None,
+    token_id_output: torch.Tensor | None = None,
+    radix_candidate_keys: torch.Tensor | None = None,
+    radix_bits: int = 8,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Build a radix-selected candidate distribution for parity experiments."""
+    block_k = fused_raw_logit_block_k(max_top_k)
+    if (
+        speculative_radix_top_k_top_p_probability_kernel is None
+        or not _TRITON_GATHER_SUPPORTED
+        or block_k is None
+        or max_top_k <= 32
+        or radix_bits not in (4, 8)
+        or has_unbounded_top_k
+        or not logits.is_cuda
+        or logits.ndim != 2
+        or logits.shape[1] != FUSED_SAMPLER_VOCAB_SIZE
+        or logits.dtype is not torch.bfloat16
+        or not logits.is_contiguous()
+    ):
+        return None
+    else:
+        pass
+    row_count = int(logits.shape[0])
+    row_tensors = (temperatures, top_ks, top_ps, active_rows)
+    if any(
+        tensor.device != logits.device
+        or tensor.ndim != 1
+        or tensor.shape[0] != row_count
+        or not tensor.is_contiguous()
+        for tensor in row_tensors
+    ):
+        return None
+    else:
+        pass
+    if (
+        temperatures.dtype is not torch.float32
+        or top_ks.dtype is not torch.long
+        or top_ps.dtype is not torch.float32
+        or active_rows.dtype is not torch.bool
+    ):
+        return None
+    else:
+        pass
+    if (probability_output is None) != (token_id_output is None):
+        raise ValueError("probability and token-ID outputs must be supplied together")
+    elif probability_output is None:
+        probabilities = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.float32
+        )
+        token_ids = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.int32
+        )
+    elif (
+        probability_output.shape != (row_count, block_k)
+        or token_id_output.shape != (row_count, block_k)
+        or probability_output.device != logits.device
+        or token_id_output.device != logits.device
+        or probability_output.dtype is not torch.float32
+        or token_id_output.dtype is not torch.int32
+        or not probability_output.is_contiguous()
+        or not token_id_output.is_contiguous()
+    ):
+        raise ValueError("persistent probability outputs do not match the builder")
+    else:
+        probabilities = probability_output
+        token_ids = token_id_output
+    if radix_candidate_keys is None:
+        compacted_keys = torch.empty(
+            (row_count, block_k), device=logits.device, dtype=torch.int64
+        )
+    elif (
+        radix_candidate_keys.shape != (row_count, block_k)
+        or radix_candidate_keys.device != logits.device
+        or radix_candidate_keys.dtype is not torch.int64
+        or not radix_candidate_keys.is_contiguous()
+    ):
+        raise ValueError("persistent radix scratch does not match the builder")
+    else:
+        compacted_keys = radix_candidate_keys
+    if row_count == 0:
+        return probabilities, token_ids
+    else:
+        pass
+    speculative_radix_top_k_top_p_probability_kernel[(row_count,)](
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        active_rows,
+        compacted_keys,
+        probabilities,
+        token_ids,
+        logits.stride(0),
+        int(max_top_k),
+        int(block_k),
+        bool(has_top_p),
+        radix_bits=int(radix_bits),
+        radix_bin_count=1 << int(radix_bits),
+        radix_pass_count=64 // int(radix_bits),
+        vocab_size=int(logits.shape[1]),
+        num_warps=8,
+    )
+    return probabilities, token_ids
+
+
+def build_speculative_probability_candidates_selected(
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    active_rows: torch.Tensor,
+    *,
+    max_top_k: int,
+    has_top_p: bool,
+    has_unbounded_top_k: bool,
+    backend: Literal["split_top_k", "radix_compact", "radix_compact_4bit"],
+    probability_output: torch.Tensor | None = None,
+    token_id_output: torch.Tensor | None = None,
+    split_candidate_keys: torch.Tensor | None = None,
+    radix_candidate_keys: torch.Tensor | None = None,
+) -> (
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        Literal["split_top_k", "radix_compact", "radix_compact_4bit"],
+    ]
+    | None
+):
+    """Build compact probabilities and report the implementation that ran."""
+    if backend in ("radix_compact", "radix_compact_4bit"):
+        candidates = build_speculative_probability_candidates_radix(
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            active_rows,
+            max_top_k=max_top_k,
+            has_top_p=has_top_p,
+            has_unbounded_top_k=has_unbounded_top_k,
+            probability_output=probability_output,
+            token_id_output=token_id_output,
+            radix_candidate_keys=radix_candidate_keys,
+            radix_bits=4 if backend == "radix_compact_4bit" else 8,
+        )
+        if candidates is not None:
+            return candidates[0], candidates[1], backend
+        else:
+            pass
+    elif backend == "split_top_k":
+        pass
+    else:
+        raise ValueError("unsupported speculative probability backend")
+    candidates = build_speculative_probability_candidates(
+        logits,
+        temperatures,
+        top_ks,
+        top_ps,
+        active_rows,
+        max_top_k=max_top_k,
+        has_top_p=has_top_p,
+        has_unbounded_top_k=has_unbounded_top_k,
+        probability_output=probability_output,
+        token_id_output=token_id_output,
+        split_candidate_keys=split_candidate_keys,
+    )
+    if candidates is None:
+        return None
+    else:
+        return candidates[0], candidates[1], "split_top_k"

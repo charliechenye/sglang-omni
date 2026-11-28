@@ -30,6 +30,16 @@ from sglang_omni.models.qwen3_tts.sglang_model import (
     predictor_gqa_attention,
 )
 from sglang_omni.platforms import current_platform
+from sglang_omni.utils.predictor_layers import (
+    ATTENTION_ROWS,
+    HAS_TRITON,
+    MAX_FUSED_ROWS,
+    FusedPredictorLayers,
+    PredictorLayerShape,
+    decode_attention,
+    fused_predictor_scratch_rows,
+    resolve_fused_predictor_width,
+)
 
 if find_spec("cutlass") is not None:
     from sglang_omni.models.qwen3_tts.cutedsl.api import (
@@ -51,6 +61,204 @@ def rounded_rmsnorm(values: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         values.float().square().mean(-1, keepdim=True) + 1e-6
     )
     return normalized.to(values.dtype) * weight
+
+
+@pytest.mark.parametrize("batch_size", [1, 8, 16])
+@pytest.mark.parametrize("verify_width", [2, 3, 4])
+def test_speculative_fused_capacity_for_c1_c8_c16(
+    batch_size: int, verify_width: int
+) -> None:
+    max_rows = fused_predictor_scratch_rows(16, verify_width)
+
+    assert max_rows == min(16 * verify_width, MAX_FUSED_ROWS)
+    assert (
+        resolve_fused_predictor_width(
+            verify_width,
+            batch_size,
+            max_rows,
+            query_heads=16,
+            kv_heads=8,
+        )
+        == verify_width
+    )
+
+
+@pytest.mark.parametrize(
+    ("graph_batch_size", "requested_width", "expected_width"),
+    [(8, 8, 8), (16, 8, 4), (16, 3, 3)],
+)
+def test_speculative_fused_capacity_reduces_only_unsupported_widths(
+    graph_batch_size: int, requested_width: int, expected_width: int
+) -> None:
+    max_rows = fused_predictor_scratch_rows(16, requested_width)
+
+    assert (
+        resolve_fused_predictor_width(
+            requested_width,
+            graph_batch_size,
+            max_rows,
+            query_heads=16,
+            kv_heads=8,
+        )
+        == expected_width
+    )
+
+
+def test_speculative_fused_capacity_respects_gqa_attention_tile() -> None:
+    max_rows = fused_predictor_scratch_rows(16, 8)
+
+    assert resolve_fused_predictor_width(
+        8,
+        graph_batch_size=8,
+        max_rows=max_rows,
+        query_heads=32,
+        kv_heads=4,
+    ) == min(8, ATTENTION_ROWS // 8)
+    assert (
+        resolve_fused_predictor_width(
+            8,
+            graph_batch_size=8,
+            max_rows=max_rows,
+            query_heads=64,
+            kv_heads=4,
+        )
+        == 1
+    )
+    assert (
+        resolve_fused_predictor_width(
+            8,
+            graph_batch_size=8,
+            max_rows=max_rows,
+            query_heads=128,
+            kv_heads=4,
+        )
+        == 0
+    )
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_fused_predictor_rejects_hidden_size_mismatch_before_kernel_launch(
+    packed: bool,
+) -> None:
+    shape = PredictorLayerShape(
+        hidden_size=64,
+        head_dim=16,
+        num_q_heads=4,
+        num_kv_heads=2,
+        intermediate_size=128,
+        split_qkv=1,
+        split_hidden=1,
+    )
+    fused = FusedPredictorLayers(shape, 2, torch.device("cpu"), torch.bfloat16)
+    token_embeds = torch.zeros((1, 1, 32), dtype=torch.bfloat16)
+    positions = torch.zeros((1,), dtype=torch.long)
+    cache = torch.zeros((1, 1, 3, 2, 16), dtype=torch.bfloat16)
+
+    with pytest.raises(ValueError, match="hidden size"):
+        if packed:
+            fused.forward_packed(
+                layers=torch.nn.ModuleList(),
+                final_norm=torch.nn.Identity(),
+                token_embeds=token_embeds,
+                batch_size=1,
+                positions=positions,
+                k_cache=cache,
+                v_cache=cache,
+            )
+        else:
+            fused.forward(
+                layers=torch.nn.ModuleList(),
+                final_norm=torch.nn.Identity(),
+                token_embeds=token_embeds,
+                batch_size=1,
+                cache_len=0,
+                positions=positions,
+                k_cache=cache,
+                v_cache=cache,
+            )
+
+
+@pytest.mark.accelerator
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not HAS_TRITON,
+    reason="requires CUDA and Triton",
+)
+@pytest.mark.parametrize("tokens_per_row", [2, 4, 8])
+@torch.inference_mode()
+def test_packed_predictor_attention_masks_per_row_absolute_positions(
+    tokens_per_row: int,
+) -> None:
+    """Packed queries with different offsets cannot attend to stale KV suffixes."""
+    batch_size = 3
+    query_heads = 4
+    kv_heads = 2
+    head_dim = 16
+    cache_slots = 16
+    device = torch.device("cuda")
+    generator = torch.Generator(device=device).manual_seed(781 + tokens_per_row)
+    query = torch.randn(
+        batch_size * tokens_per_row,
+        query_heads * head_dim,
+        generator=generator,
+        device=device,
+    ).to(torch.bfloat16)
+    keys = torch.randn(
+        batch_size,
+        cache_slots,
+        kv_heads,
+        head_dim,
+        generator=generator,
+        device=device,
+    ).to(torch.bfloat16)
+    values = torch.randn_like(keys)
+    row_starts = (1, 3, 5)
+    valid_counts = (tokens_per_row, max(1, tokens_per_row // 2), tokens_per_row - 1)
+    positions = torch.full(
+        (batch_size, tokens_per_row), -1, dtype=torch.long, device=device
+    )
+    for row in range(batch_size):
+        valid_count = valid_counts[row]
+        positions[row, :valid_count] = row_starts[row] + torch.arange(
+            valid_count, device=device
+        )
+        last_valid_slot = row_starts[row] + valid_count - 1
+        keys[row, last_valid_slot + 1 :] = 32.0
+        values[row, last_valid_slot + 1 :] = 32.0
+
+    output = torch.empty_like(query)
+    decode_attention(
+        q=query,
+        tokens_per_row=tokens_per_row,
+        k_cache=keys,
+        v_cache=values,
+        positions=positions,
+        attention_output=output,
+    )
+
+    query_rows = query.view(batch_size, tokens_per_row, query_heads, head_dim)
+    actual = output.view(batch_size, tokens_per_row, query_heads, head_dim)
+    expected = torch.zeros_like(actual, dtype=torch.float32)
+    group_size = query_heads // kv_heads
+    for row in range(batch_size):
+        for token in range(tokens_per_row):
+            position = int(positions[row, token])
+            if position < 0:
+                continue
+            else:
+                pass
+            for head in range(query_heads):
+                kv_head = head // group_size
+                scores = (
+                    query_rows[row, token, head].float()
+                    @ keys[row, : position + 1, kv_head].float().T
+                ) / head_dim**0.5
+                weights = torch.softmax(scores, dim=-1)
+                rounded_weighted_values = (
+                    weights.to(torch.bfloat16).float()
+                    @ values[row, : position + 1, kv_head].float()
+                )
+                expected[row, token, head] = rounded_weighted_values / weights.sum()
+    torch.testing.assert_close(actual.float(), expected, atol=0.04, rtol=0.02)
 
 
 @pytest.mark.accelerator

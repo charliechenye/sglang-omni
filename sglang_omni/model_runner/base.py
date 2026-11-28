@@ -1208,6 +1208,9 @@ class ModelRunner(Generic[RequestDataInput]):
         across decode steps can flush them ahead of stream completion.
         """
 
+    def on_request_terminal(self, request_id: str, succeeded: bool) -> None:
+        """Finalize request-owned metrics after terminal output handling."""
+
     def post_decode_launch(
         self,
         result: GenerationBatchResult,

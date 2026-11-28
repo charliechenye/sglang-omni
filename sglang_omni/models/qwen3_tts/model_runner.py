@@ -15,6 +15,7 @@ from sglang_omni.model_runner.prefill_inputs import (
     attach_omni_prefill_inputs,
 )
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
+from sglang_omni.models.qwen3_tts.speculative_telemetry import P16FrameTelemetry
 from sglang_omni.scheduling.types import (
     RequestOutput,
     SchedulerOutput,
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
     from sglang_omni.models.qwen3_tts.request_builders import Qwen3TTSSGLangRequestData
     from sglang_omni.models.qwen3_tts.sglang_model import (
         PredictorGraphStats,
+        PredictorSpeculativeStats,
         Qwen3TTSTalker,
     )
     from sglang_omni.scheduling.sglang_backend.output_processor import (
@@ -45,6 +47,7 @@ QWEN3_TTS_MIN_NEW_FRAMES = 2
 
 class Qwen3TTSModelInfo(TypedDict):
     predictor_cuda_graph: PredictorGraphStats
+    predictor_speculative: PredictorSpeculativeStats
 
 
 class Qwen3TTSModelRunner(ModelRunner):
@@ -69,6 +72,8 @@ class Qwen3TTSModelRunner(ModelRunner):
         self.row_ids_cache: torch.Tensor | None = None
         self.leading_silence_mask_frames = leading_silence_mask_frames
         self.silence_codec_ids = silence_codec_ids
+        self.pending_p16_frame_telemetry: dict[str, P16FrameTelemetry] = {}
+        self.pending_p16_finish_reasons: dict[str, str | None] = {}
         self.codes_event_module = (
             torch.get_device_module(self.device)
             if has_device_streams(self.device)
@@ -76,7 +81,10 @@ class Qwen3TTSModelRunner(ModelRunner):
         )
 
     def model_info(self) -> Qwen3TTSModelInfo:
-        return {"predictor_cuda_graph": self.model.predictor_graph_stats()}
+        return {
+            "predictor_cuda_graph": self.model.predictor_graph_stats(),
+            "predictor_speculative": self.model.predictor_speculative_stats(),
+        }
 
     def before_prefill(
         self,
@@ -214,9 +222,8 @@ class Qwen3TTSModelRunner(ModelRunner):
         """Install the staged semantic seeds when a request in the batch carries a
         seed, or deterministic inference has already seeded every row."""
         sampling_info = forward_batch.sampling_info
-        if sampling_info.sampling_seed is None and all(
-            scheduled_request.data.req.sampling_params.sampling_seed is None
-            for scheduled_request in requests
+        if sampling_info.sampling_seed is None and not any(
+            scheduled_request.data.user_seed_provided for scheduled_request in requests
         ):
             return
         else:
@@ -253,11 +260,94 @@ class Qwen3TTSModelRunner(ModelRunner):
         else:
             pass
         semantic_positions = self.sample_positions(forward_batch, layer0_codes.device)
-        self.model.code_predictor_forward(
-            layer0_codes,
-            hidden,
-            semantic_positions=semantic_positions,
-        )
+        telemetry = self.model.code_predictor_p16_telemetry
+        if telemetry is None:
+            self.model.code_predictor_forward(
+                layer0_codes,
+                hidden,
+                semantic_positions=semantic_positions,
+            )
+        else:
+            eligibility_reason = (
+                self.model.code_predictor_p16_frame_ineligibility_reason(
+                    layer0_codes,
+                    hidden,
+                    semantic_positions,
+                )
+            )
+            counters_before = self.model.p16_telemetry_counters()
+            try:
+                self.model.code_predictor_forward(
+                    layer0_codes,
+                    hidden,
+                    semantic_positions=semantic_positions,
+                )
+            except Exception:
+                counters_after_failure = self.model.p16_telemetry_counters()
+                telemetry.note_worker_counters(
+                    {
+                        name: counters_after_failure[name] - counters_before[name]
+                        for name in (
+                            "graph_capture_failures",
+                            "eager_spec_rounds",
+                            "invalid_probability_rows",
+                            "cuda_errors",
+                        )
+                    }
+                )
+                raise
+            else:
+                pass
+            counters_after = self.model.p16_telemetry_counters()
+            counter_delta = {
+                name: counters_after[name] - counters_before[name]
+                for name in counters_before
+            }
+            speculative = counter_delta["frames"] > 0
+            if speculative:
+                frame_telemetry = P16FrameTelemetry(
+                    eligible=eligibility_reason is None,
+                    speculative=True,
+                    native_reason=None,
+                    spec_openings=counter_delta["spec_openings"],
+                    spec_rounds=counter_delta["rounds"],
+                    spec_graph_replays=counter_delta["spec_graph_replays"],
+                    proposed=counter_delta["proposed"],
+                    accepted=counter_delta["accepted"],
+                    committed=counter_delta["committed"],
+                    graph_capture_failures=counter_delta["graph_capture_failures"],
+                    eager_spec_rounds=counter_delta["eager_spec_rounds"],
+                    invalid_probability_rows=counter_delta["invalid_probability_rows"],
+                    cuda_errors=counter_delta["cuda_errors"],
+                )
+            else:
+                if (
+                    not self.model.code_predictor_p16_enabled
+                    and eligibility_reason is None
+                ):
+                    native_reason = "feature_off"
+                else:
+                    native_reason = (
+                        eligibility_reason
+                        or self.model.code_predictor_spec_fallback_reason
+                        or self.model.code_predictor_p16_static_fallback_reason
+                        or "unsupported_runtime"
+                    )
+                frame_telemetry = P16FrameTelemetry(
+                    eligible=eligibility_reason is None,
+                    speculative=False,
+                    native_reason=native_reason,
+                )
+            if len(requests) != layer0_codes.shape[0]:
+                raise RuntimeError(
+                    "Qwen3-TTS telemetry request rows do not match Predictor rows"
+                )
+            else:
+                pass
+            for sched_req in requests:
+                self.pending_p16_frame_telemetry[sched_req.request_id] = frame_telemetry
+            else:
+                pass
         self.has_pending_code_step = True
 
     def post_process_outputs(
@@ -286,6 +376,9 @@ class Qwen3TTSModelRunner(ModelRunner):
             pass
         for row_idx, sched_req in enumerate(scheduler_output.requests):
             req_output = outputs[sched_req.request_id]
+            frame_telemetry = self.pending_p16_frame_telemetry.pop(
+                sched_req.request_id, None
+            )
             # note (ratish): a middle prefill chunk samples at a prompt row; SGLang drops
             # that token, so it gives no frame, feedback or stream chunk either.
             if sched_req.data.req.inflight_middle_chunks > 0 or req_output.data is None:
@@ -297,11 +390,42 @@ class Qwen3TTSModelRunner(ModelRunner):
                 continue
             else:
                 pass
+            telemetry = self.model.code_predictor_p16_telemetry
+            if telemetry is not None:
+                if frame_telemetry is None:
+                    raise RuntimeError(
+                        "Qwen3-TTS emitted a frame without P16 telemetry attribution"
+                    )
+                else:
+                    pass
+                telemetry.record_frame(sched_req.request_id, frame_telemetry)
+            else:
+                pass
             code_chunk = codes_snap[row_idx]
             sched_req.data.output_codes.append(code_chunk)
             sched_req.data.latest_stream_code_chunk = code_chunk
             sched_req.data.codes_ready_event = codes_ready
             sched_req.data.pending_feedback_queue.append(embeds_snap[row_idx])
+
+    def on_request_finished(
+        self, request_id: str, req_data: Qwen3TTSSGLangRequestData
+    ) -> None:
+        self.pending_p16_frame_telemetry.pop(request_id, None)
+        self.pending_p16_finish_reasons[request_id] = (
+            None
+            if req_data.finish_reason is None
+            else str(req_data.finish_reason).lower()
+        )
+
+    def on_request_terminal(self, request_id: str, succeeded: bool) -> None:
+        finish_reason = self.pending_p16_finish_reasons.pop(request_id, None)
+        telemetry = self.model.code_predictor_p16_telemetry
+        if telemetry is None:
+            return
+        elif succeeded and finish_reason not in ("abort", "error"):
+            telemetry.complete_request(request_id)
+        else:
+            telemetry.discard_request(request_id)
 
     def finalize_skip_rids(self, scheduler_output: SchedulerOutput) -> set[str]:
         return {

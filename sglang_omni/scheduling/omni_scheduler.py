@@ -3654,6 +3654,24 @@ class OmniScheduler(Generic[RequestDataT]):
                     terminal_error = callback_error
                 else:
                     pass
+                model_runner = self.model_runner
+                if model_runner is not None:
+                    try:
+                        model_runner.on_request_terminal(
+                            rid,
+                            terminal_error is None,
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "OmniScheduler terminal metrics failed for request %s",
+                            rid,
+                        )
+                        if terminal_error is None:
+                            terminal_error = exc
+                        else:
+                            pass
+                else:
+                    pass
                 # Note: (Jiaxin Deng) close the model-path interval before
                 # _close_completed_request, which discards the same rid that
                 # _emit_model_path_end_once dedups on. Emitting afterwards

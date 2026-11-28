@@ -8,14 +8,13 @@ import logging
 import os
 import re
 import tempfile
-import time
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
 from ctypes import _Pointer as Pointer
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
 
@@ -24,13 +23,6 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
-
-STARTUP_LOCK_POLL_INTERVAL_SECONDS = 0.5
-
-
-class StartupLockWaitCallback(Protocol):
-    def __call__(self) -> None:
-        """Run once per poll while another process holds the startup lock."""
 
 
 class InvalidGpuDeviceError(RuntimeError):
@@ -370,10 +362,7 @@ def get_gpu_startup_lock_path(
 
 
 @contextmanager
-def gpu_startup_lock(
-    logical_gpu_id: int,
-    startup_lock_wait_callback: StartupLockWaitCallback | None = None,
-) -> Generator[Path, None, None]:
+def gpu_startup_lock(logical_gpu_id: int) -> Generator[Path, None, None]:
     """Serialize heavyweight scheduler construction on one visible GPU."""
 
     import fcntl
@@ -381,17 +370,7 @@ def gpu_startup_lock(
     lock_path = get_gpu_startup_lock_path(logical_gpu_id)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "a+") as lock_file:
-        while True:
-            try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                if startup_lock_wait_callback is not None:
-                    startup_lock_wait_callback()
-                else:
-                    pass
-                time.sleep(STARTUP_LOCK_POLL_INTERVAL_SECONDS)
-            else:
-                break
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield lock_path
         finally:

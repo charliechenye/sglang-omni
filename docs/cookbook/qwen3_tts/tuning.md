@@ -6,6 +6,59 @@ orphan: true
 
 [Back to the Qwen3-TTS quick start](../qwen3_tts.md).
 
+## Experimental P16 CodePredictor speculation
+
+Training-free P16 CodePredictor speculation is opt-in. With
+`SGLANG_OMNI_QTTS_P16_ENABLE` unset or set to `0`, Qwen3-TTS uses its native
+Predictor path and does not load the P16 draft or allocate its speculative
+workspace and graphs. To opt in, set the flag to `1` and provide a local draft
+checkpoint and its expected digest:
+
+```bash
+export SGLANG_OMNI_QTTS_P16_ENABLE=1
+export SGLANG_OMNI_QTTS_P16_DRAFT_PATH=/absolute/path/to/p13-d-w1024-600k.pt
+export SGLANG_OMNI_QTTS_P16_DRAFT_SHA256=ea97e6eec7c2d51d32fc6dc4c80e36dfe0aa2da3ed1eb526b4e5bc99002d2d9f
+```
+
+The implementation is restricted to the pinned 1.7B CustomVoice snapshot on
+one BF16 H200 with TP1 and C1. It currently admits sampled requests with
+temperature `0.9`, top-p `1.0`, and top-k `50`. Unsupported models, batch sizes,
+or sampling settings use native decoding before speculative frame state is
+changed. The checkpoint loader verifies the pinned SHA256, manifest, recipe,
+tensor names, shapes, dtypes, normalization scales, and finite values. The
+server does not download the draft automatically.
+
+Run the in-process validator against the local model, P12 validation artifacts,
+and a passing full P15A result. A four-frame smoke validates the integration
+entry point; the complete cohort is 128 frames by four seeds:
+
+```bash
+python scripts/validate_qwen3_tts_p16_integration.py \
+  --model /absolute/path/to/0c0e3051f131929182e2c023b9537f8b1c68adfe \
+  --draft /absolute/path/to/p13-d-w1024-600k.pt \
+  --p12-root /absolute/path/to/p12-results \
+  --p15-root /absolute/path/to/p15a-results \
+  --frames 4 --seeds 1 \
+  --out /absolute/path/to/p16-smoke.json
+```
+
+Use `--frames 128 --seeds 4` for the full audit. The validator writes a success
+receipt only after native sequential replay, graph replay, probability,
+commit, cache, and request-reuse checks pass. On failure, it writes a separate
+`*.review.json` artifact when that path is available. It requires CUDA and the pinned local artifacts;
+running CPU tests does not validate GPU correctness or performance.
+
+For opt-in serving telemetry, set
+`SGLANG_OMNI_QTTS_P16_TELEMETRY_PATH` to an absolute, new JSONL filename for
+each worker. The worker refuses to append to an existing file. It writes one
+startup record and cumulative snapshots only at successful request completion;
+it does not record model or speech text. Leave the variable unset to disable
+telemetry I/O.
+
+This implementation still requires H200 correctness and performance
+validation. Passing the validator is not a production-readiness or G2.5
+equivalence claim.
+
 ## Server Readiness
 
 Before it reports ready, the server sends itself a streaming speech request in its checkpoint's mode, once per replica of its most replicated process, one after another: CustomVoice uses its first built-in speaker, VoiceDesign a short voice description, and Base a one-second tone as its reference clip. `/health` returns 503 with status `starting` until these requests finish, so the first requests after that do not wait for the kernel loading and first-use setup of the speech path. The sampler is compiled for single and batched requests while the model loads, so the first concurrent requests need no warmup of their own. A failed warmup stops the server. `SGLANG_OMNI_WARMUP_TIMEOUT` (seconds, default 600) bounds each request, and `--skip-server-warmup` reports ready without them.

@@ -88,6 +88,7 @@ from sglang_omni.models.qwen3_tts.sglang_model import (
     Qwen3TTSPromptConstants,
     Qwen3TTSTalker,
 )
+from sglang_omni.models.qwen3_tts.speculative_rng import derive_speculative_request_seed
 from sglang_omni.models.qwen3_tts.streaming_vocoder import (
     DEFAULT_QWEN3_TTS_STREAM_FOLLOWUP_STRIDE,
     IncrementalDecodeBatch,
@@ -499,6 +500,7 @@ def test_qwen3_tts_engine_attaches_its_process_speech_tokenizer_before_the_pool(
 
     loads: list[str] = []
     predictor_captures: list[tuple] = []
+    speculative_configurations: list[dict[str, int | str | bool]] = []
     float32_encoders: list[tuple[object, str]] = []
 
     def record_float32_encoder(tokenizer, checkpoint_dir: str) -> None:
@@ -551,6 +553,31 @@ def test_qwen3_tts_engine_attaches_its_process_speech_tokenizer_before_the_pool(
 
         def load_speech_tokenizer(self, tokenizer) -> None:
             self.speech_tokenizer = tokenizer
+
+        def configure_code_predictor_speculation(
+            self,
+            requested_width: int,
+            *,
+            backend: Literal["cuda_graph", "eager", "full_round_graph"],
+            probability_backend: Literal[
+                "split_top_k", "radix_compact", "radix_compact_4bit"
+            ],
+            lm_head_backend: Literal["grouped_triton", "warp_gemv", "warp_accumulate"],
+            rng_backend: Literal["per_round", "frame_pool"],
+            acceptance_backend: Literal["compact", "dense_indexed"],
+            opening_pair_graph: bool,
+        ) -> None:
+            speculative_configurations.append(
+                {
+                    "requested_width": requested_width,
+                    "backend": backend,
+                    "probability_backend": probability_backend,
+                    "lm_head_backend": lm_head_backend,
+                    "rng_backend": rng_backend,
+                    "acceptance_backend": acceptance_backend,
+                    "opening_pair_graph": opening_pair_graph,
+                }
+            )
 
         def capture_predictor_graphs(
             self, *, do_sample: bool, top_k: int, top_p: float
@@ -619,6 +646,17 @@ def test_qwen3_tts_engine_attaches_its_process_speech_tokenizer_before_the_pool(
     assert float32_encoders == (
         [(talker.speech_tokenizer, "/ckpt")] if model_type == "base" else []
     )
+    assert speculative_configurations == [
+        {
+            "requested_width": 0,
+            "backend": "cuda_graph",
+            "probability_backend": "split_top_k",
+            "lm_head_backend": "grouped_triton",
+            "rng_backend": "per_round",
+            "acceptance_backend": "compact",
+            "opening_pair_graph": False,
+        }
+    ]
     expected = qwen3_request_builders.resolve_subtalker_sampling({})
     assert predictor_captures == (
         []
@@ -642,6 +680,7 @@ def test_qwen3_tts_engine_probes_silence_ids_only_for_base(
     from sglang_omni.models.qwen3_tts.engine_builder import Qwen3TtsEngineBuilder
 
     encoded_batches: list[int] = []
+    speculative_configurations: list[dict[str, int | str | bool]] = []
 
     class FakeSpeechTokenizer:
         def get_input_sample_rate(self) -> int:
@@ -661,6 +700,31 @@ def test_qwen3_tts_engine_probes_silence_ids_only_for_base(
 
         def load_speech_tokenizer(self, tokenizer: FakeSpeechTokenizer) -> None:
             del tokenizer
+
+        def configure_code_predictor_speculation(
+            self,
+            requested_width: int,
+            *,
+            backend: Literal["cuda_graph", "eager", "full_round_graph"],
+            probability_backend: Literal[
+                "split_top_k", "radix_compact", "radix_compact_4bit"
+            ],
+            lm_head_backend: Literal["grouped_triton", "warp_gemv", "warp_accumulate"],
+            rng_backend: Literal["per_round", "frame_pool"],
+            acceptance_backend: Literal["compact", "dense_indexed"],
+            opening_pair_graph: bool,
+        ) -> None:
+            speculative_configurations.append(
+                {
+                    "requested_width": requested_width,
+                    "backend": backend,
+                    "probability_backend": probability_backend,
+                    "lm_head_backend": lm_head_backend,
+                    "rng_backend": rng_backend,
+                    "acceptance_backend": acceptance_backend,
+                    "opening_pair_graph": opening_pair_graph,
+                }
+            )
 
     qwen_tts_module = types.ModuleType("qwen_tts")
     qwen_tts_module.Qwen3TTSModel = lambda **kwargs: SimpleNamespace()
@@ -695,6 +759,17 @@ def test_qwen3_tts_engine_probes_silence_ids_only_for_base(
     assert builder.silence_codec_ids.tolist() == expected_ids
     assert builder.leading_silence_mask_frames == expected_frames
     assert bool(encoded_batches) == (tts_model_type == "base")
+    assert speculative_configurations == [
+        {
+            "requested_width": 0,
+            "backend": "cuda_graph",
+            "probability_backend": "split_top_k",
+            "lm_head_backend": "grouped_triton",
+            "rng_backend": "per_round",
+            "acceptance_backend": "compact",
+            "opening_pair_graph": False,
+        }
+    ]
 
 
 @pytest.mark.parametrize(
@@ -2872,6 +2947,47 @@ def test_qwen3_tts_predictor_codec_embeddings_use_talker_hidden_size(
     assert predictor.small_to_mtp_projection.weight.shape == (1024, 2048)
 
 
+def test_qwen3_tts_p16_model_gate_checks_talker_and_predictor_widths() -> None:
+    from sglang_omni.models.qwen3_tts.engine_builder import p16_model_fallback_reason
+
+    assert (
+        p16_model_fallback_reason(
+            model_type="custom_voice",
+            model_size="1b7",
+            checkpoint_dir="/models/0c0e3051f131929182e2c023b9537f8b1c68adfe",
+            talker_hidden_size=2048,
+            predictor_hidden_size=1024,
+            num_code_groups=16,
+            vocab_size=2048,
+        )
+        is None
+    )
+    assert (
+        p16_model_fallback_reason(
+            model_type="custom_voice",
+            model_size="1b7",
+            checkpoint_dir="/models/0c0e3051f131929182e2c023b9537f8b1c68adfe",
+            talker_hidden_size=1024,
+            predictor_hidden_size=1024,
+            num_code_groups=16,
+            vocab_size=2048,
+        )
+        == "unsupported-model"
+    )
+    assert (
+        p16_model_fallback_reason(
+            model_type="custom_voice",
+            model_size="1b7",
+            checkpoint_dir="/models/0c0e3051f131929182e2c023b9537f8b1c68adfe",
+            talker_hidden_size=2048,
+            predictor_hidden_size=2048,
+            num_code_groups=16,
+            vocab_size=2048,
+        )
+        == "unsupported-model"
+    )
+
+
 def test_qwen3_tts_codec_tables_embed_each_codebook_from_its_own_table() -> None:
     codec_tables = Qwen3TTSCodecTables(3, 5, 4)
     codes = torch.cat(
@@ -2901,6 +3017,7 @@ def test_qwen3_tts_talker_loads_each_codec_table_into_its_codebook() -> None:
     talker.codec_table_params_mapping = Qwen3TTSCodecTables.make_params_mapping(3)
     talker.cached_params_dict = dict(talker.named_parameters())
     talker.predictor_projected_embeddings = None
+    talker.code_predictor_spec_lm_head_weights = None
     tables = [torch.randn(5, 4) for _ in range(3)]
 
     talker.load_weights(
@@ -3332,7 +3449,15 @@ def test_qwen3_tts_config_starts_a_declining_platform_decoding_synchronously(
         "codec_state_slots": max_in_flight,
         "shares_engine_speech_tokenizer": True,
     }
-    assert config.stage_factory_kwargs("tts_engine") == {}
+    assert config.stage_factory_kwargs("tts_engine") == {
+        "code_predictor_spec_verify_size": 0,
+        "code_predictor_spec_backend": "cuda_graph",
+        "code_predictor_spec_probability_backend": "split_top_k",
+        "code_predictor_spec_lm_head_backend": "grouped_triton",
+        "code_predictor_spec_rng_backend": "per_round",
+        "code_predictor_spec_acceptance_backend": "compact",
+        "code_predictor_spec_opening_pair_graph": False,
+    }
 
 
 def test_qwen3_tts_config_leaves_a_measured_platform_alone(
@@ -3352,7 +3477,15 @@ def test_qwen3_tts_config_leaves_a_measured_platform_alone(
         "codec_state_slots": max_in_flight,
         "shares_engine_speech_tokenizer": True,
     }
-    assert config.stage_factory_kwargs("tts_engine") == {}
+    assert config.stage_factory_kwargs("tts_engine") == {
+        "code_predictor_spec_verify_size": 0,
+        "code_predictor_spec_backend": "cuda_graph",
+        "code_predictor_spec_probability_backend": "split_top_k",
+        "code_predictor_spec_lm_head_backend": "grouped_triton",
+        "code_predictor_spec_rng_backend": "per_round",
+        "code_predictor_spec_acceptance_backend": "compact",
+        "code_predictor_spec_opening_pair_graph": False,
+    }
 
 
 def test_qwen3_tts_vocoder_factory_leaves_the_decode_policy_to_its_caller(
@@ -8828,6 +8961,7 @@ def test_qwen3_tts_request_data_keeps_decode_tensors_on_prepared_device(
     assert isinstance(data.semantic_sampling_seed, int)
     assert 0 <= data.semantic_sampling_seed <= 0x7FFFFFFF
     assert data.req.sampling_params.sampling_seed is None
+    assert data.user_seed_provided is False
     assert data.req.sampling_params.repetition_penalty == 1.1
     assert isinstance(data.subtalker_sampling_seed, int)
     assert 0 <= data.subtalker_sampling_seed <= 0x7FFFFFFF
@@ -8876,6 +9010,7 @@ def test_qwen3_tts_request_data_uses_private_sampling_seeds(
     assert data.semantic_sampling_seed == 12345
     assert data.subtalker_sampling_seed == 67890
     assert data.req.sampling_params.sampling_seed is None
+    assert data.user_seed_provided is False
 
 
 def test_qwen3_tts_request_data_uses_public_seed_split(
@@ -8918,6 +9053,39 @@ def test_qwen3_tts_request_data_uses_public_seed_split(
     assert data.semantic_sampling_seed == expected_semantic_seed
     assert data.subtalker_sampling_seed == expected_subtalker_seed
     assert data.req.sampling_params.sampling_seed == expected_semantic_seed
+    assert data.user_seed_provided is True
+
+
+def test_qwen3_tts_speculative_draw_seed_is_namespaced_and_row_order_independent() -> (
+    None
+):
+    derive_seed = qwen3_request_builders.derive_qwen3_tts_speculative_draw_seed
+    coordinates = (67890, "request-a", 12, 4, 2, "proposal", 1)
+    expected = derive_seed(*coordinates)
+
+    assert derive_seed(*coordinates) == expected
+    assert (
+        len(
+            {
+                derive_seed(67890, "request-b", 12, 4, 2, "proposal", 1),
+                derive_seed(67890, "request-a", 13, 4, 2, "proposal", 1),
+                derive_seed(67890, "request-a", 12, 5, 2, "proposal", 1),
+                derive_seed(67890, "request-a", 12, 4, 3, "proposal", 1),
+                derive_seed(67890, "request-a", 12, 4, 2, "acceptance", 1),
+                derive_seed(67890, "request-a", 12, 4, 2, "proposal", 2),
+            }
+        )
+        == 6
+    )
+    batch_draws = {
+        request_id: derive_seed(67890, request_id, 12, 4, 2, "acceptance")
+        for request_id in ("request-a", "request-b")
+    }
+    reordered_draws = {
+        request_id: derive_seed(67890, request_id, 12, 4, 2, "acceptance")
+        for request_id in ("request-b", "request-a")
+    }
+    assert reordered_draws == batch_draws
 
 
 def stage_qwen3_tts_prepared(payload: StagePayload) -> None:
@@ -9510,6 +9678,7 @@ def test_qwen3_tts_sampling_installs_semantic_seeds_for_a_seeded_batch(
                     output_ids=[],
                 ),
                 return_logprob=False,
+                user_seed_provided=request_seed is not None,
             )
         )
         for request_seed in request_seeds
@@ -9795,6 +9964,7 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
     talker.decode_prep_epoch = 0
     requests = [
         SimpleNamespace(
+            request_id="seeded-request",
             data=Qwen3TTSSGLangRequestData(
                 semantic_sampling_seed=5,
                 subtalker_dosample=True,
@@ -9802,9 +9972,11 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
                 subtalker_top_p=0.9,
                 subtalker_top_k=40,
                 subtalker_sampling_seed=7,
-            )
+                user_seed_provided=True,
+            ),
         ),
         SimpleNamespace(
+            request_id="greedy-request",
             data=Qwen3TTSSGLangRequestData(
                 semantic_sampling_seed=9,
                 subtalker_dosample=False,
@@ -9812,15 +9984,23 @@ def test_qwen3_tts_prepare_decode_buffers_collects_private_subtalker_seeds(
                 subtalker_top_p=1.0,
                 subtalker_top_k=-1,
                 subtalker_sampling_seed=11,
-            )
+            ),
         ),
     ]
+    talker.sub_speculative_seed_tensor = torch.empty(2, dtype=torch.long)
+    talker.code_predictor_spec_requested_width = 4
+    talker.code_predictor_spec_effective_width = 0
 
     Qwen3TTSTalker.prepare_decode_buffers(talker, requests)
 
     assert talker.sub_batch_size == 2
     assert talker.semantic_sampling_seed_tensor[:2].tolist() == [5, 9]
     assert talker.sub_sampling_seed_tensor[:2].tolist() == [7, 11]
+    assert talker.sub_speculative_seed_tensor[:2].tolist() == [
+        derive_speculative_request_seed(7, "seeded-request"),
+        derive_speculative_request_seed(11, "greedy-request"),
+    ]
+    assert talker.sub_user_seed_rows == (True, False)
     assert talker.sub_temperature_tensor[:2].tolist() == pytest.approx([0.8, 1.0])
     assert talker.sub_top_k_tensor[:2].tolist() == [40, 1]
     assert talker.sub_do_sample_tensor[:2].tolist() == [True, False]
@@ -9857,6 +10037,9 @@ def test_qwen3_tts_prepare_decode_buffers_stages_the_temperature_floor(
     talker.decode_prep_rids = None
     talker.decode_prep_epoch = 0
     talker.sub_seed_offsets = torch.arange(1, 16, dtype=torch.long)
+    talker.sub_speculative_seed_tensor = None
+    talker.code_predictor_spec_requested_width = 0
+    talker.code_predictor_spec_effective_width = 0
 
     def data(temperature: float, dosample: bool) -> Qwen3TTSSGLangRequestData:
         return Qwen3TTSSGLangRequestData(
@@ -9869,10 +10052,10 @@ def test_qwen3_tts_prepare_decode_buffers_stages_the_temperature_floor(
         )
 
     requests = [
-        SimpleNamespace(data=data(temperature, True))
-        for temperature in sampled_temperatures
+        SimpleNamespace(request_id=f"temperature-{index}", data=data(temperature, True))
+        for index, temperature in enumerate(sampled_temperatures)
     ]
-    requests.append(SimpleNamespace(data=data(1e-7, False)))
+    requests.append(SimpleNamespace(request_id="greedy", data=data(1e-7, False)))
 
     Qwen3TTSTalker.prepare_decode_buffers(talker, requests)
 
@@ -9916,7 +10099,17 @@ def test_qwen3_tts_prepare_decode_buffers_requires_owned_request_data(
 
     talker = Qwen3TTSTalker.__new__(Qwen3TTSTalker)
     talker.sub_temperature_tensor = torch.empty(1, dtype=torch.float32)
-    requests = [SimpleNamespace(data=SimpleNamespace())]
+    talker.decode_prep_epoch = 0
+    talker.decode_prep_rids = None
+    talker.sub_speculative_seed_tensor = None
+    talker.code_predictor_spec_requested_width = 0
+    talker.code_predictor_spec_effective_width = 0
+    requests = [
+        SimpleNamespace(
+            request_id="malformed-request",
+            data=SimpleNamespace(decode_prep_epoch=None),
+        )
+    ]
 
     with pytest.raises(TypeError, match="request data with"):
         Qwen3TTSTalker.prepare_decode_buffers(talker, requests)
@@ -10283,6 +10476,7 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     infrastructure_saw_deferred_capture: list[bool] = []
     init_graph_calls: list[bool] = []
     predictor_captures: list[tuple] = []
+    speculative_configurations: list[dict[str, int | str | bool]] = []
     events: list[str] = []
 
     class FakeModel:
@@ -10296,6 +10490,31 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
 
         def load_speech_tokenizer(self, tokenizer) -> None:
             self.speech_tokenizer = tokenizer
+
+        def configure_code_predictor_speculation(
+            self,
+            requested_width: int,
+            *,
+            backend: Literal["cuda_graph", "eager", "full_round_graph"],
+            probability_backend: Literal[
+                "split_top_k", "radix_compact", "radix_compact_4bit"
+            ],
+            lm_head_backend: Literal["grouped_triton", "warp_gemv", "warp_accumulate"],
+            rng_backend: Literal["per_round", "frame_pool"],
+            acceptance_backend: Literal["compact", "dense_indexed"],
+            opening_pair_graph: bool,
+        ) -> None:
+            speculative_configurations.append(
+                {
+                    "requested_width": requested_width,
+                    "backend": backend,
+                    "probability_backend": probability_backend,
+                    "lm_head_backend": lm_head_backend,
+                    "rng_backend": rng_backend,
+                    "acceptance_backend": acceptance_backend,
+                    "opening_pair_graph": opening_pair_graph,
+                }
+            )
 
         def capture_predictor_graphs(
             self, *, do_sample: bool, top_k: int, top_p: float
@@ -10543,6 +10762,17 @@ def test_qwen3_tts_engine_accepts_64_batch_policy_and_enables_cuda_graph(
     )
 
     assert infrastructure_saw_deferred_capture == [True]
+    assert speculative_configurations == [
+        {
+            "requested_width": 0,
+            "backend": "cuda_graph",
+            "probability_backend": "split_top_k",
+            "lm_head_backend": "grouped_triton",
+            "rng_backend": "per_round",
+            "acceptance_backend": "compact",
+            "opening_pair_graph": False,
+        }
+    ]
     assert init_graph_calls == [True]
     assert predictor_captures == [(True, 50, 1.0)]
     assert events == ["predictor_capture", "memory_pool", "init_graphs"]
@@ -10682,7 +10912,11 @@ def test_qwen3_tts_talker_forward_accepts_shared_prefill_request_ids(
     )
 
 
-def make_prep_talker(monkeypatch, device=None, max_batch=2):
+def make_prep_talker(
+    monkeypatch: pytest.MonkeyPatch,
+    device: torch.device | None = None,
+    max_batch_size: int = 2,
+) -> tuple[type[Qwen3TTSTalker], Qwen3TTSTalker]:
     install_fake_sglang(monkeypatch)
     from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
 
@@ -10691,33 +10925,43 @@ def make_prep_talker(monkeypatch, device=None, max_batch=2):
         code_predictor_config=SimpleNamespace(vocab_size=2048)
     )
     talker.sub_temperature_tensor = torch.empty(
-        max_batch, dtype=torch.float32, device=device
+        max_batch_size, dtype=torch.float32, device=device
     )
-    talker.sub_top_p_tensor = torch.empty(max_batch, dtype=torch.float32, device=device)
-    talker.sub_top_k_tensor = torch.empty(max_batch, dtype=torch.long, device=device)
+    talker.sub_top_p_tensor = torch.empty(
+        max_batch_size, dtype=torch.float32, device=device
+    )
+    talker.sub_top_k_tensor = torch.empty(
+        max_batch_size, dtype=torch.long, device=device
+    )
     talker.semantic_sampling_seed_tensor = torch.empty(
-        max_batch, dtype=torch.long, device=device
+        max_batch_size, dtype=torch.long, device=device
     )
     talker.sub_sampling_seed_tensor = torch.empty(
-        max_batch, dtype=torch.long, device=device
+        max_batch_size, dtype=torch.long, device=device
     )
     talker.sub_do_sample_tensor = torch.empty(
-        max_batch, dtype=torch.bool, device=device
+        max_batch_size, dtype=torch.bool, device=device
     )
+    talker.sub_speculative_seed_tensor = torch.empty(
+        max_batch_size, dtype=torch.long, device=device
+    )
+    talker.code_predictor_spec_requested_width = 4
+    talker.code_predictor_spec_effective_width = 0
     talker.decode_prep_rids = None
     talker.decode_prep_epoch = 0
     return Qwen3TTSTalker, talker
 
 
 def prep_request(
-    request_id,
-    temperature,
+    request_id: str,
+    temperature: float,
     *,
-    top_k=40,
-    top_p=0.9,
-    do_sample=True,
-    seeds=(5, 7),
-):
+    top_k: int = 40,
+    top_p: float = 0.9,
+    do_sample: bool = True,
+    seeds: tuple[int, int] = (5, 7),
+    user_seed_provided: bool = False,
+) -> SimpleNamespace:
     return SimpleNamespace(
         request_id=request_id,
         data=Qwen3TTSSGLangRequestData(
@@ -10727,6 +10971,7 @@ def prep_request(
             subtalker_top_p=top_p,
             subtalker_top_k=top_k,
             subtalker_sampling_seed=seeds[1],
+            user_seed_provided=user_seed_provided,
         ),
     )
 
@@ -10754,8 +10999,11 @@ def test_qwen3_tts_prepare_decode_buffers_restages_on_request_id_reuse(
     assert talker.sub_temperature_tensor[:1].tolist() == pytest.approx([0.8])
 
     # Same request id, brand-new request data: must restage, not reuse.
-    talker_cls.prepare_decode_buffers(talker, [prep_request("req-a", 0.4)])
+    talker_cls.prepare_decode_buffers(
+        talker, [prep_request("req-a", 0.4, user_seed_provided=True)]
+    )
     assert talker.sub_temperature_tensor[:1].tolist() == pytest.approx([0.4])
+    assert talker.sub_user_seed_rows == (True,)
 
 
 def test_qwen3_tts_prepare_decode_buffers_pairs_each_column_with_its_buffer(
@@ -10764,7 +11012,7 @@ def test_qwen3_tts_prepare_decode_buffers_pairs_each_column_with_its_buffer(
     """Reordering the batch must move every column, not only the temperature."""
     talker_cls, talker = make_prep_talker(monkeypatch)
     batch = [
-        prep_request("a", 0.8),
+        prep_request("a", 0.8, user_seed_provided=True),
         prep_request("b", 0.6, top_k=20, top_p=0.5, seeds=(11, 12)),
     ]
 
@@ -10776,6 +11024,7 @@ def test_qwen3_tts_prepare_decode_buffers_pairs_each_column_with_its_buffer(
     assert talker.sub_top_k_tensor[:2].tolist() == [20, 40]
     assert talker.semantic_sampling_seed_tensor[:2].tolist() == [11, 5]
     assert talker.sub_sampling_seed_tensor[:2].tolist() == [12, 7]
+    assert talker.sub_user_seed_rows == (False, True)
 
 
 @pytest.mark.accelerator
@@ -10785,7 +11034,7 @@ def test_qwen3_tts_prepare_decode_buffers_lands_each_restage_behind_a_busy_strea
 ) -> None:
     """A restage must not read back a source the next restage already rewrote."""
     device = torch.device("cuda")
-    talker_cls, talker = make_prep_talker(monkeypatch, device=device, max_batch=4)
+    talker_cls, talker = make_prep_talker(monkeypatch, device=device, max_batch_size=4)
     batches = [
         [prep_request("a", 0.8, seeds=(11, 12))],
         [
@@ -11222,7 +11471,15 @@ def test_qwen3_tts_config_loads_frontend_only_outside_engine_process(
         split.stages[index] = stage.model_copy(update=update)
     assert split.preprocessing_in_own_process() is True
     assert split.stage_factory_kwargs("preprocessing") == {"load_frontend": True}
-    assert split.stage_factory_kwargs("tts_engine") == {}
+    assert split.stage_factory_kwargs("tts_engine") == {
+        "code_predictor_spec_verify_size": 0,
+        "code_predictor_spec_backend": "cuda_graph",
+        "code_predictor_spec_probability_backend": "split_top_k",
+        "code_predictor_spec_lm_head_backend": "grouped_triton",
+        "code_predictor_spec_rng_backend": "per_round",
+        "code_predictor_spec_acceptance_backend": "compact",
+        "code_predictor_spec_opening_pair_graph": False,
+    }
     # The edge this change unpins: compiling it used to raise because
     # process_local_edges pinned preprocessing to the engine process.
     topology = build_compiled_process_topology(split)
@@ -11928,11 +12185,22 @@ def test_qwen3_tts_vocoder_codec_state_reaches_model_info(
 
 
 def test_qwen3_tts_model_runner_reports_the_predictor_graphs() -> None:
-    predictor_stats = {"enabled": True, "replays": 5, "eager_runs": 1}
+    predictor_graph_stats = {"enabled": True, "replays": 5, "eager_runs": 1}
+    predictor_speculative_stats = {
+        "requested_width": 0,
+        "effective_width": 0,
+        "graph_mode": "disabled",
+    }
     runner = object.__new__(Qwen3TTSModelRunner)
-    runner.model = SimpleNamespace(predictor_graph_stats=lambda: predictor_stats)
+    runner.model = SimpleNamespace(
+        predictor_graph_stats=lambda: predictor_graph_stats,
+        predictor_speculative_stats=lambda: predictor_speculative_stats,
+    )
 
-    assert runner.model_info() == {"predictor_cuda_graph": predictor_stats}
+    assert runner.model_info() == {
+        "predictor_cuda_graph": predictor_graph_stats,
+        "predictor_speculative": predictor_speculative_stats,
+    }
 
 
 @pytest.mark.benchmark
