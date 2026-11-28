@@ -49,7 +49,7 @@ from sglang_omni.scheduling.types import SchedulerRequest
 from sglang_omni.utils.json import JsonValue
 from sglang_omni.utils.predictor_grouped_heads import grouped_lm_head_warp_accumulate
 
-P12_MANIFEST_SHA256 = "87ae5928d52fe1675b43c24ea15d7e054df3e0b4810e1c3ca1b42a4a040957"
+P12_MANIFEST_SHA256 = "87ae5928d52fe1675b43c24ea15d7e054df3e0b4810e1c3ca1b42a4a4a040957"
 P12_TEACHER_BASE = "caf13d4d4bd0eab7edb7186675fb7307a5a0ecdc"
 P12_TEACHER_MODE = "native_fused_fixed_prefix"
 P15_COHORT_SHA256 = "c823f32c837b4979c0e74e4b1f4c60b53f40089e9f2a7119be6b11bb8ce24725"
