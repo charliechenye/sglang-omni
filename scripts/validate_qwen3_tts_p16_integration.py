@@ -1623,6 +1623,8 @@ def run_upstream_native_reference(
     checkout = checkout_root / "sglang-omni"
     helper_source = REPOSITORY_ROOT / "scripts/qwen3_tts_p16_native_reference.py"
     environment = os.environ.copy()
+    # The parent owns its rendezvous port; the independent reference must claim its own.
+    environment.pop("MASTER_PORT", None)
     for name in (
         "SGLANG_OMNI_QTTS_P16_ENABLE",
         "SGLANG_OMNI_QTTS_P16_DRAFT_PATH",
