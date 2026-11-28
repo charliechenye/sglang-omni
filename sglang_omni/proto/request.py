@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from sglang_omni.pipeline.stage.stream_queue import StreamItem
-from sglang_omni.proto.realtime import RealtimeTranscriptionContext
 
 
 class RequestState(Enum):
@@ -40,7 +39,7 @@ class OmniRequest:
     inputs: object
     params: dict[str, object] = field(default_factory=dict)
     metadata: dict[str, object] = field(default_factory=dict)
-    realtime_transcription_context: RealtimeTranscriptionContext | None = None
+    internal_realtime_final_verification: bool = False
 
     def to_dict(self) -> dict[str, object]:
         data = {
@@ -49,26 +48,21 @@ class OmniRequest:
             "params": self.params,
             "metadata": self.metadata,
         }
-        if self.realtime_transcription_context is not None:
-            data["realtime_transcription_context"] = (
-                self.realtime_transcription_context.to_dict()
-            )
+        if self.internal_realtime_final_verification:
+            data["internal_realtime_final_verification"] = True
         else:
             pass
         return data
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "OmniRequest":
-        context = data.get("realtime_transcription_context")
-        if isinstance(context, Mapping):
-            realtime_context = RealtimeTranscriptionContext.from_dict(context)
-        else:
-            realtime_context = None
         return cls(
             inputs=data.get("inputs"),
             params=data.get("params", {}),
             metadata=data.get("metadata", {}),
-            realtime_transcription_context=realtime_context,
+            internal_realtime_final_verification=(
+                data.get("internal_realtime_final_verification") is True
+            ),
         )
 
 

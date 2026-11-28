@@ -27,7 +27,6 @@ class Qwen3ASRTemporalForwardContext:
     prompt_boundary: int
     candidate_token_ids: tuple[int, ...]
     context_token: Token[Qwen3ASRTemporalForwardContext | None] | None = None
-    graph_bucket_size: int | None = None
 
 
 _TEMPORAL_FORWARD: ContextVar[Qwen3ASRTemporalForwardContext | None] = ContextVar(
@@ -39,19 +38,17 @@ _TEMPORAL_FORWARD: ContextVar[Qwen3ASRTemporalForwardContext | None] = ContextVa
 class Qwen3ASRTemporalVerification:
     request_id: str
     accepted_prefix: tuple[int, ...]
-    pending_token_id: int
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class Qwen3ASRTemporalLogitsProcessorOutput(LogitsProcessorOutput):
-    temporal_verification: Qwen3ASRTemporalVerification | None = None
-    pending_token_ids: torch.Tensor | None = None
-    graph_bucket_size: int | None = None
+    temporal_verification: Qwen3ASRTemporalVerification
+    pending_token_ids: torch.Tensor
 
 
-@dataclass(slots=True)
+@dataclass(slots=True, kw_only=True)
 class Qwen3ASRTemporalRunnerOutput(ModelRunnerOutput):
-    temporal_verification: Qwen3ASRTemporalVerification | None = None
+    temporal_verification: Qwen3ASRTemporalVerification
 
 
 @dataclass(slots=True, kw_only=True)
@@ -118,7 +115,6 @@ def verify_greedy_candidates(
     return Qwen3ASRTemporalVerification(
         request_id=request_id,
         accepted_prefix=candidate_token_ids[:accepted_count],
-        pending_token_id=target_token_ids[accepted_count],
     )
 
 
@@ -164,15 +160,8 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
         else:
             pass
 
-        expected_rows = context.prompt_boundary + len(context.candidate_token_ids)
-        if context.graph_bucket_size is not None and (
-            context.graph_bucket_size < expected_rows
-            or hidden_states.shape[0] != context.graph_bucket_size
-        ):
-            raise RuntimeError("Qwen3-ASR temporal graph bucket changed during replay")
-        else:
-            pass
         first_prediction_row = context.prompt_boundary - 1
+        expected_rows = context.prompt_boundary + len(context.candidate_token_ids)
         prediction_states = hidden_states[first_prediction_row:expected_rows]
         if hidden_states_before_norm is not None:
             selected_hidden_states_before_norm = hidden_states_before_norm[
@@ -235,8 +224,7 @@ class Qwen3ASRTemporalLogitsProcessor(nn.Module):
         return Qwen3ASRTemporalLogitsProcessorOutput(
             **native_values,
             temporal_verification=verification,
-            pending_token_ids=temporal_token_ids[pending_row : pending_row + 1].clone(),
-            graph_bucket_size=context.graph_bucket_size,
+            pending_token_ids=temporal_token_ids[pending_row : pending_row + 1],
         )
 
 

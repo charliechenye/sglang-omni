@@ -37,7 +37,6 @@ from transformers import PreTrainedTokenizerBase, WhisperFeatureExtractor
 from sglang_omni.models.qwen3_asr.encoder_service import Qwen3ASRPreLMEncoderService
 from sglang_omni.preprocessing.transcription import prepare_audio
 from sglang_omni.proto import StagePayload
-from sglang_omni.proto.realtime import RealtimeTranscriptionContext
 from sglang_omni.scheduling.message import OutgoingMessage
 from sglang_omni.scheduling.sglang_backend import SGLangARRequestData
 from sglang_omni.scheduling.token_text_streaming import (
@@ -262,11 +261,10 @@ def make_qwen3_asr_scheduler_adapters(
             if is_streaming_refresh and streaming_prefix
             else ([], "")
         )
-        realtime_context = None
-        if enable_temporal_final_verification:
-            realtime_context = payload.request.realtime_transcription_context
-        else:
-            pass
+        is_temporal_final_request = (
+            enable_temporal_final_verification
+            and payload.request.internal_realtime_final_verification
+        )
         temperature = float(params.get("temperature") or 0.0)
         if greedy_only and temperature != 0.0:
             raise ValueError(
@@ -282,30 +280,16 @@ def make_qwen3_asr_scheduler_adapters(
         )
         temporal_candidate_token_ids: tuple[int, ...] = ()
         if (
-            enable_temporal_final_verification
-            and isinstance(realtime_context, RealtimeTranscriptionContext)
-            and realtime_context.request_id == payload.request_id
-            and realtime_context.is_final
+            is_temporal_final_request
             and is_streaming_refresh
             and isinstance(streaming_prefix, str)
             and bool(streaming_prefix)
-            and realtime_context.previous_hypothesis == streaming_prefix
-            and realtime_context.language is not None
             and rollback_tokens > 0
         ):
-            try:
-                context_language = resolve_language(realtime_context.language)
-            except ValueError:
-                context_language = None
-            if forced_language == context_language:
-                previous_token_ids = encode_literal(
-                    tokenizer, realtime_context.previous_hypothesis
-                )
-                temporal_candidate_token_ids = tuple(
-                    previous_token_ids[len(streaming_prefix_token_ids) :][:5]
-                )
-            else:
-                pass
+            previous_token_ids = encode_literal(tokenizer, streaming_prefix)
+            temporal_candidate_token_ids = tuple(
+                previous_token_ids[len(streaming_prefix_token_ids) :][:5]
+            )
         else:
             pass
         # Note(Audrey): the checkpoint reads biasing text from the system turn.
@@ -448,24 +432,10 @@ def make_qwen3_asr_scheduler_adapters(
         if temporal_candidate_token_ids:
             candidate_limit = min(5, max(request_max_new_tokens - 1, 0))
             candidate_token_ids = temporal_candidate_token_ids[:candidate_limit]
-            special_token_ids = {
-                int(token_id)
-                for token_id in getattr(tokenizer, "all_special_ids", [])
-                if isinstance(token_id, int)
-            }
-            if (
-                candidate_token_ids
-                and isinstance(realtime_context, RealtimeTranscriptionContext)
-                and all(
-                    isinstance(token_id, int)
-                    and not isinstance(token_id, bool)
-                    and 0 <= token_id < vocab_size
-                    for token_id in candidate_token_ids
-                )
-                and not any(
-                    token_id in special_token_ids or token_id == eos_token_id
-                    for token_id in candidate_token_ids
-                )
+            special_token_ids = set(tokenizer.all_special_ids)
+            if candidate_token_ids and not any(
+                token_id in special_token_ids or token_id == eos_token_id
+                for token_id in candidate_token_ids
             ):
                 temporal_request = Qwen3ASRTemporalRequest(
                     candidate_token_ids=candidate_token_ids,

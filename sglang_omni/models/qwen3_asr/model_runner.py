@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Model runner hooks for Qwen3-ASR temporal verification."""
+"""Model runners for Qwen3-ASR."""
 
 from __future__ import annotations
 
@@ -8,8 +8,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
+from sglang_omni.model_runner.base import ModelRunner
 from sglang_omni.model_runner.model_worker import ModelWorker
-from sglang_omni.models.qwen3_asr.engine_builder import Qwen3ASRModelRunner
 from sglang_omni.models.qwen3_asr.request_builders import Qwen3ASRRequestData
 from sglang_omni.models.qwen3_asr.temporal_verification import (
     Qwen3ASRTemporalForwardContext,
@@ -18,12 +18,22 @@ from sglang_omni.models.qwen3_asr.temporal_verification import (
     attach_temporal_forward_inputs,
     clear_temporal_forward_inputs,
 )
+from sglang_omni.platforms import current_platform
 from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
     SchedulerOutput,
     SchedulerRequest,
 )
+
+
+class Qwen3ASRModelRunner(ModelRunner[Qwen3ASRRequestData]):
+    """Shared autoregressive runner for Qwen3-ASR."""
+
+    supports_speculative_async_decode: bool = True
+    speculative_repetition_penalty_owner = (
+        "verify_logits" if current_platform.is_cuda() else None
+    )
 
 
 class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
@@ -43,25 +53,14 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
-        if not requests or not isinstance(requests[0].data, Qwen3ASRRequestData):
+        del forward_batch
+        if not requests:
             return
         else:
             pass
         temporal = requests[0].data.temporal_request
         if temporal is None or not temporal.admitted:
             return
-        elif (
-            forward_batch is None or len(requests) != 1 or len(schedule_batch.reqs) != 1
-        ):
-            raise RuntimeError("Qwen3-ASR temporal prefill must contain one request")
-        elif self.temporal_context is not None:
-            raise RuntimeError("Qwen3-ASR temporal forward is already active")
-        else:
-            pass
-        if len(schedule_batch.input_ids) != temporal.prompt_boundary + len(
-            temporal.candidate_token_ids
-        ):
-            raise RuntimeError("Qwen3-ASR temporal prefill boundary changed")
         else:
             pass
         self.temporal_context = attach_temporal_forward_inputs(
@@ -91,34 +90,19 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
-        if not requests or not isinstance(requests[0].data, Qwen3ASRRequestData):
+        del forward_batch, schedule_batch
+        if not requests:
             return
         else:
             pass
         temporal = requests[0].data.temporal_request
         if temporal is None or not temporal.admitted:
             return
-        elif not isinstance(
-            result.logits_output, Qwen3ASRTemporalLogitsProcessorOutput
-        ):
-            raise RuntimeError("Qwen3-ASR temporal prefill returned no verification")
         else:
             pass
         logits_output = result.logits_output
-        verification = logits_output.temporal_verification
-        pending_token_ids = logits_output.pending_token_ids
-        if (
-            verification is None
-            or verification.request_id != requests[0].request_id
-            or pending_token_ids is None
-            or pending_token_ids.numel() != 1
-        ):
-            raise RuntimeError("Qwen3-ASR temporal verification lost request ownership")
-        elif result.can_run_cuda_graph != (logits_output.graph_bucket_size is not None):
-            raise RuntimeError("Qwen3-ASR temporal graph metadata was lost")
-        else:
-            pass
-        result.next_token_ids = pending_token_ids
+        assert isinstance(logits_output, Qwen3ASRTemporalLogitsProcessorOutput)
+        result.next_token_ids = logits_output.pending_token_ids
 
     def next_input_token_ids(
         self,
@@ -128,7 +112,6 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
     ) -> torch.Tensor | None:
         if (
             len(requests) == 1
-            and isinstance(requests[0].data, Qwen3ASRRequestData)
             and requests[0].data.temporal_request is not None
             and requests[0].data.temporal_request.admitted
         ):
@@ -140,8 +123,7 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         return {
             request.request_id
             for request in scheduler_output.requests
-            if isinstance(request.data, Qwen3ASRRequestData)
-            and request.data.temporal_request is not None
+            if request.data.temporal_request is not None
             and request.data.temporal_request.admitted
         }
 
@@ -160,16 +142,13 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
             scheduler_output,
             skip_rids=skip_rids,
         )
-        logits_output = batch_result.logits_output
-        if not isinstance(logits_output, Qwen3ASRTemporalLogitsProcessorOutput):
+        if not isinstance(
+            batch_result.logits_output, Qwen3ASRTemporalLogitsProcessorOutput
+        ):
             return output
         else:
             pass
-        verification = logits_output.temporal_verification
-        if verification is None:
-            return output
-        else:
-            pass
+        verification = batch_result.logits_output.temporal_verification
         output.outputs[verification.request_id].data = None
         return Qwen3ASRTemporalRunnerOutput(
             outputs=output.outputs,
@@ -182,4 +161,4 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         )
 
 
-__all__ = ["Qwen3ASRTemporalModelRunner"]
+__all__ = ["Qwen3ASRModelRunner", "Qwen3ASRTemporalModelRunner"]

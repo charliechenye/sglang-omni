@@ -39,28 +39,14 @@ class Qwen3ASRTemporalPrefillAdder(PrefillAdder):
             pass
 
         multimodal_inputs = request.multimodal_inputs
-        if multimodal_inputs is None or multimodal_inputs.mrope_positions is None:
-            raise RuntimeError("Qwen3-ASR request builder omitted temporal mRoPE")
-        else:
-            pass
-        prompt_len = len(request.full_untruncated_fill_ids)
-        assert temporal.prompt_boundary == prompt_len
-        canonical_fill_ids = request.full_untruncated_fill_ids[:]
+        prompt_len = temporal.prompt_boundary
+        canonical_fill_ids = request.full_untruncated_fill_ids
         canonical_mrope_positions = multimodal_inputs.mrope_positions
         candidate_end = prompt_len + len(temporal.candidate_token_ids)
+        speculative_fill_ids = canonical_fill_ids[:]
+        speculative_fill_ids.extend(temporal.candidate_token_ids)
+        request.full_untruncated_fill_ids = speculative_fill_ids
         try:
-            speculative_fill_ids = canonical_fill_ids[:]
-            speculative_fill_ids.extend(temporal.candidate_token_ids)
-            request.full_untruncated_fill_ids = speculative_fill_ids
-            candidate_positions = torch.arange(
-                prompt_len,
-                candidate_end,
-                dtype=canonical_mrope_positions.dtype,
-                device=canonical_mrope_positions.device,
-            ).expand(3, -1)
-            temporal_mrope_positions = torch.cat(
-                (canonical_mrope_positions, candidate_positions), dim=1
-            )
             extend_token_count = candidate_end - request.prefix_len
             remaining_new_tokens = min(
                 request.sampling_params.max_new_tokens - len(request.output_ids),
@@ -96,8 +82,16 @@ class Qwen3ASRTemporalPrefillAdder(PrefillAdder):
         else:
             pass
 
-        multimodal_inputs.mrope_positions = temporal_mrope_positions
         try:
+            candidate_positions = torch.arange(
+                prompt_len,
+                candidate_end,
+                dtype=canonical_mrope_positions.dtype,
+                device=canonical_mrope_positions.device,
+            ).expand(3, -1)
+            multimodal_inputs.mrope_positions = torch.cat(
+                (canonical_mrope_positions, candidate_positions), dim=1
+            )
             admission_result = super().add_one_req(
                 request, has_chunked_req, truncation_align_size
             )
@@ -139,11 +133,9 @@ class Qwen3ASRTemporalPrefillAdder(PrefillAdder):
         if (
             not candidate_token_ids
             or temporal.admitted
-            or temporal.prompt_boundary != len(request.origin_input_ids)
             or self.can_run_list
             or self.running_batch.reqs
             or self.waiting_queue_len != 1
-            or self.dllm_config is not None
             or has_chunked_req
             or request.finished()
             or request.to_finish is not None
@@ -158,8 +150,8 @@ class Qwen3ASRTemporalPrefillAdder(PrefillAdder):
             or request.output_ids
             or request.kv.cache_protected_len != 0
             or request.kv.cache_inserted_len != 0
-            or len(request.full_untruncated_fill_ids) != len(request.origin_input_ids)
             or request.sampling_params.temperature != 1
+            or request.sampling_params.top_k != 1
             or request.sampling_params.repetition_penalty != 1
             or request.sampling_params.max_new_tokens - len(request.output_ids)
             < len(candidate_token_ids) + 1

@@ -766,7 +766,9 @@ class Client:
             inputs=inputs,
             params=params,
             metadata=metadata,
-            realtime_transcription_context=request.internal_realtime_context,
+            internal_realtime_final_verification=(
+                request.internal_realtime_final_verification
+            ),
         )
 
     @staticmethod

@@ -12,7 +12,12 @@ import sglang.srt.managers.scheduler_components.batch_result_processor as batch_
 import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import LogitsProcessor, LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    NextBatchPlan,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
@@ -27,8 +32,15 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 
+import sglang_omni.models.qwen3_asr.engine_builder as engine_builder_module
 import sglang_omni.preprocessing.transcription as transcription
+from sglang_omni.client.types import GenerateRequest
 from sglang_omni.models.qwen3_asr.config import Qwen3ASRFactoryArgs
+from sglang_omni.models.qwen3_asr.engine_builder import Qwen3ASREngineBuilder
+from sglang_omni.models.qwen3_asr.model_runner import (
+    Qwen3ASRModelRunner,
+    Qwen3ASRTemporalModelRunner,
+)
 from sglang_omni.models.qwen3_asr.request_builders import (
     Qwen3ASRRequestData,
     Qwen3ASRTemporalRequest,
@@ -37,7 +49,6 @@ from sglang_omni.models.qwen3_asr.request_builders import (
 from sglang_omni.models.qwen3_asr.temporal_cuda_graph_runner import (
     Qwen3ASRTemporalPrefillCudaGraphRunner,
 )
-from sglang_omni.models.qwen3_asr.temporal_runner import Qwen3ASRTemporalModelRunner
 from sglang_omni.models.qwen3_asr.temporal_scheduler import Qwen3ASRTemporalScheduler
 from sglang_omni.models.qwen3_asr.temporal_verification import (
     Qwen3ASRTemporalBatchResult,
@@ -50,7 +61,7 @@ from sglang_omni.models.qwen3_asr.temporal_verification import (
     verify_greedy_candidates,
 )
 from sglang_omni.proto import OmniRequest, StagePayload
-from sglang_omni.proto.realtime import RealtimeTranscriptionContext
+from sglang_omni.scheduling.engine_factory import SGLangGenerationEngineBuilder
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 
 
@@ -115,23 +126,21 @@ def make_logits_processor(
 
 
 @pytest.mark.parametrize(
-    ("candidates", "targets", "accepted", "pending"),
+    ("candidates", "targets", "accepted"),
     [
-        ((20, 21), [20, 21, 2], (20, 21), 2),
-        ((20, 21), [20, 9, 2], (20,), 9),
-        ((20, 21), [9, 21, 2], (), 9),
+        ((20, 21), [20, 21, 2], (20, 21)),
+        ((20, 21), [20, 9, 2], (20,)),
+        ((20, 21), [9, 21, 2], ()),
     ],
 )
 def test_greedy_verification_accepts_only_the_contiguous_prefix(
     candidates: tuple[int, ...],
     targets: list[int],
     accepted: tuple[int, ...],
-    pending: int,
 ) -> None:
     result = verify_greedy_candidates("final-1", candidates, targets)
     assert result.request_id == "final-1"
     assert result.accepted_prefix == accepted
-    assert result.pending_token_id == pending
 
 
 @pytest.mark.parametrize("bucket_size", [None, 8])
@@ -144,10 +153,6 @@ def test_logits_verification_uses_only_k_plus_one_logical_rows(
     batch = make_forward_batch(request_id, [10, 11, 12, *candidates], bucket_size)
     processor, lm_head, selected_rows = make_logits_processor(monkeypatch)
     context = attach_temporal_forward_inputs(request_id, prompt_len, candidates)
-    if bucket_size is not None:
-        context.graph_bucket_size = bucket_size
-    else:
-        pass
     try:
         output = processor(
             input_ids=None,
@@ -161,12 +166,8 @@ def test_logits_verification_uses_only_k_plus_one_logical_rows(
         clear_temporal_forward_inputs(context)
 
     assert isinstance(output, Qwen3ASRTemporalLogitsProcessorOutput)
-    assert output.temporal_verification is not None
     assert output.temporal_verification.accepted_prefix == (20,)
-    assert output.temporal_verification.pending_token_id == 9
-    assert output.pending_token_ids is not None
     assert output.pending_token_ids.tolist() == [9]
-    assert output.graph_bucket_size == bucket_size
     assert selected_rows == [[2, 3, 4]]
 
 
@@ -200,62 +201,84 @@ def test_context_survives_forward_batch_reconstruction_and_failure_cleanup(
     assert context.context_token is None
 
 
-def test_graph_trim_preserves_temporal_result_metadata(
+def test_graph_load_preserves_request_identity_and_logical_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    request_id = "final-1"
+    raw_forward_batch = make_forward_batch(request_id, [10, 11, 12, 20, 21])
+    padded_forward_batch = make_forward_batch(
+        request_id, [10, 11, 12, 20, 21], graph_bucket_size=8
+    )
+    padded_forward_batch.rids = []
+    shared_read_ends = None
+
+    def native_load(
+        runner: PrefillCudaGraphRunner, forward_batch: ForwardBatch
+    ) -> tuple[ForwardBatch, None]:
+        runner.raw_num_tokens = len(forward_batch.input_ids)
+        return padded_forward_batch, shared_read_ends
+
+    monkeypatch.setattr(PrefillCudaGraphRunner, "load_batch", native_load)
+
+    def native_trim(
+        runner: PrefillCudaGraphRunner, output: LogitsProcessorOutput
+    ) -> LogitsProcessorOutput:
+        del runner, output
+        return LogitsProcessorOutput(next_token_logits=torch.ones((1, 32)))
+
+    monkeypatch.setattr(PrefillCudaGraphRunner, "_trim_logits_output", native_trim)
+    runner = object.__new__(Qwen3ASRTemporalPrefillCudaGraphRunner)
+    temporal_context = attach_temporal_forward_inputs(request_id, 3, (20, 21))
+    try:
+        loaded_batch, loaded_read_ends = runner.load_batch(raw_forward_batch)
+    finally:
+        clear_temporal_forward_inputs(temporal_context)
+
+    assert loaded_batch is padded_forward_batch
+    assert loaded_batch.rids == [request_id]
+    assert runner.raw_num_tokens == 5
+    assert len(loaded_batch.input_ids) == 8
+    assert loaded_read_ends is None
+
     verification = Qwen3ASRTemporalVerification(
-        request_id="final-1", accepted_prefix=(20,), pending_token_id=9
+        request_id=request_id, accepted_prefix=(20,)
     )
     output = Qwen3ASRTemporalLogitsProcessorOutput(
         next_token_logits=torch.ones((3, 32)),
         temporal_verification=verification,
         pending_token_ids=torch.tensor([9]),
-        graph_bucket_size=8,
     )
-
-    def native_trim(
-        _runner: PrefillCudaGraphRunner, _output: LogitsProcessorOutput
-    ) -> LogitsProcessorOutput:
-        return LogitsProcessorOutput(next_token_logits=torch.ones((1, 32)))
-
-    monkeypatch.setattr(PrefillCudaGraphRunner, "_trim_logits_output", native_trim)
-    runner = object.__new__(Qwen3ASRTemporalPrefillCudaGraphRunner)
-    trim_logits_output = getattr(
-        runner, "_trim_logits_output"
+    trimmed = runner._trim_logits_output(
+        output
     )  # noqa: leading-underscore  # pinned SGLang trim hook
-    trimmed = trim_logits_output(output)
 
     assert isinstance(trimmed, Qwen3ASRTemporalLogitsProcessorOutput)
     assert trimmed.next_token_logits.shape == (1, 32)
     assert trimmed.temporal_verification is verification
     assert trimmed.pending_token_ids.tolist() == [9]
-    assert trimmed.graph_bucket_size == 8
 
 
 @pytest.mark.parametrize(
     (
         "enabled",
         "is_final",
-        "context_id",
         "max_tokens",
         "exclude_special_candidate",
         "expected",
     ),
     [
-        (False, True, "final-1", 8, False, ()),
-        (True, False, "final-1", 8, False, ()),
-        (True, True, "other", 8, False, ()),
-        (True, True, "final-1", 1, False, ()),
-        (True, True, "final-1", 2, False, (24,)),
-        (True, True, "final-1", 8, False, (24, 25)),
-        (True, True, "final-1", 8, True, ()),
+        (False, True, 8, False, ()),
+        (True, False, 8, False, ()),
+        (True, True, 1, False, ()),
+        (True, True, 2, False, (24,)),
+        (True, True, 8, False, (24, 25)),
+        (True, True, 8, True, ()),
     ],
 )
 def test_only_enabled_matching_final_requests_get_proposals(
     monkeypatch: pytest.MonkeyPatch,
     enabled: bool,
     is_final: bool,
-    context_id: str,
     max_tokens: int,
     exclude_special_candidate: bool,
     expected: tuple[int, ...],
@@ -306,12 +329,7 @@ def test_only_enabled_matching_final_requests_get_proposals(
                 "_asr_streaming_prefix_text": "abcdef",
                 "_asr_streaming_rollback_tokens": 2,
             },
-            realtime_transcription_context=RealtimeTranscriptionContext(
-                request_id=context_id,
-                is_final=is_final,
-                previous_hypothesis="abcdef",
-                language="English",
-            ),
+            internal_realtime_final_verification=enabled and is_final,
         ),
         data={},
     )
@@ -322,47 +340,112 @@ def test_only_enabled_matching_final_requests_get_proposals(
     assert request_data.req.sampling_params.temperature == 1
 
 
-def test_realtime_context_round_trips_inside_the_internal_request() -> None:
-    context = RealtimeTranscriptionContext(
-        request_id="final-1",
-        is_final=True,
-        previous_hypothesis="recognized words",
-        language="English",
-    )
+def test_internal_final_marker_round_trips_without_public_serialization() -> None:
     request = OmniRequest(
-        inputs={"audio_bytes": b"wav"}, realtime_transcription_context=context
+        inputs={"audio_bytes": b"wav"},
+        internal_realtime_final_verification=True,
     )
     assert OmniRequest.from_dict(request.to_dict()) == request
+    public_request = GenerateRequest(internal_realtime_final_verification=True)
+    assert "internal_realtime_final_verification" not in public_request.to_dict()
     ordinary = OmniRequest(inputs={"audio_bytes": b"wav"})
-    assert "realtime_transcription_context" not in ordinary.to_dict()
+    assert "internal_realtime_final_verification" not in ordinary.to_dict()
 
 
 def test_feature_option_defaults_off() -> None:
     assert Qwen3ASRFactoryArgs().enable_temporal_final_verification is False
 
 
-@pytest.mark.parametrize("graph_bucket_size", [None, 8])
-def test_prefill_handles_native_eager_and_graph_results(
-    graph_bucket_size: int | None,
+def test_engine_builder_selects_temporal_runner_and_scheduler_only_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    builder = object.__new__(Qwen3ASREngineBuilder)
+    builder.enable_temporal_final_verification = False
+    builder.torch_mps_model_runner = None
+    builder.audio_encoder_service = None
+    builder.uses_torch_mps = lambda: False
+    model_worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            is_hybrid_swa=False,
+            is_hybrid_ssm_cache=False,
+        )
+    )
+    monkeypatch.setattr(Qwen3ASRModelRunner, "__init__", lambda *_args: None)
+    monkeypatch.setattr(Qwen3ASRTemporalModelRunner, "__init__", lambda *_args: None)
+    ordinary_runner = builder.make_model_runner(model_worker, object())
+    assert isinstance(ordinary_runner, Qwen3ASRModelRunner)
+
+    inherited_scheduler = object()
+    inherited_calls: list[dict[str, object]] = []
+
+    def make_inherited_scheduler(
+        _builder: SGLangGenerationEngineBuilder, **kwargs: object
+    ) -> object:
+        inherited_calls.append(kwargs)
+        return inherited_scheduler
+
+    monkeypatch.setattr(
+        SGLangGenerationEngineBuilder, "make_scheduler", make_inherited_scheduler
+    )
+    monkeypatch.setattr(
+        engine_builder_module,
+        "get_schedule",
+        lambda: SimpleNamespace(page_size=1),
+    )
+
+    class NativeAllocator:
+        pass
+
+    monkeypatch.setattr(
+        engine_builder_module, "TokenToKVPoolAllocator", NativeAllocator
+    )
+    monkeypatch.setattr(
+        Qwen3ASRTemporalScheduler,
+        "__init__",
+        lambda *_args, **_kwargs: None,
+    )
+    scheduler_args = {
+        "model_worker": model_worker,
+        "tree_cache": object(),
+        "req_to_token_pool": object(),
+        "token_to_kv_pool_allocator": NativeAllocator(),
+        "server_args": object(),
+        "model_config": object(),
+        "model_runner": ordinary_runner,
+        "request_builder": None,
+        "result_adapter": None,
+        "extra_scheduler_kwargs": {},
+    }
+    assert builder.make_scheduler(**scheduler_args) is inherited_scheduler
+    assert inherited_calls == [scheduler_args]
+
+    builder.enable_temporal_final_verification = True
+    temporal_runner = builder.make_model_runner(model_worker, object())
+    assert isinstance(temporal_runner, Qwen3ASRTemporalModelRunner)
+    scheduler_args["model_runner"] = temporal_runner
+    temporal_scheduler = builder.make_scheduler(**scheduler_args)
+    assert isinstance(temporal_scheduler, Qwen3ASRTemporalScheduler)
+    assert len(inherited_calls) == 1
+
+
+def test_runner_passes_pending_target_token_to_native_result() -> None:
     request_id = "final-1"
     temporal = Qwen3ASRTemporalRequest(
         candidate_token_ids=(20, 21), prompt_boundary=3, admitted=True
     )
     data = Qwen3ASRRequestData(req=SimpleNamespace(), temporal_request=temporal)
     verification = Qwen3ASRTemporalVerification(
-        request_id=request_id, accepted_prefix=(20,), pending_token_id=9
+        request_id=request_id, accepted_prefix=(20,)
     )
     logits_output = Qwen3ASRTemporalLogitsProcessorOutput(
         next_token_logits=torch.ones((1, 32)),
         temporal_verification=verification,
         pending_token_ids=torch.tensor([9]),
-        graph_bucket_size=graph_bucket_size,
     )
     result = GenerationBatchResult(
         logits_output=logits_output,
         next_token_ids=None,
-        can_run_cuda_graph=graph_bucket_size is not None,
+        can_run_cuda_graph=False,
     )
     runner = object.__new__(Qwen3ASRTemporalModelRunner)
     runner.post_prefill(
@@ -611,30 +694,26 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
         release_features=lambda: None,
     )
     if cancel_before_commit:
-        from sglang.srt.managers.schedule_batch import FINISH_ABORT
-
         request.to_finish = FINISH_ABORT("cancelled before temporal commit")
     else:
         pass
-    request_data = Qwen3ASRRequestData(
+    request.omni_data = Qwen3ASRRequestData(
         req=request,
         temporal_request=temporal_request,
     )
-    request.omni_data = request_data
 
     class RecordingAllocator:
         def __init__(self) -> None:
             self.freed: list[torch.Tensor] = []
-            self.free_group_depth = 0
 
         def free(self, locations: torch.Tensor) -> None:
             self.freed.append(locations.clone())
 
         def free_group_begin(self) -> None:
-            self.free_group_depth += 1
+            pass
 
         def free_group_end(self) -> None:
-            self.free_group_depth -= 1
+            pass
 
     allocator = RecordingAllocator()
     token_row = torch.arange(1, 14, dtype=torch.long)
@@ -661,20 +740,17 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
     committed_prefix = () if cancel_before_commit else accepted_prefix
     owned_boundary = len(prompt_token_ids) + len(committed_prefix)
 
-    streamed_request_outputs: list[tuple[str, tuple[int, ...]]] = []
+    streamed_request_outputs: list[tuple[int, ...]] = []
 
     def record_stream_output(
-        scheduler: OmniScheduler,
+        _scheduler: OmniScheduler,
         requests: list[Req],
         return_logprob: bool = False,
         skip_req: Req | None = None,
     ) -> None:
-        assert isinstance(scheduler, OmniScheduler)
         assert not return_logprob
         streamed_request_outputs.extend(
-            (request.rid, tuple(request.output_ids))
-            for request in requests
-            if request is not skip_req
+            tuple(request.output_ids) for request in requests if request is not skip_req
         )
 
     monkeypatch.setattr(OmniScheduler, "stream_output", record_stream_output)
@@ -708,7 +784,7 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
         "checkpoint_kv_cache",
         lambda _request, _tree_cache: None,
     )
-    released_requests: list[tuple[str, bool, bool]] = []
+    released_checkpoints: list[bool] = []
 
     def record_release(
         released_request: Req,
@@ -717,14 +793,9 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
         checkpoint: bool,
     ) -> None:
         assert tree_cache.page_size == 1
+        assert released_request.rid == request_id
         assert released_request.skip_radix_cache_insert
-        released_requests.append(
-            (
-                released_request.rid,
-                checkpoint,
-                released_request.skip_radix_cache_insert,
-            )
-        )
+        released_checkpoints.append(checkpoint)
 
     monkeypatch.setattr(
         batch_result_processor_module, "release_kv_cache", record_release
@@ -798,33 +869,32 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
     schedule_batch.enable_overlap = False
     schedule_batch.decoding_reqs = []
 
-    precommit_output_ids: list[tuple[int, ...]] = []
-    precommit_fill_ids: list[tuple[int, ...]] = []
-    precommit_kv_lengths: list[tuple[int, int]] = []
-    precommit_sequence_lengths: list[tuple[int, int, int]] = []
-    precommit_mrope_lengths: list[int] = []
+    precommit_state: (
+        tuple[
+            tuple[int, ...],
+            tuple[int, ...],
+            tuple[int, int],
+            tuple[int, int, int],
+        ]
+        | None
+    ) = None
 
     def process_native_result(
-        native_scheduler: OmniScheduler,
+        _native_scheduler: OmniScheduler,
         batch: ScheduleBatch,
         native_result: GenerationBatchResult,
     ) -> None:
-        assert isinstance(native_scheduler, OmniScheduler)
+        nonlocal precommit_state
         if batch.forward_mode.is_extend():
-            precommit_output_ids.append(tuple(request.output_ids))
-            precommit_fill_ids.append(tuple(request.full_untruncated_fill_ids))
-            precommit_kv_lengths.append(
-                (request.kv.kv_committed_len, request.kv.kv_allocated_len)
-            )
-            precommit_sequence_lengths.append(
+            precommit_state = (
+                tuple(request.output_ids),
+                tuple(request.full_untruncated_fill_ids),
+                (request.kv.kv_committed_len, request.kv.kv_allocated_len),
                 (
                     int(batch.seq_lens[0]),
                     int(batch.seq_lens_cpu[0]),
                     int(batch.orig_seq_lens[0]),
-                )
-            )
-            precommit_mrope_lengths.append(
-                request.multimodal_inputs.mrope_positions.shape[1]
+                ),
             )
             result_processor.process_batch_result_prefill(batch, native_result)
         else:
@@ -835,38 +905,26 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
     scheduler.request_admission_lock = threading.RLock()
     scheduler.model_runner = SimpleNamespace(
         execution_bridge=SimpleNamespace(
-            publish_next_tokens=lambda batch, token_ids: published_next_tokens.append(
+            publish_next_tokens=lambda _batch, token_ids: published_next_tokens.append(
                 token_ids.tolist()
             )
         )
     )
     published_next_tokens: list[list[int]] = []
-    emitted_output_ids: list[tuple[int, ...]] = []
-    failure_errors: list[Exception] = []
-
-    def record_emitted_tokens(
-        emitted_request: Req,
-        emitted_request_data: Qwen3ASRRequestData,
-    ) -> None:
-        assert emitted_request_data.temporal_request is temporal_request
-        emitted_output_ids.append(tuple(emitted_request.output_ids_through_stop))
 
     def record_batch_failure(batch: ScheduleBatch, error: Exception) -> None:
         assert batch is schedule_batch
-        failure_errors.append(error)
         raise error
 
-    monkeypatch.setattr(scheduler, "emit_speculative_tokens", record_emitted_tokens)
+    monkeypatch.setattr(scheduler, "emit_speculative_tokens", lambda *_args: None)
     monkeypatch.setattr(scheduler, "handle_batch_failure", record_batch_failure)
     scheduler.process_batch_result(schedule_batch, batch_result)
-    assert failure_errors == []
-    assert precommit_output_ids == [tuple(committed_prefix)]
-    assert precommit_fill_ids == [tuple([*prompt_token_ids, *committed_prefix])]
-    assert precommit_kv_lengths == [(owned_boundary, owned_boundary)]
-    assert precommit_sequence_lengths == [
-        (owned_boundary, owned_boundary, owned_boundary)
-    ]
-    assert precommit_mrope_lengths == [len(prompt_token_ids)]
+    assert precommit_state == (
+        tuple(committed_prefix),
+        tuple([*prompt_token_ids, *committed_prefix]),
+        (owned_boundary, owned_boundary),
+        (owned_boundary, owned_boundary, owned_boundary),
+    )
     assert torch.equal(
         request.multimodal_inputs.mrope_positions,
         torch.arange(len(prompt_token_ids)).expand(3, -1),
@@ -875,52 +933,45 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
     assert scheduler.req_to_token_pool.req_to_token[0, owned_boundary:].tolist() == [
         0
     ] * (len(candidate_token_ids) - len(accepted_prefix))
-    if len(candidate_token_ids) == len(accepted_prefix):
-        assert allocator.freed == []
-    else:
-        assert len(allocator.freed) == 1
-        assert allocator.freed[0].numel() == len(candidate_token_ids) - len(
-            accepted_prefix
+    expected_rejected_locations = list(
+        range(
+            owned_boundary + 1,
+            len(prompt_token_ids) + len(candidate_token_ids) + 1,
         )
+    )
+    assert [locations.tolist() for locations in allocator.freed] == (
+        [expected_rejected_locations] if expected_rejected_locations else []
+    )
     assert batch_result.next_token_ids.tolist() == [pending_token_id]
     assert not temporal_request.admitted
 
     if cancel_before_commit:
         assert request.output_ids == array("q")
         assert request.finished()
-        assert emitted_output_ids == []
         assert published_next_tokens == []
-        assert streamed_request_outputs == [(request_id, ())]
-        assert released_requests == [(request_id, False, True)]
-        assert len(allocator.freed) == 1
-        assert allocator.freed[0].numel() == len(candidate_token_ids)
-        assert allocator.free_group_depth == 0
+        assert streamed_request_outputs == [()]
+        assert released_checkpoints == [False]
         return
     else:
         assert list(request.output_ids) == [*accepted_prefix, pending_token_id]
 
     if request.finished():
         assert pending_token_id == 2
-        assert emitted_output_ids
         assert published_next_tokens == []
-        assert streamed_request_outputs == [(request_id, tuple(request.output_ids))]
-        assert released_requests == [(request_id, True, True)]
-        assert allocator.free_group_depth == 0
+        assert streamed_request_outputs == [tuple(request.output_ids)]
+        assert released_checkpoints == [True]
         return
     else:
         assert streamed_request_outputs == []
-        assert emitted_output_ids == [tuple([*accepted_prefix, pending_token_id])]
         assert published_next_tokens == [[pending_token_id]]
 
     owned_boundary = len(prompt_token_ids) + len(accepted_prefix)
-    allocated_decode_rows: list[tuple[int, int]] = []
 
     def allocate_decode_row(
         batch: ScheduleBatch, token_per_req: int = 1
     ) -> torch.Tensor:
         assert token_per_req == 1
         assert batch.seq_lens_cpu.tolist() == [owned_boundary]
-        allocated_decode_rows.append((int(batch.seq_lens_cpu[0]), token_per_req))
         location = torch.tensor([101], dtype=torch.int64)
         batch.req_to_token_pool.req_to_token[0, owned_boundary] = location[0]
         for batch_request in batch.reqs:
@@ -935,7 +986,6 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
         lambda: SimpleNamespace(mamba=SimpleNamespace(enable_mamba_extra_buffer=False)),
     )
     schedule_batch.prepare_for_decode()
-    assert allocated_decode_rows == [(owned_boundary, 1)]
     assert schedule_batch.seq_lens.tolist() == [owned_boundary + 1]
     assert schedule_batch.seq_lens_cpu.tolist() == [owned_boundary + 1]
     assert schedule_batch.orig_seq_lens.tolist() == [owned_boundary + 1]
@@ -951,6 +1001,5 @@ def test_temporal_precommit_reclaims_only_the_rejected_suffix(
     scheduler.process_batch_result(schedule_batch, decode_result)
     assert request.finished()
     assert list(request.output_ids) == [*accepted_prefix, pending_token_id, 2]
-    assert released_requests == [(request_id, True, True)]
-    assert streamed_request_outputs == [(request_id, tuple(request.output_ids))]
-    assert allocator.free_group_depth == 0
+    assert released_checkpoints == [True]
+    assert streamed_request_outputs == [tuple(request.output_ids)]

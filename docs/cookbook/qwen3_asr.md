@@ -241,6 +241,23 @@ asyncio.run(main())
 The example assumes the upload is already mono 16 kHz PCM16; the session takes
 packets as they arrive and does not resample them.
 
+### Temporal final verification
+
+Realtime final requests can verify up to five rollback tokens from the prior partial transcript in one target prefill. The feature is disabled by default and supports one-GPU CUDA runs with synchronous decoding, overlap and Torch compile disabled, no speculative algorithm, no plain fallback or disaggregation, page size one, the native token-to-KV allocator, and Breakable prefill graphs. Hybrid KV is unsupported. Ineligible requests use ordinary prefill and decoding.
+
+Enable it with the Qwen3-ASR stage options:
+
+```bash
+--asr.factory.enable_temporal_final_verification true \
+--asr.factory.enable_async_decode false \
+--asr.factory.enable_plain_fallback false \
+--asr.engine.disable_overlap_schedule true \
+--asr.engine.enable_torch_compile false \
+--asr.engine.disable_speculative_decoding true \
+--asr.engine.page_size 1 \
+--asr.engine.cuda_graph_backend_prefill breakable
+```
+
 ## Request Parameters
 
 ### Prompt and Vocabulary Biasing

@@ -47,10 +47,7 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
         model_output: ModelRunnerOutput,
         skip_rids: Iterable[str] = (),
     ) -> None:
-        if (
-            isinstance(model_output, Qwen3ASRTemporalRunnerOutput)
-            and model_output.temporal_verification is not None
-        ):
+        if isinstance(model_output, Qwen3ASRTemporalRunnerOutput):
             return
         else:
             super().emit_stream_output(scheduler_output, model_output, skip_rids)
@@ -83,10 +80,7 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
         mr_output: ModelRunnerOutput,
     ) -> GenerationBatchResult | Qwen3ASRTemporalBatchResult:
         native_result = OmniScheduler.make_batch_result(mr_output)
-        if (
-            isinstance(mr_output, Qwen3ASRTemporalRunnerOutput)
-            and mr_output.temporal_verification is not None
-        ):
+        if isinstance(mr_output, Qwen3ASRTemporalRunnerOutput):
             verification = mr_output.temporal_verification
             return Qwen3ASRTemporalBatchResult(
                 logits_output=native_result.logits_output,
@@ -171,46 +165,24 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
         batch_result: Qwen3ASRTemporalBatchResult,
     ) -> bool:
         verification = batch_result.temporal_verification
+        prompt_len = temporal.prompt_boundary
+        candidate_end = prompt_len + len(temporal.candidate_token_ids)
+        request_pool_index = request.kv.req_pool_idx
         if (
             not schedule_batch.forward_mode.is_extend()
             or len(schedule_batch.reqs) != 1
             or not temporal.admitted
             or request.rid != verification.request_id
-            or temporal.prompt_boundary + len(temporal.candidate_token_ids)
-            != len(request.full_untruncated_fill_ids)
-            or len(request.output_ids) != 0
-            or request.kv.req_pool_idx is None
-            or request.kv.kv_committed_len != len(request.full_untruncated_fill_ids)
-            or request.kv.kv_allocated_len != len(request.full_untruncated_fill_ids)
+            or request_pool_index is None
+            or request.kv.kv_committed_len != candidate_end
+            or request.kv.kv_allocated_len != candidate_end
             or request.kv.cache_protected_len != 0
             or request.kv.cache_inserted_len != 0
-            or request.extend_end != len(request.full_untruncated_fill_ids)
-            or schedule_batch.seq_lens_cpu is None
-            or schedule_batch.seq_lens_cpu.numel() != 1
-            or int(schedule_batch.seq_lens_cpu[0])
-            != len(request.full_untruncated_fill_ids)
-            or schedule_batch.seq_lens is None
-            or schedule_batch.seq_lens.numel() != 1
-            or schedule_batch.orig_seq_lens is None
-            or schedule_batch.orig_seq_lens.numel() != 1
-            or request.multimodal_inputs is None
-            or request.multimodal_inputs.mrope_positions is None
-            or request.multimodal_inputs.mrope_positions.shape[1]
-            != len(request.full_untruncated_fill_ids)
         ):
             raise RuntimeError("Temporal KV ownership changed before commit")
         else:
             pass
-        if (
-            batch_result.next_token_ids is None
-            or batch_result.next_token_ids.numel() != 1
-        ):
-            raise RuntimeError("Temporal result has no pending native token")
-        else:
-            pass
 
-        prompt_len = temporal.prompt_boundary
-        candidate_end = len(request.full_untruncated_fill_ids)
         cancelled = (
             request.finished()
             or request.is_retracted
@@ -220,7 +192,7 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
         )
         accepted = () if cancelled else verification.accepted_prefix
         owned_boundary = prompt_len + len(accepted)
-        token_row = self.req_to_token_pool.req_to_token[request.kv.req_pool_idx]
+        token_row = self.req_to_token_pool.req_to_token[request_pool_index]
         rejected_locations = token_row[owned_boundary:candidate_end].clone()
         output_ids = array("q", request.output_ids)
         output_ids.extend(accepted)
@@ -231,7 +203,6 @@ class Qwen3ASRTemporalScheduler(OmniScheduler[Qwen3ASRRequestData]):
 
         request.output_ids = output_ids
         request.full_untruncated_fill_ids = fill_ids
-        request.refresh_fill_ids()
         request.kv.kv_committed_len = owned_boundary
         request.kv.kv_allocated_len = owned_boundary
         request.extend_end = owned_boundary

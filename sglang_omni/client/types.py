@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal, TypedDict
 
-from sglang_omni.proto.realtime import RealtimeTranscriptionContext
 from sglang_omni.scheduling.types import SpecTokensDetailsDict
 
 
@@ -174,8 +173,8 @@ class GenerateRequest:
     multimodal_train_inputs: dict[str, object] | None = None
 
     metadata: dict[str, object] = field(default_factory=dict)
-    internal_realtime_context: RealtimeTranscriptionContext | None = field(
-        default=None, repr=False, compare=False
+    internal_realtime_final_verification: bool = field(
+        default=False, repr=False, compare=False
     )
 
     def to_dict(self) -> dict[str, object]:

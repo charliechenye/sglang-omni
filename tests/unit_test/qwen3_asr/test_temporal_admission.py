@@ -74,6 +74,7 @@ def make_admission_state() -> (
         ("mixed_waiting", False),
         ("mixed_running", False),
         ("sampling", False),
+        ("top_k", False),
         ("budget", False),
         (None, True),
     ],
@@ -92,6 +93,8 @@ def test_admission_requires_isolated_greedy_cache_miss(
         adder.running_batch.reqs = [object()]
     elif unsafe_state == "sampling":
         request.sampling_params.repetition_penalty = 1.1
+    elif unsafe_state == "top_k":
+        request.sampling_params.top_k = 2
     elif unsafe_state == "budget":
         request.sampling_params.max_new_tokens = 2
     else:
@@ -126,6 +129,7 @@ def test_add_one_request_preflights_then_calls_native_once(
     ) -> PrefillProbe | AddReqResult:
         assert total_tokens > len(candidate.full_untruncated_fill_ids)
         assert not has_chunked_req
+        assert candidate.multimodal_inputs.mrope_positions.shape[1] == 4
         if preflight_ok:
             return PrefillProbe(
                 prefix_len=candidate.prefix_len,
@@ -147,6 +151,10 @@ def test_add_one_request_preflights_then_calls_native_once(
     ) -> AddReqResult:
         assert not has_chunked_req and truncation_align_size is None
         native_calls.append(tuple(candidate.full_untruncated_fill_ids))
+        expected_mrope_length = 6 if preflight_ok else 4
+        assert candidate.multimodal_inputs.mrope_positions.shape[1] == (
+            expected_mrope_length
+        )
         if native_admits:
             native_adder.can_run_list.append(candidate)
             candidate.extend_end = len(candidate.full_untruncated_fill_ids)
@@ -160,8 +168,11 @@ def test_add_one_request_preflights_then_calls_native_once(
     assert result is AddReqResult.CONTINUE
     assert len(native_calls) == 1
     assert temporal.admitted is expected_temporal
+    expected_native_fill = (
+        (10, 11, 12, 13, 20, 21) if preflight_ok else (10, 11, 12, 13)
+    )
+    assert native_calls == [expected_native_fill]
     if expected_temporal:
-        assert native_calls == [(10, 11, 12, 13, 20, 21)]
         assert request.multimodal_inputs.mrope_positions[0].tolist() == [
             0,
             1,
@@ -171,6 +182,5 @@ def test_add_one_request_preflights_then_calls_native_once(
             5,
         ]
     else:
-        assert native_calls == [(10, 11, 12, 13)]
         assert request.full_untruncated_fill_ids == array("q", [10, 11, 12, 13])
         assert request.multimodal_inputs.mrope_positions.shape[1] == 4

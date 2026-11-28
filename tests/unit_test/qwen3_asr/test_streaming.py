@@ -214,8 +214,7 @@ def test_qwen_strategy_only_propagates_final_context_when_enabled(
     )
 
     if enabled:
-        assert final.internal_realtime_context is not None
-        assert final.internal_realtime_context.is_final
+        assert final.internal_realtime_final_verification
     else:
-        assert final.internal_realtime_context is None
-    assert refresh.internal_realtime_context is None
+        assert not final.internal_realtime_final_verification
+    assert not refresh.internal_realtime_final_verification

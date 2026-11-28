@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from sglang_omni.client import GenerateRequest
-from sglang_omni.proto.realtime import RealtimeTranscriptionContext
 from sglang_omni.serve.speech_to_text import build_speech_to_text_generate_request
 
 _ROLLBACK_TOKENS = 5
@@ -72,12 +71,7 @@ class Qwen3ASRStreamingStrategy:
             }
         )
         if self.enable_temporal_final_verification and is_final and use_prefix:
-            request.internal_realtime_context = RealtimeTranscriptionContext(
-                request_id=request_id,
-                is_final=True,
-                previous_hypothesis=qwen_state.transcript,
-                language=qwen_state.language,
-            )
+            request.internal_realtime_final_verification = True
         else:
             pass
         return request

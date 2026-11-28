@@ -16,6 +16,7 @@ from sglang.srt.mem_cache.allocator import (
 )
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.runtime_context import get_schedule
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_hip_version, is_gfx95_supported
 from transformers import (
@@ -40,8 +41,19 @@ from sglang_omni.models.qwen3_asr.encoder_service import (
     Qwen3ASRPreLMEncoderService,
     build_cache_namespace,
 )
+from sglang_omni.models.qwen3_asr.model_runner import (
+    Qwen3ASRModelRunner,
+    Qwen3ASRTemporalModelRunner,
+)
 from sglang_omni.models.qwen3_asr.request_builders import Qwen3ASRRequestData
 from sglang_omni.models.qwen3_asr.sglang_model import Qwen3ASRForConditionalGeneration
+from sglang_omni.models.qwen3_asr.temporal_cuda_graph_runner import (
+    Qwen3ASRTemporalPrefillCudaGraphRunner,
+)
+from sglang_omni.models.qwen3_asr.temporal_scheduler import Qwen3ASRTemporalScheduler
+from sglang_omni.models.qwen3_asr.temporal_verification import (
+    Qwen3ASRTemporalLogitsProcessor,
+)
 from sglang_omni.models.qwen3_asr.torch_mps_runner import Qwen3ASRTorchMpsModelRunner
 from sglang_omni.platforms import current_platform
 from sglang_omni.platforms.npu import validate_npu_graph_environment
@@ -66,19 +78,6 @@ logger = logging.getLogger(__name__)
 
 
 QWEN3_ASR_FULL_PREFILL_MAX_REQUESTS = 32
-
-
-class Qwen3ASRModelRunner(ModelRunner[Qwen3ASRRequestData]):
-    """The shared AR runner, opted into speculative overlap and, on CUDA, the shared verify repetition_penalty.
-
-    Audio embeddings enter only at prefill, so a decode round reads nothing but the tokens the previous round left on the device.
-    """
-
-    supports_speculative_async_decode: bool = True
-    # note (wilsonzheng0327): the verify penalty is validated on CUDA only, so other platforms keep refusing repetition_penalty under the draft.
-    speculative_repetition_penalty_owner = (
-        "verify_logits" if current_platform.is_cuda() else None
-    )
 
 
 class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
@@ -275,10 +274,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         output_proc: SGLangOutputProcessor,
     ) -> ModelRunner[Qwen3ASRRequestData]:
         if self.uses_torch_mps():
-            from sglang_omni.models.qwen3_asr.torch_mps_runner import (
-                Qwen3ASRTorchMpsModelRunner,
-            )
-
             self.torch_mps_model_runner = Qwen3ASRTorchMpsModelRunner(
                 model_worker,
                 output_proc,
@@ -287,10 +282,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         else:
             pass
         if self.enable_temporal_final_verification:
-            from sglang_omni.models.qwen3_asr.temporal_runner import (
-                Qwen3ASRTemporalModelRunner,
-            )
-
             return Qwen3ASRTemporalModelRunner(
                 model_worker,
                 output_proc,
@@ -309,21 +300,10 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
     ) -> None:
         del device, gpu_id, server_args
         if self.enable_temporal_final_verification:
-            from sglang_omni.models.qwen3_asr.temporal_verification import (
-                Qwen3ASRTemporalLogitsProcessor,
-            )
-
             model = model_worker.model_runner.model
             model.language_model.logits_processor = Qwen3ASRTemporalLogitsProcessor(
                 model.language_model.logits_processor
             )
-        else:
-            pass
-        if self.enable_temporal_final_verification:
-            from sglang_omni.models.qwen3_asr.temporal_cuda_graph_runner import (
-                Qwen3ASRTemporalPrefillCudaGraphRunner,
-            )
-
             model_worker.model_runner.prefill_graph_runner_class = (
                 Qwen3ASRTemporalPrefillCudaGraphRunner
             )
@@ -711,8 +691,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         else:
             pass
 
-        from sglang.srt.runtime_context import get_schedule
-
         if get_schedule().page_size != 1:
             raise ValueError(
                 "Qwen3-ASR temporal final verification requires page_size=1"
@@ -747,10 +725,6 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
         }
         scheduler_arguments.update(self.extra_scheduler_callbacks())
         scheduler_arguments.update(extra_scheduler_kwargs)
-        from sglang_omni.models.qwen3_asr.temporal_scheduler import (
-            Qwen3ASRTemporalScheduler,
-        )
-
         return Qwen3ASRTemporalScheduler(**scheduler_arguments)
 
     def make_abort_callback(self) -> Callable[[str], None] | None:
