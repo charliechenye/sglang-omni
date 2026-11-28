@@ -298,16 +298,10 @@ class Qwen3ASREngineBuilder(AsrEngineBuilder[Qwen3ASRRequestData]):
     ) -> None:
         del device, gpu_id, server_args
         if self.enable_temporal_final_verification:
-            from sglang_omni.models.qwen3_asr.temporal_prefill import (
-                Qwen3ASRTemporalPrefillCudaGraphRunner,
-            )
             from sglang_omni.models.qwen3_asr.temporal_verification import (
                 Qwen3ASRTemporalLogitsProcessor,
             )
 
-            model_worker.model_runner.prefill_graph_runner_class = (
-                Qwen3ASRTemporalPrefillCudaGraphRunner
-            )
             model = model_worker.model_runner.model
             model.language_model.logits_processor = Qwen3ASRTemporalLogitsProcessor(
                 model.language_model.logits_processor

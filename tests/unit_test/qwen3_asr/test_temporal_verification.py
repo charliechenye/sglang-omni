@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import threading
 from array import array
+from contextlib import nullcontext
 from types import SimpleNamespace, TracebackType
 from typing import Protocol
 
@@ -10,6 +11,7 @@ import numpy as np
 import pytest
 import sglang.srt.managers.schedule_batch as schedule_batch_module
 import sglang.srt.managers.scheduler_components.batch_result_processor as batch_result_processor_module
+import sglang.srt.model_executor.model_runner as native_model_runner_module
 import torch
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.layers.logits_processor import (
@@ -22,19 +24,30 @@ from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
+from sglang.srt.model_executor.cuda_graph_buffer_registry import CudaGraphBufferRegistry
 from sglang.srt.model_executor.forward_batch_info import (
     CaptureHiddenMode,
     ForwardBatch,
     ForwardMode,
 )
+from sglang.srt.model_executor.model_runner import (
+    ModelRunnerOutput as SGLangModelRunnerOutput,
+)
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    PrefillCudaGraphRunner,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 
 import sglang_omni.preprocessing.transcription as transcription
+from sglang_omni.model_runner.model_worker import ModelWorker
+from sglang_omni.model_runner.sglang_model_runner import SGLModelRunner
 from sglang_omni.models.qwen3_asr.request_builders import (
     Qwen3ASRRequestData,
     Qwen3ASRTemporalRequest,
     make_qwen3_asr_scheduler_adapters,
 )
+from sglang_omni.models.qwen3_asr.temporal_runner import Qwen3ASRTemporalModelRunner
 from sglang_omni.models.qwen3_asr.temporal_scheduler import Qwen3ASRTemporalScheduler
 from sglang_omni.models.qwen3_asr.temporal_verification import (
     Qwen3ASRTemporalBatchResult,
@@ -48,6 +61,11 @@ from sglang_omni.models.qwen3_asr.temporal_verification import (
 from sglang_omni.proto import OmniRequest, StagePayload
 from sglang_omni.proto.realtime import RealtimeTranscriptionContext
 from sglang_omni.scheduling.omni_scheduler import OmniScheduler
+from sglang_omni.scheduling.types import (
+    RequestOutput,
+    SchedulerOutput,
+    SchedulerRequest,
+)
 
 
 class NoArgumentCallback(Protocol):
@@ -341,10 +359,10 @@ def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
     )
 
     from sglang_omni.models.qwen3_asr.temporal_prefill import (
-        Qwen3ASRTemporalPrefillCudaGraphRunner,
+        install_temporal_prefill_graph_gate,
     )
 
-    runner = object.__new__(Qwen3ASRTemporalPrefillCudaGraphRunner)
+    runner = object.__new__(PrefillCudaGraphRunner)
     forward_batch = ForwardBatch(
         forward_mode=ForwardMode.EXTEND,
         batch_size=1,
@@ -369,6 +387,7 @@ def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
         "can_run_graph",
         check_native_graph_eligibility,
     )
+    install_temporal_prefill_graph_gate(runner)
 
     assert runner.can_run_graph(forward_batch)
     assert native_graph_checks == [forward_batch]
@@ -383,6 +402,311 @@ def test_temporal_prefill_graph_runner_preserves_ordinary_graph_eligibility(
     )
     assert not runner.can_run_graph(forward_batch)
     assert native_graph_checks == [forward_batch]
+    clear_temporal_forward_inputs(forward_batch)
+    assert runner.can_run_graph(forward_batch)
+    assert native_graph_checks == [forward_batch, forward_batch]
+
+
+def test_temporal_forward_survives_real_runner_dispatch_and_eager_batch_copy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An eager ForwardBatch copy must not turn an admitted request into plain prefill."""
+    import sglang_omni.models.qwen3_asr.engine_builder as engine_builder
+
+    request_id = "final-3-1"
+    candidate_token_ids = (20, 21)
+    prompt_boundary = 3
+    input_token_ids = torch.tensor([10, 11, 12, 20, 21], dtype=torch.long)
+    native_graph_checks: list[ForwardBatch] = []
+    graph_executions: list[ForwardBatch] = []
+    eager_batches: list[ForwardBatch] = []
+    published_next_token_ids: list[torch.Tensor | None] = []
+
+    def make_forward_batch(token_ids: torch.Tensor) -> ForwardBatch:
+        token_count = len(token_ids)
+        forward_batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=token_ids,
+            req_pool_indices=torch.tensor([0], dtype=torch.long),
+            seq_lens=torch.tensor([token_count], dtype=torch.long),
+            out_cache_loc=torch.arange(token_count, dtype=torch.long),
+            seq_lens_sum=token_count,
+        )
+        forward_batch.rids = [request_id]
+        forward_batch.positions = torch.arange(token_count, dtype=torch.long)
+        forward_batch.extend_seq_lens = torch.tensor([token_count], dtype=torch.int32)
+        forward_batch.extend_seq_lens_cpu = [token_count]
+        forward_batch.extend_prefix_lens_cpu = [0]
+        forward_batch.capture_hidden_mode = CaptureHiddenMode.NULL
+        forward_batch.input_embeds = torch.arange(
+            token_count, dtype=torch.float32
+        ).reshape(token_count, 1)
+        return forward_batch
+
+    native_processor = LogitsProcessor.__new__(LogitsProcessor)
+    torch.nn.Module.__init__(native_processor)
+    native_processor.expected_aux_hidden_states = None
+    native_processor.keep_last_hidden_states = False
+
+    class RecordingLMHead(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.invocation_count = 0
+            self.selected_rows: list[int] = []
+
+        def forward(self, selected_hidden_states: torch.Tensor) -> torch.Tensor:
+            self.invocation_count += 1
+            self.selected_rows = [
+                int(row[0]) for row in selected_hidden_states.tolist()
+            ]
+            logits = torch.full((len(self.selected_rows), 32), -100.0)
+            prediction_by_input_row = {2: 20, 3: 21, 4: 2}
+            for selected_row, input_row in enumerate(self.selected_rows):
+                logits[selected_row, prediction_by_input_row.get(input_row, 2)] = 100.0
+            return logits
+
+    def run_lm_head(
+        selected_hidden_states: torch.Tensor,
+        lm_head: torch.nn.Module,
+        logits_metadata: LogitsMetadata | ForwardBatch,
+    ) -> torch.Tensor:
+        assert isinstance(logits_metadata, (LogitsMetadata, ForwardBatch))
+        return lm_head(selected_hidden_states)
+
+    monkeypatch.setattr(native_processor, "_get_logits", run_lm_head)
+    lm_head = RecordingLMHead()
+    graph_runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+
+    def native_can_run_graph(
+        prefill_runner: PrefillCudaGraphRunner,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        assert prefill_runner is graph_runner
+        native_graph_checks.append(forward_batch)
+        return True
+
+    monkeypatch.setattr(PrefillCudaGraphRunner, "can_run_graph", native_can_run_graph)
+
+    def execute_graph(forward_batch: ForwardBatch) -> LogitsProcessorOutput:
+        graph_executions.append(forward_batch)
+        return LogitsProcessorOutput(next_token_logits=torch.zeros((1, 32)))
+
+    graph_runner.execute = execute_graph
+    sglang_runner = object.__new__(SGLModelRunner)
+    sglang_runner.plain_decode_runner = None
+    sglang_runner.model = SimpleNamespace(shared_experts_config=None)
+    sglang_runner.device = "cpu"
+    sglang_runner.decode_cuda_graph_runner = None
+    sglang_runner.prefill_cuda_graph_runner = graph_runner
+    sglang_runner.device_timer = None
+    setattr(sglang_runner, "_prepare_eager_forward_batch", lambda _forward_batch: None)
+    setattr(
+        sglang_runner,
+        "_maybe_execute_deferred_mamba_cow_and_clear",
+        lambda _forward_batch: None,
+    )
+    setattr(sglang_runner, "_extend_forward_kwargs", lambda _forward_batch, _proxy: {})
+    forward_raw = getattr(sglang_runner, "_forward_raw")  # noqa: leading-underscore
+
+    monkeypatch.setattr(
+        native_model_runner_module,
+        "get_model",
+        lambda: SimpleNamespace(override=lambda **_fields: nullcontext()),
+    )
+    monkeypatch.setattr(native_model_runner_module, "has_forward_context", lambda: True)
+    monkeypatch.setattr(native_model_runner_module, "get_forward_context", lambda: None)
+    monkeypatch.setattr(
+        native_model_runner_module,
+        "forward_context",
+        lambda *_arguments, **_fields: nullcontext(),
+    )
+    monkeypatch.setattr(
+        native_model_runner_module, "get_global_dwdp_manager", lambda: None
+    )
+    monkeypatch.setattr(
+        native_model_runner_module,
+        "_prefill_cuda_graph_allows_context_parallel",
+        lambda *_arguments: True,
+    )
+    monkeypatch.setattr(
+        native_model_runner_module,
+        "device_timer_ctx",
+        lambda *_arguments: nullcontext(),
+    )
+
+    eager_runner = object.__new__(EagerRunner)
+    setattr(
+        eager_runner,
+        "_eager_registry",
+        CudaGraphBufferRegistry(
+            device=torch.device("cpu"),
+            max_bs=1,
+            max_num_tokens=len(input_token_ids),
+        ),
+    )
+    temporal_processor = Qwen3ASRTemporalLogitsProcessor(native_processor)
+    hidden_states = torch.arange(len(input_token_ids), dtype=torch.float32).reshape(
+        len(input_token_ids), 1
+    )
+
+    class EagerExecution:
+        def execute(
+            self,
+            forward_batch: ForwardBatch,
+            pp_proxy_tensors: object | None = None,
+        ) -> LogitsProcessorOutput:
+            replay_batch = EagerRunner.load_batch(
+                eager_runner,
+                forward_batch,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+            eager_batches.append(replay_batch)
+            return temporal_processor(
+                input_ids=None,
+                hidden_states=hidden_states,
+                lm_head=lm_head,
+                logits_metadata=replay_batch,
+            )
+
+    sglang_runner.eager_runner = EagerExecution()
+
+    def native_forward(*, forward_batch: ForwardBatch) -> SGLangModelRunnerOutput:
+        return forward_raw(forward_batch, pp_proxy_tensors=None)
+
+    sglang_runner.forward = native_forward
+    builder = object.__new__(engine_builder.Qwen3ASREngineBuilder)
+    builder.enable_temporal_final_verification = True
+    monkeypatch.setattr(builder, "uses_torch_mps", lambda: False)
+    monkeypatch.setattr(engine_builder.current_platform, "is_cuda", lambda: False)
+    monkeypatch.setattr(engine_builder.current_platform, "is_xpu", lambda: False)
+    model = SimpleNamespace(
+        shared_experts_config=None,
+        language_model=SimpleNamespace(logits_processor=native_processor),
+    )
+    sglang_runner.model = model
+    builder.setup_model(
+        model_worker=SimpleNamespace(model_runner=sglang_runner),
+        checkpoint_dir="unused",
+        device="cpu",
+        gpu_id=0,
+        server_args=SimpleNamespace(),
+    )
+
+    ordinary_before = forward_raw(
+        make_forward_batch(torch.tensor([10], dtype=torch.long)),
+        pp_proxy_tensors=None,
+    )
+    assert ordinary_before.can_run_graph
+    assert len(graph_executions) == 1
+
+    temporal_request = Qwen3ASRTemporalRequest(
+        context=RealtimeTranscriptionContext(
+            request_id=request_id,
+            segment_id=3,
+            attempt=1,
+            is_final=True,
+            previous_hypothesis="recognized words",
+            language="English",
+        ),
+        candidate_token_ids=candidate_token_ids,
+        prompt_boundary=prompt_boundary,
+        admitted=True,
+        attempted=True,
+    )
+    request_data = Qwen3ASRRequestData(temporal_request=temporal_request)
+    scheduler_request = SchedulerRequest(request_id=request_id, data=request_data)
+    schedule_batch = SimpleNamespace(
+        reqs=[SimpleNamespace()],
+        input_ids=input_token_ids,
+        is_prefill_only=False,
+    )
+    forward_batch = make_forward_batch(input_token_ids)
+    model_worker = object.__new__(ModelWorker)
+    model_worker.dllm_algorithm = None
+    model_worker.model_runner = sglang_runner
+    model_worker.record_prefill_cuda_graph_usage = (
+        lambda _forward_batch, *, can_run_graph: None
+    )
+    temporal_runner = object.__new__(Qwen3ASRTemporalModelRunner)
+    temporal_runner.tp_worker = model_worker
+    temporal_runner.retained_prefill_input_embeds = None
+    temporal_runner.retain_prefill_input_embeds = False
+    temporal_runner.execution_bridge = SimpleNamespace(
+        publish_next_tokens=lambda _batch, token_ids: published_next_token_ids.append(
+            token_ids
+        )
+    )
+    temporal_runner.output_processor = SimpleNamespace(
+        process=lambda _result, _scheduler_output: {
+            request_id: RequestOutput(
+                request_id=request_id,
+                data="must wait for temporal precommit",
+                extra={},
+            )
+        }
+    )
+    scheduler_output = SchedulerOutput(requests=[scheduler_request], batch_data=None)
+
+    batch_result = temporal_runner.prepare_and_forward(
+        forward_batch,
+        schedule_batch,
+        [scheduler_request],
+        is_prefill=True,
+    )
+
+    assert not batch_result.can_run_cuda_graph
+    assert isinstance(batch_result.logits_output, Qwen3ASRTemporalLogitsProcessorOutput)
+    assert batch_result.logits_output.temporal_verification is not None
+    assert batch_result.logits_output.temporal_verification.accepted_prefix == (
+        candidate_token_ids
+    )
+    assert lm_head.invocation_count == 1
+    assert lm_head.selected_rows == [2, 3, 4]
+    assert len(eager_batches) == 1
+    assert eager_batches[0] is not forward_batch
+    assert eager_batches[0].input_ids is forward_batch.input_ids
+    assert len(graph_executions) == 1
+    assert get_temporal_forward_inputs(eager_batches[0]) is None
+
+    temporal_runner.post_prefill(
+        batch_result,
+        forward_batch,
+        schedule_batch,
+        [scheduler_request],
+    )
+    assert batch_result.next_token_ids is not None
+    assert batch_result.next_token_ids.tolist() == [2]
+    temporal_runner.publish_next_tokens(
+        batch_result,
+        forward_batch,
+        schedule_batch,
+        [scheduler_request],
+    )
+    assert published_next_token_ids == [None]
+
+    finalized_output = temporal_runner.finalize(
+        batch_result,
+        forward_batch,
+        schedule_batch,
+        scheduler_output,
+    )
+    assert finalized_output.outputs[request_id].data is None
+    assert finalized_output.next_token_ids is not None
+    assert finalized_output.next_token_ids.tolist() == [2]
+    scheduler_result = Qwen3ASRTemporalScheduler.make_batch_result(finalized_output)
+    assert isinstance(scheduler_result, Qwen3ASRTemporalBatchResult)
+    assert scheduler_result.temporal_verification.request_id == request_id
+    assert scheduler_result.native_result.next_token_ids is not None
+    assert scheduler_result.native_result.next_token_ids.tolist() == [2]
+
+    ordinary_after = forward_raw(
+        make_forward_batch(torch.tensor([11], dtype=torch.long)),
+        pp_proxy_tensors=None,
+    )
+    assert ordinary_after.can_run_graph
+    assert len(graph_executions) == 2
+    assert native_graph_checks[-1] is not forward_batch
 
 
 def test_retracted_request_rebuilds_mrope_from_the_canonical_prompt() -> None:
