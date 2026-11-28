@@ -1500,7 +1500,7 @@ async def test_invalid_utf8_text_does_not_announce_private_preparation() -> None
         dialog,
         [
             transcript_chunk("question", True),
-            *speech_pieces(['{"text": "Hello \\ud800', '"}'])[:-1],
+            *speech_pieces(['{"text": "Hello \\ud800', '"}']),
         ],
     )
     assert not any(
