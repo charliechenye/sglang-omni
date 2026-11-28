@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TypeAlias
@@ -580,7 +581,7 @@ def build_talker(
         builder = Qwen3TtsEngineBuilder(leading_silence_mask_frames=0)
         scheduler = builder.build(
             str(model_path),
-            device=str(device),
+            device=device.type,
             gpu_id=device.index or 0,
             dtype="bfloat16",
             server_args_overrides={
@@ -2453,6 +2454,7 @@ def main() -> int:
             failure["failure_rows"] = [error.context]
         if not arguments.out.exists() and not review_path.exists():
             write_json_atomic(review_path, failure)
+        traceback.print_exc()
         print(json.dumps(failure, sort_keys=True), file=sys.stderr)
         return 1
     else:

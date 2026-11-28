@@ -259,7 +259,7 @@ def main() -> int:
     builder = Qwen3TtsEngineBuilder(leading_silence_mask_frames=0)
     scheduler = builder.build(
         str(model_path),
-        device=str(device),
+        device=device.type,
         gpu_id=0,
         dtype="bfloat16",
         server_args_overrides={
