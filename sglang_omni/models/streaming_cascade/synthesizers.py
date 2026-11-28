@@ -161,20 +161,18 @@ class OpenAISpeechSynthesizerConfig(ComponentConfig):
 class PreparedSpeech:
     """One private speech request and its bounded processed-PCM handoff."""
 
-    call_id: str
-    text: str
     request_body: dict[str, object]
     sample_iterator: AsyncIterator[np.ndarray]
-    samples: asyncio.Queue[np.ndarray | Exception | None] = field(
+    samples: asyncio.Queue[np.ndarray] = field(
         default_factory=lambda: asyncio.Queue(maxsize=1)
     )
-    task: asyncio.Task[None] = field(init=False)
+    task: asyncio.Task[httpx.HTTPError | ValueError | None] = field(init=False)
     is_authorized: bool = False
 
     def __post_init__(self) -> None:
         self.task = asyncio.create_task(self.produce())
 
-    async def produce(self) -> None:
+    async def produce(self) -> httpx.HTTPError | ValueError | None:
         try:
             async with aclosing(self.sample_iterator):
                 async for samples in self.sample_iterator:
@@ -182,25 +180,60 @@ class PreparedSpeech:
                         await self.samples.put(samples)
                     else:
                         pass
-            await self.samples.put(None)
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            await self.samples.put(error)
-            if isinstance(error, (httpx.HTTPError, ValueError)):
-                pass
+        except (httpx.HTTPError, ValueError) as error:
+            return error
+        return None
+
+    async def next_sample(
+        self,
+    ) -> np.ndarray | httpx.HTTPError | ValueError | None:
+        sample_task = asyncio.create_task(self.samples.get())
+        try:
+            await asyncio.wait(
+                {sample_task, self.task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if self.task.done():
+                result = self.task.result()
+                if result is not None:
+                    return result
+                elif sample_task.done():
+                    return sample_task.result()
+                elif not self.samples.empty():
+                    return self.samples.get_nowait()
+                else:
+                    return None
             else:
-                raise
+                return sample_task.result()
+        finally:
+            if not sample_task.done():
+                sample_task.cancel()
+                await asyncio.wait({sample_task})
+            else:
+                pass
+
+    async def samples_after(
+        self, first_sample: np.ndarray
+    ) -> AsyncIterator[np.ndarray]:
+        yield first_sample
+        while True:
+            sample = await self.next_sample()
+            if sample is None:
+                return
+            elif isinstance(sample, np.ndarray):
+                yield sample
+            else:
+                raise sample
 
     async def close(self) -> None:
-        if not self.task.done():
+        if not self.task.done() and not self.task.cancelling():
             self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
         else:
-            await self.task
+            pass
+        await asyncio.wait({self.task})
+        if self.task.cancelled():
+            return
+        else:
+            self.task.result()
 
 
 class TurnSpeaker(Replier):
@@ -482,36 +515,8 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
         sentence: str,
         language: str | None,
         style: str | None,
-        prepared_speech: PreparedSpeech | None = None,
     ) -> AsyncIterator[np.ndarray]:
         request_body = self.speech_request_body(sentence, language, style)
-        if prepared_speech is not None:
-            if (
-                prepared_speech.request_body == request_body
-                and prepared_speech.is_authorized
-            ):
-                first_sample = await prepared_speech.samples.get()
-                if isinstance(first_sample, np.ndarray):
-                    yield first_sample
-                    while True:
-                        sample = await prepared_speech.samples.get()
-                        if sample is None:
-                            break
-                        elif isinstance(sample, np.ndarray):
-                            yield sample
-                        else:
-                            raise sample
-                    return
-                elif first_sample is None or isinstance(
-                    first_sample, (httpx.HTTPError, ValueError)
-                ):
-                    await prepared_speech.close()
-                else:
-                    raise first_sample
-            else:
-                await prepared_speech.close()
-        else:
-            pass
         async with aclosing(self.http_samples(request_body)) as samples_iterator:
             async for samples in samples_iterator:
                 yield samples
@@ -581,19 +586,13 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
             async for chunk in deltas:
                 if chunk.format == TOOL_CALL and PRIVATE_SPEECH_CLOSED in chunk.payload:
                     [call] = tool_calls_of(chunk)
-                    arguments = (
-                        call.arguments if isinstance(call.arguments, dict) else {}
-                    )
-                    candidate = arguments.get("text")
+                    candidate = call.arguments["text"]
                     if (
                         self.config.prepare_closed_speech
                         and chunk.turn == turn
                         and text_end == 0
                         and not self.config.skip_screen_blocks
                         and not self.config.styles
-                        and arguments.keys() == {"text"}
-                        and isinstance(candidate, str)
-                        and candidate.strip()
                         and sentence_end(candidate, self.config.max_sentence_words)
                         is None
                         and sentence_end(
@@ -614,8 +613,6 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
                                 sentence, language, None
                             )
                             prepared_speech = PreparedSpeech(
-                                call_id=call.id,
-                                text=candidate,
                                 request_body=request_body,
                                 sample_iterator=self.http_samples(request_body),
                             )
@@ -628,18 +625,10 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
                     and PRIVATE_SPEECH_AUTHORIZED in chunk.payload
                 ):
                     if prepared_speech is not None:
-                        [call] = tool_calls_of(chunk)
                         prepared_speech.is_authorized = (
                             chunk.payload[PRIVATE_SPEECH_AUTHORIZED] is True
                             and chunk.turn == turn
-                            and call.id == prepared_speech.call_id
-                            and call.arguments == {"text": prepared_speech.text}
                         )
-                        if not prepared_speech.is_authorized:
-                            await prepared_speech.close()
-                            prepared_speech = None
-                        else:
-                            pass
                     else:
                         pass
                 else:
@@ -679,12 +668,28 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
                         for text_start, delta_style in reversed(delta_styles)
                         if text_start <= spoken_start
                     )
-                    if prepared_speech is None:
-                        samples_iterator = self.speak(sentence, language, style)
-                    else:
-                        samples_iterator = self.speak(
-                            sentence, language, style, prepared_speech
+                    samples_iterator = self.speak(sentence, language, style)
+                    if prepared_speech is not None:
+                        request_body = self.speech_request_body(
+                            sentence, language, style
                         )
+                        if (
+                            prepared_speech.is_authorized
+                            and prepared_speech.request_body == request_body
+                        ):
+                            first_sample = await prepared_speech.next_sample()
+                            if isinstance(first_sample, np.ndarray):
+                                samples_iterator = prepared_speech.samples_after(
+                                    first_sample
+                                )
+                            else:
+                                await prepared_speech.close()
+                                prepared_speech = None
+                        else:
+                            await prepared_speech.close()
+                            prepared_speech = None
+                    else:
+                        pass
                     async with aclosing(samples_iterator):
                         async for samples in samples_iterator:
                             if is_pause_due:

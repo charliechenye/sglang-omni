@@ -266,27 +266,6 @@ class SpokenTextReader:
             self.is_validly_closed = False
         self.read_end = end
 
-    def is_single_text_object(self, text: str) -> bool:
-        """Whether the accumulated arguments are exactly one valid text field."""
-        if not self.is_validly_closed or self.read_end is None:
-            return False
-        else:
-            pass
-        match = SINGLE_TEXT_VALUE_START.match(self.raw)
-        if (
-            match is None
-            or self.raw[self.read_end : self.read_end + 1] != '"'
-            or self.raw[self.read_end + 1 :].strip() != "}"
-        ):
-            return False
-        else:
-            pass
-        try:
-            arguments = json.loads(self.raw)
-        except json.JSONDecodeError:
-            return False
-        return isinstance(arguments, dict) and arguments == {"text": text}
-
 
 class DialogConfig(ComponentConfig):
     """Conversation history; one messages chunk per answered utterance.
@@ -592,18 +571,19 @@ class Dialog(StreamComponent):
         assert self.reply is not None
         if self.speech is not None and self.speech.is_streaming:
             speech = self.speech
-            first_call = calls[0] if calls else None
-            is_preparation_authorized = (
-                self.prepare_closed_speech
-                and not is_truncated
-                and len(calls) == 1
-                and first_call is not None
-                and self.text_reader is not None
-                and self.text_reader.is_single_text_object(speech.text)
-                and first_call.id == speech.call_id
-                and first_call.name == self.config.speech_tool
-                and first_call.arguments == {"text": speech.text}
-            )
+            is_preparation_authorized = False
+            if speech.has_notified_preparation and not is_truncated and len(calls) == 1:
+                [first_call] = calls
+                reader = self.text_reader
+                assert reader is not None and reader.read_end is not None
+                is_preparation_authorized = (
+                    first_call.id == speech.call_id
+                    and first_call.name == self.config.speech_tool
+                    and reader.raw[reader.read_end + 1 :].strip() == "}"
+                    and first_call.arguments == {"text": speech.text}
+                )
+            else:
+                pass
             self.text_reader = None
             self.finish_streamed_speech(
                 calls,
@@ -726,9 +706,9 @@ class Dialog(StreamComponent):
             and SINGLE_TEXT_VALUE_START.match(reader.raw) is not None
             and reader.read_end is not None
             and reader.raw[reader.read_end + 1 :].strip() in ("", "}")
+            and call.id == speech.call_id
             and candidate == speech.text
             and bool(candidate.strip())
-            and len(candidate) <= self.config.max_text_chars
         )
         if is_valid_candidate:
             try:
@@ -804,7 +784,7 @@ class Dialog(StreamComponent):
         final = tool_call_chunk(
             [spoken], self.reply_turn, self.language, is_truncated=is_truncated
         )
-        if self.prepare_closed_speech:
+        if speech.has_notified_preparation:
             final.payload[PRIVATE_SPEECH_AUTHORIZED] = is_preparation_authorized
         else:
             pass
