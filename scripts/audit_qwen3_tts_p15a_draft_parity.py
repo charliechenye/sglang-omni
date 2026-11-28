@@ -1,0 +1,396 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
+"""Compare the P16 draft path with the pinned P14/P15A runtime on P12 contexts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import torch
+
+from scripts import validate_qwen3_tts_p16_integration as p16
+from scripts.qwen3_tts_p15a_parity_reference import (
+    P15A_KERNEL_SOURCE_COMMIT,
+    P15A_SOURCE_COMMIT,
+    ReferenceDraft,
+    distribution_delta,
+    load_p15a_grouped_head_module,
+    load_p15a_radix_module,
+    load_p15a_references,
+    summarize_deltas,
+)
+from sglang_omni.models.qwen3_tts.speculative_draft import load_p16_draft_checkpoint
+from sglang_omni.utils.predictor_grouped_heads import grouped_lm_head_warp_accumulate
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--draft", type=Path, required=True)
+    parser.add_argument("--p12-root", type=Path, required=True)
+    parser.add_argument("--p15a-source-root", type=Path, required=True)
+    parser.add_argument("--frames", type=int, choices=(4, 128), required=True)
+    parser.add_argument("--seeds", type=int, choices=(1, 4), required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    if arguments.out.exists() or not arguments.out.is_absolute():
+        raise ValueError("--out must be a new absolute path")
+    else:
+        pass
+    if not torch.cuda.is_available():
+        raise RuntimeError("P15A draft numerical parity requires CUDA")
+    else:
+        pass
+    model_path = arguments.model.resolve(strict=True)
+    draft_path = arguments.draft.resolve(strict=True)
+    device = p16.require_h200()
+    model_identity = p16.model_identity(model_path)
+    _, cohort, cohort_sha, cohort_identity = p16.validation_rows(
+        arguments.p12_root,
+        model_identity,
+        arguments.frames,
+        arguments.seeds,
+    )
+    fused_width_module, head_runtime_module, source_identity = load_p15a_references(
+        arguments.p15a_source_root.resolve(strict=True)
+    )
+    radix_module, radix_identity = load_p15a_radix_module(p16.REPOSITORY_ROOT)
+    grouped_head_module, grouped_head_identity = load_p15a_grouped_head_module(
+        p16.REPOSITORY_ROOT
+    )
+    checkpoint = load_p16_draft_checkpoint(draft_path, p16.P16_DRAFT_SHA256)
+    scheduler, talker = p16.build_talker(
+        model_path,
+        device,
+        enabled=True,
+        draft_path=draft_path,
+        max_running_requests=1,
+    )
+    try:
+        production_draft = talker.code_predictor_p16_draft
+        projected_tables = talker.predictor_projected_embeddings
+        if production_draft is None or projected_tables is None:
+            raise RuntimeError(
+                "P16 draft weights or projected codec tables are missing"
+            )
+        else:
+            pass
+        reference_net = ReferenceDraft().to(device="cpu", dtype=torch.float32)
+        with torch.no_grad():
+            for name, value in (
+                ("hidden_scale", checkpoint.weights["hidden_scale"]),
+                ("embed_scale", checkpoint.weights["embed_scale"]),
+                ("in_proj.weight", checkpoint.weights["in_proj.weight"]),
+                ("in_proj.bias", checkpoint.weights["in_proj.bias"]),
+                ("out_proj.weight", checkpoint.weights["out_proj.weight"]),
+                ("out_proj.bias", checkpoint.weights["out_proj.bias"]),
+            ):
+                if name == "hidden_scale":
+                    reference_net.hidden_scale.copy_(value)
+                elif name == "embed_scale":
+                    reference_net.embed_scale.copy_(value)
+                elif name == "in_proj.weight":
+                    reference_net.in_proj.weight.copy_(value)
+                elif name == "in_proj.bias":
+                    reference_net.in_proj.bias.copy_(value)
+                elif name == "out_proj.weight":
+                    reference_net.out_proj.weight.copy_(value)
+                else:
+                    reference_net.out_proj.bias.copy_(value)
+            else:
+                pass
+        reference_draft = fused_width_module.FusedWidth(reference_net, projected_tables)
+        transformed = {
+            "folded_hidden_weight": (
+                production_draft.hidden_weight,
+                reference_draft.wh,
+            ),
+            "folded_output_weight": (
+                production_draft.output_weight,
+                reference_draft.wo,
+            ),
+            "folded_output_bias": (
+                production_draft.output_bias,
+                reference_draft.bo,
+            ),
+            "embedding_depth_lut": (
+                production_draft.embedding_depth_lut,
+                reference_draft.table.reshape_as(production_draft.embedding_depth_lut),
+            ),
+        }
+        transform_metrics: dict[str, dict[str, float | int | bool]] = {}
+        for name, (actual, expected) in transformed.items():
+            difference = (actual.float() - expected.float()).abs()
+            transform_metrics[name] = {
+                "exact": torch.equal(actual, expected),
+                "equal_elements": int(torch.count_nonzero(actual == expected)),
+                "elements": actual.numel(),
+                "max_abs": float(difference.max()),
+            }
+        else:
+            pass
+
+        heads = talker.code_predictor_spec_lm_head_weights
+        if heads is None:
+            raise RuntimeError("packed Predictor LM-head weights are missing")
+        else:
+            pass
+        reference_head = object.__new__(head_runtime_module.HeadRuntime)
+        reference_head.radix = (
+            radix_module.build_speculative_probability_candidates_radix
+        )
+        reference_head.ones = torch.ones(5, device=device, dtype=torch.bool)
+        reference_head.temps = torch.full((5,), 0.9, device=device, dtype=torch.float32)
+        reference_head.topk = torch.full((5,), 50, device=device, dtype=torch.long)
+        reference_head.topp = torch.ones(5, device=device, dtype=torch.float32)
+
+        totals = {
+            "mlp_steps": 0,
+            "mlp_exact": 0,
+            "draft_logits": 0,
+            "draft_logits_exact": 0,
+            "candidate_probability_exact": 0,
+            "proposal_chain_max_width": 0,
+            "depths": set(),
+            "mlp_max_abs": 0.0,
+            "draft_logits_max_abs": 0.0,
+            "candidate_split_vs_p15a_radix_same_logits": [],
+            "p15a_radix_candidate_vs_reference": [],
+            "production_split_vs_p15a_reference": [],
+        }
+        audit_capture = p16.P16AuditCapture()
+        for frame in cohort:
+            for repeat in range(arguments.seeds):
+                seed = p16.seed_for(frame.uid, frame.ordinal, repeat)
+                request = p16.create_request(
+                    f"p15a:{frame.uid}:{frame.ordinal}:{seed}", seed
+                )
+                _, _, captured, _ = p16.capture_frame(
+                    talker, frame, request, seed, audit_capture
+                )
+                if captured.opening is None:
+                    raise RuntimeError("P16 proposal trace has no opening context")
+                else:
+                    pass
+                round_start = (
+                    p16.tensor_field(captured.opening, "preceding_hidden")
+                    .to(device=device, dtype=torch.bfloat16)
+                    .contiguous()
+                )
+                for record in captured.rounds:
+                    depth = p16.integer_field(record, "round_depth")
+                    proposal_tokens = p16.tensor_field(record, "proposal_tokens").to(
+                        device=device, dtype=torch.long
+                    )
+                    proposal_logits = p16.tensor_field(record, "proposal_logits").to(
+                        device=device, dtype=torch.bfloat16
+                    )
+                    pending = p16.tensor_field(record, "pending_tokens").to(
+                        device=device, dtype=torch.long
+                    )
+                    width = int(proposal_tokens.shape[1])
+                    totals["proposal_chain_max_width"] = max(
+                        totals["proposal_chain_max_width"], width
+                    )
+                    for proposal_index in range(width):
+                        proposal_depth = depth + proposal_index
+                        totals["depths"].add(proposal_depth)
+                        token = (
+                            pending
+                            if proposal_index == 0
+                            else proposal_tokens[:, proposal_index - 1]
+                        )
+                        candidate_hidden = production_draft.step(
+                            round_start,
+                            token,
+                            proposal_depth,
+                        ).clone()
+                        token_id = token.contiguous()
+                        depth_tensor = torch.tensor(
+                            [proposal_depth], device=device, dtype=torch.long
+                        )
+                        reference_hidden = reference_draft(
+                            round_start.contiguous(),
+                            token_id,
+                            depth_tensor,
+                        ).clone()
+                        hidden_difference = (
+                            candidate_hidden.float() - reference_hidden.float()
+                        ).abs()
+                        totals["mlp_steps"] += 1
+                        totals["mlp_exact"] += int(
+                            torch.equal(candidate_hidden, reference_hidden)
+                        )
+                        totals["mlp_max_abs"] = max(
+                            totals["mlp_max_abs"], float(hidden_difference.max())
+                        )
+                        head_index = torch.tensor(
+                            [proposal_depth], device=device, dtype=torch.long
+                        )
+                        active = torch.ones(1, device=device, dtype=torch.bool)
+                        candidate_logits = grouped_lm_head_warp_accumulate(
+                            candidate_hidden,
+                            heads,
+                            None,
+                            head_index,
+                            active,
+                        )
+                        reference_logits = grouped_head_module.grouped_lm_head_linear(
+                            reference_hidden,
+                            heads,
+                            None,
+                            head_index,
+                            active,
+                            backend="warp_accumulate",
+                        )
+                        recorded_logits = proposal_logits[
+                            proposal_index : proposal_index + 1
+                        ].contiguous()
+                        if not torch.equal(candidate_logits, recorded_logits):
+                            raise RuntimeError(
+                                "replayed P16 draft logits differ from captured proposal logits"
+                            )
+                        else:
+                            pass
+                        logit_difference = (
+                            candidate_logits.float() - reference_logits.float()
+                        ).abs()
+                        totals["draft_logits"] += candidate_logits.numel()
+                        totals["draft_logits_exact"] += int(
+                            torch.count_nonzero(candidate_logits == reference_logits)
+                        )
+                        totals["draft_logits_max_abs"] = max(
+                            totals["draft_logits_max_abs"],
+                            float(logit_difference.max()),
+                        )
+                        candidate_split, candidate_split_ids = (
+                            p16.build_compact_probabilities(candidate_logits)
+                        )
+                        captured_probabilities = p16.tensor_field(
+                            record, "proposal_probabilities"
+                        )[proposal_index : proposal_index + 1].to(device=device)
+                        captured_ids = p16.tensor_field(record, "proposal_token_ids")[
+                            proposal_index : proposal_index + 1
+                        ].to(device=device)
+                        if not torch.equal(candidate_split, captured_probabilities):
+                            raise RuntimeError(
+                                "split probability replay differs from the captured production proposal"
+                            )
+                        else:
+                            pass
+                        totals["candidate_probability_exact"] += 1
+                        candidate_radix, candidate_radix_ids = reference_head.compact(
+                            candidate_logits.contiguous()
+                        )
+                        reference_radix, reference_radix_ids = reference_head.compact(
+                            reference_logits.contiguous()
+                        )
+                        totals["candidate_split_vs_p15a_radix_same_logits"].append(
+                            distribution_delta(
+                                candidate_split,
+                                candidate_split_ids,
+                                candidate_radix,
+                                candidate_radix_ids,
+                                p16.P16_VOCAB_SIZE,
+                            )
+                        )
+                        totals["p15a_radix_candidate_vs_reference"].append(
+                            distribution_delta(
+                                candidate_radix,
+                                candidate_radix_ids,
+                                reference_radix,
+                                reference_radix_ids,
+                                p16.P16_VOCAB_SIZE,
+                            )
+                        )
+                        totals["production_split_vs_p15a_reference"].append(
+                            distribution_delta(
+                                candidate_split,
+                                candidate_split_ids,
+                                reference_radix,
+                                reference_radix_ids,
+                                p16.P16_VOCAB_SIZE,
+                            )
+                        )
+                        round_start = candidate_hidden
+                    else:
+                        pass
+                    round_start = (
+                        p16.tensor_field(record, "preceding_hidden")
+                        .to(device=device, dtype=torch.bfloat16)
+                        .contiguous()
+                    )
+                else:
+                    pass
+                audit_capture.release(captured)
+            else:
+                pass
+        else:
+            pass
+        if set(totals["depths"]) != set(range(1, 15)):
+            raise RuntimeError(
+                f"P12 cohort did not cover every proposal depth: {sorted(totals['depths'])}"
+            )
+        elif totals["proposal_chain_max_width"] < 2:
+            raise RuntimeError("P12 cohort did not exercise chained draft proposals")
+        else:
+            pass
+
+        output = {
+            "schema": "qtts-p15a-draft-parity-v1",
+            "status": "P15A_DRAFT_PARITY_AUDIT",
+            "candidate_sha": p16.current_git_sha(),
+            "reference": {
+                "sglang_scripts_commit": P15A_SOURCE_COMMIT,
+                "source_sha256": source_identity,
+                "kernel_source_commit": P15A_KERNEL_SOURCE_COMMIT,
+                "radix_kernel": radix_identity,
+                "grouped_head_kernel": grouped_head_identity,
+            },
+            "model_revision": p16.P16_MODEL_REVISION,
+            "draft_sha256": p16.P16_DRAFT_SHA256,
+            "cohort_sha256": cohort_sha,
+            "cohort_identity": cohort_identity,
+            "proposal_depths": sorted(totals["depths"]),
+            "proposal_chain_max_width": totals["proposal_chain_max_width"],
+            "transformed_weights": transform_metrics,
+            "mlp": {
+                "steps": totals["mlp_steps"],
+                "exact_steps": totals["mlp_exact"],
+                "max_abs": totals["mlp_max_abs"],
+            },
+            "draft_logits": {
+                "elements": totals["draft_logits"],
+                "exact_elements": totals["draft_logits_exact"],
+                "max_abs": totals["draft_logits_max_abs"],
+            },
+            "probabilities": {
+                "production_builder": "split_top_k",
+                "p15a_builder": "radix_compact",
+                "candidate_split_replayed_rows": totals["candidate_probability_exact"],
+                "split_vs_p15a_radix_same_logits": summarize_deltas(
+                    totals["candidate_split_vs_p15a_radix_same_logits"]
+                ),
+                "p15a_radix_candidate_vs_reference_logits": summarize_deltas(
+                    totals["p15a_radix_candidate_vs_reference"]
+                ),
+                "production_split_vs_p15a_reference": summarize_deltas(
+                    totals["production_split_vs_p15a_reference"]
+                ),
+            },
+        }
+        arguments.out.parent.mkdir(parents=True, exist_ok=True)
+        arguments.out.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")
+    finally:
+        p16.close_runtime(scheduler)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

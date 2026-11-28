@@ -5,11 +5,11 @@
 from __future__ import annotations
 
 import argparse
-import ast
 import gc
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -579,6 +579,7 @@ def build_talker(
     *,
     enabled: bool,
     draft_path: Path | None = None,
+    max_running_requests: int = 1,
 ) -> tuple[OmniScheduler[Qwen3TTSSGLangRequestData], Qwen3TTSTalker]:
     variable_names = (
         P16_ENABLE_ENV,
@@ -613,8 +614,9 @@ def build_talker(
             dtype="bfloat16",
             server_args_overrides={
                 "tp_size": 1,
-                "max_running_requests": 4,
+                "max_running_requests": max_running_requests,
                 "max_queued_requests": 4,
+                "cuda_graph_max_bs": max_running_requests,
                 "disable_cuda_graph": False,
                 "disable_overlap_schedule": True,
                 "enable_torch_compile": False,
@@ -715,32 +717,6 @@ def run_native_incremental(
     )
     torch.cuda.synchronize(talker.predictor_device)
     return codes.detach().cpu().clone(), summed_embeddings.detach().cpu().clone()
-
-
-def upstream_native_incremental_matches() -> bool:
-    """Check that the independent native replay method is unchanged from main."""
-    relative_path = "sglang_omni/models/qwen3_tts/sglang_model.py"
-    candidate_source = Path(relative_path).read_text(encoding="utf-8")
-    upstream_source = subprocess.check_output(
-        ["git", "show", f"{P16_UPSTREAM_BASE_SHA}:{relative_path}"], text=True
-    )
-
-    def method_source(source: str) -> str | None:
-        tree = ast.parse(source)
-        for class_node in (
-            node for node in tree.body if isinstance(node, ast.ClassDef)
-        ):
-            for node in class_node.body:
-                if (
-                    isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                    and node.name == "code_predictor_forward_incremental"
-                ):
-                    return ast.get_source_segment(source, node)
-                else:
-                    pass
-        return None
-
-    return method_source(candidate_source) == method_source(upstream_source)
 
 
 def build_compact_probabilities(
@@ -1569,26 +1545,54 @@ def audit_sequential_reference(
 def run_native_controls(
     talker: Qwen3TTSTalker,
     validation_frames: list[ValidationFrame],
-    seed: int,
-) -> dict[str, bool]:
-    first_frame = validation_frames[0]
-    request_id = f"p16-control:{first_frame.uid}:{first_frame.ordinal}:{seed}"
-    off_request = create_request(request_id, seed)
-    upstream_codes, upstream_embedding = run_native_incremental(
-        talker, [first_frame], [off_request]
+    seed_count: int,
+) -> tuple[dict[str, JsonValue], torch.Tensor, torch.Tensor]:
+    codes: list[torch.Tensor] = []
+    feedback: list[torch.Tensor] = []
+    graph_stats_before = talker.predictor_graph_stats()
+    repeatability_exact = True
+    incremental_exact = True
+    for frame_index, frame in enumerate(validation_frames):
+        for repeat in range(seed_count):
+            seed = seed_for(frame.uid, frame.ordinal, repeat)
+            request = create_request(
+                f"p16-control:{frame.uid}:{frame.ordinal}:{seed}", seed
+            )
+            public_codes, public_feedback = run_public_predictor(
+                talker, [frame], [request]
+            )
+            native_codes, native_feedback = run_native_incremental(
+                talker, [frame], [request]
+            )
+            incremental_exact = (
+                torch.equal(public_codes, native_codes)
+                and torch.equal(public_feedback, native_feedback)
+                and incremental_exact
+            )
+            codes.append(public_codes[0].clone())
+            feedback.append(public_feedback[0].clone())
+            if frame_index == 0 and repeat == 0:
+                repeated_codes, repeated_feedback = run_public_predictor(
+                    talker, [frame], [request]
+                )
+                repeatability_exact = torch.equal(
+                    public_codes, repeated_codes
+                ) and torch.equal(public_feedback, repeated_feedback)
+            else:
+                pass
+        else:
+            pass
+    else:
+        pass
+    graph_stats_after = talker.predictor_graph_stats()
+    graph_replay_delta = graph_stats_after["replays"] - graph_stats_before["replays"]
+    graph_eager_delta = (
+        graph_stats_after["eager_runs"] - graph_stats_before["eager_runs"]
     )
-    off_codes, off_embedding = run_public_predictor(
-        talker, [first_frame], [off_request]
-    )
-    repeated_codes, repeated_embedding = run_public_predictor(
-        talker, [first_frame], [off_request]
-    )
-    default_off_exact = (
-        upstream_native_incremental_matches()
-        and torch.equal(off_codes, upstream_codes)
-        and torch.equal(off_embedding, upstream_embedding)
-        and torch.equal(off_codes, repeated_codes)
-        and torch.equal(off_embedding, repeated_embedding)
+    candidate_graph_exact = (
+        graph_stats_after["enabled"] is True
+        and graph_replay_delta == len(codes) + 1
+        and graph_eager_delta == 0
     )
     off_no_draft_allocation = (
         talker.code_predictor_p16_draft is None
@@ -1605,18 +1609,221 @@ def run_native_controls(
         and not talker.code_predictor_spec_opening_graphs
     )
     require(
-        default_off_exact,
-        "default_off_exact",
-        "candidate OFF output differs from the source-identical upstream incremental native path",
-    )
-    require(
         off_no_draft_allocation,
         "off_no_draft_allocation",
         "P16 resources were allocated while OFF",
     )
-    return {
-        "default_off_exact": default_off_exact,
-        "off_no_draft_allocation": off_no_draft_allocation,
+    return (
+        {
+            "candidate_native_graph_matches_incremental": incremental_exact,
+            "candidate_repeatability_exact": repeatability_exact,
+            "candidate_native_graph_replayed": candidate_graph_exact,
+            "off_no_draft_allocation": off_no_draft_allocation,
+        },
+        torch.stack(codes),
+        torch.stack(feedback),
+    )
+
+
+def native_reference_samples(
+    frames: list[ValidationFrame], seed_count: int
+) -> list[dict[str, JsonValue | torch.Tensor]]:
+    samples: list[dict[str, JsonValue | torch.Tensor]] = []
+    for frame in frames:
+        for repeat in range(seed_count):
+            seed = seed_for(frame.uid, frame.ordinal, repeat)
+            samples.append(
+                {
+                    "request_id": f"p16-control:{frame.uid}:{frame.ordinal}:{seed}",
+                    "uid": frame.uid,
+                    "ordinal": frame.ordinal,
+                    "seed": seed,
+                    "code0": frame.code0,
+                    "hidden": frame.hidden.detach().cpu().clone(),
+                }
+            )
+        else:
+            pass
+    else:
+        pass
+    return samples
+
+
+def write_torch_atomic(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        torch.save(value, temporary_path)
+        with temporary_path.open("rb") as output:
+            os.fsync(output.fileno())
+        os.replace(temporary_path, path)
+        directory_descriptor = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_descriptor)
+        finally:
+            os.close(directory_descriptor)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def run_upstream_native_reference(
+    model_path: Path,
+    input_artifact: Path,
+    output_artifact: Path,
+) -> dict[str, object]:
+    """Run pinned upstream native Predictor code in an isolated checkout."""
+    checkout_root = Path(tempfile.mkdtemp(prefix="qtts-p16-upstream-")).resolve()
+    checkout = checkout_root / "sglang-omni"
+    helper_source = REPOSITORY_ROOT / "scripts/qwen3_tts_p16_native_reference.py"
+    environment = os.environ.copy()
+    for name in (
+        "SGLANG_OMNI_QTTS_P16_ENABLE",
+        "SGLANG_OMNI_QTTS_P16_DRAFT_PATH",
+        "SGLANG_OMNI_QTTS_P16_DRAFT_SHA256",
+        "SGLANG_OMNI_QTTS_P16_TELEMETRY_PATH",
+        "PYTHONPATH",
+    ):
+        environment.pop(name, None)
+    else:
+        pass
+    environment["HF_HUB_OFFLINE"] = "1"
+    environment["TRANSFORMERS_OFFLINE"] = "1"
+    try:
+        subprocess.run(
+            [
+                "git",
+                "clone",
+                "--shared",
+                "--no-checkout",
+                str(REPOSITORY_ROOT),
+                str(checkout),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "--detach", P16_UPSTREAM_BASE_SHA],
+            cwd=checkout,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        helper_path = checkout / "scripts/qwen3_tts_p16_native_reference.py"
+        helper_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(helper_source, helper_path)
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(helper_path),
+                "--model",
+                str(model_path),
+                "--inputs",
+                str(input_artifact),
+                "--out",
+                str(output_artifact),
+                "--expected-commit",
+                P16_UPSTREAM_BASE_SHA,
+                "--model-revision",
+                P16_MODEL_REVISION,
+            ],
+            cwd=checkout,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            detail = (result.stdout + "\n" + result.stderr)[-8000:]
+            raise RuntimeError(
+                f"upstream native reference subprocess failed ({result.returncode}):\n{detail}"
+            )
+        else:
+            pass
+        return torch.load(output_artifact, map_location="cpu", weights_only=True)
+    finally:
+        shutil.rmtree(checkout_root, ignore_errors=True)
+
+
+def validate_native_reference(
+    reference: dict[str, object],
+    *,
+    input_identity: dict[str, JsonValue],
+    candidate_codes: torch.Tensor,
+    candidate_feedback: torch.Tensor,
+) -> tuple[bool, dict[str, JsonValue]]:
+    reference_identity = require_mapping(
+        reference.get("identity"), "native reference identity"
+    )
+    reference_metadata = require_mapping(
+        reference.get("metadata"), "native reference metadata"
+    )
+    require(
+        reference_identity == input_identity,
+        "default_off_reference_identity",
+        "upstream reference inputs differ from candidate OFF inputs",
+    )
+    require(
+        reference_metadata.get("upstream_commit") == P16_UPSTREAM_BASE_SHA
+        and reference_metadata.get("model_revision") == P16_MODEL_REVISION
+        and reference_metadata.get("cohort_sha256") == input_identity["cohort_sha256"],
+        "default_off_reference_identity",
+        "upstream reference metadata does not match the pinned validation identity",
+    )
+    graph_evidence = require_mapping(
+        reference_metadata.get("native_graph"), "upstream native graph evidence"
+    )
+    require(
+        graph_evidence.get("enabled") is True
+        and graph_evidence.get("replay_count") == len(candidate_codes)
+        and graph_evidence.get("eager_run_delta") == 0,
+        "default_off_reference_graph",
+        "upstream native reference did not replay one CUDA Graph per input",
+    )
+    reference_codes = reference.get("codes")
+    reference_feedback = reference.get("feedback")
+    require(
+        isinstance(reference_codes, torch.Tensor)
+        and isinstance(reference_feedback, torch.Tensor),
+        "default_off_reference_outputs",
+        "upstream reference did not save output code and feedback tensors",
+    )
+    records = reference_metadata.get("records")
+    require(
+        isinstance(records, list)
+        and len(records) == len(candidate_codes)
+        and all(isinstance(record, dict) for record in records),
+        "default_off_reference_outputs",
+        "upstream reference output records do not cover every candidate input",
+    )
+    for index, record in enumerate(records):
+        require(
+            record.get("codes_sha256") == hash_tensor(reference_codes[index])
+            and record.get("feedback_sha256") == hash_tensor(reference_feedback[index]),
+            "default_off_reference_outputs",
+            "upstream reference tensor hashes do not match its output artifact",
+            {"index": index},
+        )
+    else:
+        pass
+    exact = torch.equal(candidate_codes, reference_codes) and torch.equal(
+        candidate_feedback, reference_feedback
+    )
+    return exact, {
+        "upstream_commit": P16_UPSTREAM_BASE_SHA,
+        "model_revision": P16_MODEL_REVISION,
+        "cohort_sha256": input_identity["cohort_sha256"],
+        "sampling": input_identity["sampling"],
+        "graph_configuration": input_identity["graph_configuration"],
+        "native_graph": graph_evidence,
+        "records": records,
+        "codes_sha256": hash_tensor(reference_codes),
+        "feedback_sha256": hash_tensor(reference_feedback),
     }
 
 
@@ -1663,6 +1870,50 @@ def audit_unsupported_native_fallback(
         "unsupported request does not match independent native incremental replay",
     )
     return True
+
+
+def audit_capacity_four_batch_fallback(
+    model_path: Path,
+    draft_path: Path,
+    device: torch.device,
+    cohort: list[ValidationFrame],
+) -> bool:
+    scheduler, talker = build_talker(
+        model_path,
+        device,
+        enabled=True,
+        draft_path=draft_path,
+        max_running_requests=4,
+    )
+    try:
+        require(
+            talker.code_predictor_p16_enabled
+            and talker.predictor_k_cache.shape[1] == 4
+            and 4 in talker.predictor_graph_batch_sizes,
+            "capacity_four_control",
+            "B2/B4 fallback control was not constructed with capacity four",
+        )
+        for batch_size in (2, 4):
+            batch_frames = cohort[:batch_size]
+            batch_requests = [
+                create_request(
+                    f"p16-capacity-four-{batch_size}:{frame.uid}:{frame.ordinal}:{index}",
+                    seed_for(frame.uid, frame.ordinal, index),
+                )
+                for index, frame in enumerate(batch_frames)
+            ]
+            audit_unsupported_native_fallback(
+                talker,
+                batch_frames,
+                batch_requests,
+                "unsupported_batch",
+                "unsupported_batch_native_exact",
+            )
+        else:
+            pass
+        return True
+    finally:
+        close_runtime(scheduler)
 
 
 def test_request_reset_and_reuse(
@@ -1820,6 +2071,13 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
     require(
         arguments.out.is_absolute(), "receipt_path", "--out must be an absolute path"
     )
+    native_reference_path = arguments.out.with_suffix(".native-reference.pt")
+    native_reference_json_path = arguments.out.with_suffix(".native-reference.json")
+    require(
+        not native_reference_path.exists() and not native_reference_json_path.exists(),
+        "native_reference_path",
+        "refusing to overwrite an existing independent native reference artifact",
+    )
     model_path = arguments.model.resolve(strict=True)
     draft_path = arguments.draft.resolve(strict=True)
     model_identity_value = model_identity(model_path)
@@ -1857,16 +2115,94 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
         "missing draft checkpoint was accepted",
     )
 
-    off_scheduler, off_talker = build_talker(model_path, device, enabled=False)
-    off_checks = run_native_controls(
-        off_talker,
+    samples = native_reference_samples(cohort, arguments.seeds)
+    reference_identity: dict[str, JsonValue] = {
+        "upstream_commit": P16_UPSTREAM_BASE_SHA,
+        "model_revision": P16_MODEL_REVISION,
+        "model_identity": model_identity_value,
+        "cohort_sha256": cohort_sha,
+        "sampling": {
+            "do_sample": True,
+            "temperature": 0.9,
+            "top_p": 1.0,
+            "top_k": P16_MAX_TOP_K,
+        },
+        "graph_configuration": {
+            "max_running_requests": 1,
+            "cuda_graph_max_bs": 1,
+            "tp_size": 1,
+        },
+    }
+    input_artifact = {
+        "identity": reference_identity,
+        "inputs": samples,
+    }
+    with tempfile.TemporaryDirectory(prefix="qtts-p16-native-inputs-") as directory:
+        reference_inputs_path = Path(directory) / "native-inputs.pt"
+        reference_outputs_path = Path(directory) / "native-reference.pt"
+        torch.save(input_artifact, reference_inputs_path)
+        off_scheduler, off_talker = build_talker(
+            model_path,
+            device,
+            enabled=False,
+            max_running_requests=1,
+        )
+        try:
+            off_checks, candidate_off_codes, candidate_off_feedback = (
+                run_native_controls(off_talker, cohort, arguments.seeds)
+            )
+        finally:
+            close_runtime(off_scheduler)
+        del off_talker, off_scheduler
+        gc.collect()
+        torch.cuda.empty_cache()
+        native_reference = run_upstream_native_reference(
+            model_path,
+            reference_inputs_path,
+            reference_outputs_path,
+        )
+        default_off_exact, reference_metadata = validate_native_reference(
+            native_reference,
+            input_identity=reference_identity,
+            candidate_codes=candidate_off_codes,
+            candidate_feedback=candidate_off_feedback,
+        )
+        require(
+            default_off_exact,
+            "default_off_exact",
+            "candidate OFF codec or feedback outputs differ from independent upstream native execution",
+        )
+        off_checks["default_off_exact"] = default_off_exact
+        require(
+            all(value is True for value in off_checks.values()),
+            "default_off_candidate_graph",
+            f"candidate OFF native controls failed: {off_checks}",
+        )
+        native_reference_artifact = {
+            **native_reference,
+            "inputs": samples,
+        }
+        write_torch_atomic(native_reference_path, native_reference_artifact)
+        reference_metadata["artifact_sha256"] = sha256_file(native_reference_path)
+        reference_metadata["input_records"] = [
+            {
+                "request_id": sample["request_id"],
+                "uid": sample["uid"],
+                "ordinal": sample["ordinal"],
+                "seed": sample["seed"],
+                "code0": sample["code0"],
+                "hidden_sha256": hash_tensor(sample["hidden"]),
+            }
+            for sample in samples
+        ]
+        write_json_atomic(native_reference_json_path, reference_metadata)
+
+    unsupported_batch_exact = audit_capacity_four_batch_fallback(
+        model_path,
+        draft_path,
+        device,
         cohort,
-        seed_for(cohort[0].uid, cohort[0].ordinal, 0),
     )
-    close_runtime(off_scheduler)
-    del off_talker, off_scheduler
-    gc.collect()
-    torch.cuda.empty_cache()
 
     candidate_scheduler, talker = build_talker(
         model_path,
@@ -1876,6 +2212,9 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
     )
     require(
         talker.code_predictor_p16_enabled
+        and talker.predictor_max_batch_size == 1
+        and talker.predictor_graph_batch_sizes == (1,)
+        and talker.predictor_fused_layers.max_rows >= P16_VERIFY_WIDTH
         and int(talker.config.hidden_size) == P16_TALKER_HIDDEN_SIZE
         and int(talker.config.code_predictor_config.hidden_size)
         == P16_CODE_PREDICTOR_HIDDEN_SIZE
@@ -1961,28 +2300,7 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
         totals,
     )
     invalid_request_rejected = check_invalid_request(talker, first_frame, first_seed)
-    unsupported_batch_exact = True
     unsupported_fallback_frames = 0
-    for batch_size in (2, 4):
-        batch_frames = cohort[:batch_size]
-        batch_requests = [
-            create_request(
-                f"p16-unsupported-batch-{batch_size}:{frame.uid}:{frame.ordinal}:{index}",
-                seed_for(frame.uid, frame.ordinal, index),
-            )
-            for index, frame in enumerate(batch_frames)
-        ]
-        unsupported_batch_exact = (
-            audit_unsupported_native_fallback(
-                talker,
-                batch_frames,
-                batch_requests,
-                "unsupported_batch",
-                "unsupported_batch_native_exact",
-            )
-            and unsupported_batch_exact
-        )
-        unsupported_fallback_frames += len(batch_frames)
 
     unsupported_sampling_exact = True
     sampling_cases = (
@@ -2011,6 +2329,15 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
 
     frame_pair = cohort[:2]
     actual_stats = talker.predictor_speculative_stats()
+    graph_memory_within_budget = (
+        not actual_stats["graph_capture_memory_budget_exceeded"]
+        and actual_stats["graph_capture_memory_reserved_growth_bytes"]
+        <= actual_stats["graph_capture_memory_budget_bytes"]
+    )
+    graph_capture_count_bounded = (
+        actual_stats["full_round_graph_captures"] <= 14
+        and actual_stats["opening_pair_graph_captures"] <= 1
+    )
     no_cuda_errors = (
         talker.code_predictor_spec_cuda_errors == 0
         and talker.code_predictor_spec_invalid_probability_rows == 0
@@ -2054,6 +2381,8 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
             and talker.code_predictor_spec_native_fallback_count
             == unsupported_fallback_frames
         ),
+        "graph_capture_count_bounded": graph_capture_count_bounded,
+        "graph_memory_within_budget": graph_memory_within_budget,
         "request_reset_and_reuse": reuse_ok,
         "invalid_request_rejected": invalid_request_rejected,
         "checkpoint_weights_verified": talker.code_predictor_p16_draft_sha256
@@ -2089,6 +2418,7 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
             "audited_proposal_rows": totals.proposal_rows,
             "audited_rounds": totals.rounds,
             "committed_kv_exact_rounds": totals.valid_kv_rounds,
+            "predictor_graph_diagnostics": actual_stats,
             "rejections": totals.rejections,
             "bonuses": totals.bonuses,
             "w1_tail_rounds": totals.width_one_rounds,

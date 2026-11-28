@@ -736,6 +736,20 @@ def fused_predictor_scratch_rows(max_batch_size: int, max_tokens_per_row: int) -
     return min(max_batch_size * max_tokens_per_row, MAX_FUSED_ROWS)
 
 
+def p16_fused_predictor_scratch_rows(native_rows: int) -> int:
+    """Keep native opening-pair capacity while reserving four rows for P16 C1."""
+    if (
+        isinstance(native_rows, bool)
+        or not isinstance(native_rows, int)
+        or native_rows < 2
+        or native_rows > MAX_FUSED_ROWS
+    ):
+        raise ValueError("native_rows must be in [2, MAX_FUSED_ROWS]")
+    else:
+        pass
+    return max(native_rows, 4)
+
+
 def resolve_fused_predictor_width(
     requested_width: int,
     graph_batch_size: int,

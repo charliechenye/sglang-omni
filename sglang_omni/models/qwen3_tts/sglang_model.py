@@ -1307,6 +1307,15 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, PredictorSpeculativeMixin, nn.M
         self.code_predictor_spec_metadata_host: torch.Tensor | None = None
         self.code_predictor_spec_effective_width_histogram: dict[int, int] = {}
         self.code_predictor_spec_graph_memory_delta_bytes = 0
+        self.code_predictor_spec_graph_memory_allocated_baseline_bytes: int | None = (
+            None
+        )
+        self.code_predictor_spec_graph_memory_allocated_current_bytes = 0
+        self.code_predictor_spec_graph_memory_allocated_growth_bytes = 0
+        self.code_predictor_spec_graph_memory_reserved_baseline_bytes: int | None = None
+        self.code_predictor_spec_graph_memory_reserved_current_bytes = 0
+        self.code_predictor_spec_graph_memory_reserved_growth_bytes = 0
+        self.code_predictor_spec_graph_memory_budget_exceeded = False
         self.code_predictor_spec_graph_capture_time_ms = 0.0
         self.code_predictor_spec_configuration_time_ms = 0.0
         self.code_predictor_spec_fused_predictor_forward_count = 0
@@ -1378,7 +1387,10 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, PredictorSpeculativeMixin, nn.M
 
         semantic_seeds: list[int] = []
         p16_requested = self.code_predictor_spec_requested_width > 0
-        request_ids: list[str] | None = [] if p16_requested else None
+        collect_p16_metadata = (
+            p16_requested or self.code_predictor_p16_telemetry is not None
+        )
+        request_ids: list[str] | None = [] if collect_p16_metadata else None
         sub_temperatures: list[float] = []
         sub_top_ps: list[float] = []
         sub_top_ks: list[int] = []
@@ -1386,7 +1398,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, PredictorSpeculativeMixin, nn.M
         sub_do_samples: list[bool] = []
         sample_rows: list[int] = []
         sampling_parameters: list[tuple[float, float, int, bool]] | None = (
-            [] if p16_requested else None
+            [] if collect_p16_metadata else None
         )
         for row_idx, sched_req in enumerate(requests):
             data = sched_req.data
@@ -1450,7 +1462,7 @@ class Qwen3TTSTalker(Qwen3TTSPromptBuilderMixin, PredictorSpeculativeMixin, nn.M
         self.sub_has_sampled_rows = bool(sample_rows)
         self.sub_has_argmax_rows = len(sample_rows) < batch_size
         self.sub_request_ids = tuple(request_ids or ())
-        self.sub_sample_rows = tuple(sub_do_samples) if p16_requested else ()
+        self.sub_sample_rows = tuple(sub_do_samples) if collect_p16_metadata else ()
         self.sub_sampling_parameters = tuple(sampling_parameters or ())
         self.sub_sampled_has_top_p = has_top_p
         self.sub_sampled_max_top_k = max_top_k

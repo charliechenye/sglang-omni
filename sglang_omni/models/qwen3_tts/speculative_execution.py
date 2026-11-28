@@ -45,6 +45,7 @@ from sglang_omni.models.qwen3_tts.speculative_runtime import (
     speculative_opening_code_output_view,
     speculative_sampling_fallback_reason,
 )
+from sglang_omni.models.qwen3_tts.speculative_telemetry import P16GraphDiagnostics
 from sglang_omni.models.qwen3_tts.speculative_workspace import (
     PredictorGraphSignature,
     PredictorSpeculativeWorkspace,
@@ -57,13 +58,17 @@ from sglang_omni.utils.predictor_grouped_heads import (
     grouped_lm_head_warp_accumulate,
     grouped_lm_head_warp_accumulate_available,
 )
-from sglang_omni.utils.predictor_layers import resolve_fused_predictor_width
+from sglang_omni.utils.predictor_layers import (
+    FusedPredictorLayers,
+    p16_fused_predictor_scratch_rows,
+)
 
 logger = logging.getLogger("sglang_omni.models.qwen3_tts.sglang_model")
 
 _P16_VERIFY_WIDTH = 4
 _P16_TOP_K = 50
 _PREDICTOR_SPECULATIVE_GRAPH_MAX_KEYS = 14
+_PREDICTOR_SPECULATIVE_GRAPH_MEMORY_BUDGET_BYTES = 512 * 1024 * 1024
 _SPECULATIVE_WORKSPACE_MAX_TOP_K = _P16_TOP_K
 _PREDICTOR_GRAPH_WARMUP_PASSES = 2
 
@@ -121,6 +126,14 @@ class PredictorSpeculativeStats(TypedDict):
     opening_pair_graph_captures: int
     opening_pair_graph_capture_failures: int
     graph_capture_memory_delta_bytes: int
+    graph_capture_memory_allocated_baseline_bytes: int
+    graph_capture_memory_allocated_current_bytes: int
+    graph_capture_memory_allocated_growth_bytes: int
+    graph_capture_memory_reserved_baseline_bytes: int
+    graph_capture_memory_reserved_current_bytes: int
+    graph_capture_memory_reserved_growth_bytes: int
+    graph_capture_memory_budget_bytes: int
+    graph_capture_memory_budget_exceeded: bool
     graph_capture_time_ms: float
     workspace_bytes: int
     workspace_allocations: int
@@ -249,20 +262,32 @@ class PredictorSpeculativeMixin:
             return "unsupported-draft-head-layout"
         else:
             pass
-        attention = self.code_predictor.model.layers[0].self_attn
-        if (
-            resolve_fused_predictor_width(
-                4,
-                1,
-                self.predictor_fused_layers.max_rows,
-                int(attention.num_heads),
-                int(attention.num_kv_heads),
-            )
-            != 4
-        ):
-            return "insufficient-fused-predictor-capacity"
+        return None
+
+    def ensure_code_predictor_p16_fused_capacity(self) -> None:
+        """Reserve W4 rows before startup graph capture and KV pool sizing."""
+        fused_layers = self.predictor_fused_layers
+        if fused_layers is None:
+            raise RuntimeError("P16 fused Predictor layers are unavailable")
         else:
-            return None
+            pass
+        required_rows = p16_fused_predictor_scratch_rows(fused_layers.max_rows)
+        if required_rows == fused_layers.max_rows:
+            return
+        else:
+            pass
+        if self.predictor_graphs or self.predictor_graph_capture_count:
+            raise RuntimeError(
+                "P16 cannot resize fused Predictor scratch after graph capture"
+            )
+        else:
+            pass
+        self.predictor_fused_layers = FusedPredictorLayers(
+            fused_layers.shape,
+            required_rows,
+            self.predictor_device,
+            self.predictor_k_cache.dtype,
+        )
 
     def code_predictor_p16_graph_pool(self) -> DeviceGraphPool:
         """Share one bounded graph memory pool across the P16 graph set."""
@@ -321,13 +346,6 @@ class PredictorSpeculativeMixin:
         runtime_reason = self.code_predictor_p16_runtime_fallback_reason()
         if runtime_reason is not None:
             return runtime_reason
-        elif self.code_predictor_p16_enabled and self.code_predictor_p16_draft is None:
-            return "p16_draft_unavailable"
-        elif (
-            self.code_predictor_p16_enabled
-            and self.code_predictor_spec_lm_head_weights is None
-        ):
-            return "draft_head_unavailable"
         else:
             pass
         sampling_reason = speculative_sampling_fallback_reason(
@@ -346,6 +364,37 @@ class PredictorSpeculativeMixin:
             return "unsupported_sampling"
         elif self.predictor_graph_signature(batch_size, semantic_positions) is None:
             return "unsupported_graph_signature"
+        else:
+            pass
+        if self.code_predictor_p16_enabled:
+            workspace = self.code_predictor_spec_workspaces.get(
+                _SPECULATIVE_WORKSPACE_MAX_TOP_K
+            )
+            candidate_width = fused_raw_logit_block_k(_P16_TOP_K)
+            workspace_ready = (
+                workspace is not None
+                and workspace.max_batch_size >= 1
+                and workspace.max_verify_width >= _P16_VERIFY_WIDTH
+                and candidate_width is not None
+                and workspace.candidate_width >= candidate_width
+            )
+            if (
+                self.code_predictor_p16_draft is None
+                or self.code_predictor_spec_lm_head_weights is None
+                or self.predictor_fused_layers is None
+                or self.predictor_fused_layers.max_rows < _P16_VERIFY_WIDTH
+                or self.sub_speculative_seed_tensor is None
+                or self.sub_speculative_uniforms_tensor is None
+                or self.sub_speculative_rng_pool_tensor is None
+                or self.code_predictor_spec_active_workspace is None
+                or not workspace_ready
+                or self.code_predictor_spec_effective_width != _P16_VERIFY_WIDTH
+            ):
+                raise RuntimeError(
+                    "P16 eligible frame is missing configured speculative resources"
+                )
+            else:
+                pass
         else:
             pass
         return None
@@ -567,7 +616,7 @@ class PredictorSpeculativeMixin:
         run_once: SpeculativeGraphCaptureOperation,
         *,
         graph_pool: DeviceGraphPool | None = None,
-    ) -> tuple[ReplayableGraph, SpeculativeGraphCaptureOutputs, float, int]:
+    ) -> tuple[ReplayableGraph, SpeculativeGraphCaptureOutputs, float, int, int]:
         """Capture already-warmed operations on a persistent graph pool."""
         device = self.predictor_device
         module = self.predictor_device_module
@@ -583,7 +632,17 @@ class PredictorSpeculativeMixin:
         capture_stream = self.predictor_capture_stream
         current_stream = module.current_stream(device)
         capture_stream.wait_stream(current_stream)
-        memory_before = torch.cuda.memory_allocated(device)
+        memory_allocated_before = torch.cuda.memory_allocated(device)
+        memory_reserved_before = torch.cuda.memory_reserved(device)
+        if self.code_predictor_spec_graph_memory_allocated_baseline_bytes is None:
+            self.code_predictor_spec_graph_memory_allocated_baseline_bytes = (
+                memory_allocated_before
+            )
+            self.code_predictor_spec_graph_memory_reserved_baseline_bytes = (
+                memory_reserved_before
+            )
+        else:
+            pass
         capture_started = time.perf_counter()
         captured: ReplayableGraph | None = None
         capture_outputs: SpeculativeGraphCaptureOutputs = None
@@ -625,8 +684,43 @@ class PredictorSpeculativeMixin:
         else:
             pass
         elapsed_ms = (time.perf_counter() - capture_started) * 1000.0
-        memory_delta = max(torch.cuda.memory_allocated(device) - memory_before, 0)
-        return captured, capture_outputs, elapsed_ms, memory_delta
+        memory_allocated_after = torch.cuda.memory_allocated(device)
+        memory_reserved_after = torch.cuda.memory_reserved(device)
+        allocated_delta = max(memory_allocated_after - memory_allocated_before, 0)
+        reserved_delta = max(memory_reserved_after - memory_reserved_before, 0)
+        self.code_predictor_spec_graph_memory_allocated_current_bytes = (
+            memory_allocated_after
+        )
+        self.code_predictor_spec_graph_memory_reserved_current_bytes = (
+            memory_reserved_after
+        )
+        allocated_baseline = (
+            self.code_predictor_spec_graph_memory_allocated_baseline_bytes
+        )
+        reserved_baseline = (
+            self.code_predictor_spec_graph_memory_reserved_baseline_bytes
+        )
+        assert allocated_baseline is not None and reserved_baseline is not None
+        allocated_growth = max(memory_allocated_after - allocated_baseline, 0)
+        reserved_growth = max(memory_reserved_after - reserved_baseline, 0)
+        self.code_predictor_spec_graph_memory_allocated_growth_bytes = max(
+            self.code_predictor_spec_graph_memory_allocated_growth_bytes,
+            allocated_growth,
+        )
+        self.code_predictor_spec_graph_memory_reserved_growth_bytes = max(
+            self.code_predictor_spec_graph_memory_reserved_growth_bytes,
+            reserved_growth,
+        )
+        if reserved_growth > _PREDICTOR_SPECULATIVE_GRAPH_MEMORY_BUDGET_BYTES:
+            self.code_predictor_spec_graph_memory_budget_exceeded = True
+            captured.reset()
+            raise RuntimeError(
+                "P16 speculative graph memory exceeded its 512 MiB reserved-memory budget "
+                f"({reserved_growth} bytes)"
+            )
+        else:
+            pass
+        return captured, capture_outputs, elapsed_ms, allocated_delta, reserved_delta
 
     def try_replay_full_round_graph(
         self,
@@ -685,7 +779,7 @@ class PredictorSpeculativeMixin:
                         pass
                 with self.preserve_speculative_capture_state(workspace, batch_size):
                     graph_pool = self.code_predictor_p16_graph_pool()
-                    captured_graph, captured_outputs, elapsed_ms, memory_delta = (
+                    captured_graph, captured_outputs, elapsed_ms, memory_delta, _ = (
                         self.capture_code_predictor_spec_graph(
                             run_once, graph_pool=graph_pool
                         )
@@ -875,7 +969,7 @@ class PredictorSpeculativeMixin:
                     else:
                         pass
                     graph_pool = self.code_predictor_p16_graph_pool()
-                    captured_graph, _, elapsed_ms, memory_delta = (
+                    captured_graph, _, elapsed_ms, memory_delta, _ = (
                         self.capture_code_predictor_spec_graph(
                             run_once, graph_pool=graph_pool
                         )
@@ -1748,6 +1842,8 @@ class PredictorSpeculativeMixin:
         else:
             pass
 
+        self.ensure_code_predictor_p16_fused_capacity()
+
         self.sub_speculative_seed_tensor = torch.zeros(
             1, device=self.predictor_device, dtype=torch.long
         )
@@ -1818,7 +1914,48 @@ class PredictorSpeculativeMixin:
         for head_index, lm_head in enumerate(self.code_predictor.lm_head):
             packed_weights[head_index].copy_(lm_head.weight)
 
+    def predictor_speculative_graph_diagnostics(self) -> P16GraphDiagnostics:
+        graph_captures = (
+            self.code_predictor_spec_full_round_graph_capture_count
+            + self.code_predictor_spec_opening_graph_capture_count
+        )
+        return {
+            "opening_pair_graph_captures": (
+                self.code_predictor_spec_opening_graph_capture_count
+            ),
+            "full_round_graph_captures": (
+                self.code_predictor_spec_full_round_graph_capture_count
+            ),
+            "graph_captures": graph_captures,
+            "graph_capture_time_ms": self.code_predictor_spec_graph_capture_time_ms,
+            "graph_capture_memory_allocated_baseline_bytes": (
+                self.code_predictor_spec_graph_memory_allocated_baseline_bytes or 0
+            ),
+            "graph_capture_memory_allocated_current_bytes": (
+                self.code_predictor_spec_graph_memory_allocated_current_bytes
+            ),
+            "graph_capture_memory_allocated_growth_bytes": (
+                self.code_predictor_spec_graph_memory_allocated_growth_bytes
+            ),
+            "graph_capture_memory_reserved_baseline_bytes": (
+                self.code_predictor_spec_graph_memory_reserved_baseline_bytes or 0
+            ),
+            "graph_capture_memory_reserved_current_bytes": (
+                self.code_predictor_spec_graph_memory_reserved_current_bytes
+            ),
+            "graph_capture_memory_reserved_growth_bytes": (
+                self.code_predictor_spec_graph_memory_reserved_growth_bytes
+            ),
+            "graph_capture_memory_budget_bytes": (
+                _PREDICTOR_SPECULATIVE_GRAPH_MEMORY_BUDGET_BYTES
+            ),
+            "graph_capture_memory_budget_exceeded": (
+                self.code_predictor_spec_graph_memory_budget_exceeded
+            ),
+        }
+
     def predictor_speculative_stats(self) -> PredictorSpeculativeStats:
+        graph_diagnostics = self.predictor_speculative_graph_diagnostics()
         average_codes_per_round = (
             self.code_predictor_spec_committed_count
             / self.code_predictor_spec_round_count
@@ -1949,18 +2086,8 @@ class PredictorSpeculativeMixin:
                 self.code_predictor_spec_full_round_graph_capture_failure_count
                 + self.code_predictor_spec_opening_graph_capture_failure_count
             ),
-            "graph_captures": (
-                self.code_predictor_spec_full_round_graph_capture_count
-                + self.code_predictor_spec_opening_graph_capture_count
-            ),
-            "full_round_graph_captures": (
-                self.code_predictor_spec_full_round_graph_capture_count
-            ),
             "full_round_graph_capture_failures": (
                 self.code_predictor_spec_full_round_graph_capture_failure_count
-            ),
-            "opening_pair_graph_captures": (
-                self.code_predictor_spec_opening_graph_capture_count
             ),
             "opening_pair_graph_capture_failures": (
                 self.code_predictor_spec_opening_graph_capture_failure_count
@@ -1968,7 +2095,7 @@ class PredictorSpeculativeMixin:
             "graph_capture_memory_delta_bytes": (
                 self.code_predictor_spec_graph_memory_delta_bytes
             ),
-            "graph_capture_time_ms": self.code_predictor_spec_graph_capture_time_ms,
+            **graph_diagnostics,
             "workspace_bytes": workspace_bytes,
             "workspace_allocations": (
                 self.code_predictor_spec_workspace_allocation_count

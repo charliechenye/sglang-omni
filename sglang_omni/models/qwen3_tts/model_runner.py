@@ -17,7 +17,10 @@ from sglang_omni.model_runner.prefill_inputs import (
 )
 from sglang_omni.models.qwen3_omni.talker_model_runner import QwenTalkerModelRunner
 from sglang_omni.models.qwen3_tts.speculative_execution import PredictorSpeculativeStats
-from sglang_omni.models.qwen3_tts.speculative_telemetry import P16FrameTelemetry
+from sglang_omni.models.qwen3_tts.speculative_telemetry import (
+    P16FrameTelemetry,
+    P16GraphDiagnostics,
+)
 from sglang_omni.scheduling.types import (
     RequestOutput,
     SchedulerOutput,
@@ -377,10 +380,13 @@ class Qwen3TTSModelRunner(ModelRunner):
             codes_ready.record()
         else:
             pass
+        telemetry = self.model.code_predictor_p16_telemetry
         for row_idx, sched_req in enumerate(scheduler_output.requests):
             req_output = outputs[sched_req.request_id]
-            frame_telemetry = self.pending_p16_frame_telemetry.pop(
-                sched_req.request_id, None
+            frame_telemetry = (
+                self.pending_p16_frame_telemetry.pop(sched_req.request_id, None)
+                if telemetry is not None
+                else None
             )
             # note (ratish): a middle prefill chunk samples at a prompt row; SGLang drops
             # that token, so it gives no frame, feedback or stream chunk either.
@@ -393,12 +399,25 @@ class Qwen3TTSModelRunner(ModelRunner):
                 continue
             else:
                 pass
-            telemetry = self.model.code_predictor_p16_telemetry
             if telemetry is not None:
                 if frame_telemetry is None:
                     logger.error(
                         f"Qwen3-TTS frame {sched_req.request_id} has no P16 telemetry attribution"
                     )
+                    try:
+                        telemetry.record_frame(
+                            sched_req.request_id,
+                            P16FrameTelemetry(
+                                eligible=False,
+                                speculative=False,
+                                native_reason="telemetry_attribution_missing",
+                            ),
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to record missing P16 frame telemetry for request %s",
+                            sched_req.request_id,
+                        )
                 else:
                     try:
                         telemetry.record_frame(sched_req.request_id, frame_telemetry)
@@ -417,6 +436,10 @@ class Qwen3TTSModelRunner(ModelRunner):
     def on_request_finished(
         self, request_id: str, req_data: Qwen3TTSSGLangRequestData
     ) -> None:
+        if self.model.code_predictor_p16_telemetry is None:
+            return
+        else:
+            pass
         self.pending_p16_frame_telemetry.pop(request_id, None)
         self.pending_p16_finish_reasons[request_id] = (
             None
@@ -425,13 +448,21 @@ class Qwen3TTSModelRunner(ModelRunner):
         )
 
     def on_request_terminal(self, request_id: str, succeeded: bool) -> None:
-        finish_reason = self.pending_p16_finish_reasons.pop(request_id, None)
         telemetry = self.model.code_predictor_p16_telemetry
         if telemetry is None:
             return
-        elif succeeded and finish_reason not in ("abort", "error"):
+        else:
+            pass
+        self.pending_p16_frame_telemetry.pop(request_id, None)
+        finish_reason = self.pending_p16_finish_reasons.pop(request_id, None)
+        if succeeded and finish_reason not in ("abort", "error"):
             try:
-                telemetry.complete_request(request_id)
+                graph_diagnostics: P16GraphDiagnostics = (
+                    self.model.predictor_speculative_graph_diagnostics()
+                )
+                telemetry.complete_request(
+                    request_id, graph_diagnostics=graph_diagnostics
+                )
             except Exception:
                 logger.exception(
                     f"Failed to complete P16 telemetry for request {request_id}"

@@ -60,6 +60,25 @@ class P16StartupRecord(TypedDict):
     pid: int
 
 
+class P16GraphDiagnostics(TypedDict):
+    opening_pair_graph_captures: int
+    full_round_graph_captures: int
+    graph_captures: int
+    graph_capture_time_ms: float
+    graph_capture_memory_allocated_baseline_bytes: int
+    graph_capture_memory_allocated_current_bytes: int
+    graph_capture_memory_allocated_growth_bytes: int
+    graph_capture_memory_reserved_baseline_bytes: int
+    graph_capture_memory_reserved_current_bytes: int
+    graph_capture_memory_reserved_growth_bytes: int
+    graph_capture_memory_budget_bytes: int
+    graph_capture_memory_budget_exceeded: bool
+
+
+class P16CompletionGraphDiagnostics(P16GraphDiagnostics):
+    captures_since_previous_request: int
+
+
 class P16CompletionRecord(TypedDict):
     schema: str
     kind: Literal["request_complete"]
@@ -68,6 +87,7 @@ class P16CompletionRecord(TypedDict):
     seq: int
     native_reason_counts: dict[str, int]
     counters: P16TelemetryCounters
+    graph_diagnostics: P16CompletionGraphDiagnostics | None
 
 
 P16TelemetryRecord: TypeAlias = P16StartupRecord | P16CompletionRecord
@@ -150,6 +170,7 @@ class P16WorkerTelemetry:
             "cuda_errors": 0,
         }
         self.native_reason_counts: dict[str, int] = {}
+        self.last_graph_capture_count = 0
         self.requests: dict[str, RequestTelemetry] = {}
         self.write_record(
             P16StartupRecord(
@@ -245,7 +266,11 @@ class P16WorkerTelemetry:
         else:
             pass
 
-    def complete_request(self, request_id: str) -> None:
+    def complete_request(
+        self,
+        request_id: str,
+        graph_diagnostics: P16GraphDiagnostics | None = None,
+    ) -> None:
         request = self.requests.pop(request_id, RequestTelemetry())
         if request.spec_frames > request.eligible_frames:
             raise RuntimeError("P16 telemetry recorded speculative ineligible frames")
@@ -329,6 +354,21 @@ class P16WorkerTelemetry:
             )
         else:
             pass
+        if graph_diagnostics is None:
+            request_graph_diagnostics = None
+        else:
+            captures_since_previous_request = (
+                graph_diagnostics["graph_captures"] - self.last_graph_capture_count
+            )
+            if captures_since_previous_request < 0:
+                raise RuntimeError("P16 graph capture count decreased")
+            else:
+                pass
+            request_graph_diagnostics: P16CompletionGraphDiagnostics = {
+                **graph_diagnostics,
+                "captures_since_previous_request": captures_since_previous_request,
+            }
+            self.last_graph_capture_count = graph_diagnostics["graph_captures"]
         self.write_record(
             P16CompletionRecord(
                 schema=P16_TELEMETRY_SCHEMA,
@@ -338,6 +378,7 @@ class P16WorkerTelemetry:
                 seq=self.sequence,
                 native_reason_counts=dict(self.native_reason_counts),
                 counters=dict(self.counters),
+                graph_diagnostics=request_graph_diagnostics,
             )
         )
 

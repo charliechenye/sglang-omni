@@ -11,6 +11,7 @@ import pytest
 
 from sglang_omni.models.qwen3_tts.speculative_telemetry import (
     P16FrameTelemetry,
+    P16GraphDiagnostics,
     P16WorkerTelemetry,
 )
 
@@ -52,6 +53,7 @@ class CompletionRecord(TypedDict):
     seq: int
     native_reason_counts: dict[str, int]
     counters: TelemetryCounters
+    graph_diagnostics: P16GraphDiagnostics | None
 
 
 TelemetryRecord: TypeAlias = StartupRecord | CompletionRecord
@@ -204,3 +206,54 @@ def test_telemetry_rejects_invalid_frame_counters(
             ),
         )
     telemetry.close()
+
+
+def test_graph_diagnostics_track_capture_deltas_without_changing_counter_schema(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "graph-diagnostics.jsonl"
+    telemetry = P16WorkerTelemetry(
+        path,
+        enabled=False,
+        draft_sha256=None,
+        draft_loaded=False,
+        pid=123,
+    )
+    diagnostics: P16GraphDiagnostics = {
+        "opening_pair_graph_captures": 1,
+        "full_round_graph_captures": 2,
+        "graph_captures": 3,
+        "graph_capture_time_ms": 18.5,
+        "graph_capture_memory_allocated_baseline_bytes": 1024,
+        "graph_capture_memory_allocated_current_bytes": 2048,
+        "graph_capture_memory_allocated_growth_bytes": 1024,
+        "graph_capture_memory_reserved_baseline_bytes": 4096,
+        "graph_capture_memory_reserved_current_bytes": 8192,
+        "graph_capture_memory_reserved_growth_bytes": 4096,
+        "graph_capture_memory_budget_bytes": 512 * 1024 * 1024,
+        "graph_capture_memory_budget_exceeded": False,
+    }
+    for request_id in ("request-1", "request-2"):
+        telemetry.record_frame(
+            request_id,
+            P16FrameTelemetry(
+                eligible=True,
+                speculative=False,
+                native_reason="feature_off",
+            ),
+        )
+        telemetry.complete_request(request_id, graph_diagnostics=diagnostics)
+    else:
+        pass
+    telemetry.close()
+
+    _, first, second = read_records(path)
+    assert set(first["counters"]) == set(TelemetryCounters.__annotations__)
+    assert first["graph_diagnostics"] is not None
+    assert second["graph_diagnostics"] is not None
+    assert first["graph_diagnostics"]["captures_since_previous_request"] == 3
+    assert second["graph_diagnostics"]["captures_since_previous_request"] == 0
+    assert (
+        second["graph_diagnostics"]["graph_capture_memory_reserved_growth_bytes"]
+        == 4096
+    )
