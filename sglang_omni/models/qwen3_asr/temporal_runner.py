@@ -13,6 +13,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 
+from sglang_omni.model_runner.model_worker import ModelWorker
 from sglang_omni.models.qwen3_asr.engine_builder import Qwen3ASRModelRunner
 from sglang_omni.models.qwen3_asr.request_builders import Qwen3ASRRequestData
 from sglang_omni.models.qwen3_asr.temporal_prefill import (
@@ -20,11 +21,13 @@ from sglang_omni.models.qwen3_asr.temporal_prefill import (
 )
 from sglang_omni.models.qwen3_asr.temporal_verification import (
     Qwen3ASRTemporalForward,
+    Qwen3ASRTemporalForwardContext,
     Qwen3ASRTemporalLogitsProcessorOutput,
     Qwen3ASRTemporalRunnerOutput,
     attach_temporal_forward_inputs,
     clear_temporal_forward_inputs,
 )
+from sglang_omni.scheduling.sglang_backend.output_processor import SGLangOutputProcessor
 from sglang_omni.scheduling.types import (
     ModelRunnerOutput,
     SchedulerOutput,
@@ -37,12 +40,21 @@ logger = logging.getLogger(__name__)
 class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
     supports_speculative_async_decode: bool = False
 
+    def __init__(
+        self, tp_worker: ModelWorker, output_processor: SGLangOutputProcessor
+    ) -> None:
+        super().__init__(tp_worker, output_processor)
+        self.temporal_forward_context_stack: list[
+            Qwen3ASRTemporalForwardContext | None
+        ] = []
+
     def before_prefill(
         self,
         forward_batch: ForwardBatch | None,
         schedule_batch: ScheduleBatch,
         requests: list[SchedulerRequest],
     ) -> None:
+        self.temporal_forward_context_stack.append(None)
         if not requests or not isinstance(requests[0].data, Qwen3ASRRequestData):
             return
         else:
@@ -69,7 +81,7 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
             )
         else:
             pass
-        attach_temporal_forward_inputs(
+        temporal_context = attach_temporal_forward_inputs(
             forward_batch,
             Qwen3ASRTemporalForward(
                 request_id=requests[0].request_id,
@@ -77,6 +89,7 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
                 candidate_token_ids=temporal_request.candidate_token_ids,
             ),
         )
+        self.temporal_forward_context_stack[-1] = temporal_context
         graph_runner = self.tp_worker.model_runner.prefill_cuda_graph_runner
         if isinstance(graph_runner, PrefillCudaGraphRunner):
             install_temporal_prefill_graph_gate(graph_runner)
@@ -90,7 +103,19 @@ class Qwen3ASRTemporalModelRunner(Qwen3ASRModelRunner):
         requests: list[SchedulerRequest],
     ) -> None:
         del schedule_batch, requests
-        clear_temporal_forward_inputs(forward_batch)
+        if not self.temporal_forward_context_stack:
+            return
+        else:
+            pass
+        temporal_context = self.temporal_forward_context_stack[-1]
+        if temporal_context is not None:
+            if forward_batch is None:
+                raise RuntimeError("Qwen3-ASR cleanup lost its owning forward batch")
+            else:
+                clear_temporal_forward_inputs(forward_batch, temporal_context)
+        else:
+            pass
+        self.temporal_forward_context_stack.pop()
 
     def post_prefill(
         self,
