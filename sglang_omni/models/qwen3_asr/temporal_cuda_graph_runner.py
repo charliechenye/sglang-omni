@@ -84,11 +84,7 @@ class Qwen3ASRTemporalPrefillCudaGraphRunner(PrefillCudaGraphRunner):
                 for field in fields(LogitsProcessorOutput)
             },
             temporal_verification=output.temporal_verification,
-            pending_token_ids=(
-                output.pending_token_ids.clone()
-                if output.pending_token_ids is not None
-                else None
-            ),
+            pending_token_ids=output.pending_token_ids,
             graph_replay=output.graph_replay,
         )
 
