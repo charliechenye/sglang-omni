@@ -1,10 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """Synthesizer kinds: reply audio from the reply text."""
 
+from __future__ import annotations
+
 import asyncio
 import logging
 import re
 from collections.abc import AsyncIterator
+from contextlib import aclosing
+from dataclasses import dataclass, field
 from typing import Literal
 
 import httpx
@@ -24,6 +28,7 @@ from sglang_omni.models.streaming_cascade.base import (
     control_chunk,
     iterate,
     replying,
+    sentence_end,
     sentences,
     text_chunk,
     with_language,
@@ -44,7 +49,12 @@ from sglang_omni.proto.streams import (
     chunk_style,
     control_type,
 )
-from sglang_omni.proto.tools import is_partial_call, tool_calls_of
+from sglang_omni.proto.tools import (
+    PRIVATE_SPEECH_AUTHORIZED,
+    PRIVATE_SPEECH_CLOSED,
+    is_partial_call,
+    tool_calls_of,
+)
 from sglang_omni.scheduling.session import ChunkEmitter
 
 logger = logging.getLogger(__name__)
@@ -143,7 +153,54 @@ class OpenAISpeechSynthesizerConfig(ComponentConfig):
     drop_quiet_start: bool = False
     sentence_pause_ms: float = Field(default=0, ge=0)
     skip_screen_blocks: bool = False
+    prepare_closed_speech: bool = False
     api_key_env: str = "OPENAI_API_KEY"
+
+
+@dataclass(kw_only=True)
+class PreparedSpeech:
+    """One private speech request and its bounded processed-PCM handoff."""
+
+    call_id: str
+    text: str
+    request_body: dict[str, object]
+    sample_iterator: AsyncIterator[np.ndarray]
+    samples: asyncio.Queue[np.ndarray | Exception | None] = field(
+        default_factory=lambda: asyncio.Queue(maxsize=1)
+    )
+    task: asyncio.Task[None] = field(init=False)
+    is_authorized: bool = False
+
+    def __post_init__(self) -> None:
+        self.task = asyncio.create_task(self.produce())
+
+    async def produce(self) -> None:
+        try:
+            async with aclosing(self.sample_iterator):
+                async for samples in self.sample_iterator:
+                    if samples.size:
+                        await self.samples.put(samples)
+                    else:
+                        pass
+            await self.samples.put(None)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self.samples.put(error)
+            if isinstance(error, (httpx.HTTPError, ValueError)):
+                pass
+            else:
+                raise
+
+    async def close(self) -> None:
+        if not self.task.done():
+            self.task.cancel()
+            try:
+                await self.task
+            except asyncio.CancelledError:
+                pass
+        else:
+            await self.task
 
 
 class TurnSpeaker(Replier):
@@ -200,8 +257,14 @@ class TurnSpeaker(Replier):
             speech: asyncio.Queue[TimedChunk | None],
         ) -> AsyncIterator[TimedChunk]:
             async for text in iterate(speech):
-                emit(text)
-                yield text
+                if text.format == TOOL_CALL and (
+                    PRIVATE_SPEECH_CLOSED in text.payload
+                    or PRIVATE_SPEECH_AUTHORIZED in text.payload
+                ):
+                    yield text
+                else:
+                    emit(text)
+                    yield text
 
         async def speak_call_then_end(
             turn: int, speech: asyncio.Queue[TimedChunk | None]
@@ -241,6 +304,11 @@ class TurnSpeaker(Replier):
             if chunk.format == TOOL_CALL and chunk.turn in replies.interrupted:
                 # note (Jingwen): an interrupt can overtake a piece of its turn on the way here, and a speech started from that piece would wait for text that never arrives and hold every later speech.
                 pass
+            elif chunk.format == TOOL_CALL and PRIVATE_SPEECH_CLOSED in chunk.payload:
+                if chunk.turn == streamed_turn and replies.is_running(chunk.turn):
+                    deltas.put_nowait(chunk)
+                else:
+                    pass
             elif chunk.format == TOOL_CALL:
                 [call] = tool_calls_of(chunk)
                 text = text_chunk(
@@ -259,6 +327,14 @@ class TurnSpeaker(Replier):
                 if is_partial_call(chunk):
                     streamed_turn = chunk.turn
                 else:
+                    if (
+                        is_streamed
+                        and replies.is_running(chunk.turn)
+                        and PRIVATE_SPEECH_AUTHORIZED in chunk.payload
+                    ):
+                        deltas.put_nowait(chunk)
+                    else:
+                        pass
                     streamed_turn = None
                     if is_streamed and not replies.is_running(chunk.turn):
                         pass
@@ -357,23 +433,18 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
         else:
             return self.config.language
 
-    async def follow_deltas(
-        self,
-        deltas: AsyncIterator[TimedChunk],
-        delta_styles: list[tuple[int, str | None]],
-    ) -> AsyncIterator[TimedChunk]:
-        """The reply's deltas, recording the user language they carry (a delta without one means the dialog knows none for this reply, such as after its configured language is cleared) and, in delta_styles, the reply offset each delta starts at with its style."""
-        text_start = 0
-        async for chunk in deltas:
-            self.session_language = chunk_language(chunk)
-            delta_styles.append((text_start, chunk_style(chunk)))
-            text_start += len(chunk.payload["text"])
-            yield chunk
+    def normalize_spoken_text(self, spoken: str) -> str:
+        text = UNSPOKEN_SYMBOLS.sub("", MARKDOWN_LINK.sub(r"\1", spoken))
+        text = TABLE_PIPE.sub(
+            ", ",
+            TABLE_EDGE_PIPE.sub("", LINE_MARKER.sub("", BARE_URL.sub(r"\1", text))),
+        )
+        return " ".join(text.split())
 
-    async def speak(
+    def speech_request_body(
         self, sentence: str, language: str | None, style: str | None
-    ) -> AsyncIterator[np.ndarray]:
-        body: dict[str, object] = {
+    ) -> dict[str, object]:
+        request_body: dict[str, object] = {
             "model": self.config.model,
             "voice": self.config.voice,
             "input": sentence,
@@ -381,18 +452,18 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
             "stream": True,
         }
         if language is not None:
-            body["language"] = language
+            request_body["language"] = language
             if language == "English":
                 # Note (ruoyu): A Base voice cloned from a Chinese reference read the digits of English sentences as Chinese numerals in 12 of 50 takes and the same numbers written as words in 0 of 50; the aligner reads the digits with the same words.
-                body["input"] = spoken_text(sentence, language)[0]
+                request_body["input"] = spoken_text(sentence, language)[0]
             else:
                 pass
         else:
             pass
         if style in self.config.styles:
-            body["references"] = [self.config.styles[style].model_dump()]
+            request_body["references"] = [self.config.styles[style].model_dump()]
         elif self.config.reference_audio_path:
-            body["references"] = [
+            request_body["references"] = [
                 {
                     "audio_path": self.config.reference_audio_path,
                     **(
@@ -404,8 +475,54 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
             ]
         else:
             pass
+        return request_body
+
+    async def speak(
+        self,
+        sentence: str,
+        language: str | None,
+        style: str | None,
+        prepared_speech: PreparedSpeech | None = None,
+    ) -> AsyncIterator[np.ndarray]:
+        request_body = self.speech_request_body(sentence, language, style)
+        if prepared_speech is not None:
+            if (
+                prepared_speech.request_body == request_body
+                and prepared_speech.is_authorized
+            ):
+                first_sample = await prepared_speech.samples.get()
+                if isinstance(first_sample, np.ndarray):
+                    yield first_sample
+                    while True:
+                        sample = await prepared_speech.samples.get()
+                        if sample is None:
+                            break
+                        elif isinstance(sample, np.ndarray):
+                            yield sample
+                        else:
+                            raise sample
+                    return
+                elif first_sample is None or isinstance(
+                    first_sample, (httpx.HTTPError, ValueError)
+                ):
+                    await prepared_speech.close()
+                else:
+                    raise first_sample
+            else:
+                await prepared_speech.close()
+        else:
+            pass
+        async with aclosing(self.http_samples(request_body)) as samples_iterator:
+            async for samples in samples_iterator:
+                yield samples
+
+    async def http_samples(
+        self, request_body: dict[str, object]
+    ) -> AsyncIterator[np.ndarray]:
         async with self.client.stream(
-            "POST", f"{self.config.base_url.rstrip('/')}/audio/speech", json=body
+            "POST",
+            f"{self.config.base_url.rstrip('/')}/audio/speech",
+            json=request_body,
         ) as response:
             response.raise_for_status()
             rate = response.headers.get("X-Sample-Rate")
@@ -456,72 +573,157 @@ class OpenAISpeechSynthesizer(TurnSpeaker):
         )
         follows_sentence_end = True
         delta_styles: list[tuple[int, str | None]] = []
-        async for span, ends_sentence in sentences(
-            self.follow_deltas(deltas, delta_styles), self.config.max_sentence_words
-        ):
-            reply_text += span
-            if self.config.skip_screen_blocks:
-                # note (Haoling Pu): a span can start inside a block an earlier span opened, so the reply so far is blanked before the span is cut from it.
-                spoken = blank_screen_blocks(reply_text)[text_end:]
-            else:
-                spoken = span
-            text = UNSPOKEN_SYMBOLS.sub("", MARKDOWN_LINK.sub(r"\1", spoken))
-            text = TABLE_PIPE.sub(
-                ", ",
-                TABLE_EDGE_PIPE.sub("", LINE_MARKER.sub("", BARE_URL.sub(r"\1", text))),
-            )
-            sentence = " ".join(text.split())
-            language = (
-                self.sentence_language(sentence) if self.config.language else None
-            )
-            emit(
-                control_chunk(REPLY_SENTENCE, turn=turn, **with_language({}, language))
-            )
-            # note (Haoling Pu): each request ends at its last word, so back-to-back requests leave about 0.12 s between sentences, against about 0.35 s when one request reads the whole reply; a cut inside a sentence gets no pause.
-            is_pause_due = bool(audio_ms and pause_samples and follows_sentence_end)
-            plays_audio = False
-            # Note (ruoyu): Qwen3-TTS answers 500 to a sentence with no word in it, which would close the session.
-            if re.search(r"\w", sentence):
-                # note (Haoling Pu): a span starts with the spacing after the sentence before it, which the model wrote before the tag of this one.
-                spoken_start = text_end + len(span) - len(span.lstrip())
-                style = next(
-                    delta_style
-                    for text_start, delta_style in reversed(delta_styles)
-                    if text_start <= spoken_start
-                )
-                async for samples in self.speak(sentence, language, style):
-                    if is_pause_due:
-                        audio_ms += pause_samples * 1000 / self.sample_rate_hz
-                        emit(
-                            audio_chunk(
-                                np.zeros(pause_samples, dtype="<f4"),
-                                self.sample_rate_hz,
-                                turn,
-                            )
+        prepared_speech: PreparedSpeech | None = None
+
+        async def follow_reply_deltas() -> AsyncIterator[TimedChunk]:
+            nonlocal prepared_speech
+            text_start = 0
+            async for chunk in deltas:
+                if chunk.format == TOOL_CALL and PRIVATE_SPEECH_CLOSED in chunk.payload:
+                    [call] = tool_calls_of(chunk)
+                    arguments = (
+                        call.arguments if isinstance(call.arguments, dict) else {}
+                    )
+                    candidate = arguments.get("text")
+                    if (
+                        self.config.prepare_closed_speech
+                        and chunk.turn == turn
+                        and text_end == 0
+                        and not self.config.skip_screen_blocks
+                        and not self.config.styles
+                        and arguments.keys() == {"text"}
+                        and isinstance(candidate, str)
+                        and candidate.strip()
+                        and sentence_end(candidate, self.config.max_sentence_words)
+                        is None
+                        and sentence_end(
+                            candidate,
+                            self.config.max_sentence_words,
+                            is_complete=True,
                         )
-                        is_pause_due = False
+                        == len(candidate)
+                    ):
+                        sentence = self.normalize_spoken_text(candidate)
+                        if re.search(r"\w", sentence):
+                            language = (
+                                self.sentence_language(sentence)
+                                if self.config.language
+                                else None
+                            )
+                            request_body = self.speech_request_body(
+                                sentence, language, None
+                            )
+                            prepared_speech = PreparedSpeech(
+                                call_id=call.id,
+                                text=candidate,
+                                request_body=request_body,
+                                sample_iterator=self.http_samples(request_body),
+                            )
+                        else:
+                            pass
                     else:
                         pass
-                    plays_audio = True
-                    audio_ms += len(samples) * 1000 / self.sample_rate_hz
-                    emit(audio_chunk(samples, self.sample_rate_hz, turn))
+                elif (
+                    chunk.format == TOOL_CALL
+                    and PRIVATE_SPEECH_AUTHORIZED in chunk.payload
+                ):
+                    if prepared_speech is not None:
+                        [call] = tool_calls_of(chunk)
+                        prepared_speech.is_authorized = (
+                            chunk.payload[PRIVATE_SPEECH_AUTHORIZED] is True
+                            and chunk.turn == turn
+                            and call.id == prepared_speech.call_id
+                            and call.arguments == {"text": prepared_speech.text}
+                        )
+                        if not prepared_speech.is_authorized:
+                            await prepared_speech.close()
+                            prepared_speech = None
+                        else:
+                            pass
+                    else:
+                        pass
+                else:
+                    self.session_language = chunk_language(chunk)
+                    delta_styles.append((text_start, chunk_style(chunk)))
+                    text_start += len(chunk.payload["text"])
+                    yield chunk
+
+        try:
+            async for span, ends_sentence in sentences(
+                follow_reply_deltas(), self.config.max_sentence_words
+            ):
+                reply_text += span
+                if self.config.skip_screen_blocks:
+                    # note (Haoling Pu): a span can start inside a block an earlier span opened, so the reply so far is blanked before the span is cut from it.
+                    spoken = blank_screen_blocks(reply_text)[text_end:]
+                else:
+                    spoken = span
+                sentence = self.normalize_spoken_text(spoken)
+                language = (
+                    self.sentence_language(sentence) if self.config.language else None
+                )
+                emit(
+                    control_chunk(
+                        REPLY_SENTENCE, turn=turn, **with_language({}, language)
+                    )
+                )
+                # note (Haoling Pu): each request ends at its last word, so back-to-back requests leave about 0.12 s between sentences, against about 0.35 s when one request reads the whole reply; a cut inside a sentence gets no pause.
+                is_pause_due = bool(audio_ms and pause_samples and follows_sentence_end)
+                plays_audio = False
+                # Note (ruoyu): Qwen3-TTS answers 500 to a sentence with no word in it, which would close the session.
+                if re.search(r"\w", sentence):
+                    # note (Haoling Pu): a span starts with the spacing after the sentence before it, which the model wrote before the tag of this one.
+                    spoken_start = text_end + len(span) - len(span.lstrip())
+                    style = next(
+                        delta_style
+                        for text_start, delta_style in reversed(delta_styles)
+                        if text_start <= spoken_start
+                    )
+                    if prepared_speech is None:
+                        samples_iterator = self.speak(sentence, language, style)
+                    else:
+                        samples_iterator = self.speak(
+                            sentence, language, style, prepared_speech
+                        )
+                    async with aclosing(samples_iterator):
+                        async for samples in samples_iterator:
+                            if is_pause_due:
+                                audio_ms += pause_samples * 1000 / self.sample_rate_hz
+                                emit(
+                                    audio_chunk(
+                                        np.zeros(pause_samples, dtype="<f4"),
+                                        self.sample_rate_hz,
+                                        turn,
+                                    )
+                                )
+                                is_pause_due = False
+                            else:
+                                pass
+                            plays_audio = True
+                            audio_ms += len(samples) * 1000 / self.sample_rate_hz
+                            emit(audio_chunk(samples, self.sample_rate_hz, turn))
+                else:
+                    pass
+                heard = spoken.rstrip()
+                if TITLE_BEFORE_NAME.search(heard):
+                    ends_heard_sentence = False
+                elif len(heard) < len(span.rstrip()):
+                    # note (Haoling Pu): a span that ends inside a screen block ends a sentence for the pause only where the words heard before the block do, so a period on the screen adds no silence.
+                    ends_heard_sentence = bool(SENTENCE_END.search(heard))
+                else:
+                    ends_heard_sentence = ends_sentence
+                if plays_audio:
+                    follows_sentence_end = ends_heard_sentence
+                else:
+                    # note (Haoling Pu): a span that plays nothing, with no word in it or dropped whole by drop_quiet_start, sends no pause, so a sentence end before it or at its end still puts one pause before the next audio.
+                    follows_sentence_end = follows_sentence_end or ends_heard_sentence
+                text_end += len(span)
+                self.progress(emit, turn, text_end, audio_ms)
+        finally:
+            if prepared_speech is not None:
+                await prepared_speech.close()
             else:
                 pass
-            heard = spoken.rstrip()
-            if TITLE_BEFORE_NAME.search(heard):
-                ends_heard_sentence = False
-            elif len(heard) < len(span.rstrip()):
-                # note (Haoling Pu): a span that ends inside a screen block ends a sentence for the pause only where the words heard before the block do, so a period on the screen adds no silence.
-                ends_heard_sentence = bool(SENTENCE_END.search(heard))
-            else:
-                ends_heard_sentence = ends_sentence
-            if plays_audio:
-                follows_sentence_end = ends_heard_sentence
-            else:
-                # note (Haoling Pu): a span that plays nothing, with no word in it or dropped whole by drop_quiet_start, sends no pause, so a sentence end before it or at its end still puts one pause before the next audio.
-                follows_sentence_end = follows_sentence_end or ends_heard_sentence
-            text_end += len(span)
-            self.progress(emit, turn, text_end, audio_ms)
 
     async def close(self) -> None:
         await self.client.aclose()

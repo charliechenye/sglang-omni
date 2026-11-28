@@ -6,6 +6,9 @@ from pydantic import BaseModel
 from sglang_omni.proto.session import TimedChunk
 from sglang_omni.proto.streams import REPLY_TRUNCATED, TOOL, TOOL_CALL, TOOL_RESPONSE
 
+PRIVATE_SPEECH_CLOSED = "_private_speech_closed"
+PRIVATE_SPEECH_AUTHORIZED = "_private_speech_authorized"
+
 
 class ToolCall(BaseModel):
     id: str

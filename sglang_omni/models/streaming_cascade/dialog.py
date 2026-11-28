@@ -21,6 +21,9 @@ from sglang_omni.models.streaming_cascade.base import (
     control_chunk,
     messages_chunk,
 )
+from sglang_omni.models.streaming_cascade.synthesizers import (
+    OpenAISpeechSynthesizerConfig,
+)
 from sglang_omni.proto.session import TimedChunk
 from sglang_omni.proto.streams import (
     COMMIT,
@@ -48,6 +51,8 @@ from sglang_omni.proto.streams import (
     control_type,
 )
 from sglang_omni.proto.tools import (
+    PRIVATE_SPEECH_AUTHORIZED,
+    PRIVATE_SPEECH_CLOSED,
     ToolCall,
     is_partial_call,
     tool_call_chunk,
@@ -185,14 +190,17 @@ class Speech:
 
     text: str
     entry_index: int
+    call_id: str
     # True while the model is still writing the call: text is what reached the synthesizer so far.
     is_streaming: bool = False
+    has_notified_preparation: bool = False
 
 
 # The arguments of a call up to the opening quote of its text value, with any scalar arguments written before it.
 TEXT_VALUE_START = re.compile(
     r'\s*\{(?:\s*"(?:[^"\\]|\\.)*"\s*:\s*(?:"(?:[^"\\]|\\.)*"|[^,{}\[\]"]+)\s*,)*\s*"text"\s*:\s*"'
 )
+SINGLE_TEXT_VALUE_START = re.compile(r'\s*\{\s*"text"\s*:\s*"')
 HIGH_SURROGATE_ESCAPE = re.compile(r"\\u[dD][89abAB][0-9a-fA-F]{2}")
 
 
@@ -204,10 +212,15 @@ class SpokenTextReader:
         self.text = ""
         self.read_end: int | None = None
         self.is_closed = False
+        self.is_validly_closed = False
 
     def feed(self, fragment: str) -> None:
         """Add the next piece of the arguments; text grows by what it completes."""
         self.raw += fragment
+        if self.is_closed:
+            return
+        else:
+            pass
         if self.read_end is None:
             match = TEXT_VALUE_START.match(self.raw)
             if match is None:
@@ -219,11 +232,13 @@ class SpokenTextReader:
         end = self.read_end
         # Where the first half of a character written as two escapes begins, while its second half may still be on its way.
         held: int | None = None
+        is_closing_quote = False
         while not self.is_closed:
             if end >= len(self.raw):
                 break
             elif self.raw[end] == '"':
                 self.is_closed = True
+                is_closing_quote = True
             else:
                 if self.raw[end] != "\\":
                     step = 1
@@ -245,9 +260,32 @@ class SpokenTextReader:
             pass
         try:
             self.text += json.loads(f'"{self.raw[self.read_end:end]}"')
+            self.is_validly_closed = is_closing_quote
         except json.JSONDecodeError:
             self.is_closed = True
+            self.is_validly_closed = False
         self.read_end = end
+
+    def is_single_text_object(self, text: str) -> bool:
+        """Whether the accumulated arguments are exactly one valid text field."""
+        if not self.is_validly_closed or self.read_end is None:
+            return False
+        else:
+            pass
+        match = SINGLE_TEXT_VALUE_START.match(self.raw)
+        if (
+            match is None
+            or self.raw[self.read_end : self.read_end + 1] != '"'
+            or self.raw[self.read_end + 1 :].strip() != "}"
+        ):
+            return False
+        else:
+            pass
+        try:
+            arguments = json.loads(self.raw)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(arguments, dict) and arguments == {"text": text}
 
 
 class DialogConfig(ComponentConfig):
@@ -345,6 +383,7 @@ class Dialog(StreamComponent):
         self.inference_count = 0
         # Reads the text of the call the model is writing; None between calls.
         self.text_reader: SpokenTextReader | None = None
+        self.prepare_closed_speech = False
         # note (Jingwen): with a long past speech in the history and a call required, Qwen3.8-27B followed a client's new instructions in 3 of 12 samples, and in 10 of 12 with them repeated beside the next utterance.
         self.has_new_instructions = False
         # Reply audio produced so far as (characters of the reply text with audio, audio ms), one entry per spoken sentence, for truncating an interrupted reply to what was heard.
@@ -368,6 +407,12 @@ class Dialog(StreamComponent):
 
     def place(self, settings: "ComponentGraphConfig", name: str) -> None:
         self.awaits_delivery = bool(settings.delivery_reporters(name))
+        self.prepare_closed_speech = any(
+            isinstance(node.component, OpenAISpeechSynthesizerConfig)
+            and node.component.prepare_closed_speech
+            and TOOL_CALL in node.edges().get(name, frozenset())
+            for node in settings.nodes
+        )
 
     def adopt(self, previous: StreamComponent) -> None:
         if isinstance(previous, Dialog):
@@ -545,12 +590,30 @@ class Dialog(StreamComponent):
     def start_speech(self, calls: list[ToolCall], is_truncated: bool) -> None:
         """Record the model's calls and speak the first one that can be; any other is answered at once, so the next prompt holds one answer per call."""
         assert self.reply is not None
-        self.text_reader = None
         if self.speech is not None and self.speech.is_streaming:
-            self.finish_streamed_speech(calls, is_truncated)
+            speech = self.speech
+            first_call = calls[0] if calls else None
+            is_preparation_authorized = (
+                self.prepare_closed_speech
+                and not is_truncated
+                and len(calls) == 1
+                and first_call is not None
+                and self.text_reader is not None
+                and self.text_reader.is_single_text_object(speech.text)
+                and first_call.id == speech.call_id
+                and first_call.name == self.config.speech_tool
+                and first_call.arguments == {"text": speech.text}
+            )
+            self.text_reader = None
+            self.finish_streamed_speech(
+                calls,
+                is_truncated,
+                is_preparation_authorized=is_preparation_authorized,
+            )
             return
         else:
             pass
+        self.text_reader = None
         self.messages.append(
             ChatMessage(
                 role="assistant",
@@ -568,7 +631,9 @@ class Dialog(StreamComponent):
                     tool_message(call.id, {"status": "interrupted", "heard_prefix": ""})
                 )
                 self.speech = Speech(
-                    text=call.arguments["text"], entry_index=len(self.messages) - 1
+                    text=call.arguments["text"],
+                    entry_index=len(self.messages) - 1,
+                    call_id=call.id,
                 )
             else:
                 logger.warning(f"turn {self.reply_turn}: {call.name} refused: {error}")
@@ -614,8 +679,9 @@ class Dialog(StreamComponent):
             self.text_reader = SpokenTextReader()
         else:
             pass
-        self.text_reader.feed(call.arguments)
-        text = self.text_reader.text[: self.config.max_text_chars]
+        reader = self.text_reader
+        reader.feed(call.arguments)
+        text = reader.text[: self.config.max_text_chars]
         if self.speech is None and not text.strip():
             return
         elif self.speech is None:
@@ -627,7 +693,10 @@ class Dialog(StreamComponent):
             )
             self.reply = []
             self.speech = Speech(
-                text="", entry_index=len(self.messages) - 1, is_streaming=True
+                text="",
+                entry_index=len(self.messages) - 1,
+                call_id=call.id,
+                is_streaming=True,
             )
             self.announce_turn()
         else:
@@ -649,6 +718,39 @@ class Dialog(StreamComponent):
             )
         else:
             pass
+        candidate = reader.text
+        is_valid_candidate = (
+            self.prepare_closed_speech
+            and not speech.has_notified_preparation
+            and reader.is_validly_closed
+            and SINGLE_TEXT_VALUE_START.match(reader.raw) is not None
+            and reader.read_end is not None
+            and reader.raw[reader.read_end + 1 :].strip() in ("", "}")
+            and candidate == speech.text
+            and bool(candidate.strip())
+            and len(candidate) <= self.config.max_text_chars
+        )
+        if is_valid_candidate:
+            try:
+                candidate.encode("utf-8")
+            except UnicodeEncodeError:
+                is_valid_candidate = False
+            else:
+                pass
+        else:
+            pass
+        if is_valid_candidate:
+            speech.has_notified_preparation = True
+            closed = tool_call_chunk(
+                [ToolCall(id=call.id, name=call.name, arguments={"text": candidate})],
+                self.reply_turn,
+                self.language,
+                is_partial=True,
+            )
+            closed.payload[PRIVATE_SPEECH_CLOSED] = True
+            self.emit(closed)
+        else:
+            pass
 
     def record_streamed_calls(self, calls: list[ToolCall]) -> None:
         """Show the calls of the speech being streamed in its assistant entry, which sits before the call's answer."""
@@ -658,7 +760,13 @@ class Dialog(StreamComponent):
             update={"tool_calls": [assistant_tool_call(call) for call in calls]}
         )
 
-    def finish_streamed_speech(self, calls: list[ToolCall], is_truncated: bool) -> None:
+    def finish_streamed_speech(
+        self,
+        calls: list[ToolCall],
+        is_truncated: bool,
+        *,
+        is_preparation_authorized: bool,
+    ) -> None:
         """The model finished the call whose text is already being spoken: the synthesizer is told the text is complete, and any other call is answered at once. A call the token budget cut has no arguments to read, so what was spoken is its text."""
         assert self.emit is not None and self.speech is not None
         speech = self.speech
@@ -693,11 +801,14 @@ class Dialog(StreamComponent):
             )
         else:
             pass
-        self.emit(
-            tool_call_chunk(
-                [spoken], self.reply_turn, self.language, is_truncated=is_truncated
-            )
+        final = tool_call_chunk(
+            [spoken], self.reply_turn, self.language, is_truncated=is_truncated
         )
+        if self.prepare_closed_speech:
+            final.payload[PRIVATE_SPEECH_AUTHORIZED] = is_preparation_authorized
+        else:
+            pass
+        self.emit(final)
 
     def end_speech(self, chunk: TimedChunk) -> None:
         """The speech's audio reached the client, or its synthesis failed; its call is answered."""

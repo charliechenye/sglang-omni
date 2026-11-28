@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import httpx
@@ -914,6 +915,7 @@ def speech_profile(**changes: dict[str, object]) -> StreamingCascadePipelineConf
 def test_the_profile_speaks_only_through_the_tool():
     settings = speech_profile().component_graph()
     assert settings.node("dialog").component.speech_tool == "tts_start"
+    assert settings.node("tts").component.prepare_closed_speech is False
     assert [tool.name for tool in settings.node("llm").component.tools] == ["tts_start"]
     assert settings.node("tts").edges()["dialog"] == {TOOL_CALL}
     assert TEXT_DELTA in settings.node("aligner").edges()["tts"]
@@ -1157,6 +1159,484 @@ def spoken_pieces(texts: list[str], turn: int = 1) -> list[TimedChunk]:
     ]
     whole = ToolCall(id="call_1", name="tts_start", arguments={"text": "".join(texts)})
     return [*pieces, tool_call_chunk([whole], turn, "English")]
+
+
+def streamed_speech_nodes(prepare_closed_speech: bool = True):
+    graph = speech_profile(
+        tts={"prepare_closed_speech": prepare_closed_speech}
+    ).component_graph()
+    dialog = build(graph.node("dialog").component.model_dump())
+    dialog.place(graph, "dialog")
+    synthesizer = build(graph.node("tts").component.model_dump())
+    incoming: asyncio.Queue[TimedChunk | None] = asyncio.Queue()
+    outputs: list[TimedChunk] = []
+    output_events: dict[tuple[str, int], asyncio.Event] = {}
+    input_barrier = asyncio.Event()
+
+    async def inputs() -> AsyncIterator[TimedChunk]:
+        while (chunk := await incoming.get()) is not None:
+            yield chunk
+            if control_type(chunk) == REPLY_HEARD:
+                input_barrier.set()
+            else:
+                pass
+
+    def emit(chunk: TimedChunk) -> None:
+        outputs.append(chunk)
+        if chunk.format == PCM_F32:
+            output_events.setdefault(("audio", chunk.turn), asyncio.Event()).set()
+        elif control_type(chunk) == TURN_DONE:
+            output_events.setdefault(("done", chunk.turn), asyncio.Event()).set()
+        else:
+            pass
+
+    task = asyncio.create_task(synthesizer.process(inputs(), emit))
+    dialog.emit = incoming.put_nowait
+    dialog.handle(transcript_chunk("question", True))
+    dialog.respond_to_waiting()
+    return dialog, synthesizer, incoming, outputs, output_events, input_barrier, task
+
+
+async def close_streamed_speech_nodes(synthesizer, task):
+    if not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    else:
+        await task
+    await synthesizer.close()
+
+
+@pytest.mark.asyncio
+async def test_a_closed_speech_is_prepared_privately_then_adopted_after_authorization():
+    dialog, synthesizer, _, outputs, output_events, _, task = streamed_speech_nodes()
+    request_started = asyncio.Event()
+    request_bodies: list[dict[str, object]] = []
+    private_samples = np.full(240, 16384, dtype="<i2")
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content))
+        request_started.set()
+        return httpx.Response(
+            200,
+            content=private_samples.tobytes(),
+            headers={"X-Sample-Rate": "24000"},
+        )
+
+    synthesizer.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    try:
+        for chunk in speech_pieces(['{"text": "Hello there.', '"}']):
+            dialog.handle(chunk)
+        await request_started.wait()
+
+        assert len(request_bodies) == 1
+        assert not [chunk for chunk in outputs if chunk.format == PCM_F32]
+        assert not [chunk for chunk in outputs if control_type(chunk) == TURN_DONE]
+        assert [
+            chunk.payload["text"] for chunk in outputs if chunk.format == TEXT_DELTA
+        ] == ["Hello there."]
+
+        dialog.handle(
+            tool_call_chunk(
+                [
+                    ToolCall(
+                        id="call_1",
+                        name="tts_start",
+                        arguments={"text": "Hello there."},
+                    )
+                ],
+                1,
+                "English",
+            )
+        )
+        await output_events[("done", 1)].wait()
+
+        assert len(request_bodies) == 1
+        audio = np.concatenate(
+            [
+                np.frombuffer(chunk.payload, dtype="<f4")
+                for chunk in outputs
+                if chunk.format == PCM_F32
+            ]
+        )
+        np.testing.assert_array_equal(audio, np.full(240, 0.5, dtype="<f4"))
+    finally:
+        await close_streamed_speech_nodes(synthesizer, task)
+
+
+@pytest.mark.asyncio
+async def test_a_reader_decode_error_does_not_start_private_speech():
+    dialog, synthesizer, incoming, outputs, output_events, barrier, task = (
+        streamed_speech_nodes()
+    )
+    request_bodies: list[dict[str, object]] = []
+    samples = np.full(120, 8192, dtype="<i2")
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200, content=samples.tobytes(), headers={"X-Sample-Rate": "24000"}
+        )
+
+    synthesizer.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    try:
+        for chunk in speech_pieces(['{"text": "Hello ', r'\q"']):
+            dialog.handle(chunk)
+        incoming.put_nowait(control_chunk(REPLY_HEARD, turn=1))
+        await barrier.wait()
+        assert not request_bodies
+
+        dialog.handle(
+            tool_call_chunk(
+                [
+                    ToolCall(
+                        id="call_1", name="tts_start", arguments=r'{"text":"Hello \q"}'
+                    )
+                ],
+                1,
+                "English",
+            )
+        )
+        await output_events[("done", 1)].wait()
+        assert [body["input"] for body in request_bodies] == ["Hello"]
+        assert len([chunk for chunk in outputs if chunk.format == PCM_F32]) == 1
+    finally:
+        await close_streamed_speech_nodes(synthesizer, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prepare_closed_speech", "text", "early_requests", "expected_inputs"),
+    [
+        (False, "Hello there.", 0, ["Hello there."]),
+        (True, "One. Two.", 1, ["One.", "Two."]),
+    ],
+)
+async def test_default_off_and_ineligible_replies_keep_canonical_dispatch(
+    prepare_closed_speech: bool,
+    text: str,
+    early_requests: int,
+    expected_inputs: list[str],
+):
+    dialog, synthesizer, incoming, outputs, output_events, barrier, task = (
+        streamed_speech_nodes(prepare_closed_speech)
+    )
+    request_bodies: list[dict[str, object]] = []
+    samples = np.full(240, 8192, dtype="<i2")
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content))
+        return httpx.Response(
+            200, content=samples.tobytes(), headers={"X-Sample-Rate": "24000"}
+        )
+
+    synthesizer.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    try:
+        for chunk in speech_pieces([f'{{"text": "{text}', '"}']):
+            dialog.handle(chunk)
+        incoming.put_nowait(control_chunk(REPLY_HEARD, turn=1))
+        if early_requests:
+            await output_events[("audio", 1)].wait()
+        else:
+            await barrier.wait()
+        assert len(request_bodies) == early_requests
+
+        dialog.handle(
+            tool_call_chunk(
+                [ToolCall(id="call_1", name="tts_start", arguments={"text": text})],
+                1,
+                "English",
+            )
+        )
+        await output_events[("done", 1)].wait()
+        assert [body["input"] for body in request_bodies] == expected_inputs
+        assert (
+            len([chunk for chunk in outputs if control_type(chunk) == TURN_DONE]) == 1
+        )
+    finally:
+        await close_streamed_speech_nodes(synthesizer, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "changed_call",
+        "changed_body",
+        "malformed_arguments",
+        "duplicate_text",
+        "additional_argument",
+        "multiple_calls",
+        "truncated",
+    ],
+)
+async def test_invalid_final_authorization_discards_private_audio(failure: str):
+    dialog, synthesizer, _, outputs, output_events, _, task = streamed_speech_nodes()
+    request_started = asyncio.Event()
+    request_bodies: list[dict[str, object]] = []
+    private_samples = np.full(240, 24576, dtype="<i2")
+    canonical_samples = np.full(120, -16384, dtype="<i2")
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content))
+        request_started.set()
+        response_samples = (
+            private_samples if len(request_bodies) == 1 else canonical_samples
+        )
+        return httpx.Response(
+            200,
+            content=response_samples.tobytes(),
+            headers={"X-Sample-Rate": "24000"},
+        )
+
+    synthesizer.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    candidate = "Hello there."
+    closure_call_id = "call_2" if failure == "changed_call" else "call_1"
+    trailing_arguments = {
+        "duplicate_text": ', "text": "Hello there."}',
+        "additional_argument": ', "speed": 1}',
+    }.get(failure)
+    try:
+        dialog.handle(
+            tool_call_chunk(
+                [
+                    ToolCall(
+                        id="call_1",
+                        name="tts_start",
+                        arguments='{"text": "Hello there.',
+                    )
+                ],
+                1,
+                is_partial=True,
+            )
+        )
+        dialog.handle(
+            tool_call_chunk(
+                [
+                    ToolCall(
+                        id=closure_call_id,
+                        name="tts_start",
+                        arguments='"' + ("" if trailing_arguments else "}"),
+                    )
+                ],
+                1,
+                is_partial=True,
+            )
+        )
+        await request_started.wait()
+        assert not [chunk for chunk in outputs if chunk.format == PCM_F32]
+        if trailing_arguments is not None:
+            dialog.handle(
+                tool_call_chunk(
+                    [
+                        ToolCall(
+                            id=closure_call_id,
+                            name="tts_start",
+                            arguments=trailing_arguments,
+                        )
+                    ],
+                    1,
+                    is_partial=True,
+                )
+            )
+        else:
+            pass
+
+        if failure == "changed_body":
+            arguments: object = {"text": "Changed."}
+        elif failure == "malformed_arguments":
+            arguments = "{bad json"
+        elif failure == "additional_argument":
+            arguments = {"text": candidate, "speed": 1}
+        else:
+            arguments = {"text": candidate}
+        calls = [ToolCall(id=closure_call_id, name="tts_start", arguments=arguments)]
+        if failure == "multiple_calls":
+            calls.append(
+                ToolCall(id="call_2", name="other", arguments={"text": "Later."})
+            )
+        else:
+            pass
+        dialog.handle(
+            tool_call_chunk(
+                calls,
+                1,
+                "English",
+                is_truncated=failure == "truncated",
+            )
+        )
+        await output_events[("done", 1)].wait()
+
+        assert len(request_bodies) == 2
+        audio = np.concatenate(
+            [
+                np.frombuffer(chunk.payload, dtype="<f4")
+                for chunk in outputs
+                if chunk.format == PCM_F32
+            ]
+        )
+        np.testing.assert_array_equal(
+            audio, np.full(len(canonical_samples), -0.5, dtype="<f4")
+        )
+    finally:
+        await close_streamed_speech_nodes(synthesizer, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("canonical_fails", [False, True])
+async def test_a_private_http_failure_falls_back_before_public_audio(
+    canonical_fails: bool,
+):
+    dialog, synthesizer, _, outputs, output_events, _, task = streamed_speech_nodes()
+    request_bodies: list[dict[str, object]] = []
+    request_started = asyncio.Event()
+    canonical_samples = np.full(120, -16384, dtype="<i2")
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content))
+        request_started.set()
+        if len(request_bodies) == 1 or canonical_fails:
+            return httpx.Response(503)
+        else:
+            return httpx.Response(
+                200,
+                content=canonical_samples.tobytes(),
+                headers={"X-Sample-Rate": "24000"},
+            )
+
+    synthesizer.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    try:
+        for chunk in speech_pieces(['{"text": "Hello there.', '"}']):
+            dialog.handle(chunk)
+        await request_started.wait()
+        assert not [chunk for chunk in outputs if chunk.format == PCM_F32]
+
+        dialog.handle(
+            tool_call_chunk(
+                [
+                    ToolCall(
+                        id="call_1",
+                        name="tts_start",
+                        arguments={"text": "Hello there."},
+                    )
+                ],
+                1,
+                "English",
+            )
+        )
+        await output_events[("done", 1)].wait()
+
+        assert len(request_bodies) == 2
+        done = [chunk for chunk in outputs if control_type(chunk) == TURN_DONE]
+        assert len(done) == 1
+        if canonical_fails:
+            assert SPEECH_ERROR in done[0].payload
+            assert not [chunk for chunk in outputs if chunk.format == PCM_F32]
+        else:
+            assert SPEECH_ERROR not in done[0].payload
+            audio = np.concatenate(
+                [
+                    np.frombuffer(chunk.payload, dtype="<f4")
+                    for chunk in outputs
+                    if chunk.format == PCM_F32
+                ]
+            )
+            np.testing.assert_array_equal(
+                audio, np.full(len(canonical_samples), -0.5, dtype="<f4")
+            )
+    finally:
+        await close_streamed_speech_nodes(synthesizer, task)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("adopted", [False, True])
+async def test_interrupt_closes_the_private_stream_before_and_after_adoption(
+    adopted: bool,
+):
+    dialog, synthesizer, incoming, outputs, output_events, _, task = (
+        streamed_speech_nodes()
+    )
+    request_bodies: list[dict[str, object]] = []
+    request_started = asyncio.Event()
+    first_sample_sent = asyncio.Event()
+    private_stream_closed = asyncio.Event()
+    keep_private_stream_open = asyncio.Event()
+    next_samples = np.full(120, -8192, dtype="<i2")
+    private_samples = np.full(120, 8192, dtype="<i2")
+
+    async def private_stream() -> AsyncIterator[bytes]:
+        try:
+            first_sample_sent.set()
+            yield private_samples.tobytes()
+            await keep_private_stream_open.wait()
+        finally:
+            private_stream_closed.set()
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        request_bodies.append(json.loads(request.content))
+        if len(request_bodies) == 1:
+            request_started.set()
+            return httpx.Response(
+                200,
+                content=private_stream(),
+                headers={"X-Sample-Rate": "24000"},
+            )
+        else:
+            return httpx.Response(
+                200,
+                content=next_samples.tobytes(),
+                headers={"X-Sample-Rate": "24000"},
+            )
+
+    synthesizer.client = httpx.AsyncClient(transport=httpx.MockTransport(answer))
+    try:
+        for chunk in speech_pieces(['{"text": "Hello there.', '"}']):
+            dialog.handle(chunk)
+        await request_started.wait()
+        await first_sample_sent.wait()
+        if adopted:
+            dialog.handle(
+                tool_call_chunk(
+                    [
+                        ToolCall(
+                            id="call_1",
+                            name="tts_start",
+                            arguments={"text": "Hello there."},
+                        )
+                    ],
+                    1,
+                    "English",
+                )
+            )
+            await output_events[("audio", 1)].wait()
+        else:
+            pass
+
+        await synthesizer.control(control_chunk(INTERRUPT, turn=1))
+        await private_stream_closed.wait()
+        assert len(
+            [chunk for chunk in outputs if chunk.format == PCM_F32 and chunk.turn == 1]
+        ) == (1 if adopted else 0)
+
+        incoming.put_nowait(control_chunk(TURN_DONE, turn=1))
+        incoming.put_nowait(
+            tool_call_chunk(
+                [ToolCall(id="call_2", name="tts_start", arguments={"text": "Next."})],
+                2,
+                "English",
+            )
+        )
+        await output_events[("done", 2)].wait()
+
+        assert len(request_bodies) == 2
+        assert [chunk.turn for chunk in outputs if chunk.format == PCM_F32] == (
+            [1, 2] if adopted else [2]
+        )
+    finally:
+        keep_private_stream_open.set()
+        await close_streamed_speech_nodes(synthesizer, task)
 
 
 @pytest.mark.asyncio
