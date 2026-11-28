@@ -31,6 +31,7 @@ from scripts.validate_qwen3_tts_p16_integration import (
     P16_MODEL_REVISION,
     P16_NATIVE_REFERENCE_IMPORTS,
     ValidationFailure,
+    opening_trace_checks,
     validate_native_reference,
 )
 from sglang_omni.models.qwen3_tts.sglang_model import Qwen3TTSTalker
@@ -272,3 +273,23 @@ def test_p15a_w1_tail_requires_one_target_commit_and_no_proposals() -> None:
         audit_w1_tail_round(verify_width=1, proposal_count=1, committed_token_count=1)
     with pytest.raises(RuntimeError, match="one committed target token"):
         audit_w1_tail_round(verify_width=1, proposal_count=0, committed_token_count=0)
+
+
+def test_opening_trace_ignores_only_uncommitted_code_suffix() -> None:
+    first = {
+        "opening_logits": torch.zeros((1, 2048)),
+        "opening_sampling_seeds": torch.tensor([19]),
+        "opening_sampling_positions": torch.tensor([1]),
+        "pending_tokens": torch.tensor([23]),
+        "preceding_hidden": torch.zeros((1, 1024)),
+        "output_codes": torch.tensor([[11, 23] + [0] * 14]),
+    }
+    other = {name: value.clone() for name, value in first.items()}
+    other["output_codes"][:, 2:] = 31
+    assert all(opening_trace_checks(first, other).values())
+
+    other["output_codes"][0, 1] = 24
+    assert not opening_trace_checks(first, other)["opening_committed_codes"]
+    other["output_codes"][0, 1] = 23
+    other["opening_sampling_seeds"][0] = 20
+    assert not opening_trace_checks(first, other)["opening_sampling_seeds"]

@@ -1916,6 +1916,29 @@ def audit_capacity_four_batch_fallback(
         close_runtime(scheduler)
 
 
+def opening_trace_checks(
+    first: AuditRecord, other: AuditRecord
+) -> dict[str, bool]:
+    fields = (
+        "opening_logits",
+        "opening_sampling_seeds",
+        "opening_sampling_positions",
+        "pending_tokens",
+        "preceding_hidden",
+    )
+    checks = {
+        name: torch.equal(tensor_field(first, name), tensor_field(other, name))
+        for name in fields
+    }
+    # Only codebooks 0 and 1 have been committed at opening. The persistent
+    # output buffer's suffix belongs to earlier frames until the rounds fill it.
+    checks["opening_committed_codes"] = torch.equal(
+        tensor_field(first, "output_codes")[:, :2],
+        tensor_field(other, "output_codes")[:, :2],
+    )
+    return checks
+
+
 def test_request_reset_and_reuse(
     talker: Qwen3TTSTalker,
     frame: ValidationFrame,
@@ -1961,20 +1984,8 @@ def test_request_reset_and_reuse(
     audit_capture.release(independent_audit)
     if first_audit.opening is None or independent_audit.opening is None:
         raise RuntimeError("P16 request-ID audit did not capture its opening trace")
-    opening_fields = (
-        "opening_logits",
-        "opening_sampling_seeds",
-        "opening_sampling_positions",
-        "output_codes",
-        "pending_tokens",
-        "preceding_hidden",
-    )
-    same_opening_trace = all(
-        torch.equal(
-            tensor_field(first_audit.opening, field_name),
-            tensor_field(independent_audit.opening, field_name),
-        )
-        for field_name in opening_fields
+    independent_opening = opening_trace_checks(
+        first_audit.opening, independent_audit.opening
     )
     second_request = create_request(request_id, second_seed)
     second_codes, second_embedding, second_audit, _ = capture_frame(
@@ -2008,21 +2019,38 @@ def test_request_reset_and_reuse(
         totals,
     )
     audit_capture.release(repeated_audit)
+    if repeated_audit.opening is None:
+        raise RuntimeError("P16 request-reuse audit did not capture its opening trace")
+    repeated_opening = opening_trace_checks(first_audit.opening, repeated_audit.opening)
+    checks = {
+        "repeated_codes": torch.equal(first_codes, repeated_codes),
+        "repeated_feedback": torch.equal(first_embedding, repeated_embedding),
+        "independent_codes": torch.equal(first_codes, independent_codes),
+        "independent_feedback": torch.equal(first_embedding, independent_embedding),
+        **{f"independent_{name}": passed for name, passed in independent_opening.items()},
+        **{f"repeated_{name}": passed for name, passed in repeated_opening.items()},
+        "repeated_round_count": len(first_audit.rounds) == len(repeated_audit.rounds),
+        "repeated_rounds": first_evidence["rounds"] == repeated_evidence["rounds"],
+        "independent_rounds": first_evidence["rounds"] == independent_evidence["rounds"],
+        "repeated_seed": first_speculative_seed == repeated_speculative_seed,
+        "independent_seed": first_speculative_seed == independent_speculative_seed,
+        "changed_seed": first_speculative_seed != second_speculative_seed,
+    }
+    failed_checks = [name for name, passed in checks.items() if not passed]
     require(
-        torch.equal(first_codes, repeated_codes)
-        and torch.equal(first_embedding, repeated_embedding)
-        and torch.equal(first_codes, independent_codes)
-        and torch.equal(first_embedding, independent_embedding)
-        and same_opening_trace
-        and len(first_audit.rounds or []) == len(repeated_audit.rounds or [])
-        and first_evidence["rounds"] == repeated_evidence["rounds"]
-        and first_evidence["rounds"] == independent_evidence["rounds"]
-        and first_speculative_seed == repeated_speculative_seed
-        and first_speculative_seed == independent_speculative_seed
-        and first_speculative_seed != second_speculative_seed,
+        not failed_checks,
         "request_reset_and_reuse",
-        "explicit seeds changed across request IDs or after request identity reuse",
-        context_for(frame, first_seed),
+        f"request identity or seed reuse mismatch: {failed_checks}",
+        {
+            **context_for(frame, first_seed),
+            "failed_checks": failed_checks,
+            "speculative_seeds": {
+                "first": first_speculative_seed,
+                "independent": independent_speculative_seed,
+                "second": second_speculative_seed,
+                "repeated": repeated_speculative_seed,
+            },
+        },
     )
     return True
 
