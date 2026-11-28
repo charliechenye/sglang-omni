@@ -16,7 +16,7 @@ import tempfile
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, TypeAlias
+from typing import Literal, TypeAlias, cast
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
@@ -2055,6 +2055,110 @@ def check_invalid_request(
         )
 
 
+def run_candidate_control_process(
+    control: Literal["off", "capacity_four"],
+    model_path: Path,
+    draft_path: Path,
+    inputs_path: Path,
+    seed_count: int,
+) -> dict[str, object]:
+    # An SGLang engine owns its process for its entire lifetime.
+    output_path = inputs_path.with_name(f"{control}.pt")
+    environment = os.environ.copy()
+    environment.pop("MASTER_PORT", None)
+    print(f"P16_CONTROL_START {control}", flush=True)
+    process = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--control",
+            control,
+            "--model",
+            str(model_path),
+            "--draft",
+            str(draft_path),
+            "--inputs",
+            str(inputs_path),
+            "--seeds",
+            str(seed_count),
+            "--out",
+            str(output_path),
+        ],
+        cwd=REPOSITORY_ROOT,
+        env=environment,
+        check=False,
+    )
+    if process.returncode != 0:
+        review_path = output_path.with_suffix(".review.json")
+        if review_path.is_file():
+            review = json.loads(review_path.read_text())
+            raise ValidationFailure(
+                review["check"], review["detail"], review["context"]
+            )
+        raise RuntimeError(
+            f"P16 {control} control subprocess failed ({process.returncode}); "
+            "see the preceding traceback"
+        )
+    print(f"P16_CONTROL_COMPLETE {control}", flush=True)
+    return torch.load(output_path, map_location="cpu", weights_only=True)
+
+
+def candidate_control_main() -> int:
+    parser = argparse.ArgumentParser(description="Internal P16 candidate control")
+    parser.add_argument("--control", choices=("off", "capacity_four"), required=True)
+    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--draft", type=Path, required=True)
+    parser.add_argument("--inputs", type=Path, required=True)
+    parser.add_argument("--seeds", type=int, choices=(1, 4), required=True)
+    parser.add_argument("--out", type=Path, required=True)
+    arguments = parser.parse_args()
+    try:
+        device = require_h200()
+        artifact = torch.load(
+            arguments.inputs, map_location="cpu", weights_only=True
+        )
+        # The coordinator serializes frames in frame-major, then seed order.
+        # Both controls consume the same frozen rows as the upstream reference.
+        cohort = [
+            ValidationFrame(
+                uid=sample["uid"],
+                ordinal=sample["ordinal"],
+                hidden=sample["hidden"],
+                code0=sample["code0"],
+            )
+            for sample in artifact["inputs"][:: arguments.seeds]
+        ]
+        if arguments.control == "off":
+            scheduler, talker = build_talker(
+                arguments.model, device, enabled=False, max_running_requests=1
+            )
+            try:
+                checks, codes, feedback = run_native_controls(
+                    talker, cohort, arguments.seeds
+                )
+            finally:
+                close_runtime(scheduler)
+            result = {"checks": checks, "codes": codes, "feedback": feedback}
+        else:
+            result = {
+                "unsupported_batch_native_exact": audit_capacity_four_batch_fallback(
+                    arguments.model, arguments.draft, device, cohort
+                )
+            }
+        write_torch_atomic(arguments.out, result)
+    except ValidationFailure as error:
+        write_json_atomic(
+            arguments.out.with_suffix(".review.json"),
+            {
+                "check": error.check,
+                "detail": error.detail,
+                "context": error.context,
+            },
+        )
+        raise
+    return 0
+
+
 def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
     candidate_sha = current_git_sha()
     require(
@@ -2088,7 +2192,6 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
         "p15_gate",
         "P15A cohort identity differs from the P16 validation cohort",
     )
-    device = require_h200()
     require(
         sha256_file(draft_path) == P16_DRAFT_SHA256,
         "draft_checkpoint",
@@ -2134,21 +2237,13 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
     with tempfile.TemporaryDirectory(prefix="qtts-p16-native-inputs-") as directory:
         reference_inputs_path = Path(directory) / "native-inputs.pt"
         torch.save(input_artifact, reference_inputs_path)
-        off_scheduler, off_talker = build_talker(
-            model_path,
-            device,
-            enabled=False,
-            max_running_requests=1,
+        off_result = run_candidate_control_process(
+            "off", model_path, draft_path, reference_inputs_path, arguments.seeds
         )
-        try:
-            off_checks, candidate_off_codes, candidate_off_feedback = (
-                run_native_controls(off_talker, cohort, arguments.seeds)
-            )
-        finally:
-            close_runtime(off_scheduler)
-        del off_talker, off_scheduler
-        gc.collect()
-        torch.cuda.empty_cache()
+        off_checks = cast(dict[str, JsonValue], off_result["checks"])
+        candidate_off_codes = cast(torch.Tensor, off_result["codes"])
+        candidate_off_feedback = cast(torch.Tensor, off_result["feedback"])
+        print("P16_CONTROL_START upstream_native_reference", flush=True)
         native_reference = run_upstream_native_reference(
             model_path,
             reference_inputs_path,
@@ -2189,14 +2284,21 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
             for sample in samples
         ]
         write_json_atomic(native_reference_json_path, reference_metadata)
+        print("P16_CONTROL_COMPLETE default_off_exact", flush=True)
 
-    unsupported_batch_exact = audit_capacity_four_batch_fallback(
-        model_path,
-        draft_path,
-        device,
-        cohort,
-    )
+        batch_result = run_candidate_control_process(
+            "capacity_four",
+            model_path,
+            draft_path,
+            reference_inputs_path,
+            arguments.seeds,
+        )
+        unsupported_batch_exact = batch_result["unsupported_batch_native_exact"] is True
 
+    # The coordinator has not built an engine yet. Its only engine is C1 ON.
+    os.environ.pop("MASTER_PORT", None)
+    device = require_h200()
+    print("P16_CONTROL_START candidate_on", flush=True)
     candidate_scheduler, talker = build_talker(
         model_path,
         device,
@@ -2438,6 +2540,8 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
 
 
 def main() -> int:
+    if sys.argv[1:2] == ["--control"]:
+        return candidate_control_main()
     arguments = parse_arguments()
     review_path = arguments.out.with_name(f"{arguments.out.name}.review.json")
     try:
