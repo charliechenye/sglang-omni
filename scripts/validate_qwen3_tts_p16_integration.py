@@ -1446,7 +1446,7 @@ def audit_sequential_reference(
             "valid_kv_length": valid_kv_length,
         }
         round_evidence.append(round_row)
-        preceding_hidden = accepted_target_hidden
+        preceding_hidden = accepted_target_hidden.to(device)
         committed_depth += committed_count
     require(
         int(totals.rounds) > 0 and int(code_prefix[0, 15]) in range(P16_VOCAB_SIZE),
