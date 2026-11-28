@@ -1570,7 +1570,8 @@ async def test_private_failure_falls_back_only_before_public_audio(
             failure_position = next(
                 index
                 for index, chunk in enumerate(run.outputs)
-                if SPEECH_ERROR in chunk.payload
+                if control_type(chunk) == TURN_DONE
+                and SPEECH_ERROR in chunk.payload
             )
             assert audio_positions[-1] < failure_position
         else:
