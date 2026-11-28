@@ -17,6 +17,12 @@ from typing import TypedDict
 P16_REFERENCE_ROOT_ENV = "SGLANG_OMNI_QTTS_P16_REFERENCE_ROOT"
 P16_UPSTREAM_BASE_SHA = "a6e2fc6d98ab6abbed1c0ea40d0a7d6d038f3d74"
 NATIVE_TALKER_SOURCE_RELATIVE_PATH = "sglang_omni/models/qwen3_tts/sglang_model.py"
+NATIVE_REFERENCE_IMPORTS: dict[str, str] = {
+    "talker": "sglang_omni/models/qwen3_tts/sglang_model.py",
+    "engine_builder": "sglang_omni/models/qwen3_tts/engine_builder.py",
+    "request_builders": "sglang_omni/models/qwen3_tts/request_builders.py",
+    "scheduler": "sglang_omni/scheduling/omni_scheduler.py",
+}
 reference_root = os.environ.get(P16_REFERENCE_ROOT_ENV)
 REPOSITORY_ROOT = (
     Path(reference_root).resolve()
@@ -25,8 +31,6 @@ REPOSITORY_ROOT = (
 )
 if str(REPOSITORY_ROOT) in sys.path:
     sys.path.remove(str(REPOSITORY_ROOT))
-else:
-    pass
 sys.path.insert(0, str(REPOSITORY_ROOT))
 
 import torch
@@ -62,26 +66,29 @@ def native_reference_talker(
     model_runner = scheduler.model_runner
     if model_runner is None:
         raise RuntimeError("native reference scheduler has no model runner")
-    else:
-        pass
     talker = model_runner.model
     if not isinstance(talker, Qwen3TTSTalker):
         raise RuntimeError("native reference scheduler model is not a Qwen3-TTS Talker")
-    else:
-        pass
     return talker
 
 
-def native_talker_source_path(talker: Qwen3TTSTalker) -> Path:
-    source_path = Path(inspect.getfile(type(talker))).resolve(strict=True)
-    expected_source_path = REPOSITORY_ROOT / NATIVE_TALKER_SOURCE_RELATIVE_PATH
-    if source_path != expected_source_path:
-        raise RuntimeError(
-            f"native reference imported its Talker from {source_path}, expected {expected_source_path}"
-        )
-    else:
-        pass
-    return source_path
+def native_reference_import_source_paths(talker: Qwen3TTSTalker) -> dict[str, str]:
+    imported = {
+        "talker": type(talker),
+        "engine_builder": Qwen3TtsEngineBuilder,
+        "request_builders": Qwen3TTSSGLangRequestData,
+        "scheduler": OmniScheduler,
+    }
+    paths = {}
+    for name, imported_type in imported.items():
+        source_path = Path(inspect.getfile(imported_type)).resolve(strict=True)
+        expected_path = REPOSITORY_ROOT / NATIVE_REFERENCE_IMPORTS[name]
+        if source_path != expected_path:
+            raise RuntimeError(
+                f"native reference imported {name} from {source_path}, expected {expected_path}"
+            )
+        paths[name] = str(source_path)
+    return paths
 
 
 class NativeReferenceInputIdentity(TypedDict):
@@ -109,8 +116,6 @@ def native_reference_output_rows(
         raise ValueError("native reference code output must contain one batch row")
     elif feedback.ndim == 0 or feedback.shape[0] != 1:
         raise ValueError("native reference feedback output must contain one batch row")
-    else:
-        pass
     codes_row = codes.detach().cpu()[0].contiguous().clone()
     feedback_row = feedback.detach().cpu()[0].contiguous().clone()
     record: NativeReferenceRecord = {
@@ -129,22 +134,14 @@ def validate_model_identity(model_path: Path, identity: Mapping[str, object]) ->
     snapshot_name = identity.get("snapshot")
     if not isinstance(model_name, str) or not isinstance(snapshot_name, str):
         raise RuntimeError("native reference model identity is incomplete")
-    else:
-        pass
     if model_name != "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice":
         raise RuntimeError("native reference model name is not the pinned model")
-    else:
-        pass
     config_path = model_path / "config.json"
     if not config_path.is_file():
         raise FileNotFoundError("native reference model config is missing")
-    else:
-        pass
     shards = sorted(model_path.glob("*.safetensors"))
     if not shards:
         raise FileNotFoundError("native reference model weight shards are missing")
-    else:
-        pass
     actual_model_identity = {
         "model": model_name,
         "snapshot": snapshot_name,
@@ -156,8 +153,6 @@ def validate_model_identity(model_path: Path, identity: Mapping[str, object]) ->
     }
     if model_path.name != snapshot_name or actual_model_identity != identity:
         raise RuntimeError("native reference model snapshot identity does not match")
-    else:
-        pass
 
 
 def validate_reference_identity(identity: Mapping[str, object]) -> None:
@@ -176,15 +171,11 @@ def validate_reference_identity(identity: Mapping[str, object]) -> None:
         "tp_size": 1,
     }:
         raise RuntimeError("native reference input has unsupported graph settings")
-    else:
-        pass
 
 
 def parse_reference_sample(sample: object) -> NativeReferenceSample:
     if not isinstance(sample, dict):
         raise RuntimeError("native reference sample is not a mapping")
-    else:
-        pass
     request_id = sample.get("request_id")
     uid = sample.get("uid")
     ordinal = sample.get("ordinal")
@@ -211,8 +202,6 @@ def parse_reference_sample(sample: object) -> NativeReferenceSample:
         or not bool(torch.isfinite(hidden).all())
     ):
         raise RuntimeError("native reference sample fields are invalid")
-    else:
-        pass
     return {
         "request_id": request_id,
         "uid": uid,
@@ -239,33 +228,23 @@ def main() -> int:
         raise RuntimeError(
             f"upstream reference checkout is {actual_commit}, expected {arguments.expected_commit}"
         )
-    else:
-        pass
 
     artifact = torch.load(arguments.inputs, map_location="cpu", weights_only=True)
     if not isinstance(artifact, dict):
         raise RuntimeError("native reference input artifact is not a mapping")
-    else:
-        pass
     identity = artifact.get("identity")
     inputs = artifact.get("inputs")
     if not isinstance(identity, dict) or not isinstance(inputs, list):
         raise RuntimeError("native reference input artifact is malformed")
-    else:
-        pass
     reference_identity: NativeReferenceInputIdentity = identity
     validate_reference_identity(reference_identity)
     model_path = arguments.model.resolve(strict=True)
     if reference_identity["model_revision"] != arguments.model_revision:
         raise RuntimeError("native reference input model revision does not match")
-    else:
-        pass
     validate_model_identity(model_path, reference_identity["model_identity"])
     device = torch.device("cuda:0")
     if not torch.cuda.is_available():
         raise RuntimeError("independent upstream native reference requires CUDA")
-    else:
-        pass
 
     for name in (
         "SGLANG_OMNI_QTTS_P16_ENABLE",
@@ -274,8 +253,6 @@ def main() -> int:
         "SGLANG_OMNI_QTTS_P16_TELEMETRY_PATH",
     ):
         os.environ.pop(name, None)
-    else:
-        pass
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
@@ -295,14 +272,15 @@ def main() -> int:
             "enable_torch_compile": False,
         },
     )
-    talker = native_reference_talker(scheduler)
-    talker_source_path = native_talker_source_path(talker)
-
-    code_outputs: list[torch.Tensor] = []
-    feedback_outputs: list[torch.Tensor] = []
-    records: list[NativeReferenceRecord] = []
-    graph_stats_before = talker.predictor_graph_stats()
     try:
+        talker = native_reference_talker(scheduler)
+        import_source_paths = native_reference_import_source_paths(talker)
+        talker_source_path = Path(import_source_paths["talker"])
+
+        code_outputs: list[torch.Tensor] = []
+        feedback_outputs: list[torch.Tensor] = []
+        records: list[NativeReferenceRecord] = []
+        graph_stats_before = talker.predictor_graph_stats()
         for untrusted_sample in inputs:
             sample = parse_reference_sample(untrusted_sample)
             request_data = Qwen3TTSSGLangRequestData(
@@ -337,8 +315,6 @@ def main() -> int:
             code_outputs.append(code_row)
             feedback_outputs.append(feedback_row)
             records.append(record)
-        else:
-            pass
         graph_stats_after = talker.predictor_graph_stats()
         actual_replays = graph_stats_after["replays"] - graph_stats_before["replays"]
         if (
@@ -349,8 +325,6 @@ def main() -> int:
             raise RuntimeError(
                 "upstream native reference did not replay a CUDA Graph for every input"
             )
-        else:
-            pass
         output = {
             "identity": identity,
             "metadata": {
@@ -360,6 +334,8 @@ def main() -> int:
                 "model_source_path_relative": talker_source_path.relative_to(
                     REPOSITORY_ROOT
                 ).as_posix(),
+                "reference_source_root": str(REPOSITORY_ROOT),
+                "imported_source_paths": import_source_paths,
                 "cohort_sha256": identity["cohort_sha256"],
                 "sampling": identity["sampling"],
                 "graph_configuration": {

@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Literal, TypedDict
 
 import torch
 
@@ -23,6 +25,12 @@ from scripts.qwen3_tts_p15a_parity_reference import (
 )
 from sglang_omni.models.qwen3_tts.speculative_draft import load_p16_draft_checkpoint
 from sglang_omni.utils.predictor_grouped_heads import grouped_lm_head_warp_accumulate
+
+
+class NumericalParityReport(TypedDict):
+    status: Literal["PASS", "FAIL"]
+    checks: dict[str, bool]
+    probability_backend_comparison: Literal["DIAGNOSTIC_ONLY_TV"]
 
 
 def parse_arguments() -> argparse.Namespace:
@@ -49,7 +57,9 @@ def expected_runtime_proposal_depths() -> tuple[int, ...]:
     )
 
 
-def proposal_depth_coverage(observed_depths: set[int]) -> dict[str, list[int]]:
+def proposal_depth_coverage(
+    observed_depths: set[int],
+) -> dict[str, list[int] | bool]:
     expected_depths = set(expected_runtime_proposal_depths())
     actual_depths = set(observed_depths)
     return {
@@ -58,6 +68,47 @@ def proposal_depth_coverage(observed_depths: set[int]) -> dict[str, list[int]]:
         "missing_proposal_depths": sorted(expected_depths - actual_depths),
         "unexpected_proposal_depths": sorted(actual_depths - expected_depths),
     }
+
+
+def numerical_parity(
+    totals: Mapping[str, int],
+    transformed_weights: Mapping[str, Mapping[str, bool | float | int]],
+) -> NumericalParityReport:
+    checks = {
+        "transformed_weights_exact": all(
+            bool(value["exact"]) for value in transformed_weights.values()
+        ),
+        "standalone_mlp_exact": totals["standalone_mlp_steps"] > 0
+        and totals["standalone_mlp_exact"] == totals["standalone_mlp_steps"],
+        "runtime_mlp_exact": totals["mlp_steps"] > 0
+        and totals["mlp_exact"] == totals["mlp_steps"],
+        "draft_logits_exact": totals["draft_logits"] > 0
+        and totals["draft_logits_exact"] == totals["draft_logits"],
+        "captured_draft_logits_exact": totals["captured_draft_logits_exact"]
+        == totals["mlp_steps"],
+        "production_probabilities_and_ids_exact": totals["candidate_probability_exact"]
+        == totals["mlp_steps"],
+    }
+    return {
+        "status": "PASS" if all(checks.values()) else "FAIL",
+        "checks": checks,
+        "probability_backend_comparison": "DIAGNOSTIC_ONLY_TV",
+    }
+
+
+def audit_outcome(
+    *,
+    full_audit: bool,
+    runtime_coverage_complete: bool,
+    numerical_passed: bool,
+) -> tuple[str, int]:
+    if not numerical_passed or (full_audit and not runtime_coverage_complete):
+        return "P15A_DRAFT_PARITY_REVIEW", 1
+    elif full_audit:
+        return "P15A_DRAFT_PARITY_PASS", 0
+    elif runtime_coverage_complete:
+        return "P15A_DRAFT_PARITY_SMOKE_COVERAGE_COMPLETE", 0
+    return "P15A_DRAFT_PARITY_SMOKE_PARTIAL_COVERAGE", 0
 
 
 def audit_w1_tail_round(
@@ -70,8 +121,6 @@ def audit_w1_tail_round(
             raise RuntimeError(
                 "W1 tail must have zero draft proposals and one committed target token"
             )
-        else:
-            pass
         return True
     else:
         return False
@@ -81,12 +130,8 @@ def main() -> int:
     arguments = parse_arguments()
     if arguments.out.exists() or not arguments.out.is_absolute():
         raise ValueError("--out must be a new absolute path")
-    else:
-        pass
     if not torch.cuda.is_available():
         raise RuntimeError("P15A draft numerical parity requires CUDA")
-    else:
-        pass
     model_path = arguments.model.resolve(strict=True)
     draft_path = arguments.draft.resolve(strict=True)
     device = p16.require_h200()
@@ -119,8 +164,6 @@ def main() -> int:
             raise RuntimeError(
                 "P16 draft weights or projected codec tables are missing"
             )
-        else:
-            pass
         reference_net = ReferenceDraft().to(device="cpu", dtype=torch.float32)
         with torch.no_grad():
             for name, value in (
@@ -143,8 +186,6 @@ def main() -> int:
                     reference_net.out_proj.weight.copy_(value)
                 else:
                     reference_net.out_proj.bias.copy_(value)
-            else:
-                pass
         reference_draft = fused_width_module.FusedWidth(reference_net, projected_tables)
         transformed = {
             "folded_hidden_weight": (
@@ -173,14 +214,10 @@ def main() -> int:
                 "elements": actual.numel(),
                 "max_abs": float(difference.max()),
             }
-        else:
-            pass
 
         heads = talker.code_predictor_spec_lm_head_weights
         if heads is None:
             raise RuntimeError("packed Predictor LM-head weights are missing")
-        else:
-            pass
         reference_head = object.__new__(head_runtime_module.HeadRuntime)
         reference_head.radix = (
             radix_module.build_speculative_probability_candidates_radix
@@ -203,6 +240,7 @@ def main() -> int:
             "standalone_depths": set(),
             "draft_logits": 0,
             "draft_logits_exact": 0,
+            "captured_draft_logits_exact": 0,
             "candidate_probability_exact": 0,
             "candidate_probability_elements": 0,
             "candidate_probability_token_id_elements": 0,
@@ -229,8 +267,6 @@ def main() -> int:
                 )
                 if captured.opening is None:
                     raise RuntimeError("P16 proposal trace has no opening context")
-                else:
-                    pass
                 opening_hidden = (
                     p16.tensor_field(captured.opening, "preceding_hidden")
                     .to(device=device, dtype=torch.bfloat16)
@@ -270,8 +306,6 @@ def main() -> int:
                         totals["standalone_mlp_max_abs"],
                         float(hidden_difference.max()),
                     )
-                else:
-                    pass
                 round_start = opening_hidden
                 for record in captured.rounds:
                     depth = p16.integer_field(record, "round_depth")
@@ -291,8 +325,6 @@ def main() -> int:
                         raise RuntimeError(
                             "actual proposal width differs from the fixed K3 round contract"
                         )
-                    else:
-                        pass
                     committed_token_count = int(
                         p16.tensor_field(record, "committed_token_counts")[0]
                     )
@@ -302,8 +334,6 @@ def main() -> int:
                         totals["w1_tail_rounds"] += 1
                         totals["w1_tail_proposals"] += proposal_count
                         totals["w1_tail_committed_tokens"] += committed_token_count
-                    else:
-                        pass
                     totals["proposal_chain_max_width"] = max(
                         totals["proposal_chain_max_width"], width
                     )
@@ -365,12 +395,9 @@ def main() -> int:
                         recorded_logits = proposal_logits[
                             proposal_index : proposal_index + 1
                         ].contiguous()
-                        if not torch.equal(candidate_logits, recorded_logits):
-                            raise RuntimeError(
-                                "replayed P16 draft logits differ from captured proposal logits"
-                            )
-                        else:
-                            pass
+                        totals["captured_draft_logits_exact"] += int(
+                            torch.equal(candidate_logits, recorded_logits)
+                        )
                         logit_difference = (
                             candidate_logits.float() - reference_logits.float()
                         ).abs()
@@ -391,15 +418,10 @@ def main() -> int:
                         captured_ids = p16.tensor_field(record, "proposal_token_ids")[
                             proposal_index : proposal_index + 1
                         ].to(device=device)
-                        if not torch.equal(
-                            candidate_split, captured_probabilities
-                        ) or not torch.equal(candidate_split_ids, captured_ids):
-                            raise RuntimeError(
-                                "split probability replay or token IDs differ from the captured production proposal"
-                            )
-                        else:
-                            pass
-                        totals["candidate_probability_exact"] += 1
+                        totals["candidate_probability_exact"] += int(
+                            torch.equal(candidate_split, captured_probabilities)
+                            and torch.equal(candidate_split_ids, captured_ids)
+                        )
                         totals[
                             "candidate_probability_elements"
                         ] += candidate_split.numel()
@@ -440,20 +462,12 @@ def main() -> int:
                             )
                         )
                         round_start = candidate_hidden
-                    else:
-                        pass
                     round_start = (
                         p16.tensor_field(record, "preceding_hidden")
                         .to(device=device, dtype=torch.bfloat16)
                         .contiguous()
                     )
-                else:
-                    pass
                 audit_capture.release(captured)
-            else:
-                pass
-        else:
-            pass
         if set(totals["standalone_depths"]) != set(expected_mlp_conditioning_depths()):
             raise RuntimeError(
                 "standalone MLP replay did not cover conditioning depths "
@@ -468,8 +482,6 @@ def main() -> int:
             or totals["w1_tail_committed_tokens"] != totals["w1_tail_rounds"]
         ):
             raise RuntimeError("W1 target-only rounds violated their commit contract")
-        else:
-            pass
 
         proposal_coverage = proposal_depth_coverage(totals["proposal_depths"])
         if proposal_coverage["unexpected_proposal_depths"]:
@@ -477,12 +489,30 @@ def main() -> int:
                 "actual K3 proposals included illegal depths: "
                 f"{proposal_coverage['unexpected_proposal_depths']}"
             )
-        else:
-            pass
+
+        runtime_coverage_complete = not proposal_coverage["missing_proposal_depths"]
+        proposal_coverage["complete"] = runtime_coverage_complete
+        proposal_coverage["required_for_full_audit"] = True
+        numerical_counts: dict[str, int] = {
+            "standalone_mlp_steps": totals["standalone_mlp_steps"],
+            "standalone_mlp_exact": totals["standalone_mlp_exact"],
+            "mlp_steps": totals["mlp_steps"],
+            "mlp_exact": totals["mlp_exact"],
+            "draft_logits": totals["draft_logits"],
+            "draft_logits_exact": totals["draft_logits_exact"],
+            "captured_draft_logits_exact": totals["captured_draft_logits_exact"],
+            "candidate_probability_exact": totals["candidate_probability_exact"],
+        }
+        numerical = numerical_parity(numerical_counts, transform_metrics)
+        status, exit_code = audit_outcome(
+            full_audit=arguments.frames == 128 and arguments.seeds == 4,
+            runtime_coverage_complete=runtime_coverage_complete,
+            numerical_passed=numerical["status"] == "PASS",
+        )
 
         output = {
             "schema": "qtts-p15a-draft-parity-v1",
-            "status": "P15A_DRAFT_PARITY_AUDIT",
+            "status": status,
             "candidate_sha": p16.current_git_sha(),
             "reference": {
                 "sglang_scripts_commit": P15A_SOURCE_COMMIT,
@@ -507,6 +537,7 @@ def main() -> int:
                 "max_abs": totals["standalone_mlp_max_abs"],
             },
             "runtime_proposal_coverage": proposal_coverage,
+            "numerical_parity": numerical,
             "proposal_chain_max_width": totals["proposal_chain_max_width"],
             "w1_tail": {
                 "rounds": totals["w1_tail_rounds"],
@@ -549,9 +580,9 @@ def main() -> int:
         }
         arguments.out.parent.mkdir(parents=True, exist_ok=True)
         arguments.out.write_text(json.dumps(output, indent=2, sort_keys=True) + "\n")
+        return exit_code
     finally:
         p16.close_runtime(scheduler)
-    return 0
 
 
 if __name__ == "__main__":

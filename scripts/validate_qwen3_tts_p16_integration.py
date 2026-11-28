@@ -20,8 +20,6 @@ from typing import Literal, TypeAlias
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
-else:
-    pass
 
 import torch
 import torch.nn.functional as F
@@ -58,6 +56,12 @@ P15_COHORT_SHA256 = "c823f32c837b4979c0e74e4b1f4c60b53f40089e9f2a7119be6b11bb8ce
 P16_SCHEMA = "qtts-p16-integration-v1"
 P16_UPSTREAM_BASE_SHA = "a6e2fc6d98ab6abbed1c0ea40d0a7d6d038f3d74"
 P16_NATIVE_REFERENCE_ROOT_ENV = "SGLANG_OMNI_QTTS_P16_REFERENCE_ROOT"
+P16_NATIVE_REFERENCE_IMPORTS: dict[str, str] = {
+    "talker": "sglang_omni/models/qwen3_tts/sglang_model.py",
+    "engine_builder": "sglang_omni/models/qwen3_tts/engine_builder.py",
+    "request_builders": "sglang_omni/models/qwen3_tts/request_builders.py",
+    "scheduler": "sglang_omni/scheduling/omni_scheduler.py",
+}
 P16_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 P16_GROUPS = 16
 P16_TALKER_HIDDEN_SIZE = 2048
@@ -105,8 +109,6 @@ class P16AuditCapture:
             raise RuntimeError(
                 "P16 audit frame was not released after sequential replay"
             )
-        else:
-            pass
         frame = CapturedFrame()
         self.current = frame
         return frame
@@ -114,8 +116,6 @@ class P16AuditCapture:
     def release(self, frame: CapturedFrame) -> None:
         if self.current is not frame:
             raise RuntimeError("P16 audit release does not match the active frame")
-        else:
-            pass
         self.current = None
 
     def __call__(
@@ -137,8 +137,6 @@ class P16AuditCapture:
         else:
             if self.current is None or self.current.opening is None:
                 raise RuntimeError("P16 round audit arrived before its opening event")
-            else:
-                pass
             self.current.rounds.append(record)
 
 
@@ -170,8 +168,6 @@ def require(
 ) -> None:
     if not condition:
         raise ValidationFailure(check, detail, context or {})
-    else:
-        pass
 
 
 def parse_arguments() -> ValidationArguments:
@@ -200,8 +196,6 @@ def sha256_file(path: Path) -> str:
     with path.open("rb") as source:
         while block := source.read(1024 * 1024):
             digest.update(block)
-        else:
-            pass
     return digest.hexdigest()
 
 
@@ -219,8 +213,6 @@ def read_json(path: Path) -> JsonValue:
 def require_mapping(value: JsonValue, label: str) -> dict[str, JsonValue]:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         raise RuntimeError(f"{label} must be a JSON object")
-    else:
-        pass
     return value
 
 
@@ -228,8 +220,6 @@ def require_string(mapping: dict[str, JsonValue], key: str) -> str:
     value = mapping.get(key)
     if not isinstance(value, str):
         raise RuntimeError(f"JSON field {key} must be a string")
-    else:
-        pass
     return value
 
 
@@ -237,8 +227,6 @@ def require_integer(mapping: dict[str, JsonValue], key: str) -> int:
     value = mapping.get(key)
     if isinstance(value, bool) or not isinstance(value, int):
         raise RuntimeError(f"JSON field {key} must be an integer")
-    else:
-        pass
     return value
 
 
@@ -246,8 +234,6 @@ def tensor_field(record: AuditRecord, name: str) -> torch.Tensor:
     value = record.get(name)
     if not isinstance(value, torch.Tensor):
         raise RuntimeError(f"P16 audit field {name} is not a tensor")
-    else:
-        pass
     return value
 
 
@@ -255,8 +241,6 @@ def integer_field(record: AuditRecord, name: str) -> int:
     value = record.get(name)
     if isinstance(value, bool) or not isinstance(value, int):
         raise RuntimeError(f"P16 audit field {name} is not an integer")
-    else:
-        pass
     return value
 
 
@@ -333,8 +317,6 @@ def validation_rows(
     shard_values = manifest.get("shards")
     if not isinstance(shard_values, list):
         raise RuntimeError("P12 manifest shards must be a list")
-    else:
-        pass
     validation_shards: list[tuple[Path, str]] = []
     for shard_value in shard_values:
         shard = require_mapping(shard_value, "P12 shard record")
@@ -353,8 +335,6 @@ def validation_rows(
                 f"P12 validation shard hash mismatch: {shard_name}",
             )
             validation_shards.append((shard_path, shard_hash))
-        else:
-            pass
     counts = require_mapping(manifest.get("counts"), "P12 split counts")
     validation_count = sum(
         value
@@ -398,8 +378,6 @@ def validation_rows(
             raise RuntimeError(
                 f"validation request index is missing in {shard_path.name}"
             )
-        else:
-            pass
         for request_value in requests:
             request = require_mapping(request_value, "P12 validation request")
             uid = require_string(request, "uid")
@@ -458,8 +436,6 @@ def validation_rows(
             "p14_cohort",
             f"full P14 cohort hash differs: {cohort_sha}",
         )
-    else:
-        pass
     return sealed_frames, cohort, cohort_sha, identity_value
 
 
@@ -478,16 +454,12 @@ def validate_p15_gate(p15_root: Path) -> tuple[dict[str, JsonValue], Path]:
             decision = require_mapping(read_json(path), "P15A decision")
         except RuntimeError:
             continue
-        else:
-            pass
         identity = require_mapping(decision.get("identity"), "P15A identity")
         if (
             decision.get("status") == "P15A_NATIVE_HEAD_PASS"
             and identity.get("cohort_sha256") == P15_COHORT_SHA256
         ):
             passing.append((decision, path))
-        else:
-            pass
     require(
         len(passing) == 1,
         "p15_gate",
@@ -597,8 +569,6 @@ def build_talker(
     if enabled:
         if draft_path is None:
             raise ValueError("enabled P16 construction requires a local draft file")
-        else:
-            pass
         os.environ[P16_ENABLE_ENV] = "1"
         os.environ[P16_DRAFT_PATH_ENV] = str(draft_path.resolve(strict=True))
         os.environ[P16_DRAFT_SHA256_ENV] = P16_DRAFT_SHA256
@@ -626,8 +596,6 @@ def build_talker(
         talker = builder.talker_model
         if talker is None:
             raise RuntimeError("production Qwen3-TTS builder did not retain its Talker")
-        else:
-            pass
         return scheduler, talker
     finally:
         for name, value in prior_environment.items():
@@ -732,8 +700,6 @@ def build_compact_probabilities(
     top_ps = torch.ones((row_count,), device=device, dtype=torch.float32)
     if active_rows is None:
         active_rows = torch.ones((row_count,), device=device, dtype=torch.bool)
-    else:
-        pass
     candidates = build_speculative_probability_candidates(
         logits.contiguous(),
         temperatures,
@@ -746,8 +712,6 @@ def build_compact_probabilities(
     )
     if candidates is None:
         raise RuntimeError("split Top-K probability builder rejected an audited shape")
-    else:
-        pass
     probabilities, token_ids = candidates
     require(
         uses_split_top_k(logits, P16_MAX_TOP_K, P16_CANDIDATE_WIDTH),
@@ -847,8 +811,6 @@ def context_for(
     }
     if round_depth is not None:
         context["round_depth"] = round_depth
-    else:
-        pass
     return context
 
 
@@ -878,12 +840,8 @@ def capture_frame(
         raise RuntimeError(
             "P16 request data did not use the Qwen3-TTS request contract"
         )
-    else:
-        pass
     if talker.code_predictor_spec_audit_observer is not audit_capture:
         talker.set_code_predictor_speculative_audit_observer(audit_capture)
-    else:
-        pass
     talker.prepare_decode_buffers([request])
     expected_seed = int(request_data.subtalker_sampling_seed)
     require(
@@ -996,8 +954,6 @@ def audit_sequential_reference(
     rounds = captured.rounds
     if opening is None:
         raise RuntimeError("P16 production trace is incomplete")
-    else:
-        pass
     talker.prepare_decode_buffers([request])
     device = talker.predictor_device
     layer0_codes, talker_hidden, semantic_positions = input_tensors([frame], device)
@@ -1101,16 +1057,12 @@ def audit_sequential_reference(
     projected_tables = talker.predictor_projected_embeddings
     if projected_tables is None:
         raise RuntimeError("P16 sequential reference requires projected codec tables")
-    else:
-        pass
     draft_runtime = talker.code_predictor_p16_draft
     packed_head_weights = talker.code_predictor_spec_lm_head_weights
     if draft_runtime is None or packed_head_weights is None:
         raise RuntimeError(
             "P16 sequential reference requires the loaded draft and target heads"
         )
-    else:
-        pass
     proposal_index_total = 0
     target_query_total = 1
     rejection_total = 0
@@ -1341,8 +1293,6 @@ def audit_sequential_reference(
                 target_token = int(target_id)
                 if target_token < 0:
                     continue
-                else:
-                    pass
                 draft_probability = probability_at(
                     proposal_probabilities_expected[correction_row].to(device),
                     proposal_ids_expected[correction_row].to(device),
@@ -1579,12 +1529,6 @@ def run_native_controls(
                 repeatability_exact = torch.equal(
                     public_codes, repeated_codes
                 ) and torch.equal(public_feedback, repeated_feedback)
-            else:
-                pass
-        else:
-            pass
-    else:
-        pass
     graph_stats_after = talker.predictor_graph_stats()
     graph_replay_delta = graph_stats_after["replays"] - graph_stats_before["replays"]
     graph_eager_delta = (
@@ -1643,10 +1587,6 @@ def native_reference_samples(
                     "hidden": frame.hidden.detach().cpu().clone(),
                 }
             )
-        else:
-            pass
-    else:
-        pass
     return samples
 
 
@@ -1691,8 +1631,6 @@ def run_upstream_native_reference(
         "PYTHONPATH",
     ):
         environment.pop(name, None)
-    else:
-        pass
     environment["HF_HUB_OFFLINE"] = "1"
     environment["TRANSFORMERS_OFFLINE"] = "1"
     try:
@@ -1743,8 +1681,6 @@ def run_upstream_native_reference(
             raise RuntimeError(
                 f"upstream native reference subprocess failed ({result.returncode}):\n{detail}"
             )
-        else:
-            pass
         return torch.load(output_artifact, map_location="cpu", weights_only=True)
     finally:
         shutil.rmtree(checkout_root, ignore_errors=True)
@@ -1783,6 +1719,33 @@ def validate_native_reference(
         "default_off_reference_import",
         "upstream reference did not record the pinned Talker source path",
     )
+    source_root_value = reference_metadata.get("reference_source_root")
+    imported_source_paths = reference_metadata.get("imported_source_paths")
+    require(
+        isinstance(source_root_value, str)
+        and Path(source_root_value).is_absolute()
+        and Path(source_root_value) == Path(source_root_value).resolve()
+        and isinstance(imported_source_paths, dict)
+        and set(imported_source_paths) == set(P16_NATIVE_REFERENCE_IMPORTS),
+        "default_off_reference_import",
+        "upstream reference did not record its pinned import source root and modules",
+    )
+    source_root = Path(source_root_value)
+    for module_name, relative_path in P16_NATIVE_REFERENCE_IMPORTS.items():
+        imported_source_path = imported_source_paths[module_name]
+        expected_source_path = source_root / relative_path
+        require(
+            isinstance(imported_source_path, str)
+            and Path(imported_source_path).is_absolute()
+            and imported_source_path == str(expected_source_path),
+            "default_off_reference_import",
+            f"upstream reference imported {module_name} outside its recorded source checkout",
+        )
+    require(
+        reference_metadata["model_source_path"] == imported_source_paths["talker"],
+        "default_off_reference_import",
+        "upstream Talker source path differs from the imported Talker module",
+    )
     graph_evidence = require_mapping(
         reference_metadata.get("native_graph"), "upstream native graph evidence"
     )
@@ -1810,6 +1773,7 @@ def validate_native_reference(
         "upstream reference output shapes or dtypes differ from candidate outputs",
     )
     records = reference_metadata.get("records")
+    input_records = reference.get("inputs")
     require(
         isinstance(records, list)
         and len(records) == len(candidate_codes)
@@ -1825,8 +1789,23 @@ def validate_native_reference(
             "upstream reference tensor hashes do not match its output artifact",
             {"index": index},
         )
-    else:
-        pass
+    require(
+        isinstance(input_records, list)
+        and len(input_records) == len(records)
+        and all(isinstance(sample, dict) for sample in input_records),
+        "default_off_reference_inputs",
+        "native reference artifact does not retain every input row",
+    )
+    for index, (record, sample) in enumerate(zip(records, input_records)):
+        require(
+            all(
+                record.get(field) == sample.get(field)
+                for field in ("request_id", "uid", "ordinal", "seed")
+            ),
+            "default_off_reference_identity",
+            "native reference output row is associated with the wrong input or order",
+            {"index": index},
+        )
     exact = torch.equal(candidate_codes, reference_codes) and torch.equal(
         candidate_feedback, reference_feedback
     )
@@ -1835,6 +1814,8 @@ def validate_native_reference(
         "model_revision": P16_MODEL_REVISION,
         "model_source_path": reference_metadata["model_source_path"],
         "model_source_path_relative": reference_metadata["model_source_path_relative"],
+        "reference_source_root": source_root_value,
+        "imported_source_paths": imported_source_paths,
         "cohort_sha256": input_identity["cohort_sha256"],
         "sampling": input_identity["sampling"],
         "graph_configuration": input_identity["graph_configuration"],
@@ -1927,8 +1908,6 @@ def audit_capacity_four_batch_fallback(
                 "unsupported_batch",
                 "unsupported_batch_native_exact",
             )
-        else:
-            pass
         return True
     finally:
         close_runtime(scheduler)
@@ -1949,8 +1928,6 @@ def test_request_reset_and_reuse(
     )
     if talker.sub_speculative_seed_tensor is None:
         raise RuntimeError("P16 request seed buffer disappeared during reuse audit")
-    else:
-        pass
     first_speculative_seed = int(talker.sub_speculative_seed_tensor[0])
     first_evidence = audit_sequential_reference(
         talker,
@@ -1981,8 +1958,6 @@ def test_request_reset_and_reuse(
     audit_capture.release(independent_audit)
     if first_audit.opening is None or independent_audit.opening is None:
         raise RuntimeError("P16 request-ID audit did not capture its opening trace")
-    else:
-        pass
     opening_fields = (
         "opening_logits",
         "opening_sampling_seeds",
@@ -2056,8 +2031,6 @@ def check_invalid_request(
     request_data = request.data
     if not isinstance(request_data, Qwen3TTSSGLangRequestData):
         raise RuntimeError("invalid-request fixture is not Qwen3-TTS request data")
-    else:
-        pass
     object.__setattr__(request_data, "semantic_sampling_seed", "invalid-seed")
     prior_seed = talker.sub_speculative_seed_tensor[0].detach().cpu().clone()
     try:
@@ -2227,235 +2200,238 @@ def run_validation(arguments: ValidationArguments) -> dict[str, JsonValue]:
         enabled=True,
         draft_path=draft_path,
     )
-    require(
-        talker.code_predictor_p16_enabled
-        and talker.predictor_max_batch_size == 1
-        and talker.predictor_graph_batch_sizes == (1,)
-        and talker.predictor_fused_layers.max_rows >= P16_VERIFY_WIDTH
-        and int(talker.config.hidden_size) == P16_TALKER_HIDDEN_SIZE
-        and int(talker.config.code_predictor_config.hidden_size)
-        == P16_CODE_PREDICTOR_HIDDEN_SIZE
-        and talker.code_predictor_p16_draft is not None
-        and talker.code_predictor_p16_draft_sha256 == P16_DRAFT_SHA256
-        and talker.code_predictor_spec_effective_width == P16_VERIFY_WIDTH
-        and talker.code_predictor_spec_requested_width == P16_VERIFY_WIDTH,
-        "checkpoint_weights_verified",
-        "production builder did not load the pinned draft and graph configuration",
-    )
-    # Retained receipt field for compatibility; target verification now calls
-    # the native LM-head module directly and does not select F.linear.
-    native_target_flinear = False
-    require(
-        talker.code_predictor_p16_static_fallback_reason is None,
-        "p16_eligibility",
-        f"H200 worker is statically ineligible: {talker.code_predictor_p16_static_fallback_reason}",
-    )
     try:
-        normalize_qwen3_tts_seed(True)
-    except ValueError:
-        invalid_public_seed_rejected = True
-    else:
-        invalid_public_seed_rejected = False
-    require(
-        invalid_public_seed_rejected,
-        "invalid_request_rejected",
-        "public Qwen3-TTS request seed validator accepted a boolean seed",
-    )
-
-    totals = AuditTotals()
-    audit_capture = P16AuditCapture()
-    candidate_visits: list[dict[str, JsonValue]] = []
-    same_seed_trace_exact = True
-    for cohort_index, frame in enumerate(cohort):
-        for repeat in range(arguments.seeds):
-            seed = seed_for(frame.uid, frame.ordinal, repeat)
-            request_id = f"p16:{frame.uid}:{frame.ordinal}:{seed}"
-            request = create_request(request_id, seed)
-            candidate_codes, candidate_embedding, captured, counters = capture_frame(
-                talker,
-                frame,
-                request,
-                seed,
-                audit_capture,
-            )
-            evidence = audit_sequential_reference(
-                talker,
-                frame,
-                request,
-                seed,
-                candidate_codes,
-                candidate_embedding,
-                captured,
-                totals,
-            )
-            audit_capture.release(captured)
-            evidence["cohort_index"] = cohort_index
-            counter_json: dict[str, JsonValue] = {}
-            for name, value in counters.items():
-                counter_json[name] = value
-            else:
-                pass
-            evidence["graph_counter_delta"] = counter_json
-            candidate_visits.append(evidence)
+        require(
+            talker.code_predictor_p16_enabled
+            and talker.predictor_max_batch_size == 1
+            and talker.predictor_graph_batch_sizes == (1,)
+            and talker.predictor_fused_layers.max_rows >= P16_VERIFY_WIDTH
+            and int(talker.config.hidden_size) == P16_TALKER_HIDDEN_SIZE
+            and int(talker.config.code_predictor_config.hidden_size)
+            == P16_CODE_PREDICTOR_HIDDEN_SIZE
+            and talker.code_predictor_p16_draft is not None
+            and talker.code_predictor_p16_draft_sha256 == P16_DRAFT_SHA256
+            and talker.code_predictor_spec_effective_width == P16_VERIFY_WIDTH
+            and talker.code_predictor_spec_requested_width == P16_VERIFY_WIDTH,
+            "checkpoint_weights_verified",
+            "production builder did not load the pinned draft and graph configuration",
+        )
+        # Retained receipt field for compatibility; target verification now calls
+        # the native LM-head module directly and does not select F.linear.
+        native_target_flinear = False
+        require(
+            talker.code_predictor_p16_static_fallback_reason is None,
+            "p16_eligibility",
+            f"H200 worker is statically ineligible: {talker.code_predictor_p16_static_fallback_reason}",
+        )
+        try:
+            normalize_qwen3_tts_seed(True)
+        except ValueError:
+            invalid_public_seed_rejected = True
         else:
-            pass
-    require(
-        len(candidate_visits) == arguments.frames * arguments.seeds,
-        "audit_coverage",
-        "not every requested P14 frame and seed was audited",
-    )
+            invalid_public_seed_rejected = False
+        require(
+            invalid_public_seed_rejected,
+            "invalid_request_rejected",
+            "public Qwen3-TTS request seed validator accepted a boolean seed",
+        )
 
-    first_frame = cohort[0]
-    first_seed = seed_for(first_frame.uid, first_frame.ordinal, 0)
-    reused_seed = seed_for(first_frame.uid, first_frame.ordinal, 1)
-    reuse_ok = test_request_reset_and_reuse(
-        talker,
-        first_frame,
-        first_seed,
-        reused_seed,
-        audit_capture,
-        totals,
-    )
-    invalid_request_rejected = check_invalid_request(talker, first_frame, first_seed)
-    unsupported_fallback_frames = 0
+        totals = AuditTotals()
+        audit_capture = P16AuditCapture()
+        candidate_visits: list[dict[str, JsonValue]] = []
+        same_seed_trace_exact = True
+        for cohort_index, frame in enumerate(cohort):
+            for repeat in range(arguments.seeds):
+                seed = seed_for(frame.uid, frame.ordinal, repeat)
+                request_id = f"p16:{frame.uid}:{frame.ordinal}:{seed}"
+                request = create_request(request_id, seed)
+                candidate_codes, candidate_embedding, captured, counters = (
+                    capture_frame(
+                        talker,
+                        frame,
+                        request,
+                        seed,
+                        audit_capture,
+                    )
+                )
+                evidence = audit_sequential_reference(
+                    talker,
+                    frame,
+                    request,
+                    seed,
+                    candidate_codes,
+                    candidate_embedding,
+                    captured,
+                    totals,
+                )
+                audit_capture.release(captured)
+                evidence["cohort_index"] = cohort_index
+                counter_json: dict[str, JsonValue] = {}
+                for name, value in counters.items():
+                    counter_json[name] = value
+                evidence["graph_counter_delta"] = counter_json
+                candidate_visits.append(evidence)
+        require(
+            len(candidate_visits) == arguments.frames * arguments.seeds,
+            "audit_coverage",
+            "not every requested P14 frame and seed was audited",
+        )
 
-    unsupported_sampling_exact = True
-    sampling_cases = (
-        ("greedy", {"do_sample": False}),
-        ("temperature", {"temperature": 0.8}),
-        ("top-k", {"top_k": 49}),
-        ("top-p", {"top_p": 0.95}),
-    )
-    for name, sampling_options in sampling_cases:
-        sampling_request = create_request(
-            f"p16-unsupported-{name}:{first_frame.uid}:{first_frame.ordinal}",
+        first_frame = cohort[0]
+        first_seed = seed_for(first_frame.uid, first_frame.ordinal, 0)
+        reused_seed = seed_for(first_frame.uid, first_frame.ordinal, 1)
+        reuse_ok = test_request_reset_and_reuse(
+            talker,
+            first_frame,
             first_seed,
-            **sampling_options,
+            reused_seed,
+            audit_capture,
+            totals,
         )
-        unsupported_sampling_exact = (
-            audit_unsupported_native_fallback(
-                talker,
-                [first_frame],
-                [sampling_request],
-                "unsupported_sampling",
-                "unsupported_sampling_native_exact",
-            )
-            and unsupported_sampling_exact
+        invalid_request_rejected = check_invalid_request(
+            talker, first_frame, first_seed
         )
-        unsupported_fallback_frames += 1
+        unsupported_fallback_frames = 0
 
-    frame_pair = cohort[:2]
-    actual_stats = talker.predictor_speculative_stats()
-    graph_memory_within_budget = (
-        not actual_stats["graph_capture_memory_budget_exceeded"]
-        and actual_stats["graph_capture_memory_reserved_growth_bytes"]
-        <= actual_stats["graph_capture_memory_budget_bytes"]
-    )
-    graph_capture_count_bounded = (
-        actual_stats["full_round_graph_captures"] <= 14
-        and actual_stats["opening_pair_graph_captures"] <= 1
-    )
-    no_cuda_errors = (
-        talker.code_predictor_spec_cuda_errors == 0
-        and talker.code_predictor_spec_invalid_probability_rows == 0
-        and talker.code_predictor_spec_native_fallback_count
-        == unsupported_fallback_frames
-        and talker.code_predictor_spec_full_round_graph_replay_count
-        == talker.code_predictor_spec_round_count
-    )
-    require(
-        no_cuda_errors,
-        "no_cuda_errors",
-        "P16 recorded CUDA, invalid-row, eager, or graph coverage errors",
-    )
-    require(
-        totals.rejections > 0 and totals.bonuses > 0 and totals.width_one_rounds > 0,
-        "reject_and_bonus_audited",
-        "cohort did not exercise rejection, bonus, and W1 tail paths",
-    )
-    require(
-        totals.valid_kv_rounds == totals.rounds
-        and totals.compact_probability_rows >= totals.native_target_rows
-        and totals.native_target_rows > 0,
-        "committed_kv_exact",
-        "sequential target/probability/KV audit coverage is incomplete",
-    )
-    checks = {
-        **off_checks,
-        "bad_checkpoint_rejected": bad_checkpoint_rejected,
-        "unsupported_batch_native_exact": unsupported_batch_exact,
-        "unsupported_sampling_native_exact": unsupported_sampling_exact,
-        "packed_hidden_exact": True,
-        "native_target_logits_exact": True,
-        "compact_probability_exact": True,
-        "committed_kv_exact": True,
-        "same_seed_B_C_trace_exact": same_seed_trace_exact,
-        "reject_and_bonus_audited": True,
-        "real_wrapper_used": type(talker).__name__ == "Qwen3TTSTalker",
-        "graph_replays_no_fallback": (
-            actual_stats["full_round_graph_replay_coverage"] == 1.0
-            and actual_stats["opening_pair_graph_replay_coverage"] == 1.0
+        unsupported_sampling_exact = True
+        sampling_cases = (
+            ("greedy", {"do_sample": False}),
+            ("temperature", {"temperature": 0.8}),
+            ("top-k", {"top_k": 49}),
+            ("top-p", {"top_p": 0.95}),
+        )
+        for name, sampling_options in sampling_cases:
+            sampling_request = create_request(
+                f"p16-unsupported-{name}:{first_frame.uid}:{first_frame.ordinal}",
+                first_seed,
+                **sampling_options,
+            )
+            unsupported_sampling_exact = (
+                audit_unsupported_native_fallback(
+                    talker,
+                    [first_frame],
+                    [sampling_request],
+                    "unsupported_sampling",
+                    "unsupported_sampling_native_exact",
+                )
+                and unsupported_sampling_exact
+            )
+            unsupported_fallback_frames += 1
+
+        actual_stats = talker.predictor_speculative_stats()
+        graph_memory_within_budget = (
+            not actual_stats["graph_capture_memory_budget_exceeded"]
+            and actual_stats["graph_capture_memory_reserved_growth_bytes"]
+            <= actual_stats["graph_capture_memory_budget_bytes"]
+        )
+        graph_capture_count_bounded = (
+            actual_stats["full_round_graph_captures"] <= 14
+            and actual_stats["opening_pair_graph_captures"] <= 1
+        )
+        no_cuda_errors = (
+            talker.code_predictor_spec_cuda_errors == 0
+            and talker.code_predictor_spec_invalid_probability_rows == 0
             and talker.code_predictor_spec_native_fallback_count
             == unsupported_fallback_frames
-        ),
-        "graph_capture_count_bounded": graph_capture_count_bounded,
-        "graph_memory_within_budget": graph_memory_within_budget,
-        "request_reset_and_reuse": reuse_ok,
-        "invalid_request_rejected": invalid_request_rejected,
-        "checkpoint_weights_verified": talker.code_predictor_p16_draft_sha256
-        == P16_DRAFT_SHA256,
-        "no_cuda_errors": no_cuda_errors,
-    }
-    require(
-        all(checks.values()),
-        "p16_checks",
-        f"one or more required P16 checks failed: {[name for name, passed in checks.items() if not passed]}",
-    )
-    receipt: dict[str, JsonValue] = {
-        "schema": P16_SCHEMA,
-        "status": "P16_INTEGRATION_PASS",
-        "candidate_sha": candidate_sha,
-        "draft_sha256": P16_DRAFT_SHA256,
-        "model_revision": P16_MODEL_REVISION,
-        "production_entrypoint": "Qwen3TTSTalker.code_predictor_forward",
-        "cuda_graph_on": True,
-        "dtype": "bfloat16",
-        "cohort_sha256": cohort_sha,
-        "audited_visits": len(candidate_visits),
-        "checks": checks,
-        "g2_5_status": "NOT_CERTIFIED",
-        "evidence": {
-            "p14_cohort_identity": cohort_identity,
-            "p15_decision_sha256": sha256_file(p15_decision_path),
-            "model_identity": model_identity_value,
-            "draft_sha256_verified": sha256_file(draft_path),
-            "target_native_flinear_probe_exact": native_target_flinear,
-            "audited_target_rows": totals.native_target_rows,
-            "audited_compact_probability_rows": totals.compact_probability_rows,
-            "audited_proposal_rows": totals.proposal_rows,
-            "audited_rounds": totals.rounds,
-            "committed_kv_exact_rounds": totals.valid_kv_rounds,
-            "predictor_graph_diagnostics": actual_stats,
-            "graph_memory_budget_semantics": (
-                "The 512 MiB limit is a post-capture reserved-memory growth guard; "
-                "it does not preallocate or reserve that memory before capture."
+            and talker.code_predictor_spec_full_round_graph_replay_count
+            == talker.code_predictor_spec_round_count
+        )
+        require(
+            no_cuda_errors,
+            "no_cuda_errors",
+            "P16 recorded CUDA, invalid-row, eager, or graph coverage errors",
+        )
+        require(
+            totals.rejections > 0
+            and totals.bonuses > 0
+            and totals.width_one_rounds > 0,
+            "reject_and_bonus_audited",
+            "cohort did not exercise rejection, bonus, and W1 tail paths",
+        )
+        require(
+            totals.valid_kv_rounds == totals.rounds
+            and totals.compact_probability_rows >= totals.native_target_rows
+            and totals.native_target_rows > 0,
+            "committed_kv_exact",
+            "sequential target/probability/KV audit coverage is incomplete",
+        )
+        checks = {
+            **off_checks,
+            "bad_checkpoint_rejected": bad_checkpoint_rejected,
+            "unsupported_batch_native_exact": unsupported_batch_exact,
+            "unsupported_sampling_native_exact": unsupported_sampling_exact,
+            "packed_hidden_exact": True,
+            "native_target_logits_exact": True,
+            "compact_probability_exact": True,
+            "committed_kv_exact": True,
+            "same_seed_B_C_trace_exact": same_seed_trace_exact,
+            "reject_and_bonus_audited": True,
+            "real_wrapper_used": type(talker).__name__ == "Qwen3TTSTalker",
+            "graph_replays_no_fallback": (
+                actual_stats["full_round_graph_replay_coverage"] == 1.0
+                and actual_stats["opening_pair_graph_replay_coverage"] == 1.0
+                and talker.code_predictor_spec_native_fallback_count
+                == unsupported_fallback_frames
             ),
-            "rejections": totals.rejections,
-            "bonuses": totals.bonuses,
-            "w1_tail_rounds": totals.width_one_rounds,
-            "full_round_graph_replays": talker.code_predictor_spec_full_round_graph_replay_count,
-            "opening_pair_graph_replays": talker.code_predictor_spec_opening_graph_replay_count,
-            "full_round_graph_captures": talker.code_predictor_spec_full_round_graph_capture_count,
-            "opening_pair_graph_captures": talker.code_predictor_spec_opening_graph_capture_count,
-            "probability_backend_execution_counts": actual_stats[
-                "probability_backend_execution_counts"
-            ],
-            "visits": candidate_visits,
-            "failure_rows": [],
-        },
-    }
-    close_runtime(candidate_scheduler)
-    return receipt
+            "graph_capture_count_bounded": graph_capture_count_bounded,
+            "graph_memory_within_budget": graph_memory_within_budget,
+            "request_reset_and_reuse": reuse_ok,
+            "invalid_request_rejected": invalid_request_rejected,
+            "checkpoint_weights_verified": talker.code_predictor_p16_draft_sha256
+            == P16_DRAFT_SHA256,
+            "no_cuda_errors": no_cuda_errors,
+        }
+        require(
+            all(checks.values()),
+            "p16_checks",
+            f"one or more required P16 checks failed: {[name for name, passed in checks.items() if not passed]}",
+        )
+        receipt: dict[str, JsonValue] = {
+            "schema": P16_SCHEMA,
+            "status": "P16_INTEGRATION_PASS",
+            "candidate_sha": candidate_sha,
+            "draft_sha256": P16_DRAFT_SHA256,
+            "model_revision": P16_MODEL_REVISION,
+            "production_entrypoint": "Qwen3TTSTalker.code_predictor_forward",
+            "cuda_graph_on": True,
+            "dtype": "bfloat16",
+            "cohort_sha256": cohort_sha,
+            "audited_visits": len(candidate_visits),
+            "checks": checks,
+            "g2_5_status": "NOT_CERTIFIED",
+            "evidence": {
+                "p14_cohort_identity": cohort_identity,
+                "p15_decision_sha256": sha256_file(p15_decision_path),
+                "model_identity": model_identity_value,
+                "draft_sha256_verified": sha256_file(draft_path),
+                "target_native_flinear_probe_exact": native_target_flinear,
+                "audited_target_rows": totals.native_target_rows,
+                "audited_compact_probability_rows": totals.compact_probability_rows,
+                "audited_proposal_rows": totals.proposal_rows,
+                "audited_rounds": totals.rounds,
+                "committed_kv_exact_rounds": totals.valid_kv_rounds,
+                "predictor_graph_diagnostics": actual_stats,
+                "graph_memory_budget_semantics": (
+                    "The 512 MiB limit is a post-capture reserved-memory growth guard; "
+                    "it does not preallocate or reserve that memory before capture."
+                ),
+                "rejections": totals.rejections,
+                "bonuses": totals.bonuses,
+                "w1_tail_rounds": totals.width_one_rounds,
+                "full_round_graph_replays": talker.code_predictor_spec_full_round_graph_replay_count,
+                "opening_pair_graph_replays": talker.code_predictor_spec_opening_graph_replay_count,
+                "full_round_graph_captures": talker.code_predictor_spec_full_round_graph_capture_count,
+                "opening_pair_graph_captures": talker.code_predictor_spec_opening_graph_capture_count,
+                "probability_backend_execution_counts": actual_stats[
+                    "probability_backend_execution_counts"
+                ],
+                "visits": candidate_visits,
+                "failure_rows": [],
+            },
+        }
+        return receipt
+    finally:
+        close_runtime(candidate_scheduler)
 
 
 def main() -> int:
@@ -2475,12 +2451,8 @@ def main() -> int:
         if isinstance(error, ValidationFailure):
             failure["failed_check"] = error.check
             failure["failure_rows"] = [error.context]
-        else:
-            pass
         if not arguments.out.exists() and not review_path.exists():
             write_json_atomic(review_path, failure)
-        else:
-            pass
         print(json.dumps(failure, sort_keys=True), file=sys.stderr)
         return 1
     else:
